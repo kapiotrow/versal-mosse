@@ -19,7 +19,6 @@ TARGET         := hw_emu
 PATCH_ROWS     := 128
 PATCH_COLS     := 128
 N_CHANNELS     := 16
-N_FILTERS      := $(N_CHANNELS)
 FFT_2D_DT      := 0          # 0=cint16, 1=cfloat
 ITER_CNT       := 1
 PL_FREQ        := 312.5
@@ -109,21 +108,11 @@ VPP_FLAGS  += --temp_dir $(BUILD_DIR)/_x
 # =========================================================
 # PL kernel compile flags (per kernel)
 # =========================================================
-CONV_VPP_FLAGS  := --hls.clock $(VPP_CLOCK_FREQ):conv_layer
-CONV_VPP_FLAGS  += --Xpreproc="-DPATCH_ROWS=$(PATCH_ROWS)"
-CONV_VPP_FLAGS  += --Xpreproc="-DPATCH_COLS=$(PATCH_COLS)"
-CONV_VPP_FLAGS  += --Xpreproc="-DN_FILTERS=$(N_FILTERS)"
+CAM_VPP_FLAGS   := --hls.clock $(VPP_CLOCK_FREQ):camera_capture
 
-FMT_VPP_FLAGS   := --hls.clock $(VPP_CLOCK_FREQ):fmt_adapter
-FMT_VPP_FLAGS   += --Xpreproc="-DPATCH_ROWS=$(PATCH_ROWS)"
-FMT_VPP_FLAGS   += --Xpreproc="-DPATCH_COLS=$(PATCH_COLS)"
-
-CMUL_VPP_FLAGS  := --hls.clock $(VPP_CLOCK_FREQ):cmul_accum
-CMUL_VPP_FLAGS  += --Xpreproc="-DPATCH_ROWS=$(PATCH_ROWS)"
-CMUL_VPP_FLAGS  += --Xpreproc="-DPATCH_COLS=$(PATCH_COLS)"
-CMUL_VPP_FLAGS  += --Xpreproc="-DN_CHANNELS=$(N_CHANNELS)"
-
-PEAK_VPP_FLAGS  := --hls.clock $(VPP_CLOCK_FREQ):peak_detect
+CROP_VPP_FLAGS  := --hls.clock $(VPP_CLOCK_FREQ):roi_crop
+CROP_VPP_FLAGS  += --Xpreproc="-DPATCH_ROWS=$(PATCH_ROWS)"
+CROP_VPP_FLAGS  += --Xpreproc="-DPATCH_COLS=$(PATCH_COLS)"
 
 # =========================================================
 # Host application compiler flags
@@ -133,6 +122,8 @@ GCC_FLAGS  += -DPATCH_ROWS=$(PATCH_ROWS)
 GCC_FLAGS  += -DPATCH_COLS=$(PATCH_COLS)
 GCC_FLAGS  += -DN_CHANNELS=$(N_CHANNELS)
 GCC_FLAGS  += -DITER_CNT=$(ITER_CNT)
+GCC_FLAGS  += -DFRAME_ROWS=1080
+GCC_FLAGS  += -DFRAME_COLS=1920
 
 GCC_INC    := -I$(SDKTARGETSYSROOT)/usr/include/xrt
 GCC_INC    += -I$(XILINX_VITIS)/aietools/include/
@@ -152,20 +143,16 @@ GCC_LIBS   += -ladf_api_xrt -lxrt_coreutil
 # =========================================================
 VPP_LINK_FLAGS  := --vivado.synth.jobs 8
 VPP_LINK_FLAGS  += --config $(SYS_CONFIGS)/mosse_x1.cfg
-VPP_LINK_FLAGS  += --clock.freqHz $(VPP_CLOCK_FREQ):conv_layer_0
-VPP_LINK_FLAGS  += --clock.freqHz $(VPP_CLOCK_FREQ):fmt_adapter_0
-VPP_LINK_FLAGS  += --clock.freqHz $(VPP_CLOCK_FREQ):cmul_accum_0
-VPP_LINK_FLAGS  += --clock.freqHz $(VPP_CLOCK_FREQ):peak_detect_0
+VPP_LINK_FLAGS  += --clock.freqHz $(VPP_CLOCK_FREQ):camera_capture_0
+VPP_LINK_FLAGS  += --clock.freqHz $(VPP_CLOCK_FREQ):roi_crop_0
 
 # =========================================================
 # Kernel XO targets
 # =========================================================
-CONV_XO   := $(BUILD_DIR)/conv_layer.$(TARGET).xo
-FMT_XO    := $(BUILD_DIR)/fmt_adapter.$(TARGET).xo
-CMUL_XO   := $(BUILD_DIR)/cmul_accum.$(TARGET).xo
-PEAK_XO   := $(BUILD_DIR)/peak_detect.$(TARGET).xo
+CAM_XO  := $(BUILD_DIR)/camera_capture.$(TARGET).xo
+CROP_XO := $(BUILD_DIR)/roi_crop.$(TARGET).xo
 
-KERNEL_XOS := $(CONV_XO) $(FMT_XO) $(CMUL_XO) $(PEAK_XO)
+KERNEL_XOS := $(CAM_XO) $(CROP_XO)
 
 # =========================================================
 # Rules
@@ -196,34 +183,33 @@ print-%: ; @echo $* = $($*)
 # -------------------------------------------------------
 kernels: $(KERNEL_XOS)
 
-$(CONV_XO): $(PL_SRC_REPO)/conv_layer/conv_layer.cpp
+$(CAM_XO): $(PL_SRC_REPO)/camera_capture/camera_capture.cpp
 	mkdir -p $(BUILD_DIR)
-	v++ $(VPP_FLAGS) $(CONV_VPP_FLAGS) -c -k conv_layer $< -o $@
+	v++ $(VPP_FLAGS) $(CAM_VPP_FLAGS) -c -k camera_capture $< -o $@
 
-$(FMT_XO): $(PL_SRC_REPO)/fmt_adapter/fmt_adapter.cpp
+$(CROP_XO): $(PL_SRC_REPO)/roi_crop/roi_crop.cpp
 	mkdir -p $(BUILD_DIR)
-	v++ $(VPP_FLAGS) $(FMT_VPP_FLAGS) -c -k fmt_adapter $< -o $@
-
-$(CMUL_XO): $(PL_SRC_REPO)/cmul_accum/cmul_accum.cpp
-	mkdir -p $(BUILD_DIR)
-	v++ $(VPP_FLAGS) $(CMUL_VPP_FLAGS) -c -k cmul_accum $< -o $@
-
-$(PEAK_XO): $(PL_SRC_REPO)/peak_detect/peak_detect.cpp
-	mkdir -p $(BUILD_DIR)
-	v++ $(VPP_FLAGS) $(PEAK_VPP_FLAGS) -c -k peak_detect $< -o $@
+	v++ $(VPP_FLAGS) $(CROP_VPP_FLAGS) -c -k roi_crop $< -o $@
 
 # -------------------------------------------------------
 # AIE graph
 # -------------------------------------------------------
 graph: $(LIBADF_A)
 
-$(LIBADF_A): $(AIE_SRC_REPO)/mosse_graph.cpp $(AIE_SRC_REPO)/mosse_graph.h \
-             $(AIE_SRC_REPO)/fft_graph.h $(AIE_SRC_REPO)/ifft_graph.h
+$(LIBADF_A): $(AIE_SRC_REPO)/mosse_graph.cpp  \
+             $(AIE_SRC_REPO)/mosse_graph.h     \
+             $(AIE_SRC_REPO)/fft_graph.h       \
+             $(AIE_SRC_REPO)/ifft_graph.h      \
+             $(AIE_SRC_REPO)/conv2d_kernel.h   \
+             $(AIE_SRC_REPO)/conv2d_kernel.cpp \
+             $(AIE_SRC_REPO)/cmul_accum_kernel.h \
+             $(AIE_SRC_REPO)/cmul_accum_kernel.cpp
 	mkdir -p $(BUILD_DIR)
 	cd $(BUILD_DIR) && aiecompiler $(AIE_FLAGS) $(GRAPH_SRC_CPP) 2>&1 | tee aiecompiler.log
 
 aiesim: graph
-	cd $(BUILD_DIR) && aiesimulator $(AIE_SIM_FLAGS) 2>&1 | tee aiesim.log
+	cd $(BUILD_DIR) && aiesimulator $(AIE_SIM_FLAGS) \
+	    -i=$(AIE_SRC_REPO)/aiesim_data 2>&1 | tee aiesim.log
 
 # -------------------------------------------------------
 # System link

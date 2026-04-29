@@ -11,7 +11,7 @@ SECONDS=0
 export XILINX_XRT=/usr
 
 # Executing the elf...
-./fft_2d_aie_xrt.elf a.xclbin
+./mosse_tracker.elf a.xclbin
 
 return_code=$?
 

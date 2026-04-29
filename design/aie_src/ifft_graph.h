@@ -1,122 +1,130 @@
 /*
  * ifft_graph.h
- * AIE IFFT2D graph for the MOSSE tracker response computation.
+ * AIE IFFT2D graph for the MOSSE correlation response.
  *
- * Single instance — applied after the PL cmul_accum kernel has
- * accumulated the element-wise product  Σ_c H_c* ⊙ FFT(f_c)
- * across all N_CHANNELS feature channels.
+ * Single instance; fed by the accumulated correlation spectrum
+ * Σ_c H_c* ⊙ F_c written to DDR by cmul_accum_kernel, then passed to
+ * the IFFT row input via gmio_ifft_row_in by the APU.
  *
- * Point sizes are identical to the FFT graph (same patch dimensions).
- * The IFFT normalization shift: log2(PATCH_COLS) for row IFFT and
- * log2(PATCH_ROWS) for col IFFT.  Adjust FFT_2D_TP_IFFT_SHIFT below
- * to match the DSPLib convention (shift is applied per stage).
+ * Same row/col-transpose-via-DDR pattern as fft_graph.h:
+ *   ifft_row_out → gmio_ifft_row_out → DDR   (APU transposes)
+ *   DDR → gmio_ifft_col_in → ifft_col_in
+ *   ifft_col_out → gmio_response → DDR       (APU reads for peak detection)
+ *
+ * Normalization shift (resolved design decision):
+ *   Row IFFT: shift = 0   (no normalization on row pass)
+ *   Col IFFT: shift = 14  (= log2(128) + log2(128) for 128×128 patches)
+ *
+ * R7 risk: DSPLib TP_SHIFT may mean total output shift, not per-stage.
+ * If aiesim response is 2^14× too large, set FFT_2D_TP_IFFT_COL_SHIFT = 0
+ * and apply >> 14 normalization in the APU after reading gmio_response.
+ *
+ * fft_graph.h must be included before this file (provides point-size macros).
  */
 
 #pragma once
 
 #include "adf.h"
 #include "fft_ifft_dit_1ch_graph.hpp"
+#include "fft_graph.h"
 
 using namespace adf;
 namespace dsplib = xf::dsp::aie;
 
-// Reuse point-size and type macros from fft_graph.h — include order matters.
-// fft_graph.h must be included before ifft_graph.h.
+// ---------------------------------------------------------------
+// IFFT normalization shifts (split across row and col passes)
+// For 128-point: log2(128) = 7; total = 14.
+// Apply entire shift on col pass so row output stays at full precision.
+// ---------------------------------------------------------------
+#define FFT_2D_TP_IFFT_ROW_SHIFT   0    // no shift on row IFFT
+#define FFT_2D_TP_IFFT_COL_SHIFT  14    // full normalization on col IFFT
 
-#define FFT_2D_TP_IFFT_NIFFT   0    // 0 = inverse FFT
-// TODO: set shift to log2(PATCH_COLS) + log2(PATCH_ROWS) split appropriately
-// For 128-point: log2(128)=7; typical split: row shift=0, col shift=7 (or both=0 and
-// normalise in cmul_accum). Start with 0 and verify numerically.
-#define FFT_2D_TP_IFFT_SHIFT   0
+#define FFT_2D_TP_IFFT_NIFFT       0    // 0 = inverse FFT
 
-extern uint8_t ifftRows_grInsts, ifftCols_grInsts;
+// Window sizes reuse FFT sizes (same point size, same window stride)
+#define IFFT_ROW_WINDOW_BUFF_SIZE  FFT_ROW_WINDOW_BUFF_SIZE
+#define IFFT_COL_WINDOW_BUFF_SIZE  FFT_COL_WINDOW_BUFF_SIZE
 
 // ---------------------------------------------------------------
 // IFFTrows_graph
-// Applies PATCH_COLS-point IFFT across each row of the accumulated
-// frequency-domain response map.
-// PLIO: "IFFTRowIn0", "IFFTRowOut0"
+// PATCH_COLS-point IFFT, row shift = 0.
 // ---------------------------------------------------------------
 class IFFTrows_graph : public graph
 {
 public:
-    input_plio  row_in;
-    output_plio row_out;
+    port<input>  row_in;
+    port<output> row_out;
+
+    dsplib::fft::dit_1ch::fft_ifft_dit_1ch_graph<
+        FFT_2D_TT_DATA, FFT_2D_TT_TWIDDLE,
+        FFT_ROW_TP_POINT_SIZE,
+        FFT_2D_TP_IFFT_NIFFT,
+        FFT_2D_TP_IFFT_ROW_SHIFT,
+        FFT_ROW_CASCADE_LEN,
+        FFT_2D_TP_DYN_PT_SIZE,
+        FFT_ROW_TP_WINDOW_VSIZE> IFFTrow_gr;
 
     IFFTrows_graph()
     {
-        dsplib::fft::dit_1ch::fft_ifft_dit_1ch_graph<
-            FFT_2D_TT_DATA, FFT_2D_TT_TWIDDLE,
-            FFT_ROW_TP_POINT_SIZE,
-            FFT_2D_TP_IFFT_NIFFT,
-            FFT_2D_TP_IFFT_SHIFT,
-            FFT_ROW_CASCADE_LEN,
-            FFT_2D_TP_DYN_PT_SIZE,
-            FFT_ROW_TP_WINDOW_VSIZE> IFFTrow_gr;
-
         runtime<ratio>(*IFFTrow_gr.getKernels()) = 0.8;
 
-        std::string in_name  = "IFFTRowIn"  + std::to_string(ifftRows_grInsts);
-        std::string out_name = "IFFTRowOut" + std::to_string(ifftRows_grInsts);
-        std::string in_file  = "ifft_row_in_"  + std::to_string(ifftRows_grInsts) + ".txt";
-        std::string out_file = "data/ifft_row_out_" + std::to_string(ifftRows_grInsts) + ".txt";
-
-        row_in  = input_plio::create(in_name.c_str(),  plio_128_bits, in_file.c_str());
-        row_out = output_plio::create(out_name.c_str(), plio_128_bits, out_file.c_str());
-
-        adf::connect<window<FFT_ROW_WINDOW_BUFF_SIZE>>(row_in.out[0],     IFFTrow_gr.in[0]);
-        adf::connect<window<FFT_ROW_WINDOW_BUFF_SIZE>>(IFFTrow_gr.out[0], row_out.in[0]);
-
-        ++ifftRows_grInsts;
+        adf::connect<window<IFFT_ROW_WINDOW_BUFF_SIZE>>(row_in,             IFFTrow_gr.in[0]);
+        adf::connect<window<IFFT_ROW_WINDOW_BUFF_SIZE>>(IFFTrow_gr.out[0],  row_out);
     }
 };
 
 // ---------------------------------------------------------------
 // IFFTcols_graph
-// Applies PATCH_ROWS-point IFFT across each column of the row-IFFT
-// output (fed transposed data from PL).
-// PLIO: "IFFTColIn0", "IFFTColOut0"
+// PATCH_ROWS-point IFFT, col shift = 14 (full normalization).
 // ---------------------------------------------------------------
 class IFFTcols_graph : public graph
 {
 public:
-    input_plio  col_in;
-    output_plio col_out;
+    port<input>  col_in;
+    port<output> col_out;
+
+    dsplib::fft::dit_1ch::fft_ifft_dit_1ch_graph<
+        FFT_2D_TT_DATA, FFT_2D_TT_TWIDDLE,
+        FFT_COL_TP_POINT_SIZE,
+        FFT_2D_TP_IFFT_NIFFT,
+        FFT_2D_TP_IFFT_COL_SHIFT,
+        FFT_COL_CASCADE_LEN,
+        FFT_2D_TP_DYN_PT_SIZE,
+        FFT_COL_TP_WINDOW_VSIZE> IFFTcol_gr;
 
     IFFTcols_graph()
     {
-        dsplib::fft::dit_1ch::fft_ifft_dit_1ch_graph<
-            FFT_2D_TT_DATA, FFT_2D_TT_TWIDDLE,
-            FFT_COL_TP_POINT_SIZE,
-            FFT_2D_TP_IFFT_NIFFT,
-            FFT_2D_TP_IFFT_SHIFT,
-            FFT_COL_CASCADE_LEN,
-            FFT_2D_TP_DYN_PT_SIZE,
-            FFT_COL_TP_WINDOW_VSIZE> IFFTcol_gr;
-
         runtime<ratio>(*IFFTcol_gr.getKernels()) = 0.8;
 
-        std::string in_name  = "IFFTColIn"  + std::to_string(ifftCols_grInsts);
-        std::string out_name = "IFFTColOut" + std::to_string(ifftCols_grInsts);
-        std::string in_file  = "ifft_col_in_"  + std::to_string(ifftCols_grInsts) + ".txt";
-        std::string out_file = "data/ifft_col_out_" + std::to_string(ifftCols_grInsts) + ".txt";
-
-        col_in  = input_plio::create(in_name.c_str(),  plio_128_bits, in_file.c_str());
-        col_out = output_plio::create(out_name.c_str(), plio_128_bits, out_file.c_str());
-
-        adf::connect<window<FFT_COL_WINDOW_BUFF_SIZE>>(col_in.out[0],     IFFTcol_gr.in[0]);
-        adf::connect<window<FFT_COL_WINDOW_BUFF_SIZE>>(IFFTcol_gr.out[0], col_out.in[0]);
-
-        ++ifftCols_grInsts;
+        adf::connect<window<IFFT_COL_WINDOW_BUFF_SIZE>>(col_in,             IFFTcol_gr.in[0]);
+        adf::connect<window<IFFT_COL_WINDOW_BUFF_SIZE>>(IFFTcol_gr.out[0],  col_out);
     }
 };
 
 // ---------------------------------------------------------------
 // IFFT2D_graph — single instance
+// Row→col path broken: APU manages DDR transpose via GMIO.
 // ---------------------------------------------------------------
 class IFFT2D_graph : public graph
 {
 public:
+    port<input>  ifft_row_in;   // ← gmio_ifft_row_in  (accumulated spectrum from APU)
+    port<output> ifft_row_out;  // → gmio_ifft_row_out  (APU reads and transposes)
+    port<input>  ifft_col_in;   // ← gmio_ifft_col_in   (APU-transposed data)
+    port<output> ifft_col_out;  // → gmio_response       (final correlation response)
+
     IFFTrows_graph ifft_rows;
     IFFTcols_graph ifft_cols;
+
+    IFFT2D_graph()
+    {
+        adf::connect<>(ifft_row_in,          ifft_rows.row_in);
+        adf::connect<>(ifft_rows.row_out,    ifft_row_out);
+
+        adf::connect<>(ifft_col_in,          ifft_cols.col_in);
+        adf::connect<>(ifft_cols.col_out,    ifft_col_out);
+
+        // NOTE: ifft_row_out and ifft_col_in are NOT connected here.
+        // APU reads via gmio_ifft_row_out, transposes, writes via gmio_ifft_col_in.
+    }
 };

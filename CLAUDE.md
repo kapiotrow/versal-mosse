@@ -33,77 +33,98 @@ Build artifacts land under `build/$(TARGET)/$(PATCH_ROWS)x$(PATCH_COLS)/ch$(N_CH
 ## Architecture overview
 
 ```
-PS (A72)
-  video frame → patch extraction → filter update (A_ch, B, H_ch*)
+PS (A72) — mosse_tracker.cpp
+  Drives all GMIO ports in the per-frame, per-channel loop.
+  Runs peak_detect_sw() and filter_update_kissfft() (stubs).
 
-PL kernels
-  conv_layer   : RGB patch → INT8 feature maps (N_CHANNELS channels)
-  fmt_adapter  : INT8 feature map + Hanning window → cint16 stream → AIE
-  cmul_accum   : transpose buffer + H_ch* multiply + Σ accumulate + IFFT transpose
-  peak_detect  : argmax on response map → (disp_row, disp_col)
+PL kernels (2 total)
+  camera_capture : zero-fill DDR frame buffer (stub; TODO: MIPI RX)
+  roi_crop       : DDR frame → PATCH_ROWS×PATCH_COLS patch → 128-bit AXIS → AIE PatchIn
 
-AIE
-  fft2d[0..N_CHANNELS-1]  : PATCH_COLS-point row FFT + PATCH_ROWS-point col FFT
-  ifft2d                   : PATCH_COLS-point row IFFT + PATCH_ROWS-point col IFFT
+AIE — single instances, serial per-channel processing
+  conv2d_kernel      : int8 patch stream + weights → cint16 feature stream (stub: pass-through cast)
+  fft2d (FFT2D_graph): PATCH_COLS-pt row FFT → GMIO → DDR; APU transposes; DDR → GMIO → PATCH_ROWS-pt col FFT
+  cmul_accum_kernel  : col-FFT stream ⊙ H_ch* + accumulate (stub: pass-through)
+  ifft2d (IFFT2D_graph): same DDR-transpose pattern as fft2d; PATCH_COLS-pt row IFFT + PATCH_ROWS-pt col IFFT
 ```
 
-### PLIO naming
+### PLIO (1 port)
 
-Forward FFT channel `ch` (0-based): `FFTRowIn{ch}`, `FFTRowOut{ch}`, `FFTColIn{ch}`, `FFTColOut{ch}`
-Inverse FFT (single instance): `IFFTRowIn0`, `IFFTRowOut0`, `IFFTColIn0`, `IFFTColOut0`
+`PatchIn` — roi_crop PL kernel → conv2d AIE kernel (128-bit, int8 stream).
 
-These names must match between `fft_graph.h` / `ifft_graph.h` and `mosse_x1.cfg` stream_connect entries.
+This name must match between `mosse_graph.h` (`input_plio::create("PatchIn", ...)`) and
+`mosse_x1.cfg` (`stream_connect=roi_crop_0.patch_out:ai_engine_0.PatchIn`).
 
-### cmul_accum data flow (per tracking frame)
+### GMIO ports (10 total: 6 input + 4 output)
 
-For channels 0 … N_CHANNELS-1 (serial):
-1. Drain AIE row-FFT output → DDR `transpose_buf` (row-major store, col-major read-back)
-2. Re-stream columns → AIE col-FFT input
-3. Read col-FFT output, multiply by conjugate filter `H_ch*`, accumulate into `accum_buf`
+| Name | Dir | Purpose |
+|---|---|---|
+| `gmio_weights` | DDR→AIE | conv2d INT8 weights per channel |
+| `gmio_fft_row_out` | AIE→DDR | fft_rows output; APU transposes |
+| `gmio_fft_col_in` | DDR→AIE | APU-transposed data → fft_cols |
+| `gmio_filter` | DDR→AIE | H_ch* per channel → cmul_accum |
+| `gmio_accum_in` | DDR→AIE | Previous partial sum (skipped on ch=0) |
+| `gmio_accum_out` | AIE→DDR | Updated partial sum |
+| `gmio_ifft_row_in` | DDR→AIE | Accumulated spectrum → ifft_rows |
+| `gmio_ifft_row_out` | AIE→DDR | ifft_rows output; APU transposes |
+| `gmio_ifft_col_in` | DDR→AIE | APU-transposed data → ifft_cols |
+| `gmio_response` | AIE→DDR | Final correlation response → peak_detect_sw |
 
-On the last channel only: flush `accum_buf` → IFFT row input; handle IFFT transpose the same way.
+### Per-frame data flow (mosse_tracker.cpp)
 
-### aiesim iteration count
-
-`mosse_graph.cpp` runs the graph for `ITER_CNT * PATCH_ROWS` iterations (one iteration processes two rows: `FFT_ROW_WS=2`).
+```
+camera_capture → DDR frame
+For ch = 0..N_CHANNELS-1:
+  roi_crop → PatchIn PLIO → conv2d → fft_rows → gmio_fft_row_out → DDR
+  APU: transpose_inplace()
+  DDR → gmio_fft_col_in → fft_cols → cmul_accum → gmio_accum_out → DDR
+After all channels:
+  DDR accum → gmio_ifft_row_in → ifft_rows → gmio_ifft_row_out → DDR
+  APU: transpose_inplace()
+  DDR → gmio_ifft_col_in → ifft_cols → gmio_response → DDR
+  APU: peak_detect_sw() → update pos
+  APU: filter_update_kissfft() (stub)
+```
 
 ## Key design decisions
 
-- **Serial channel processing**: N_CHANNELS FFT2D instances are driven one at a time
-  by fmt_adapter + cmul_accum. This minimises PLIO count at the cost of throughput.
-  Increasing parallelism later requires adding PLIO ports and updating mosse_x1.cfg.
+- **AIE-centric architecture**: All FFT/IFFT/conv/cmul compute runs on AIE. PL is only
+  camera_capture + roi_crop. APU orchestrates via GMIO DDR round-trips.
 
-- **PATCH_ROWS == PATCH_COLS**: Both row and column FFT use the same point size.
-  This differs from the tutorial which always had MAT_ROWS = MAT_COLS/2.
+- **Serial channel processing**: The single FFT2D and IFFT2D instance are reused across all
+  N_CHANNELS (driven serially via GMIO). Minimal PL/PLIO count at the cost of throughput.
 
-- **Transpose in DDR**: The row-FFT output is transposed by cmul_accum via a DDR
-  scratch buffer (`transpose_buf`, 64 KB for 128×128 cint16). Consider binding to
-  URAM for lower latency once placement is confirmed.
+- **Transpose in DDR (APU)**: `transpose_inplace()` runs on A72 between row-FFT and col-FFT.
+  ~64 KB memcpy + index reorder; acceptable at 30 fps for 128×128 patches.
 
-- **Filter update on PS**: A_ch[], B[], H_ch* computation runs on the A72 using a
-  software FFT library (KissFFT recommended). Move to PL if PS becomes a bottleneck.
+- **Accumulator in DDR**: The partial accumulator (128×128 cint16 = 64 KB) lives in DDR
+  (gmio_accum_out/gmio_accum_in). Fits easily; on-tile storage would require a Memory Tile.
 
-- **Conv layer weights**: `conv_layer.cpp` has placeholder zero weights. Replace with:
+- **Filter update on PS**: A_ch[], B[], H_ch* computation runs on the A72 using KissFFT.
+  Move to AIE if PS becomes a bottleneck.
+
+- **IFFT normalization**: Row IFFT shift = 0; col IFFT shift = 14 (= log2(128)+log2(128)).
+  If aiesim response is 2^14× too large, set col shift to 0 and apply >>14 in APU after
+  reading gmio_response.
+
+- **Conv layer weights**: `conv2d_kernel.cpp` has pass-through stub. Replace with:
   - Pretrained INT8 weights exported from Brevitas (simplest path), or
-  - FINN-generated RTL kernel (see notes below on FINN/Versal compatibility).
+  - FINN-generated RTL kernel (Versal support limited as of 2025.2).
 
 ## FINN / Brevitas notes
 
 FINN's Versal support is limited as of 2025.2. Recommended approach:
 1. Train and quantize the conv layer in Brevitas (PyTorch QAT).
 2. Export weights as INT8 numpy arrays.
-3. Hand-implement the conv in HLS (`conv_layer.cpp`) using those weights.
+3. Hand-implement the conv in the AIE `conv2d_kernel.cpp` using those weights.
 4. Monitor FINN Versal support for future migration to generated IP.
-
-Alternatively, the FINN-generated IP can target the PL fabric only (treating
-VEK280 PL as UltraScale+ class) and be packaged as an RTL kernel via `package_xo`.
 
 ## Build commands
 
 ```bash
 make graph                         # compile AIE graph only
-make aiesim                        # run AIE simulator
-make kernels                       # compile all PL HLS kernels
+make aiesim                        # run AIE simulator (uses aiesim_data/patch_in.txt)
+make kernels                       # compile camera_capture + roi_crop PL kernels
 make xsa                           # link kernels + graph → XSA file
 make application                   # cross-compile host ELF (aarch64)
 make sd_card                       # full build: kernels → graph → xsa → application → package
@@ -117,34 +138,37 @@ make cleanall
 ```
 design/
 ├── aie_src/
-│   ├── fft_graph.h       # FFT2D graph (N_CHANNELS instances, forward FFT)
-│   ├── ifft_graph.h      # IFFT2D graph (single instance, inverse FFT)
-│   ├── mosse_graph.h     # Top-level: FFT2D[] + IFFT2D
-│   ├── mosse_graph.cpp   # Instantiation + aiesim main
-│   └── constraints.aiecst
+│   ├── fft_graph.h            # FFT2D_graph (single instance, GMIO-broken row→col)
+│   ├── ifft_graph.h           # IFFT2D_graph (single instance, same pattern)
+│   ├── conv2d_kernel.h/.cpp   # int8 patch → cint16 feature (stub: cast only)
+│   ├── cmul_accum_kernel.h/.cpp # col-FFT ⊙ H_ch* + accumulate (stub: pass-through)
+│   ├── mosse_graph.h          # Top-level: PLIO + 10 GMIO + 2 custom kernels + FFT2D + IFFT2D
+│   ├── mosse_graph.cpp        # Instantiation + aiesim smoke test main()
+│   ├── constraints.aiecst     # PatchIn PLIO shim placement
+│   └── aiesim_data/
+│       └── patch_in.txt       # 16384 zeroed int8 samples for aiesim smoke test
 ├── pl_src/
-│   ├── conv_layer/       # Quantized 3×3 conv, INT8 weights
-│   ├── fmt_adapter/      # INT8→cint16, Hanning window, → AIE
-│   ├── cmul_accum/       # Transpose + H_ch* multiply + accumulate + IFFT feed
-│   └── peak_detect/      # argmax → displacement output
+│   ├── camera_capture/        # Zero-fill frame buffer stub
+│   └── roi_crop/              # Extract patch, stream to PatchIn PLIO
 ├── host_app_src/
-│   └── mosse_tracker.cpp # XRT tracking loop, filter update
+│   └── mosse_tracker.cpp      # GMIO-driven XRT tracking loop
 ├── system_configs/
-│   └── mosse_x1.cfg      # v++ linker: kernel instances + stream wiring
-├── profiling_configs/    # xrt.ini (trace settings)
-├── directives/           # post_sys_link.tcl (AIE clock = 1 GHz)
-└── exec_scripts/         # run_script.sh (board execution — ELF name is stale, update to mosse_tracker.elf)
+│   └── mosse_x1.cfg           # v++ linker: camera_capture + roi_crop + PatchIn
+├── profiling_configs/         # xrt.ini (trace settings)
+├── directives/                # post_sys_link.tcl (AIE clock = 1 GHz)
+└── exec_scripts/
+    └── run_script.sh          # Board execution (mosse_tracker.elf a.xclbin)
 ```
 
 ## Current status / TODOs
 
-- [ ] `conv_layer.cpp`: implement sliding-window 3×3 MAC + fill weights
+- [ ] `conv2d_kernel.cpp`: implement sliding-window 3×3 MAC + Hanning window + load weights
+- [ ] `cmul_accum_kernel.cpp`: implement element-wise cmul_conj + accumulate
 - [ ] `mosse_tracker.cpp`: add video decode loop (OpenCV or V4L2)
 - [ ] `mosse_tracker.cpp`: implement first-frame filter initialization
-- [ ] `mosse_tracker.cpp`: implement PS-side filter update (KissFFT)
-- [ ] `mosse_x1.cfg`: expand stream_connect for all N_CHANNELS PLIO ports (currently only ch=0)
-- [ ] Prepare aiesim test vectors under `design/aie_src/aiesim_data/`
-- [ ] Validate IFFT normalization shift (`FFT_2D_TP_IFFT_SHIFT` in `ifft_graph.h`; should be `log2(PATCH_COLS) + log2(PATCH_ROWS)`)
-- [ ] Validate cmul_accum fixed-point shift in `cmul_cint16()`
-- [ ] Bind `transpose_buf` to URAM in `cmul_accum.cpp`
-- [ ] Update `exec_scripts/run_script.sh` — currently references old ELF name `fft_2d_aie_xrt.elf`
+- [ ] `mosse_tracker.cpp`: implement PS-side filter update (KissFFT for A_ch, B, H_ch*)
+- [ ] `mosse_tracker.cpp`: implement `transpose_inplace()` (currently stub)
+- [ ] Validate IFFT normalization shift (see ifft_graph.h R7 note)
+- [ ] Validate cmul_accum fixed-point precision (cint16 accumulator overflow risk for N_CHANNELS=16)
+- [ ] aiesim: verify smoke test passes without deadlock (`make aiesim N_CHANNELS=1 ITER_CNT=1`)
+- [ ] hw_emu: verify single-channel end-to-end (`make sd_card TARGET=hw_emu N_CHANNELS=1 ITER_CNT=1`)
