@@ -102,17 +102,17 @@ public:
         // --- PLIO ---
         patch_in = input_plio::create("PatchIn", plio_128_bits, "patch_in.txt");
 
-        // --- GMIO (burst_length = 64 bytes — minimum AXI4 burst, GMIO-aligned) ---
-        gmio_weights     = input_gmio::create("gmio_weights",      64);
-        gmio_fft_row_out = output_gmio::create("gmio_fft_row_out", 64);
-        gmio_fft_col_in  = input_gmio::create("gmio_fft_col_in",   64);
-        gmio_filter      = input_gmio::create("gmio_filter",       64);
-        gmio_accum_in    = input_gmio::create("gmio_accum_in",     64);
-        gmio_accum_out   = output_gmio::create("gmio_accum_out",   64);
-        gmio_ifft_row_in = input_gmio::create("gmio_ifft_row_in",  64);
-        gmio_ifft_row_out= output_gmio::create("gmio_ifft_row_out",64);
-        gmio_ifft_col_in = input_gmio::create("gmio_ifft_col_in",  64);
-        gmio_response    = output_gmio::create("gmio_response",    64);
+        // --- GMIO (burst_length = 64 bytes, bandwidth = 1000 MB/s estimate) ---
+        gmio_weights     = input_gmio::create("gmio_weights",      64, 1000);
+        gmio_fft_row_out = output_gmio::create("gmio_fft_row_out", 64, 1000);
+        gmio_fft_col_in  = input_gmio::create("gmio_fft_col_in",   64, 1000);
+        gmio_filter      = input_gmio::create("gmio_filter",       64, 1000);
+        gmio_accum_in    = input_gmio::create("gmio_accum_in",     64, 1000);
+        gmio_accum_out   = output_gmio::create("gmio_accum_out",   64, 1000);
+        gmio_ifft_row_in = input_gmio::create("gmio_ifft_row_in",  64, 1000);
+        gmio_ifft_row_out= output_gmio::create("gmio_ifft_row_out",64, 1000);
+        gmio_ifft_col_in = input_gmio::create("gmio_ifft_col_in",  64, 1000);
+        gmio_response    = output_gmio::create("gmio_response",    64, 1000);
 
         // --- Custom kernel instantiation ---
         conv2d = kernel::create(conv2d_kernel);
@@ -130,13 +130,13 @@ public:
         adf::connect<stream>(patch_in.out[0], conv2d.in[0]);
 
         // gmio_weights → conv2d weights buffer (in[1])
-        // R4: input_buffer<int8_t> in kernel signature → window/buffer connect type
         adf::connect<>(gmio_weights.out[0], conv2d.in[1]);
+        adf::dimensions(conv2d.in[1]) = {CONV_WEIGHT_BYTES_PAD};  // 64 int8_t elements
 
-        // conv2d → fft2d row-FFT input
-        // DSPLib expects input_buffer (window); use explicit window connect.
-        // conv2d output is a stream; ADF will insert a stream-to-window FIFO automatically.
-        adf::connect<window<FFT_ROW_WINDOW_BUFF_SIZE>>(conv2d.out[0], fft2d.fft_row_in);
+        // conv2d (stream) → fft2d row-FFT input (window)
+        // Use bare connect<> so ADF infers the stream→window adapter.
+        // The window<> template cannot be used when the source port is a stream.
+        adf::connect<>(conv2d.out[0], fft2d.fft_row_in);
 
         // fft2d row-FFT output → GMIO (DDR, APU reads and transposes)
         adf::connect<>(fft2d.fft_row_out, gmio_fft_row_out.in[0]);
@@ -148,10 +148,17 @@ public:
         adf::connect<stream>(fft2d.fft_col_out, cmul.in[0]);
 
         // gmio_filter → cmul filter buffer (in[1])
+        // single_buffer: filter and accum_prev together = 2×64 KB; double-buffering both
+        // would consume the full 256 KB tile memory leaving nothing for code/stack.
+        // Serial per-channel processing means there is nothing to pipeline against anyway.
         adf::connect<>(gmio_filter.out[0], cmul.in[1]);
+        adf::dimensions(cmul.in[1]) = {PATCH_ROWS * PATCH_COLS};  // cint16_t elements
+        adf::single_buffer(cmul.in[1]);
 
-        // gmio_accum_in → cmul previous accumulator (in[2]; skipped ch=0 at runtime)
+        // gmio_accum_in → cmul previous accumulator (in[2]; APU sends zeros for ch=0)
         adf::connect<>(gmio_accum_in.out[0], cmul.in[2]);
+        adf::dimensions(cmul.in[2]) = {PATCH_ROWS * PATCH_COLS};  // cint16_t elements
+        adf::single_buffer(cmul.in[2]);
 
         // cmul output → gmio_accum_out (DDR)
         adf::connect<>(cmul.out[0], gmio_accum_out.in[0]);

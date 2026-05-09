@@ -91,8 +91,11 @@ GRAPH_SRC_CPP := $(AIE_SRC_REPO)/mosse_graph.cpp
 
 # Aiesimulator flags
 AIE_SIM_FLAGS := --pkg-dir $(WORK_DIR)/
-# TODO: add -i= pointing to aiesim input data once test vectors are prepared
-# AIE_SIM_FLAGS += -i=$(AIE_SRC_REPO)/aiesim_data
+AIE_SIM_FLAGS += -i=$(AIE_SRC_REPO)/aiesim_data
+# Safety net: kill simulation after 500M cycles instead of freezing the OS.
+# One 128-pt FFT row takes ~200 cycles on AIE-ML; 64 rows × 2 passes (fwd+inv)
+# × 200 cycles × safety margin of 10× ≈ 256000 cycles. 500M is very conservative.
+AIE_SIM_FLAGS += --simulation-cycle-timeout=100000
 
 # =========================================================
 # v++ common flags
@@ -157,14 +160,17 @@ KERNEL_XOS := $(CAM_XO) $(CROP_XO)
 # =========================================================
 # Rules
 # =========================================================
-.PHONY: help kernels graph aiesim xsa application package sd_card run_emu cleanall
+.PHONY: help kernels graph gen_vectors aiesim graph_fft aiesim_fft xsa application package sd_card run_emu cleanall
 
 help:
 	@echo ""
 	@echo "versal-mosse build targets:"
 	@echo "  make kernels      — compile PL HLS kernels"
 	@echo "  make graph        — compile AIE graph"
-	@echo "  make aiesim       — run AIE simulator"
+	@echo "  make gen_vectors  — generate aiesim test vectors (impulse input)"
+	@echo "  make aiesim       — run AIE simulator (round-trip FFT test)"
+	@echo "  make graph_fft    — compile FFT-only smoke-test graph"
+	@echo "  make aiesim_fft   — run FFT-only aiesim (2-GMIO, no PLIO)"
 	@echo "  make xsa          — link → .xsa"
 	@echo "  make application  — cross-compile host ELF"
 	@echo "  make package      — package SD card image"
@@ -207,9 +213,38 @@ $(LIBADF_A): $(AIE_SRC_REPO)/mosse_graph.cpp  \
 	mkdir -p $(BUILD_DIR)
 	cd $(BUILD_DIR) && aiecompiler $(AIE_FLAGS) $(GRAPH_SRC_CPP) 2>&1 | tee aiecompiler.log
 
-aiesim: graph
-	cd $(BUILD_DIR) && aiesimulator $(AIE_SIM_FLAGS) \
-	    -i=$(AIE_SRC_REPO)/aiesim_data 2>&1 | tee aiesim.log
+gen_vectors:
+	python3 $(PROJECT_REPO)/scripts/gen_aiesim_vectors.py $(AIE_SRC_REPO)/aiesim_data
+
+aiesim: graph gen_vectors
+	cd $(BUILD_DIR) && aiesimulator $(AIE_SIM_FLAGS) 2>&1 | tee aiesim.log
+	@echo "--- aiesim done; check aiesim.log for PASS/FAIL ---"
+
+# -------------------------------------------------------
+# FFT-only aiesim — isolated DSPLib row-FFT smoke test
+# -------------------------------------------------------
+FFT_ONLY_BUILD_DIR := build/$(TARGET)/$(PATCH_ROWS)x$(PATCH_COLS)/fft_only
+FFT_ONLY_WORK_DIR  := $(FFT_ONLY_BUILD_DIR)/Work
+FFT_ONLY_SRC       := $(AIE_SRC_REPO)/fft_only_graph.cpp
+
+# Reuse AIE_FLAGS but swap workdir and supply empty constraints file
+# to prevent aiecompiler picking up the PatchIn PLIO constraint.
+FFT_ONLY_AIE_FLAGS  := $(filter-out --workdir=$(WORK_DIR),$(AIE_FLAGS))
+FFT_ONLY_AIE_FLAGS  += --workdir=$(FFT_ONLY_WORK_DIR)
+FFT_ONLY_AIE_FLAGS  += --constraints $(AIE_SRC_REPO)/fft_only_constraints.aiecst
+
+FFT_ONLY_SIM_FLAGS  := --pkg-dir $(FFT_ONLY_WORK_DIR)/
+FFT_ONLY_SIM_FLAGS  += -i=$(AIE_SRC_REPO)/aiesim_data
+FFT_ONLY_SIM_FLAGS  += --simulation-cycle-timeout=100000
+
+graph_fft:
+	mkdir -p $(FFT_ONLY_BUILD_DIR)
+	cd $(FFT_ONLY_BUILD_DIR) && aiecompiler $(FFT_ONLY_AIE_FLAGS) \
+	    $(FFT_ONLY_SRC) 2>&1 | tee aiecompiler_fft.log
+
+aiesim_fft: graph_fft
+	-cd $(FFT_ONLY_BUILD_DIR) && timeout 120 aiesimulator $(FFT_ONLY_SIM_FLAGS) 2>&1 | tee aiesim_fft.log
+	@echo "--- aiesim_fft done; check $(FFT_ONLY_BUILD_DIR)/aiesim_fft.log ---"
 
 # -------------------------------------------------------
 # System link
