@@ -144,24 +144,28 @@ public:
         // GMIO (APU-transposed) → fft2d col-FFT input
         adf::connect<>(gmio_fft_col_in.out[0], fft2d.fft_col_in);
 
-        // fft2d col-FFT output → cmul kernel (stream)
-        adf::connect<stream>(fft2d.fft_col_out, cmul.in[0]);
+        // fft2d col-FFT output → cmul kernel.
+        // fft_col_out is a window port (FFT_COL_WINDOW_BUFF_SIZE per invocation =
+        // PATCH_COLS*FFT_COL_WS cint16).  All cmul buffers use the same chunk size so
+        // the kernel fires once per FFT window (64 times per 128×128 frame).
+        // Total tile memory: 4 × (PATCH_COLS*FFT_COL_WS × 4 B) × 2 (ping-pong) ≈ 8 KB,
+        // well within the 256 KB per-tile limit.
+        // connect<stream> is wrong here (source is window, not stream); bare connect<>
+        // lets ADF infer the window→buffer connection.
+        adf::connect<>(fft2d.fft_col_out, cmul.in[0]);
+        adf::dimensions(cmul.in[0]) = {PATCH_COLS * FFT_COL_WS};  // one FFT window chunk
 
         // gmio_filter → cmul filter buffer (in[1])
-        // single_buffer: filter and accum_prev together = 2×64 KB; double-buffering both
-        // would consume the full 256 KB tile memory leaving nothing for code/stack.
-        // Serial per-channel processing means there is nothing to pipeline against anyway.
         adf::connect<>(gmio_filter.out[0], cmul.in[1]);
-        adf::dimensions(cmul.in[1]) = {PATCH_ROWS * PATCH_COLS};  // cint16_t elements
-        adf::single_buffer(cmul.in[1]);
+        adf::dimensions(cmul.in[1]) = {PATCH_COLS * FFT_COL_WS};  // chunk-aligned with in[0]
 
         // gmio_accum_in → cmul previous accumulator (in[2]; APU sends zeros for ch=0)
         adf::connect<>(gmio_accum_in.out[0], cmul.in[2]);
-        adf::dimensions(cmul.in[2]) = {PATCH_ROWS * PATCH_COLS};  // cint16_t elements
-        adf::single_buffer(cmul.in[2]);
+        adf::dimensions(cmul.in[2]) = {PATCH_COLS * FFT_COL_WS};  // chunk-aligned with in[0]
 
         // cmul output → gmio_accum_out (DDR)
         adf::connect<>(cmul.out[0], gmio_accum_out.in[0]);
+        adf::dimensions(cmul.out[0]) = {PATCH_COLS * FFT_COL_WS};  // chunk-aligned with in[0]
 
         // IFFT: APU reads gmio_accum_out, writes accumulated spectrum to gmio_ifft_row_in
         adf::connect<>(gmio_ifft_row_in.out[0],  ifft2d.ifft_row_in);

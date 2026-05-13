@@ -20,22 +20,29 @@
 #include "cmul_accum_kernel.h"
 
 void cmul_accum_kernel(
-    input_stream<cint16>   *fft_col_in,
-    output_stream<cint16>  *accum_out,
-    input_buffer<cint16_t> &filter,
-    input_buffer<cint16_t> &accum_prev)
+    input_buffer<cint16_t>  &fft_col_in,
+    output_buffer<cint16_t> &accum_out,
+    input_buffer<cint16_t>  &filter,
+    input_buffer<cint16_t>  &accum_prev)
 {
     (void)filter;
     (void)accum_prev;
 
+    // .data() returns a raw pointer — same pattern used in DSPLib kernels
+    // (e.g. bitonic_sort.cpp).  aie::begin() / operator[] require aie_api/aie.hpp
+    // which is not in the chess-clang include path.
+    cint16_t* __restrict in_ptr  = (cint16_t*)fft_col_in.data();
+    cint16_t* __restrict out_ptr = (cint16_t*)accum_out.data();
+
     // chess_prepare_for_pipelining: use modulo scheduling instead of
     // whole-graph scheduling.  Avoids OOM in noodle when compiled in
     // parallel with the large DSPLib FFT tiles.
-    for (int i = 0; i < PATCH_ROWS * PATCH_COLS; ++i)
+    // Process one FFT window chunk per invocation; the kernel is called
+    // PATCH_ROWS/FFT_COL_WS = 64 times per frame by ADF's ping-pong scheduler.
+    for (int i = 0; i < PATCH_COLS * FFT_COL_WS; ++i)
     chess_prepare_for_pipelining
-    chess_loop_range(PATCH_ROWS * PATCH_COLS, PATCH_ROWS * PATCH_COLS)
+    chess_loop_range(PATCH_COLS * FFT_COL_WS, PATCH_COLS * FFT_COL_WS)
     {
-        cint16_t f = readincr(fft_col_in);
-        writeincr(accum_out, f);  // stub: pass through, no multiply/accumulate
+        out_ptr[i] = in_ptr[i];  // stub: pass through, no multiply/accumulate
     }
 }

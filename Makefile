@@ -92,10 +92,11 @@ GRAPH_SRC_CPP := $(AIE_SRC_REPO)/mosse_graph.cpp
 # Aiesimulator flags
 AIE_SIM_FLAGS := --pkg-dir $(WORK_DIR)/
 AIE_SIM_FLAGS += -i=$(AIE_SRC_REPO)/aiesim_data
-# Safety net: kill simulation after 500M cycles instead of freezing the OS.
-# One 128-pt FFT row takes ~200 cycles on AIE-ML; 64 rows × 2 passes (fwd+inv)
-# × 200 cycles × safety margin of 10× ≈ 256000 cycles. 500M is very conservative.
-AIE_SIM_FLAGS += --simulation-cycle-timeout=100000
+# Safety net: abort if the simulation freezes.
+# Full MOSSE pipeline (conv2d 16K samples + 4× 128-pt FFT passes on 128×128)
+# needs ~500K–2M simulated cycles.  5M gives a generous margin; the external
+# `timeout 600` in the aiesim rule fires first in practice.
+AIE_SIM_FLAGS += --simulation-cycle-timeout=5000000
 
 # =========================================================
 # v++ common flags
@@ -214,11 +215,11 @@ $(LIBADF_A): $(AIE_SRC_REPO)/mosse_graph.cpp  \
 	cd $(BUILD_DIR) && aiecompiler $(AIE_FLAGS) $(GRAPH_SRC_CPP) 2>&1 | tee aiecompiler.log
 
 gen_vectors:
-	python3 $(PROJECT_REPO)/scripts/gen_aiesim_vectors.py $(AIE_SRC_REPO)/aiesim_data
+	cd $(PROJECT_REPO) && env PYTHONHOME= PYTHONPATH= uv run python3 scripts/gen_aiesim_vectors.py $(AIE_SRC_REPO)/aiesim_data
 
 aiesim: graph gen_vectors
-	cd $(BUILD_DIR) && aiesimulator $(AIE_SIM_FLAGS) 2>&1 | tee aiesim.log
-	@echo "--- aiesim done; check aiesim.log for PASS/FAIL ---"
+	-cd $(BUILD_DIR) && timeout 600 aiesimulator $(AIE_SIM_FLAGS) 2>&1 | tee aiesim.log
+	@echo "--- aiesim done; check $(BUILD_DIR)/aiesim.log for PASS/FAIL ---"
 
 # -------------------------------------------------------
 # FFT-only aiesim — isolated DSPLib row-FFT smoke test

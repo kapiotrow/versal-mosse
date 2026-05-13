@@ -1,10 +1,7 @@
 #!/bin/bash
 
-#Copyright (C) 2025, Advanced Micro Devices, Inc. All rights reserved.
-#SPDX-License-Identifier: MIT
-
 # =======================================================
-# Set Platform ,Vitis and Versal Image repo
+# Set Platform, Vitis and Versal Image repo
 # =======================================================
 export PLATFORM_REPO_PATHS=/home/karolina/Xilinx/2025.2/Vitis/base_platforms
 export XILINX_VITIS=/home/karolina/Xilinx/2025.2/Vitis

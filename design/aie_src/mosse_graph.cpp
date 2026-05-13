@@ -59,9 +59,6 @@ static void transpose_inplace(int16_t *buf, int rows, int cols)
 
 int main(int argc, char **argv)
 {
-    mosse_graph.init();
-    mosse_graph.run(-1);   // free-running; terminated via end(timeout) after all GMIOs complete
-
     // ----------------------------------------------------------------
     // GMIO::malloc buffers — aiesim requires DMA buffers to be allocated
     // via GMIO::malloc so the GMIO model can track their addresses.
@@ -86,25 +83,42 @@ int main(int argc, char **argv)
         filter_buf[i * 2 + 1] = 0;
     }
 
-    // ----------------------------------------------------------------
-    // Step 1: weights → conv2d → fft_rows → fft_row_out
-    //
-    // ARM OUTPUT FIRST.  In aiesim cycle-approximate mode, wait() drives
-    // simulation cycles globally.  If fft_rows produces output before the
-    // shim MM2S receiver is armed (aie2gm_nb not yet called), the output
-    // stream FIFO fills, back-pressure stalls the entire pipeline, and
-    // wait() deadlocks.  Arming before gm2aie_nb guarantees the receiver
-    // is active for the full duration of the stage.
-    // ----------------------------------------------------------------
-    mosse_graph.gmio_fft_row_out.aie2gm_nb(fft_scratch, PATCH_BYTES);  // arm output first
-    mosse_graph.gmio_weights.gm2aie_nb(weights_buf, 64);
-    mosse_graph.gmio_weights.wait();
+    mosse_graph.init();
 
-    // PatchIn PLIO reads from aiesim_data/patch_in.txt (impulse at (0,0), value=1).
+    // ----------------------------------------------------------------
+    // PRE-LOAD weights BEFORE run(-1); arm output GMIOs AFTER run(-1).
+    //
+    // RC-1 (weights deadlock, fixed): the PLIO model starts streaming
+    // patch_in.txt once PL-Interface is configured (inside init()).  After
+    // run(-1) enables the cores the PLIO consumes ALL cycle credits in
+    // cycle-approximate mode, starving the weights GMIO DMA.  Fix: load
+    // weights between init() and run(-1) while the PLIO model is still idle
+    // (cores not yet enabled) so the 64-byte DMA completes uncontested.
+    //
+    // RC-2 (output GMIO before run, now fixed): calling aie2gm_nb on an
+    // output GMIO before run(-1) sets up a DMA descriptor before the AIE
+    // output channel is active; in Vitis 2025.2 cycle-approximate mode that
+    // DMA never captures post-run output.  Output GMIOs must be armed after
+    // run(-1).  In cycle-approximate mode zero simulation cycles advance
+    // between run(-1) and the next API call, so there is no back-pressure
+    // risk from the FFT's output FIFO filling before the DMA is armed.
+    // ----------------------------------------------------------------
+    mosse_graph.gmio_weights.gm2aie_nb(weights_buf, 64);
+    mosse_graph.gmio_weights.wait();   // completes while PLIO is idle (cores not yet enabled)
+
+    mosse_graph.run(-1);   // enables cores + PLIO; conv2d starts immediately (weights ready)
+
+    // PatchIn PLIO reads from aiesim_data/patch_in.txt (impulse at (0,0),
+    // value=1) followed by padding zeros — see gen_aiesim_vectors.py.
+    // The padding keeps the PLIO model "active" (not stalled) for the full
+    // ~50 000-cycle test so cycle-credit starvation cannot occur.
     // conv2d casts int8 → cint16, feeds fft2d.fft_rows.
 
     // Step 2: collect row-FFT output (PATCH_ROWS rows of PATCH_COLS-pt FFT)
+    mosse_graph.gmio_fft_row_out.aie2gm_nb(fft_scratch, PATCH_BYTES);  // arm AFTER run()
+    printf("[aiesim] step 2: waiting for fft_row_out...\n"); fflush(stdout);
     mosse_graph.gmio_fft_row_out.wait();
+    printf("[aiesim] step 2: fft_row_out done\n"); fflush(stdout);
 
     printf("[aiesim] fft_row_out[0..3]: {%d,%d} {%d,%d} {%d,%d} {%d,%d}\n",
            fft_scratch[0], fft_scratch[1],
@@ -117,21 +131,19 @@ int main(int argc, char **argv)
     transpose_inplace(fft_scratch, PATCH_ROWS, PATCH_COLS);
 
     // Step 4: fft_cols + cmul → accum_out
-    //
-    // ARM OUTPUT FIRST — same reasoning as stage 1: the three input gm2aie_nb
-    // calls are all in flight simultaneously, so cmul may fire as soon as all
-    // three inputs are available (which can happen before any individual
-    // wait() returns).  The accum_out receiver must be armed before that point.
+    // Arm output GMIO first, then fire all input GMIOs.
+    // Do NOT call wait() on input GMIOs (gm2aie_nb) — only output GMIOs need wait().
+    // Calling input wait() blocks until the kernel consumes the buffer, which causes
+    // a deadlock if the kernel cannot run while we're holding the thread here.
     mosse_graph.gmio_accum_out.aie2gm_nb(accum_buf, PATCH_BYTES);  // arm output first
     mosse_graph.gmio_filter.gm2aie_nb(filter_buf,  PATCH_BYTES);
     mosse_graph.gmio_accum_in.gm2aie_nb(accum_zero, PATCH_BYTES);  // ch=0: zero init
     mosse_graph.gmio_fft_col_in.gm2aie_nb(fft_scratch, PATCH_BYTES);
-    mosse_graph.gmio_filter.wait();
-    mosse_graph.gmio_accum_in.wait();
-    mosse_graph.gmio_fft_col_in.wait();
 
     // Step 5: collect cmul_accum output (= col-FFT pass-through in stub)
+    printf("[aiesim] step 4/5: waiting for accum_out...\n"); fflush(stdout);
     mosse_graph.gmio_accum_out.wait();
+    printf("[aiesim] step 4/5: accum_out done\n"); fflush(stdout);
 
     printf("[aiesim] accum_out[0..3]:   {%d,%d} {%d,%d} {%d,%d} {%d,%d}\n",
            accum_buf[0], accum_buf[1],
@@ -144,10 +156,12 @@ int main(int argc, char **argv)
     // ----------------------------------------------------------------
 
     // Step 6: row IFFT (128-pt, shift=0)
-    mosse_graph.gmio_ifft_row_in.gm2aie_nb(accum_buf, PATCH_BYTES);
+    // Arm output first, then fire input. No wait() on input GMIO.
     mosse_graph.gmio_ifft_row_out.aie2gm_nb(fft_scratch, PATCH_BYTES);
-    mosse_graph.gmio_ifft_row_in.wait();
+    mosse_graph.gmio_ifft_row_in.gm2aie_nb(accum_buf, PATCH_BYTES);
+    printf("[aiesim] step 6: waiting for ifft_row_out...\n"); fflush(stdout);
     mosse_graph.gmio_ifft_row_out.wait();
+    printf("[aiesim] step 6: ifft_row done\n"); fflush(stdout);
 
     printf("[aiesim] ifft_row_out[0..3]: {%d,%d} {%d,%d} {%d,%d} {%d,%d}\n",
            fft_scratch[0], fft_scratch[1],
@@ -159,21 +173,18 @@ int main(int argc, char **argv)
     transpose_inplace(fft_scratch, PATCH_ROWS, PATCH_COLS);
 
     // Step 8: col IFFT (128-pt, shift=14) + collect response
-    mosse_graph.gmio_ifft_col_in.gm2aie_nb(fft_scratch, PATCH_BYTES);
+    // Arm output first, then fire input. No wait() on input GMIO.
     mosse_graph.gmio_response.aie2gm_nb(resp_buf, PATCH_BYTES);
-    mosse_graph.gmio_ifft_col_in.wait();
+    mosse_graph.gmio_ifft_col_in.gm2aie_nb(fft_scratch, PATCH_BYTES);
+    printf("[aiesim] step 8: waiting for response...\n"); fflush(stdout);
     mosse_graph.gmio_response.wait();
+    printf("[aiesim] step 8: response done\n"); fflush(stdout);
 
     printf("[aiesim] response[0..3]:     {%d,%d} {%d,%d} {%d,%d} {%d,%d}\n",
            resp_buf[0], resp_buf[1],
            resp_buf[2], resp_buf[3],
            resp_buf[4], resp_buf[5],
            resp_buf[6], resp_buf[7]);
-
-    // Timeout: after all GMIO transactions complete, conv2d is re-invoked (run(-1))
-    // and blocks waiting for more PLIO data that never arrives.  end(10000) sends
-    // the termination signal and forcibly stops the simulation after 10 s.
-    mosse_graph.end(10000);
 
     // ----------------------------------------------------------------
     // Verification
@@ -232,10 +243,12 @@ int main(int argc, char **argv)
                "        Check FFT_2D_TP_IFFT_COL_SHIFT in ifft_graph.h.\n\n",
                resp0_re);
 
-    // Use _exit() to skip C++ static-object destructors.  With run(-1), end(10000)
-    // force-stops the simulation; the graph destructor then tries to communicate
-    // with a dead event loop and hangs.  _exit() bypasses all destructors and exits
-    // immediately.  fflush ensures the printf output is visible first.
+    // Do NOT call end() — with run(-1), end()'s post-disable cleanup competes for
+    // cycle credits with --simulation-cycle-timeout; if the timeout fires first,
+    // neither can proceed and the simulation deadlocks permanently.
+    // _exit() kills our process immediately; conv2d stalls on exhausted PLIO stream,
+    // the event loop drains the remaining cycle budget uncontested then exits.
+    // Makefile `timeout 600` is a safety net. GMIO::free must NOT be called.
     fflush(stdout);
     _exit(pass ? 0 : 1);
 }

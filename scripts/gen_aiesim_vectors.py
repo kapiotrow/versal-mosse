@@ -47,15 +47,31 @@ IFFT_SHIFT_COL = 14  # log2(128) + log2(128)
 
 PLIO_BEAT_SAMPLES = 16  # plio_128_bits / 8 bits per int8 = 16 samples per beat
 
+# Number of zero-padding frames appended after the real test data.
+# Purpose: prevent PLIO cycle-credit starvation in aiesim cycle-approximate mode.
+# After the PLIO exhausts its file it enters an "active retry" state that
+# monopolizes ALL simulation cycle credits, freezing every kernel and DMA.
+# With PLIO_PADDING_FRAMES extra frames of zeros the PLIO stays active for
+# the full ~50 000-cycle test duration; the conv2d kernel processes the extra
+# frames but the GMIO DMA is armed for exactly PATCH_BYTES (one frame) so
+# the padding output is never collected and the verification is unaffected.
+PLIO_PADDING_FRAMES = 4
+
 
 def write_plio_txt(path: str, samples: np.ndarray) -> None:
-    """Write int8 samples in plio_128_bits format: 16 samples per line."""
+    """Write int8 samples in plio_128_bits format: 16 samples per line.
+
+    Appends PLIO_PADDING_FRAMES of all-zeros after the real data to prevent
+    the PLIO simulation model from stalling mid-test.
+    """
     assert samples.dtype == np.int8
     assert len(samples) == N
     assert N % PLIO_BEAT_SAMPLES == 0
+    padding = np.zeros(N * PLIO_PADDING_FRAMES, dtype=np.int8)
+    all_samples = np.concatenate([samples, padding])
     with open(path, 'w') as f:
-        for i in range(0, N, PLIO_BEAT_SAMPLES):
-            f.write(' '.join(str(int(s)) for s in samples[i:i + PLIO_BEAT_SAMPLES]) + '\n')
+        for i in range(0, len(all_samples), PLIO_BEAT_SAMPLES):
+            f.write(' '.join(str(int(s)) for s in all_samples[i:i + PLIO_BEAT_SAMPLES]) + '\n')
 
 
 def simulate_roundtrip(patch_int8: np.ndarray) -> np.ndarray:

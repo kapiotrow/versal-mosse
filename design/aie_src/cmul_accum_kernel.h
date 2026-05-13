@@ -29,8 +29,8 @@
 using namespace adf;
 
 void cmul_accum_kernel(
-    input_stream<cint16>   *fft_col_in,   // ← fft2d.fft_col_out
-    output_stream<cint16>  *accum_out,    // → gmio_accum_out (DDR)
-    input_buffer<cint16_t> &filter,       // H_ch*; PATCH_ROWS*PATCH_COLS cint16
-    input_buffer<cint16_t> &accum_prev    // previous Σ; same size (APU sends zeros for ch=0)
+    input_buffer<cint16_t>  &fft_col_in,  // ← fft2d.fft_col_out (window port)
+    output_buffer<cint16_t> &accum_out,   // → gmio_accum_out (DDR)
+    input_buffer<cint16_t>  &filter,      // H_ch*; PATCH_ROWS*PATCH_COLS cint16
+    input_buffer<cint16_t>  &accum_prev   // previous Σ; same size (APU sends zeros for ch=0)
 );
