@@ -12,22 +12,26 @@
  *   patch_in.txt = unit impulse at spatial position (r=0, c=0), int8 value 1.
  *   (All other samples = 0.)
  *
- * Expected output after the full pipeline (FFT → identity filter → IFFT):
+ * Expected output after the full pipeline (FFT → identity filter + accum → IFFT):
  *   2D FFT of δ[r=0,c=0]  = constant spectrum {1,0} for all (k1,k2).
- *   cmul_accum stub passes through unchanged (filter ignored).
- *   2D IFFT (row shift=0, col shift=12) of all-ones spectrum:
- *     row IFFT → each output row has DSPLib constant C≈43 at n=0, {0,0} elsewhere
- *     after transpose → row 0 = all {43,0}, rows 1..127 = zero
- *     col IFFT raw acc ≈ 5120 (empirically from shift=10 giving 5); 5120>>12=1
- *               shift 12 → {1,0} at n=0, {0,0} elsewhere
- *   Final: resp[0,0] = {1,0}, all others = {0,0}.
+ *   cmul_accum: H*={1,0}, accum_prev={1,0} (simulates ch≥1, not ch=0).
+ *     element-wise: re = F_re*H_re + F_im*H_im = 1; im = 0
+ *     output = accum_prev + product = {1,0} + {1,0} = {2,0} everywhere.
+ *   2D IFFT (row shift=0, col shift=12) of all-{2,0} spectrum:
+ *     row IFFT → each output row has ≈{86,0} at n=0, {0,0} elsewhere (2×43)
+ *     after transpose → row 0 = all {86,0}, rows 1..127 = zero
+ *     col IFFT raw acc ≈ 10240 (2×5120); 10240>>12 = 2
+ *   Final: resp[0,0] ≈ {2,0}, all others = {0,0}.
+ *
+ * This tests the accumulation code path: if accum_prev reads are broken the
+ * kernel falls back to {1,0} (product only) → resp0_re=1 → norm_ok FAIL.
  *
  * Tolerance: ±2 LSB for elements expected to be 0 (cint16 twiddle quantization).
  *
  * PASS criteria (see verification block at end of main()):
  *   1. Dominant peak is at index 0 (correct location after round-trip).
- *   2. Peak real part is in [0, 4] — not 0 (deadlock/zero filter) and not
- *      large (e.g. 16384 would indicate the col IFFT shift is 0, not 14).
+ *   2. Peak real part is in [2, 6] — not 0/1 (accumulation broken/deadlock) and
+ *      not large (e.g. 16384 would indicate the col IFFT shift is 0, not 12).
  *   3. Peak imag part in [-2, 2] (real input → real output).
  *   4. All non-peak elements have magnitude ≤ 2.
  */
@@ -90,12 +94,24 @@ int main(int argc, char **argv)
         filter_buf[i * 2 + 1] = 0;
     }
 
-    // Build combined cmul input: interleave filter and zero accum by chunk.
-    memset(cmul_in_buf, 0, CMUL_IN_BYTES);  // zeros all accum halves
-    for (int c = 0; c < N_CHUNKS; ++c)
+    // Build combined cmul input: interleave filter and accum_prev by chunk.
+    // accum_prev = {1,0} everywhere — simulates ch≥1 (adding to existing accumulator).
+    // Expected kernel output: F*H* + accum_prev = {1,0} + {1,0} = {2,0} everywhere.
+    // If accumulation is broken (accum reads ignored) the output stays {1,0} → FAIL.
+    memset(cmul_in_buf, 0, CMUL_IN_BYTES);
+    for (int c = 0; c < N_CHUNKS; ++c) {
+        // Filter half
         memcpy((int8_t*)cmul_in_buf + (size_t)c * 2 * CHUNK_BYTES,
                (int8_t*)filter_buf  + (size_t)c * CHUNK_BYTES,
                CHUNK_BYTES);
+        // Accum-prev half: {1,0} everywhere
+        int16_t* acc_ptr = (int16_t*)((int8_t*)cmul_in_buf
+                           + (size_t)c * 2 * CHUNK_BYTES + CHUNK_BYTES);
+        for (int i = 0; i < CHUNK_ELEMS; ++i) {
+            acc_ptr[i * 2]     = 1;
+            acc_ptr[i * 2 + 1] = 0;
+        }
+    }
 
     mosse_graph.init();
 
@@ -230,13 +246,14 @@ int main(int argc, char **argv)
 
     // Checks (see header comment for rationale):
     bool loc_ok  = (dom_idx == 0);          // peak at spatial origin
-    bool norm_ok = (resp0_re >= 1) && (resp0_re <= 4);   // not 0 (deadlock/zero), not 16384
+    bool norm_ok = (resp0_re >= 2) && (resp0_re <= 6);   // 2× accum: {1,0}+{1,0}={2,0}; not 1 (no accum) or 0 (deadlock)
     bool imag_ok = (resp0_im >= -2) && (resp0_im <= 2);  // near-zero imag
     bool snr_ok  = (max_noise <= 2);         // quantisation noise floor
 
-    printf("\n=== FFT/IFFT round-trip test ===\n");
+    printf("\n=== FFT/IFFT round-trip + accumulation test ===\n");
     printf("  Input:    unit impulse at (r=0, c=0), int8 = 1\n");
-    printf("  Expected: resp[0,0]={1,0}, all others={0,0}\n");
+    printf("  Filter:   H*={1,0}, accum_prev={1,0} (ch>=1 simulation)\n");
+    printf("  Expected: resp[0,0]~={2,0}, all others={0,0}\n");
     printf("  Peak:     {%d,%d} at flat index %d (r=%d, c=%d)\n",
            resp0_re, resp0_im, dom_idx,
            dom_idx / PATCH_COLS, dom_idx % PATCH_COLS);
@@ -252,16 +269,19 @@ int main(int argc, char **argv)
     printf("  OVERALL: %s\n\n", pass ? "PASS" : "FAIL");
 
     if (!norm_ok && resp0_re > 100)
-        printf("  HINT: col IFFT shift may be wrong (resp0_re=%d; expected ~1).\n"
+        printf("  HINT: col IFFT shift may be wrong (resp0_re=%d; expected ~2).\n"
                "        Check FFT_2D_TP_IFFT_COL_SHIFT in ifft_graph.h.\n\n",
                resp0_re);
+    if (!norm_ok && resp0_re == 1)
+        printf("  HINT: accumulation may be broken — accum_prev={1,0} was supplied\n"
+               "        but resp0_re=1 suggests only the product was used (no add).\n\n");
 
     // Do NOT call end() — with run(-1), end()'s post-disable cleanup competes for
     // cycle credits with --simulation-cycle-timeout; if the timeout fires first,
     // neither can proceed and the simulation deadlocks permanently.
     // _exit() kills our process immediately; conv2d stalls on exhausted PLIO stream,
     // the event loop drains the remaining cycle budget uncontested then exits.
-    // Makefile `timeout 600` is a safety net. GMIO::free must NOT be called.
+    // Makefile `timeout 1200` is a safety net. GMIO::free must NOT be called.
     fflush(stdout);
     _exit(pass ? 0 : 1);
 }
