@@ -15,11 +15,11 @@
  * Expected output after the full pipeline (FFT → identity filter → IFFT):
  *   2D FFT of δ[r=0,c=0]  = constant spectrum {1,0} for all (k1,k2).
  *   cmul_accum stub passes through unchanged (filter ignored).
- *   2D IFFT (row shift=0, col shift=14) of all-ones spectrum:
- *     row IFFT → each output row = {128,0} at n=0, {0,0} elsewhere
- *     after transpose → row 0 = all {128,0}, rows 1..127 = zero
- *     col IFFT → IFFT_raw of {128,...,128} = {128×128,0,...} = {16384,0,...}
- *               shift 14 → {1,0} at n=0, {0,0} elsewhere
+ *   2D IFFT (row shift=0, col shift=12) of all-ones spectrum:
+ *     row IFFT → each output row has DSPLib constant C≈43 at n=0, {0,0} elsewhere
+ *     after transpose → row 0 = all {43,0}, rows 1..127 = zero
+ *     col IFFT raw acc ≈ 5120 (empirically from shift=10 giving 5); 5120>>12=1
+ *               shift 12 → {1,0} at n=0, {0,0} elsewhere
  *   Final: resp[0,0] = {1,0}, all others = {0,0}.
  *
  * Tolerance: ±2 LSB for elements expected to be 0 (cint16 twiddle quantization).
@@ -67,21 +67,35 @@ int main(int argc, char **argv)
     constexpr int PATCH_ELEMS = PATCH_ROWS * PATCH_COLS;
     constexpr int PATCH_BYTES = PATCH_ELEMS * 4;   // cint16 = 4 B/sample
 
+    // Combined cmul input: [filter_chunk_c | accum_chunk_c] per kernel invocation.
+    // Layout interleaved by chunk so each 2*CHUNK-element kernel window sees both halves.
+    // See cmul_accum_kernel.h for rationale (single GMIO buffer avoids ISS deadlock).
+    constexpr int CHUNK_ELEMS   = PATCH_COLS * FFT_COL_WS;  // 256 cint16 per chunk
+    constexpr int CHUNK_BYTES   = CHUNK_ELEMS * 4;           // 1024 B per chunk
+    constexpr int N_CHUNKS      = PATCH_ROWS / FFT_COL_WS;  // 64 chunks
+    constexpr int CMUL_IN_BYTES = PATCH_BYTES * 2;           // 131072 B total
+
     int8_t  *weights_buf = (int8_t*)  GMIO::malloc(64);
     int16_t *filter_buf  = (int16_t*) GMIO::malloc(PATCH_BYTES);
-    int16_t *accum_zero  = (int16_t*) GMIO::malloc(PATCH_BYTES);
+    int16_t *cmul_in_buf = (int16_t*) GMIO::malloc(CMUL_IN_BYTES);
     int16_t *fft_scratch = (int16_t*) GMIO::malloc(PATCH_BYTES);
     int16_t *accum_buf   = (int16_t*) GMIO::malloc(PATCH_BYTES);
     int16_t *resp_buf    = (int16_t*) GMIO::malloc(PATCH_BYTES);
 
     memset(weights_buf, 0, 64);
-    memset(accum_zero,  0, PATCH_BYTES);
 
     // Identity filter: H[i] = {re=1, im=0} — round-trip test expects IFFT(FFT(x)) = x
     for (int i = 0; i < PATCH_ELEMS; ++i) {
         filter_buf[i * 2]     = 1;
         filter_buf[i * 2 + 1] = 0;
     }
+
+    // Build combined cmul input: interleave filter and zero accum by chunk.
+    memset(cmul_in_buf, 0, CMUL_IN_BYTES);  // zeros all accum halves
+    for (int c = 0; c < N_CHUNKS; ++c)
+        memcpy((int8_t*)cmul_in_buf + (size_t)c * 2 * CHUNK_BYTES,
+               (int8_t*)filter_buf  + (size_t)c * CHUNK_BYTES,
+               CHUNK_BYTES);
 
     mosse_graph.init();
 
@@ -135,9 +149,8 @@ int main(int argc, char **argv)
     // Do NOT call wait() on input GMIOs (gm2aie_nb) — only output GMIOs need wait().
     // Calling input wait() blocks until the kernel consumes the buffer, which causes
     // a deadlock if the kernel cannot run while we're holding the thread here.
-    mosse_graph.gmio_accum_out.aie2gm_nb(accum_buf, PATCH_BYTES);  // arm output first
-    mosse_graph.gmio_filter.gm2aie_nb(filter_buf,  PATCH_BYTES);
-    mosse_graph.gmio_accum_in.gm2aie_nb(accum_zero, PATCH_BYTES);  // ch=0: zero init
+    mosse_graph.gmio_accum_out.aie2gm_nb(accum_buf, PATCH_BYTES);      // arm output first
+    mosse_graph.gmio_cmul_in.gm2aie_nb(cmul_in_buf, CMUL_IN_BYTES);   // [filter | zero_accum]
     mosse_graph.gmio_fft_col_in.gm2aie_nb(fft_scratch, PATCH_BYTES);
 
     // Step 5: collect cmul_accum output (= col-FFT pass-through in stub)
@@ -217,7 +230,7 @@ int main(int argc, char **argv)
 
     // Checks (see header comment for rationale):
     bool loc_ok  = (dom_idx == 0);          // peak at spatial origin
-    bool norm_ok = (resp0_re >= 0) && (resp0_re <= 4);   // not 0, not 16384
+    bool norm_ok = (resp0_re >= 1) && (resp0_re <= 4);   // not 0 (deadlock/zero), not 16384
     bool imag_ok = (resp0_im >= -2) && (resp0_im <= 2);  // near-zero imag
     bool snr_ok  = (max_noise <= 2);         // quantisation noise floor
 

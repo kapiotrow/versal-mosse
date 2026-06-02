@@ -93,10 +93,11 @@ GRAPH_SRC_CPP := $(AIE_SRC_REPO)/mosse_graph.cpp
 AIE_SIM_FLAGS := --pkg-dir $(WORK_DIR)/
 AIE_SIM_FLAGS += -i=$(AIE_SRC_REPO)/aiesim_data
 # Safety net: abort if the simulation freezes.
-# Full MOSSE pipeline (conv2d 16K samples + 4× 128-pt FFT passes on 128×128)
-# needs ~500K–2M simulated cycles.  5M gives a generous margin; the external
-# `timeout 600` in the aiesim rule fires first in practice.
-AIE_SIM_FLAGS += --simulation-cycle-timeout=5000000
+# cmul_accum_kernel does 64 invocations × 64 v8cint16 vector loads from memory
+# tile 13_0 = 4096 loads.  Cycle-approximate ISS models cross-tile vector loads
+# at ~20K cycles each → ~82M cycles total.  500M gives a 6× safety margin and
+# won't fire before the 1200s wall-clock kills a genuinely hung simulation.
+AIE_SIM_FLAGS += --simulation-cycle-timeout=500000000
 
 # =========================================================
 # v++ common flags
@@ -218,7 +219,7 @@ gen_vectors:
 	cd $(PROJECT_REPO) && env PYTHONHOME= PYTHONPATH= uv run python3 scripts/gen_aiesim_vectors.py $(AIE_SRC_REPO)/aiesim_data
 
 aiesim: graph gen_vectors
-	-cd $(BUILD_DIR) && timeout 600 aiesimulator $(AIE_SIM_FLAGS) 2>&1 | tee aiesim.log
+	-cd $(BUILD_DIR) && timeout 1200 aiesimulator $(AIE_SIM_FLAGS) 2>&1 | tee aiesim.log
 	@echo "--- aiesim done; check $(BUILD_DIR)/aiesim.log for PASS/FAIL ---"
 
 # -------------------------------------------------------

@@ -58,6 +58,9 @@
 #ifndef N_CHANNELS
 #  define N_CHANNELS  16
 #endif
+#ifndef FFT_COL_WS
+#  define FFT_COL_WS  2   // must match fft_graph.h FFT_COL_WS
+#endif
 #ifndef ITER_CNT
 #  define ITER_CNT    1
 #endif
@@ -75,6 +78,9 @@ constexpr size_t PATCH_ELEMS       = PATCH_ROWS * PATCH_COLS;
 constexpr size_t FFT_BYTES         = PATCH_ELEMS * 4;           // cint16 = 4 B/sample
 constexpr size_t FILTER_BYTES      = PATCH_ELEMS * 4;           // per channel
 constexpr size_t ACCUM_BYTES       = PATCH_ELEMS * 4;
+constexpr size_t CMUL_IN_BYTES     = PATCH_ELEMS * 4 * 2;       // [filter|accum] interleaved by chunk
+constexpr int    CMUL_CHUNK_INT16  = PATCH_COLS * FFT_COL_WS * 2; // int16_t per half-chunk
+constexpr int    CMUL_N_CHUNKS     = PATCH_ROWS / FFT_COL_WS;
 constexpr size_t RESP_BYTES        = PATCH_ELEMS * 4;
 constexpr size_t FRAME_BYTES       = (size_t)FRAME_ROWS * FRAME_COLS * 3; // RGB uint8
 // conv2d weights: 3×3×3 INT8 = 27 bytes, padded to 64-byte GMIO alignment
@@ -156,8 +162,7 @@ int main(int argc, char **argv)
     xrt::aie::gmio gm_weights     (device, uuid, "gmio_weights");
     xrt::aie::gmio gm_fft_row_out (device, uuid, "gmio_fft_row_out");
     xrt::aie::gmio gm_fft_col_in  (device, uuid, "gmio_fft_col_in");
-    xrt::aie::gmio gm_filter      (device, uuid, "gmio_filter");
-    xrt::aie::gmio gm_accum_in    (device, uuid, "gmio_accum_in");
+    xrt::aie::gmio gm_cmul_in     (device, uuid, "gmio_cmul_in");
     xrt::aie::gmio gm_accum_out   (device, uuid, "gmio_accum_out");
     xrt::aie::gmio gm_ifft_row_in (device, uuid, "gmio_ifft_row_in");
     xrt::aie::gmio gm_ifft_row_out(device, uuid, "gmio_ifft_row_out");
@@ -175,6 +180,9 @@ int main(int argc, char **argv)
                                xrt::bo::flags::normal, device.get_info<xrt::info::device::bdf>());
     // Partial accumulator (cint16, 64 KB)
     auto accum_bo   = xrt::bo(device, ACCUM_BYTES,
+                               xrt::bo::flags::normal, device.get_info<xrt::info::device::bdf>());
+    // Combined cmul input: [filter_chunk | accum_chunk] interleaved per kernel invocation
+    auto cmul_bo    = xrt::bo(device, CMUL_IN_BYTES,
                                xrt::bo::flags::normal, device.get_info<xrt::info::device::bdf>());
     // Filter H_ch* for all channels (cint16, 64 KB × N_CHANNELS)
     auto filter_bo  = xrt::bo(device, FILTER_BYTES * N_CHANNELS,
@@ -235,19 +243,31 @@ int main(int argc, char **argv)
             // APU: transpose row-FFT output in-place
             transpose_inplace(row_bo.map<void *>(), PATCH_ROWS, PATCH_COLS, 4);
 
-            // Feed transposed data to col-FFT + filter to cmul_accum
-            gm_fft_col_in.gm2aie_nb(row_bo.map<void *>(), FFT_BYTES);
-            int16_t *fp = filter_bo.map<int16_t *>()
-                          + ch * (int)(PATCH_ELEMS * 2);  // cint16: 2 × int16
-            gm_filter.gm2aie_nb(fp, FILTER_BYTES);
-
-            if (ch > 0) {
-                gm_accum_in.gm2aie_nb(accum_bo.map<void *>(), ACCUM_BYTES);
-                gm_accum_in.wait();
+            // Pack [filter_chunk_c | accum_chunk_c] into cmul_bo for all chunks.
+            // For ch=0 the accum half is zeroed; for ch>0 it carries the running sum.
+            {
+                int16_t *flt = filter_bo.map<int16_t*>() + ch * (int)(PATCH_ELEMS * 2);
+                int16_t *acc = (ch == 0) ? nullptr : accum_bo.map<int16_t*>();
+                int16_t *dst = cmul_bo.map<int16_t*>();
+                for (int c = 0; c < CMUL_N_CHUNKS; ++c) {
+                    memcpy(dst + c * 2 * CMUL_CHUNK_INT16,
+                           flt + c * CMUL_CHUNK_INT16,
+                           CMUL_CHUNK_INT16 * sizeof(int16_t));
+                    if (acc)
+                        memcpy(dst + c * 2 * CMUL_CHUNK_INT16 + CMUL_CHUNK_INT16,
+                               acc + c * CMUL_CHUNK_INT16,
+                               CMUL_CHUNK_INT16 * sizeof(int16_t));
+                    else
+                        memset(dst + c * 2 * CMUL_CHUNK_INT16 + CMUL_CHUNK_INT16, 0,
+                               CMUL_CHUNK_INT16 * sizeof(int16_t));
+                }
             }
 
+            // Feed transposed data to col-FFT + combined [filter|accum] to cmul_accum
+            gm_fft_col_in.gm2aie_nb(row_bo.map<void *>(), FFT_BYTES);
+            gm_cmul_in.gm2aie_nb(cmul_bo.map<void *>(), CMUL_IN_BYTES);
+
             gm_fft_col_in.wait();
-            gm_filter.wait();
 
             // Read updated partial accumulator
             gm_accum_out.aie2gm_nb(accum_bo.map<void *>(), ACCUM_BYTES);

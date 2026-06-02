@@ -11,13 +11,13 @@
  *   DDR → gmio_ifft_col_in → ifft_col_in
  *   ifft_col_out → gmio_response → DDR       (APU reads for peak detection)
  *
- * Normalization shift (resolved design decision):
+ * Normalization shift (empirically calibrated):
  *   Row IFFT: shift = 0   (no normalization on row pass)
- *   Col IFFT: shift = 14  (= log2(128) + log2(128) for 128×128 patches)
+ *   Col IFFT: shift = 12  (DSPLib col raw acc ~5120 for all-{43} row input; 5120>>12=1)
  *
- * R7 risk: DSPLib TP_SHIFT may mean total output shift, not per-stage.
- * If aiesim response is 2^14× too large, set FFT_2D_TP_IFFT_COL_SHIFT = 0
- * and apply >> 14 normalization in the APU after reading gmio_response.
+ * Note: DSPLib cint16 IFFT with TP_SHIFT=0 does NOT scale by N (unlike mathematical IFFT).
+ * It applies fixed-point twiddle normalization per stage, giving a non-obvious scaling constant.
+ * The col shift was determined empirically to make round-trip FFT→IFFT of a unit impulse give 1.
  *
  * fft_graph.h must be included before this file (provides point-size macros).
  */
@@ -37,7 +37,7 @@ namespace dsplib = xf::dsp::aie;
 // Apply entire shift on col pass so row output stays at full precision.
 // ---------------------------------------------------------------
 #define FFT_2D_TP_IFFT_ROW_SHIFT   0    // no shift on row IFFT
-#define FFT_2D_TP_IFFT_COL_SHIFT  14    // full normalization on col IFFT
+#define FFT_2D_TP_IFFT_COL_SHIFT  12    // empirically calibrated: row-IFFT gives ~43 per row; col raw acc ~5120; 5120>>12=1
 
 #define FFT_2D_TP_IFFT_NIFFT       0    // 0 = inverse FFT
 

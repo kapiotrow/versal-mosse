@@ -14,9 +14,8 @@
  *     DDR → gmio_fft_col_in ↓
  *   fft2d.fft_cols — PATCH_ROWS-point col FFT (DSPLib)
  *     ↓ (internal)
- *   cmul_accum_kernel — H_ch* ⊙ F_ch + accumulate (stub: pass-through)
- *     ← gmio_filter      (H_ch* from APU, per channel)
- *     ← gmio_accum_in    (previous partial sum; skipped on ch=0)
+ *   cmul_accum_kernel — H_ch* ⊙ F_ch + accumulate
+ *     ← gmio_cmul_in     ([H_ch* | prev_Σ] packed, per channel)
  *     ↓ gmio_accum_out → DDR
  *
  *   After all N_CHANNELS channels, APU reads accum_out and writes to
@@ -30,10 +29,12 @@
  *     ↓ gmio_response → DDR
  *   APU: peak_detect_sw() + filter_update_kissfft()
  *
- * GMIO summary (10 ports: 6 input + 4 output):
- *   IN:  gmio_weights, gmio_fft_col_in, gmio_filter, gmio_accum_in,
+ * GMIO summary (9 ports: 5 input + 4 output):
+ *   IN:  gmio_weights, gmio_fft_col_in, gmio_cmul_in,
  *        gmio_ifft_row_in, gmio_ifft_col_in
  *   OUT: gmio_fft_row_out, gmio_accum_out, gmio_ifft_row_out, gmio_response
+ *
+ * gmio_cmul_in carries [H_ch* | prev_Σ] packed per chunk — see cmul_accum_kernel.h.
  *
  * PLIO summary (1 port):
  *   IN: PatchIn
@@ -70,9 +71,8 @@ public:
     output_gmio gmio_fft_row_out;   // row-FFT output → DDR (APU transposes)
     input_gmio  gmio_fft_col_in;    // DDR (transposed) → col-FFT input
 
-    // cmul_accum filter and accumulator (shared serially)
-    input_gmio  gmio_filter;        // H_ch* per channel ← DDR (APU writes)
-    input_gmio  gmio_accum_in;      // previous partial sum ← DDR (skipped on ch=0)
+    // cmul_accum combined input and output (shared serially)
+    input_gmio  gmio_cmul_in;       // [H_ch* | prev_Σ] packed per chunk ← DDR (APU writes)
     output_gmio gmio_accum_out;     // updated partial sum → DDR
 
     // IFFT input: APU writes accumulated spectrum after all channels
@@ -106,8 +106,7 @@ public:
         gmio_weights     = input_gmio::create("gmio_weights",      64, 1000);
         gmio_fft_row_out = output_gmio::create("gmio_fft_row_out", 64, 1000);
         gmio_fft_col_in  = input_gmio::create("gmio_fft_col_in",   64, 1000);
-        gmio_filter      = input_gmio::create("gmio_filter",       64, 1000);
-        gmio_accum_in    = input_gmio::create("gmio_accum_in",     64, 1000);
+        gmio_cmul_in     = input_gmio::create("gmio_cmul_in",       64, 1000);
         gmio_accum_out   = output_gmio::create("gmio_accum_out",   64, 1000);
         gmio_ifft_row_in = input_gmio::create("gmio_ifft_row_in",  64, 1000);
         gmio_ifft_row_out= output_gmio::create("gmio_ifft_row_out",64, 1000);
@@ -144,28 +143,21 @@ public:
         // GMIO (APU-transposed) → fft2d col-FFT input
         adf::connect<>(gmio_fft_col_in.out[0], fft2d.fft_col_in);
 
-        // fft2d col-FFT output → cmul kernel.
-        // fft_col_out is a window port (FFT_COL_WINDOW_BUFF_SIZE per invocation =
-        // PATCH_COLS*FFT_COL_WS cint16).  All cmul buffers use the same chunk size so
-        // the kernel fires once per FFT window (64 times per 128×128 frame).
-        // Total tile memory: 4 × (PATCH_COLS*FFT_COL_WS × 4 B) × 2 (ping-pong) ≈ 8 KB,
-        // well within the 256 KB per-tile limit.
-        // connect<stream> is wrong here (source is window, not stream); bare connect<>
-        // lets ADF infer the window→buffer connection.
+        // fft2d col-FFT output → cmul.in[0] (fft_col_in, acquired 1st — must be first)
+        // fft_col_out is a tile-to-tile window port; its lock is set by the col-FFT tile
+        // (22_0), not by a GMIO DMA.  In Vitis 2025.2 cycle-approximate aiesim, INPUT
+        // GMIO locks on this tile (filter/accum) only deliver correctly after the
+        // tile-to-tile lock fires first in the iteration — see cmul_accum_kernel.h note.
         adf::connect<>(fft2d.fft_col_out, cmul.in[0]);
-        adf::dimensions(cmul.in[0]) = {PATCH_COLS * FFT_COL_WS};  // one FFT window chunk
+        adf::dimensions(cmul.in[0]) = {PATCH_COLS * FFT_COL_WS};
 
-        // gmio_filter → cmul filter buffer (in[1])
-        adf::connect<>(gmio_filter.out[0], cmul.in[1]);
-        adf::dimensions(cmul.in[1]) = {PATCH_COLS * FFT_COL_WS};  // chunk-aligned with in[0]
-
-        // gmio_accum_in → cmul previous accumulator (in[2]; APU sends zeros for ch=0)
-        adf::connect<>(gmio_accum_in.out[0], cmul.in[2]);
-        adf::dimensions(cmul.in[2]) = {PATCH_COLS * FFT_COL_WS};  // chunk-aligned with in[0]
+        // gmio_cmul_in → cmul.in[1] ([filter | accum_prev] packed; single GMIO lock)
+        adf::connect<>(gmio_cmul_in.out[0], cmul.in[1]);
+        adf::dimensions(cmul.in[1]) = {2 * PATCH_COLS * FFT_COL_WS};
 
         // cmul output → gmio_accum_out (DDR)
         adf::connect<>(cmul.out[0], gmio_accum_out.in[0]);
-        adf::dimensions(cmul.out[0]) = {PATCH_COLS * FFT_COL_WS};  // chunk-aligned with in[0]
+        adf::dimensions(cmul.out[0]) = {PATCH_COLS * FFT_COL_WS};
 
         // IFFT: APU reads gmio_accum_out, writes accumulated spectrum to gmio_ifft_row_in
         adf::connect<>(gmio_ifft_row_in.out[0],  ifft2d.ifft_row_in);
