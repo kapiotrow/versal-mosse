@@ -82,7 +82,7 @@ constexpr size_t CMUL_IN_BYTES     = PATCH_ELEMS * 4 * 2;       // [filter|accum
 constexpr int    CMUL_CHUNK_INT16  = PATCH_COLS * FFT_COL_WS * 2; // int16_t per half-chunk
 constexpr int    CMUL_N_CHUNKS     = PATCH_ROWS / FFT_COL_WS;
 constexpr size_t RESP_BYTES        = PATCH_ELEMS * 4;
-constexpr size_t FRAME_BYTES       = (size_t)FRAME_ROWS * FRAME_COLS * 3; // RGB uint8
+constexpr size_t FRAME_BYTES       = (size_t)FRAME_ROWS * FRAME_COLS;  // single-channel grayscale uint8
 // conv2d weights: 3×3×3 INT8 = 27 bytes, padded to 64-byte GMIO alignment
 constexpr size_t WEIGHT_CH_BYTES   = 64;
 
@@ -135,6 +135,50 @@ static void filter_update_kissfft(/* ... */) { /* TODO */ }
 static void compute_gaussian_response(/* ... */) { /* TODO */ }
 
 // -----------------------------------------------------------------------
+// Test data injection (for hw_emu validation)
+// -----------------------------------------------------------------------
+
+// Generate a synthetic test frame: impulse at (impulse_row, impulse_col).
+// Useful for functional validation of the pipeline.
+static void inject_impulse_frame(uint8_t *frame_buf, int rows, int cols,
+                                 int impulse_row, int impulse_col, uint8_t value)
+{
+    // Zero-fill the entire frame
+    for (int i = 0; i < rows * cols; ++i)
+        frame_buf[i] = 0;
+
+    // Place impulse at specified location
+    if (impulse_row >= 0 && impulse_row < rows &&
+        impulse_col >= 0 && impulse_col < cols) {
+        frame_buf[impulse_row * cols + impulse_col] = value;
+    }
+}
+
+// Generate a synthetic test frame: gradient pattern (for edge/feature testing).
+static void inject_gradient_frame(uint8_t *frame_buf, int rows, int cols)
+{
+    for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+            // Ramp from 0 (top-left) to 255 (bottom-right)
+            int val = ((r * 256 / rows) + (c * 256 / cols)) / 2;
+            frame_buf[r * cols + c] = (uint8_t)(val & 0xFF);
+        }
+    }
+}
+
+// Generate a synthetic test frame: checkerboard pattern.
+static void inject_checkerboard_frame(uint8_t *frame_buf, int rows, int cols, int square_size)
+{
+    for (int r = 0; r < rows; ++r) {
+        for (int c = 0; c < cols; ++c) {
+            int sq_r = r / square_size;
+            int sq_c = c / square_size;
+            frame_buf[r * cols + c] = ((sq_r + sq_c) & 1) ? 255 : 0;
+        }
+    }
+}
+
+// -----------------------------------------------------------------------
 // Main tracking loop
 // -----------------------------------------------------------------------
 int main(int argc, char **argv)
@@ -154,45 +198,45 @@ int main(int argc, char **argv)
     // AIE graph
     // ------------------------------------------------------------------
     xrt::graph gr(device, uuid, "mosse_graph");
-    gr.run(-1);  // streaming — driven by GMIO transactions in the loop
+    gr.run();  // run forever, driven by GMIO transactions in the loop
 
     // ------------------------------------------------------------------
     // GMIO handles (names must match MOSSE_graph constructor strings exactly)
     // ------------------------------------------------------------------
-    xrt::aie::gmio gm_weights     (device, uuid, "gmio_weights");
-    xrt::aie::gmio gm_fft_row_out (device, uuid, "gmio_fft_row_out");
-    xrt::aie::gmio gm_fft_col_in  (device, uuid, "gmio_fft_col_in");
-    xrt::aie::gmio gm_cmul_in     (device, uuid, "gmio_cmul_in");
-    xrt::aie::gmio gm_accum_out   (device, uuid, "gmio_accum_out");
-    xrt::aie::gmio gm_ifft_row_in (device, uuid, "gmio_ifft_row_in");
-    xrt::aie::gmio gm_ifft_row_out(device, uuid, "gmio_ifft_row_out");
-    xrt::aie::gmio gm_ifft_col_in (device, uuid, "gmio_ifft_col_in");
-    xrt::aie::gmio gm_response    (device, uuid, "gmio_response");
+    xrt::aie::buffer gm_weights     (device, uuid, "gmio_weights");
+    xrt::aie::buffer gm_fft_row_out (device, uuid, "gmio_fft_row_out");
+    xrt::aie::buffer gm_fft_col_in  (device, uuid, "gmio_fft_col_in");
+    xrt::aie::buffer gm_cmul_in     (device, uuid, "gmio_cmul_in");
+    xrt::aie::buffer gm_accum_out   (device, uuid, "gmio_accum_out");
+    xrt::aie::buffer gm_ifft_row_in (device, uuid, "gmio_ifft_row_in");
+    xrt::aie::buffer gm_ifft_row_out(device, uuid, "gmio_ifft_row_out");
+    xrt::aie::buffer gm_ifft_col_in (device, uuid, "gmio_ifft_col_in");
+    xrt::aie::buffer gm_response    (device, uuid, "gmio_response");
 
     // ------------------------------------------------------------------
     // XRT BOs (host-accessible DDR buffers)
     // ------------------------------------------------------------------
     // Frame buffer for camera_capture output
     auto frame_bo   = xrt::bo(device, FRAME_BYTES,
-                               xrt::bo::flags::normal, device.get_info<xrt::info::device::bdf>());
+                               xrt::bo::flags::normal, 0);
     // Shared row-FFT ↔ IFFT row scratch (cint16, 64 KB)
     auto row_bo     = xrt::bo(device, FFT_BYTES,
-                               xrt::bo::flags::normal, device.get_info<xrt::info::device::bdf>());
+                               xrt::bo::flags::normal, 0);
     // Partial accumulator (cint16, 64 KB)
     auto accum_bo   = xrt::bo(device, ACCUM_BYTES,
-                               xrt::bo::flags::normal, device.get_info<xrt::info::device::bdf>());
+                               xrt::bo::flags::normal, 0);
     // Combined cmul input: [filter_chunk | accum_chunk] interleaved per kernel invocation
     auto cmul_bo    = xrt::bo(device, CMUL_IN_BYTES,
-                               xrt::bo::flags::normal, device.get_info<xrt::info::device::bdf>());
+                               xrt::bo::flags::normal, 0);
     // Filter H_ch* for all channels (cint16, 64 KB × N_CHANNELS)
     auto filter_bo  = xrt::bo(device, FILTER_BYTES * N_CHANNELS,
-                               xrt::bo::flags::normal, device.get_info<xrt::info::device::bdf>());
+                               xrt::bo::flags::normal, 0);
     // Weights for all channels (64 B × N_CHANNELS)
     auto weights_bo = xrt::bo(device, WEIGHT_CH_BYTES * N_CHANNELS,
-                               xrt::bo::flags::normal, device.get_info<xrt::info::device::bdf>());
+                               xrt::bo::flags::normal, 0);
     // Correlation response map (cint16, 64 KB)
     auto resp_bo    = xrt::bo(device, RESP_BYTES,
-                               xrt::bo::flags::normal, device.get_info<xrt::info::device::bdf>());
+                               xrt::bo::flags::normal, 0);
 
     // ------------------------------------------------------------------
     // PL kernel handles
@@ -216,10 +260,21 @@ int main(int argc, char **argv)
     // ------------------------------------------------------------------
     for (int frame = 0; frame < ITER_CNT; ++frame) {
 
-        // 1. Camera capture → DDR frame buffer
+        // 1. Camera capture → DDR frame buffer (zeros the buffer)
         {
             auto run = cam(frame_bo, FRAME_ROWS, FRAME_COLS);
             run.wait();
+        }
+
+        // 1b. Inject test data into frame buffer (for hw_emu validation)
+        // For functional testing, use an impulse at the tracked position.
+        // TODO: Replace with real video capture loop (OpenCV, V4L2).
+        {
+            uint8_t *frame_ptr = frame_bo.map<uint8_t *>();
+            int test_row = pos_row;
+            int test_col = pos_col;
+            inject_impulse_frame(frame_ptr, FRAME_ROWS, FRAME_COLS, test_row, test_col, 200);
+            frame_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);  // Flush host → device
         }
 
         // 2. Per-channel: conv2d + FFT2D + cmul_accum
@@ -229,14 +284,13 @@ int main(int argc, char **argv)
         for (int ch = 0; ch < N_CHANNELS; ++ch) {
 
             // Load weights for channel ch
-            int8_t *wp = weights_bo.map<int8_t *>() + ch * WEIGHT_CH_BYTES;
-            gm_weights.gm2aie_nb(wp, WEIGHT_CH_BYTES);
+            gm_weights.async(weights_bo, XCL_BO_SYNC_BO_GMIO_TO_AIE, WEIGHT_CH_BYTES, ch * WEIGHT_CH_BYTES);
             gm_weights.wait();
 
             // roi_crop → PatchIn PLIO → conv2d → fft_rows → gmio_fft_row_out
             auto crop_run = crop(frame_bo, FRAME_COLS,
                                  roi_row, roi_col, PATCH_ROWS, PATCH_COLS);
-            gm_fft_row_out.aie2gm_nb(row_bo.map<void *>(), FFT_BYTES);
+            gm_fft_row_out.async(row_bo, XCL_BO_SYNC_BO_AIE_TO_GMIO, FFT_BYTES, 0);
             crop_run.wait();
             gm_fft_row_out.wait();
 
@@ -264,27 +318,28 @@ int main(int argc, char **argv)
             }
 
             // Feed transposed data to col-FFT + combined [filter|accum] to cmul_accum
-            gm_fft_col_in.gm2aie_nb(row_bo.map<void *>(), FFT_BYTES);
-            gm_cmul_in.gm2aie_nb(cmul_bo.map<void *>(), CMUL_IN_BYTES);
+            gm_fft_col_in.async(row_bo, XCL_BO_SYNC_BO_GMIO_TO_AIE, FFT_BYTES, 0);
+            gm_cmul_in.async(cmul_bo, XCL_BO_SYNC_BO_GMIO_TO_AIE, CMUL_IN_BYTES, 0);
 
             gm_fft_col_in.wait();
+            gm_cmul_in.wait();  // Wait for filter/accum data to reach AIE before accum reads
 
             // Read updated partial accumulator
-            gm_accum_out.aie2gm_nb(accum_bo.map<void *>(), ACCUM_BYTES);
+            gm_accum_out.async(accum_bo, XCL_BO_SYNC_BO_AIE_TO_GMIO, ACCUM_BYTES, 0);
             gm_accum_out.wait();
         }
 
         // 3. IFFT: APU feeds accumulated spectrum to IFFT row input
-        gm_ifft_row_in.gm2aie_nb(accum_bo.map<void *>(), ACCUM_BYTES);
-        gm_ifft_row_out.aie2gm_nb(row_bo.map<void *>(), FFT_BYTES);
+        gm_ifft_row_in.async(accum_bo, XCL_BO_SYNC_BO_GMIO_TO_AIE, ACCUM_BYTES, 0);
+        gm_ifft_row_out.async(row_bo, XCL_BO_SYNC_BO_AIE_TO_GMIO, FFT_BYTES, 0);
         gm_ifft_row_in.wait();
         gm_ifft_row_out.wait();
 
         // APU: transpose IFFT row output in-place
         transpose_inplace(row_bo.map<void *>(), PATCH_ROWS, PATCH_COLS, 4);
 
-        gm_ifft_col_in.gm2aie_nb(row_bo.map<void *>(), FFT_BYTES);
-        gm_response.aie2gm_nb(resp_bo.map<void *>(), RESP_BYTES);
+        gm_ifft_col_in.async(row_bo, XCL_BO_SYNC_BO_GMIO_TO_AIE, FFT_BYTES, 0);
+        gm_response.async(resp_bo, XCL_BO_SYNC_BO_AIE_TO_GMIO, RESP_BYTES, 0);
         gm_ifft_col_in.wait();
         gm_response.wait();
 
@@ -303,6 +358,6 @@ int main(int argc, char **argv)
     // ------------------------------------------------------------------
     // Cleanup
     // ------------------------------------------------------------------
-    gr.end(1000);  // 1 s timeout
+    gr.end(0);  // block until graph completes
     return EXIT_SUCCESS;
 }

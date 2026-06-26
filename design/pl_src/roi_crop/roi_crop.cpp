@@ -1,15 +1,24 @@
 /*
  * roi_crop.cpp
- * PL stub: reads the ROI patch from DDR and streams it to AIE via PatchIn PLIO.
+ * Extracts a ROI patch from a DDR frame buffer and streams it to AIE via PatchIn PLIO.
  *
- * The stub writes zeroed 128-bit beats; the real implementation should
- * read frame_buf[(roi_row+r)*frame_cols*3 + (roi_col+c)*3 + ch] and pack
- * pixels correctly.
+ * Reads frame pixels in row-major order from frame_buf starting at (roi_row, roi_col),
+ * packs 16 consecutive uint8 pixels per 128-bit AXIS beat, and streams to PLIO.
  *
- * Packing: 16 uint8 values per 128-bit word, sequential row-major order.
- * The PLIO is plio_128_bits so each beat transfers 16 bytes.
- * Total beats = patch_rows * patch_cols / 16 (assuming patch size is
- * a multiple of 16; for 128×128 = 16384 pixels = 1024 beats).
+ * Frame layout: [row 0: pixel 0, pixel 1, ...] [row 1: ...] etc. (linear uint8 array)
+ * ROI extraction: start at frame_buf[roi_row * frame_cols + roi_col],
+ *                 read patch_rows × patch_cols pixels in row-major order
+ *
+ * Packing (128-bit = 16 bytes):
+ *   beat[0].data[7:0]     = pixel[0]
+ *   beat[0].data[15:8]    = pixel[1]
+ *   ...
+ *   beat[0].data[127:120] = pixel[15]
+ *
+ * HLS Optimization:
+ * - Nested row/column loops (no division by runtime patch_cols in pipeline)
+ * - UNROLL inner pixel packing loop for II=1 pipelining
+ * - Total beats counter computed once outside pipeline
  */
 
 #include "roi_crop.h"
@@ -23,7 +32,7 @@ void roi_crop(
     int  patch_rows,
     int  patch_cols)
 {
-#pragma HLS INTERFACE m_axi     port=frame_buf  bundle=gmem0  depth=6220800
+#pragma HLS INTERFACE m_axi     port=frame_buf  bundle=gmem0  depth=2073600
 #pragma HLS INTERFACE axis      port=patch_out
 #pragma HLS INTERFACE s_axilite port=frame_cols bundle=control
 #pragma HLS INTERFACE s_axilite port=roi_row    bundle=control
@@ -32,18 +41,31 @@ void roi_crop(
 #pragma HLS INTERFACE s_axilite port=patch_cols bundle=control
 #pragma HLS INTERFACE s_axilite port=return     bundle=control
 
-    // Total pixels in the patch; must be a multiple of 16 for 128-bit packing.
-    // Default: 128×128 = 16384 pixels → 1024 beats.
-    int total_pixels = patch_rows * patch_cols;
-    int total_beats  = total_pixels / 16;
+    // Pre-compute total beats outside the pipeline
+    // >> 4 is bit-shift (divide by 16); no hardware divider
+    int total_beats = (patch_rows * patch_cols) >> 4;
+    int beat = 0;
 
-    for (int beat = 0; beat < total_beats; ++beat) {
+    // Nested loops: row-major iteration without division inside pipeline
+    for (int r = 0; r < patch_rows; ++r) {
+        for (int c = 0; c < patch_cols; c += 16) {
 #pragma HLS PIPELINE II=1
-        ap_axiu<128,0,0,0> word;
-        word.data = 0;  // TODO: read 16 pixels from frame_buf at correct offsets
-        word.keep = (ap_uint<16>)-1;
-        word.strb = (ap_uint<16>)-1;
-        word.last = (beat == total_beats - 1) ? 1 : 0;
-        patch_out.write(word);
+            ap_axiu<128,0,0,0> word;
+            word.keep = (ap_uint<16>)-1;
+            word.strb = (ap_uint<16>)-1;
+            word.last = (beat == total_beats - 1) ? 1 : 0;
+
+            // Unroll inner pixel packing loop: 16 pixels read in parallel
+            for (int i = 0; i < 16; ++i) {
+#pragma HLS UNROLL
+                // Frame address: (roi_row + r) * frame_cols + (roi_col + c + i)
+                int frame_idx = (roi_row + r) * frame_cols + (roi_col + c + i);
+                ap_uint<8> pix = frame_buf[frame_idx];
+                word.data.range(8*i + 7, 8*i) = pix;
+            }
+
+            patch_out.write(word);
+            beat++;
+        }
     }
 }

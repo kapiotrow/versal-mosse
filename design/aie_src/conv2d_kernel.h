@@ -1,29 +1,35 @@
 /*
  * conv2d_kernel.h
- * AIE-ML kernel: 3×3 INT8 convolution with Hanning window (stub).
+ * AIE-ML kernel: 3×3 INT8 convolution + separable Hanning window.
  *
  * Processes one feature channel per invocation. Called N_CHANNELS times
  * per frame with different weights loaded via gmio_weights each time.
  *
- * Input:  int8 pixel stream from PatchIn PLIO (PATCH_ROWS * PATCH_COLS samples)
- * Output: cint16 stream to fft2d row-FFT input (real = windowed feature, imag = 0)
+ * Input:  int8 grayscale pixel stream from PatchIn PLIO
+ *         (PATCH_ROWS * PATCH_COLS samples, row-major)
+ * Output: cint16 stream to fft2d row-FFT input
+ *         (real = Hanning-windowed feature value, imag = 0)
  *
- * Weights: loaded into tile local memory via gmio_weights GMIO before each call.
- *          Layout: [IN_CHANNELS=3][KSIZE=3][KSIZE=3] int8, padded to 64 bytes
- *          for GMIO alignment.
+ * Weights: 64-byte buffer loaded via gmio_weights before each invocation.
+ *   [0 : 9]   int8  w[KSIZE=3][KSIZE=3]  — 3×3 grayscale conv weights (row-major)
+ *   [9]       int8  out_shift             — right-shift: int32 acc → int16
+ *   [10:14]   int32 bias_acc (LE)         — bias in accumulator domain
+ *   [14:18]   float32 dequant_scale (LE)  — for host validation only, not used by kernel
+ *   [18:64]   zero padding
  *
- * Scalar parameters (patch_rows, patch_cols, channel) are intentionally absent:
- * ADF requires scalars to be wired as RTP ports, which adds graph complexity
- * not needed while the implementation is a stub. Use PATCH_ROWS / PATCH_COLS
- * compile-time defines (set by the Makefile) and add RTP wiring when the full
- * 3×3 sliding-window implementation is in place.
+ * Weights are derived from the first conv layer of MobileNetV3-Small (pretrained
+ * ImageNet) collapsed to grayscale via luminance coefficients.
+ * Generate with:  make weights  (runs scripts/export_weights.py)
  *
- * Hanning window: TODO — apply separable 1D Hanning to each output sample.
- *                 Compute on-the-fly from row/col index to avoid a 32 KB table.
+ * Input quantization contract:
+ *   x_int8 in [-127, 127]  represents  x_gray_float = x_int8 / 127
+ *   where x_gray_float is the ImageNet-normalized grayscale float:
+ *     x_gray = 0.2989*R + 0.5870*G + 0.1140*B   (then ImageNet mean/std normalized)
+ *   roi_crop / host should apply this quantization before sending to PLIO.
  *
- * Hardware note (R1): a 128×128 int16 Hanning table = 32 KB, which combined
- * with other tile buffers risks exceeding 64 KB tile data memory on AIE-ML.
- * Use on-the-fly computation; verify with aiecompiler --report-all.
+ * Hanning window: applied to the int16 convolution output using a precomputed
+ *   Q1.15 table (hanning_128.h).  The window zeros the patch borders, reducing
+ *   spectral leakage in the downstream FFT.
  */
 
 #pragma once
@@ -31,16 +37,16 @@
 #include <adf.h>
 using namespace adf;
 
-// Number of input channels (RGB)
+// Single grayscale input channel
 #ifndef CONV_IN_CH
-#  define CONV_IN_CH  3
+#  define CONV_IN_CH  1
 #endif
 // Kernel size
 #ifndef CONV_KSIZE
 #  define CONV_KSIZE  3
 #endif
 // Weight array size for one output channel, padded to 64-byte GMIO alignment
-#define CONV_WEIGHT_BYTES_RAW  (CONV_IN_CH * CONV_KSIZE * CONV_KSIZE)   // 27
+#define CONV_WEIGHT_BYTES_RAW  (CONV_IN_CH * CONV_KSIZE * CONV_KSIZE)   // 9
 #define CONV_WEIGHT_BYTES_PAD  64                                         // padded
 
 void conv2d_kernel(

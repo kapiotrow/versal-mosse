@@ -6,7 +6,7 @@
  *
  *   PatchIn (PLIO) ← roi_crop PL kernel
  *     ↓
- *   conv2d_kernel  — 3×3 INT8 conv + Hanning window (stub: pass-through)
+ *   conv2d_kernel  — 3×3 INT8 conv + separable Hanning window (int8 → cint16)
  *     ↓ (window)
  *   fft2d.fft_rows — PATCH_COLS-point row FFT (DSPLib)
  *     ↓ gmio_fft_row_out → DDR

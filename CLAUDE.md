@@ -8,13 +8,13 @@ Extends the AIE 2D-FFT tutorial (XD073) with a full object tracking pipeline.
 ## Environment setup
 
 ```bash
-source sample_env_setup.sh
+source setup_env.sh
 ```
 
-Required env vars (same as tutorial):
+This script sets all required env vars (same as tutorial):
 - `PLATFORM_REPO_PATHS`, `XILINX_VITIS`, `COMMON_IMAGE_VERSAL`
-- `DSPLIB_VITIS` — set to Vitis Libraries **root** (e.g. `.../Vitis_Libraries`), NOT the dsp subdirectory. The Makefile appends `/dsp` internally.
-- `PLATFORM` — set to VEK280 XPFM path
+- `DSPLIB_VITIS` — Vitis Libraries **root** (e.g. `.../Vitis_Libraries`), NOT the dsp subdirectory. The Makefile appends `/dsp` internally.
+- `PLATFORM` — VEK280 XPFM path: `xilinx_vek280_base_202520_1.xpfm`
 
 ## Build parameters
 
@@ -42,9 +42,10 @@ PL kernels (2 total)
   roi_crop       : DDR frame → PATCH_ROWS×PATCH_COLS patch → 128-bit AXIS → AIE PatchIn
 
 AIE — single instances, serial per-channel processing
-  conv2d_kernel      : int8 patch stream + weights → cint16 feature stream (stub: pass-through cast)
+  conv2d_kernel      : int8 patch → 3×3 MAC + ReLU + Hanning window → cint16 feature stream
+                       (MobileNet-v3 Small layer 1, INT8-quantized, RGB collapsed to grayscale)
   fft2d (FFT2D_graph): PATCH_COLS-pt row FFT → GMIO → DDR; APU transposes; DDR → GMIO → PATCH_ROWS-pt col FFT
-  cmul_accum_kernel  : col-FFT stream ⊙ H_ch* + accumulate (stub: pass-through)
+  cmul_accum_kernel  : col-FFT stream ⊙ H_ch* + accumulate (implemented with int32 accumulator)
   ifft2d (IFFT2D_graph): same DDR-transpose pattern as fft2d; PATCH_COLS-pt row IFFT + PATCH_ROWS-pt col IFFT
 ```
 
@@ -55,16 +56,15 @@ AIE — single instances, serial per-channel processing
 This name must match between `mosse_graph.h` (`input_plio::create("PatchIn", ...)`) and
 `mosse_x1.cfg` (`stream_connect=roi_crop_0.patch_out:ai_engine_0.PatchIn`).
 
-### GMIO ports (10 total: 6 input + 4 output)
+### GMIO ports (9 total: 5 input + 4 output)
 
 | Name | Dir | Purpose |
 |---|---|---|
 | `gmio_weights` | DDR→AIE | conv2d INT8 weights per channel |
 | `gmio_fft_row_out` | AIE→DDR | fft_rows output; APU transposes |
 | `gmio_fft_col_in` | DDR→AIE | APU-transposed data → fft_cols |
-| `gmio_filter` | DDR→AIE | H_ch* per channel → cmul_accum |
-| `gmio_accum_in` | DDR→AIE | Previous partial sum (skipped on ch=0) |
-| `gmio_accum_out` | AIE→DDR | Updated partial sum |
+| `gmio_cmul_in` | DDR→AIE | [H_ch* \| prev_Σ] packed per chunk (replaces separate gmio_filter/gmio_accum_in) |
+| `gmio_accum_out` | AIE→DDR | Updated partial sum after cmul_accum |
 | `gmio_ifft_row_in` | DDR→AIE | Accumulated spectrum → ifft_rows |
 | `gmio_ifft_row_out` | AIE→DDR | ifft_rows output; APU transposes |
 | `gmio_ifft_col_in` | DDR→AIE | APU-transposed data → ifft_cols |
@@ -107,23 +107,32 @@ After all channels:
   If aiesim response is 2^14× too large, set col shift to 0 and apply >>14 in APU after
   reading gmio_response.
 
-- **Conv layer weights**: `conv2d_kernel.cpp` has pass-through stub. Replace with:
-  - Pretrained INT8 weights exported from Brevitas (simplest path), or
-  - FINN-generated RTL kernel (Versal support limited as of 2025.2).
+- **Conv layer implementation**: `conv2d_kernel.cpp` implements 3×3 sliding-window convolution with:
+  - Per-channel INT8 weights from MobileNet-v3 Small (pretrained on ImageNet, quantized via Brevitas)
+  - ReLU activation applied post-convolution (clamp negatives to 0)
+  - Separable Hanning window folded into MAC loop (reduces spectral leakage in FFT)
+  - Per-channel quantization: weights loaded via gmio_weights, bias and out_shift precomputed
+  - Generate weights with: `make weights` (runs scripts/export_weights.py)
 
-## FINN / Brevitas notes
+## Weight export (MobileNetV3-Small layer 1)
 
-FINN's Versal support is limited as of 2025.2. Recommended approach:
-1. Train and quantize the conv layer in Brevitas (PyTorch QAT).
-2. Export weights as INT8 numpy arrays.
-3. Hand-implement the conv in the AIE `conv2d_kernel.cpp` using those weights.
-4. Monitor FINN Versal support for future migration to generated IP.
+Export and quantize via `make weights`:
+1. Extracts first conv layer of torchvision.models.mobilenet_v3_small (pretrained)
+2. Folds BatchNorm into weights/bias
+3. Collapses RGB → grayscale using ITU-R BT.601 luminance: 0.2989×R + 0.5870×G + 0.1140×B
+4. Symmetric INT8 quantization per output channel
+5. Outputs:
+   - `design/aie_src/weights/layer0_weights.bin` — 16 × 64 B (16 channels)
+   - `design/aie_src/weights/layer0.h` — shift/scale metadata
+   - `design/aie_src/hanning_128.h` — precomputed Q1.15 Hanning window
 
 ## Build commands
 
 ```bash
+make weights                       # export MobileNet-v3 Small layer 1 (INT8 weights + hanning table)
+make gen_vectors                   # generate aiesim test vectors
 make graph                         # compile AIE graph only
-make aiesim                        # run AIE simulator (uses aiesim_data/patch_in.txt)
+make aiesim                        # run AIE simulator (cycle-approx ISS with GMIO/PLIO workarounds)
 make kernels                       # compile camera_capture + roi_crop PL kernels
 make xsa                           # link kernels + graph → XSA file
 make application                   # cross-compile host ELF (aarch64)
@@ -138,15 +147,20 @@ make cleanall
 ```
 design/
 ├── aie_src/
-│   ├── fft_graph.h            # FFT2D_graph (single instance, GMIO-broken row→col)
+│   ├── fft_graph.h            # FFT2D_graph (single instance, GMIO row→col)
 │   ├── ifft_graph.h           # IFFT2D_graph (single instance, same pattern)
-│   ├── conv2d_kernel.h/.cpp   # int8 patch → cint16 feature (stub: cast only)
-│   ├── cmul_accum_kernel.h/.cpp # col-FFT ⊙ H_ch* + accumulate (stub: pass-through)
+│   ├── conv2d_kernel.h/.cpp   # MobileNet-v3 layer 1: 3×3 MAC + ReLU + Hanning window
+│   ├── cmul_accum_kernel.h/.cpp # col-FFT ⊙ H_ch* + accumulate (int32 accumulator)
 │   ├── mosse_graph.h          # Top-level: PLIO + 10 GMIO + 2 custom kernels + FFT2D + IFFT2D
 │   ├── mosse_graph.cpp        # Instantiation + aiesim smoke test main()
 │   ├── constraints.aiecst     # PatchIn PLIO shim placement
+│   ├── hanning_128.h          # Precomputed Q1.15 Hanning window (auto-generated)
+│   ├── weights/               # MobileNet-v3 Small layer 1 (INT8, auto-generated)
+│   │   ├── layer0_weights.bin # 16 channels × 64 B
+│   │   ├── layer0.h           # Shift/scale metadata per channel
+│   │   └── layer0_meta.npz    # Validation data
 │   └── aiesim_data/
-│       └── patch_in.txt       # 16384 zeroed int8 samples for aiesim smoke test
+│       └── s*/                # Test scenarios: s0, s1a, s1b, etc. (impulse at various positions)
 ├── pl_src/
 │   ├── camera_capture/        # Zero-fill frame buffer stub
 │   └── roi_crop/              # Extract patch, stream to PatchIn PLIO
@@ -160,15 +174,28 @@ design/
     └── run_script.sh          # Board execution (mosse_tracker.elf a.xclbin)
 ```
 
-## Current status / TODOs
+## Current status (as of 2026-06-17)
 
-- [ ] `conv2d_kernel.cpp`: implement sliding-window 3×3 MAC + Hanning window + load weights
-- [ ] `cmul_accum_kernel.cpp`: implement element-wise cmul_conj + accumulate
-- [ ] `mosse_tracker.cpp`: add video decode loop (OpenCV or V4L2)
-- [ ] `mosse_tracker.cpp`: implement first-frame filter initialization
-- [ ] `mosse_tracker.cpp`: implement PS-side filter update (KissFFT for A_ch, B, H_ch*)
-- [ ] `mosse_tracker.cpp`: implement `transpose_inplace()` (currently stub)
-- [ ] Validate IFFT normalization shift (see ifft_graph.h R7 note)
-- [ ] Validate cmul_accum fixed-point precision (cint16 accumulator overflow risk for N_CHANNELS=16)
-- [ ] aiesim: verify smoke test passes without deadlock (`make aiesim N_CHANNELS=1 ITER_CNT=1`)
+### Completed
+- [x] `conv2d_kernel.cpp`: 3×3 MAC + ReLU + Hanning window (MobileNet-v3 Small layer 1)
+- [x] Weight export: MobileNet-v3 Small layer 1 (INT8-quantized, RGB→grayscale collapsed)
+- [x] `cmul_accum_kernel.cpp`: element-wise cmul_conj + int32 accumulate
+- [x] aiesim N_CHANNELS=1: PASS (real arithmetic with ISS workarounds for GMIO/PLIO bugs)
+- [x] Two-channel aiesim support added (N_CHANNELS=2 option in sim)
+- [x] Pre-computed FFT bypass for aiesim (Bug 2/3: PLIO→stream→window delivery broken in cycle-approx ISS)
+
+### In Progress / Next
+- [ ] aiesim N_CHANNELS=16: test multi-channel accumulation
+- [ ] mosse_tracker.cpp: add video decode loop (OpenCV or V4L2)
+- [ ] mosse_tracker.cpp: implement first-frame filter initialization
+- [ ] mosse_tracker.cpp: implement PS-side filter update (KissFFT for A_ch, B, H_ch*)
+- [ ] mosse_tracker.cpp: implement `transpose_inplace()` (currently stub)
+- [ ] Validate IFFT normalization shift (col_shift=12 empirically tuned; see ifft_graph.h)
+- [ ] Validate cmul_accum fixed-point precision for N_CHANNELS=16 accumulation
 - [ ] hw_emu: verify single-channel end-to-end (`make sd_card TARGET=hw_emu N_CHANNELS=1 ITER_CNT=1`)
+
+### Known Issues
+- **Cycle-approx aiesim GMIO/PLIO bugs** (Vitis 2025.2): See [[feedback-aiesim-gmio]]
+  - aie2gm_nb() transfers only one kernel invocation per call (not full N bytes)
+  - PLIO→stream→window adapter delivers wrong data for non-zero positions
+  - **Workaround**: Loop per-invocation on output GMIO, pre-compute FFT outputs for aiesim

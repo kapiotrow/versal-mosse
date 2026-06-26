@@ -12,6 +12,11 @@
 #   make sd_card    — kernels + graph + xsa + application + package
 #   make cleanall   — remove all build outputs
 
+# Fail recipes when any command in a `... | tee` pipeline fails (otherwise
+# tee's exit code masks v++/aiecompiler failures and the build marches on).
+SHELL := /bin/bash
+.SHELLFLAGS := -o pipefail -c
+
 # =========================================================
 # Build parameters
 # =========================================================
@@ -84,14 +89,21 @@ AIE_FLAGS  += --Xpreproc="-DITER_CNT=$(ITER_CNT)"
 AIE_FLAGS  += --verbose
 AIE_FLAGS  += --log-level=5
 AIE_FLAGS  += --pl-freq=$(PL_FREQ)
+AIE_FLAGS  += --constraints $(AIE_SRC_REPO)/constraints.aiecst
 AIE_FLAGS  += --Xchess="main:bridge.llibs=softfloat m"
+AIE_FLAGS  += --Xelfgen="-j2"
 AIE_FLAGS  += --workdir=$(WORK_DIR)
 
 GRAPH_SRC_CPP := $(AIE_SRC_REPO)/mosse_graph.cpp
 
+# Test scenario — selects aiesim_data/<SCENARIO>/ for PLIO and GMIO data.
+# Scenarios: s0 (default/baseline), s1 (off-centre), s2 (DC), s3 (imag filter), s4 (Gaussian)
+SCENARIO         ?= s0
+SCENARIO_DATA_DIR = $(AIE_SRC_REPO)/aiesim_data/$(SCENARIO)
+
 # Aiesimulator flags
 AIE_SIM_FLAGS := --pkg-dir $(WORK_DIR)/
-AIE_SIM_FLAGS += -i=$(AIE_SRC_REPO)/aiesim_data
+AIE_SIM_FLAGS += -i=$(SCENARIO_DATA_DIR)
 # Safety net: abort if the simulation freezes.
 # cmul_accum_kernel does 64 invocations × 64 v8cint16 vector loads from memory
 # tile 13_0 = 4096 loads.  Cycle-approximate ISS models cross-tile vector loads
@@ -116,8 +128,6 @@ VPP_FLAGS  += --temp_dir $(BUILD_DIR)/_x
 CAM_VPP_FLAGS   := --hls.clock $(VPP_CLOCK_FREQ):camera_capture
 
 CROP_VPP_FLAGS  := --hls.clock $(VPP_CLOCK_FREQ):roi_crop
-CROP_VPP_FLAGS  += --Xpreproc="-DPATCH_ROWS=$(PATCH_ROWS)"
-CROP_VPP_FLAGS  += --Xpreproc="-DPATCH_COLS=$(PATCH_COLS)"
 
 # =========================================================
 # Host application compiler flags
@@ -162,13 +172,14 @@ KERNEL_XOS := $(CAM_XO) $(CROP_XO)
 # =========================================================
 # Rules
 # =========================================================
-.PHONY: help kernels graph gen_vectors aiesim graph_fft aiesim_fft xsa application package sd_card run_emu cleanall
+.PHONY: help kernels graph gen_vectors aiesim graph_fft aiesim_fft xsa application package sd_card run_emu weights cleanall
 
 help:
 	@echo ""
 	@echo "versal-mosse build targets:"
 	@echo "  make kernels      — compile PL HLS kernels"
 	@echo "  make graph        — compile AIE graph"
+	@echo "  make weights      — export MobileNetV3-Small INT8 weights for conv2d_kernel"
 	@echo "  make gen_vectors  — generate aiesim test vectors (impulse input)"
 	@echo "  make aiesim       — run AIE simulator (round-trip FFT test)"
 	@echo "  make graph_fft    — compile FFT-only smoke-test graph"
@@ -215,12 +226,16 @@ $(LIBADF_A): $(AIE_SRC_REPO)/mosse_graph.cpp  \
 	mkdir -p $(BUILD_DIR)
 	cd $(BUILD_DIR) && aiecompiler $(AIE_FLAGS) $(GRAPH_SRC_CPP) 2>&1 | tee aiecompiler.log
 
+weights:
+	cd $(PROJECT_REPO) && env PYTHONHOME= PYTHONPATH= uv run --extra weights python3 scripts/export_weights.py $(AIE_SRC_REPO)/weights
+
 gen_vectors:
 	cd $(PROJECT_REPO) && env PYTHONHOME= PYTHONPATH= uv run python3 scripts/gen_aiesim_vectors.py $(AIE_SRC_REPO)/aiesim_data
 
 aiesim: graph gen_vectors
-	-cd $(BUILD_DIR) && timeout 1200 aiesimulator $(AIE_SIM_FLAGS) 2>&1 | tee aiesim.log
-	@echo "--- aiesim done; check $(BUILD_DIR)/aiesim.log for PASS/FAIL ---"
+	-cd $(BUILD_DIR) && AIESIM_SCENARIO_DIR=$(SCENARIO_DATA_DIR) \
+	    timeout 1200 aiesimulator $(AIE_SIM_FLAGS) 2>&1 | tee aiesim.log
+	@echo "--- aiesim done (SCENARIO=$(SCENARIO)); check $(BUILD_DIR)/aiesim.log for PASS/FAIL ---"
 
 # -------------------------------------------------------
 # FFT-only aiesim — isolated DSPLib row-FFT smoke test
@@ -254,10 +269,9 @@ aiesim_fft: graph_fft
 xsa: $(BUILD_DIR)/$(XSA)
 
 $(BUILD_DIR)/$(XSA): $(KERNEL_XOS) $(LIBADF_A)
-	cd $(BUILD_DIR) && \
 	v++ $(VPP_FLAGS) $(VPP_LINK_FLAGS) -l \
 	    $(KERNEL_XOS) $(LIBADF_A) \
-	    -o $(XSA) 2>&1 | tee vpp_link.log
+	    -o $(BUILD_DIR)/$(XSA) 2>&1 | tee $(BUILD_DIR)/vpp_link.log
 
 # -------------------------------------------------------
 # Host application

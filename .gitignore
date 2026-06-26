@@ -9,6 +9,7 @@
 #Ignore logs folder and log files
 /logs
 .log
+*.log
 
 #Ignore lock files
 .lock
@@ -23,3 +24,7 @@ _ide/.wsdata
 #Misc
 CLAUDE.md
 _ide/
+design/aie_src/aiesim_data/
+v++.package_summary
+a.xclbin
+analyzer_input/
