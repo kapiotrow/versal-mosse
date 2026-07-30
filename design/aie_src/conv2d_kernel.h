@@ -49,8 +49,19 @@ using namespace adf;
 #define CONV_WEIGHT_BYTES_RAW  (CONV_IN_CH * CONV_KSIZE * CONV_KSIZE)   // 9
 #define CONV_WEIGHT_BYTES_PAD  64                                         // padded
 
+#ifndef FFT_ROW_WS
+#  define FFT_ROW_WS  2
+#endif
+
+// Output chunk = exactly one row-FFT input window.
+// MUST equal FFT_ROW_TP_WINDOW_VSIZE in fft_graph.h (= PATCH_ROWS * FFT_ROW_WS),
+// so conv2d.out connects to fft_row_in as a direct window→window link with NO
+// stream→window adapter (that adapter is the suspected cause of the hw_emu hang).
+// conv2d therefore fires (PATCH_ROWS*PATCH_COLS)/CONV_OUT_CHUNK times per patch.
+#define CONV_OUT_CHUNK  (PATCH_ROWS * FFT_ROW_WS)
+
 void conv2d_kernel(
-    input_stream<int8>    *patch_in,     // from PatchIn PLIO
-    output_stream<cint16> *feature_out,  // to fft2d.fft_row_in (via window buffer)
+    input_stream<int32>   *patch_in,     // from PatchIn PLIO (int32 words = 4 packed int8 pixels)
+    output_buffer<cint16> &feature_out,  // window → fft2d.fft_row_in (CONV_OUT_CHUNK samples)
     input_buffer<int8_t>  &weights       // loaded via gmio_weights; CONV_WEIGHT_BYTES_PAD bytes
 );

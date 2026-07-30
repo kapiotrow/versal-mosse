@@ -45,7 +45,8 @@ AIE — single instances, serial per-channel processing
   conv2d_kernel      : int8 patch → 3×3 MAC + ReLU + Hanning window → cint16 feature stream
                        (MobileNet-v3 Small layer 1, INT8-quantized, RGB collapsed to grayscale)
   fft2d (FFT2D_graph): PATCH_COLS-pt row FFT → GMIO → DDR; APU transposes; DDR → GMIO → PATCH_ROWS-pt col FFT
-  cmul_accum_kernel  : col-FFT stream ⊙ H_ch* + accumulate (implemented with int32 accumulator)
+  cmul_accum_kernel  : col-FFT stream ⊙ H_ch* + accumulate (int32 intermediates,
+                       cint16 accumulator in DDR — saturating; see headroom note)
   ifft2d (IFFT2D_graph): same DDR-transpose pattern as fft2d; PATCH_COLS-pt row IFFT + PATCH_ROWS-pt col IFFT
 ```
 
@@ -132,7 +133,10 @@ Export and quantize via `make weights`:
 make weights                       # export MobileNet-v3 Small layer 1 (INT8 weights + hanning table)
 make gen_vectors                   # generate aiesim test vectors
 make graph                         # compile AIE graph only
-make aiesim                        # run AIE simulator (cycle-approx ISS with GMIO/PLIO workarounds)
+make aiesim                        # run AIE simulator — NOTE: bypasses PatchIn→conv2d→row-FFT
+make aiesim_plio                   # same, but deletes fft_col_in.bin to force the REAL PatchIn path
+make aiesim_plio CONV2D_MODE=2     # bisect: conv2d synthesizes output, never reads the stream
+make rootfs                        # feature-downgraded rootfs copy (v++ corrupts the pristine one)
 make kernels                       # compile camera_capture + roi_crop PL kernels
 make xsa                           # link kernels + graph → XSA file
 make application                   # cross-compile host ELF (aarch64)
@@ -150,7 +154,7 @@ design/
 │   ├── fft_graph.h            # FFT2D_graph (single instance, GMIO row→col)
 │   ├── ifft_graph.h           # IFFT2D_graph (single instance, same pattern)
 │   ├── conv2d_kernel.h/.cpp   # MobileNet-v3 layer 1: 3×3 MAC + ReLU + Hanning window
-│   ├── cmul_accum_kernel.h/.cpp # col-FFT ⊙ H_ch* + accumulate (int32 accumulator)
+│   ├── cmul_accum_kernel.h/.cpp # col-FFT ⊙ H_ch* + accumulate (cint16 accum, saturating)
 │   ├── mosse_graph.h          # Top-level: PLIO + 10 GMIO + 2 custom kernels + FFT2D + IFFT2D
 │   ├── mosse_graph.cpp        # Instantiation + aiesim smoke test main()
 │   ├── constraints.aiecst     # PatchIn PLIO shim placement
@@ -179,10 +183,18 @@ design/
 ### Completed
 - [x] `conv2d_kernel.cpp`: 3×3 MAC + ReLU + Hanning window (MobileNet-v3 Small layer 1)
 - [x] Weight export: MobileNet-v3 Small layer 1 (INT8-quantized, RGB→grayscale collapsed)
-- [x] `cmul_accum_kernel.cpp`: element-wise cmul_conj + int32 accumulate
+- [x] `cmul_accum_kernel.cpp`: element-wise cmul_conj + accumulate (int32 intermediates)
+- [x] cmul_accum saturation bug fixed (2026-07-30) — the int32→int16 accumulate cast
+      **wrapped** instead of clamping, flipping the accumulated spectrum's sign on
+      overflow and sending peak detection to a garbage index. Now saturates.
 - [x] aiesim N_CHANNELS=1: PASS (real arithmetic with ISS workarounds for GMIO/PLIO bugs)
 - [x] Two-channel aiesim support added (N_CHANNELS=2 option in sim)
-- [x] Pre-computed FFT bypass for aiesim (Bug 2/3: PLIO→stream→window delivery broken in cycle-approx ISS)
+- [x] Pre-computed FFT bypass for aiesim — **now obsolete**; it was working around a
+      misdiagnosis (see Known Issues). It SKIPS the PatchIn→conv2d→row-FFT path, so
+      `make aiesim` does not validate it. Use `make aiesim_plio`.
+- [x] conv2d hang root-caused (2026-07-30): weights-buffer starvation, not the PLIO
+- [x] `v++ --package` rootfs corruption fixed — `make rootfs` (every hw_emu run died at boot)
+- [x] aiesim: full conv2d → FFT → cmul → IFFT → response chain drains end to end
 
 ### In Progress / Next
 - [ ] aiesim N_CHANNELS=16: test multi-channel accumulation
@@ -191,11 +203,58 @@ design/
 - [ ] mosse_tracker.cpp: implement PS-side filter update (KissFFT for A_ch, B, H_ch*)
 - [ ] mosse_tracker.cpp: implement `transpose_inplace()` (currently stub)
 - [ ] Validate IFFT normalization shift (col_shift=12 empirically tuned; see ifft_graph.h)
-- [ ] Validate cmul_accum fixed-point precision for N_CHANNELS=16 accumulation
+- [ ] Validate cmul_accum headroom for N_CHANNELS=16. The DDR accumulator is **cint16**,
+      so `16 × per-channel magnitude` must fit 32767 or the sum clips. Saturation now makes
+      that benign rather than catastrophic, but not absent — widening the accumulator to
+      int32 (GMIO sizes + host) is the fix if real magnitudes don't fit.
+      Note: the aiesim harness has **no channel loop** — 16-ch testing needs one added.
 - [ ] hw_emu: verify single-channel end-to-end (`make sd_card TARGET=hw_emu N_CHANNELS=1 ITER_CNT=1`)
 
 ### Known Issues
-- **Cycle-approx aiesim GMIO/PLIO bugs** (Vitis 2025.2): See [[feedback-aiesim-gmio]]
-  - aie2gm_nb() transfers only one kernel invocation per call (not full N bytes)
-  - PLIO→stream→window adapter delivers wrong data for non-zero positions
-  - **Workaround**: Loop per-invocation on output GMIO, pre-compute FFT outputs for aiesim
+
+- **conv2d weights are consumed per FIRING, not per patch.** `weights` is an `input_buffer`,
+  and ADF acquires every input buffer before every invocation. conv2d fires
+  `PATCH_ELEMS / CONV_OUT_CHUNK` times per patch (32 at 64×64), so the driver must supply that
+  many 64-byte buffers, and must start the patch flowing *first* or it deadlocks. This was the
+  cause of every historical "PLIO hang". **Proper fix (not yet done): make weights an RTP /
+  async parameter**, whose value persists across invocations.
+
+- **RETRACTED — "PLIO→stream→window delivers wrong data for non-zero positions."** Disproved
+  2026-07-30: with weights fed correctly, the s1 impulse's energy lands in row 17, exactly where
+  it belongs. PatchIn delivers correctly in aiesim, off-centre impulses included. See
+  [[feedback-aiesim-gmio]].
+
+- **aie2gm_nb() transfers only one kernel invocation per call** (not the full N bytes) — still
+  real. Loop one `aie2gm_nb`/`wait` pair per invocation on every output GMIO.
+
+- **`v++ --package` corrupts the 2025.2 rootfs** (ext4 feature mismatch) — every hw_emu run
+  panicked at boot until fixed. `make rootfs` builds a feature-downgraded copy;
+  `package`/`smoke_package` depend on it. See [[vpp_package_corrupts_rootfs]].
+
+- **hw_emu PL→AIE PLIO delivers nothing — OPEN.** The weights-free smoke graph reports
+  `plio | S00_AXIS | IN | 0.00 MBps` and hangs, while the same graph with the stream read
+  removed passes. Since aiesim proves the AIE-side construct is sound, the fault is in the
+  PL→shim path. Unresolved.
+
+- **IFFT col shift = 12 destroys narrowband spectra — OPEN.** It was calibrated so a
+  broadband (impulse) spectrum round-trips to 1, which assumes ~64× summation gain in the IFFT.
+  A DC-concentrated spectrum gets no such gain: s2's response came back **identically zero**
+  (`2731 >> 12 == 0`) while s1 works fine. **Real image patches are DC-dominated**, so this may
+  affect actual tracking. Settle before trusting hardware results.
+  See [[ifft-col-shift-narrowband]].
+
+- **DSPLib's cint16 FFT loss is additive, not a gain factor.** Each pass subtracts ~21 from a
+  summed DC bin, independent of amplitude (measured at 64×64: ideal 64→43 and 448→427; ideal
+  2752→2731 and 27328→27307). So `row_dc = PATCH_COLS*c - 21`, `accum0 = PATCH_ROWS*row_dc - 21`.
+  Any "expected = N" calculation is wrong. The loss scales with how much *summation* the input
+  causes — an impulse loses only ~3, since its DC bin has one non-zero term.
+  (A "2/3 gain" fits the const=1 point by coincidence and is refuted at const=7 — don't fit a
+  scaling law to one data point.)
+
+- **Test vectors sat below the fixed-point floor.** s1 used an impulse of amplitude 1, which
+  quantizes to nothing (20/4096 bins non-zero after the row FFT). Now `GEN_IMPULSE_AMP=100`.
+  s0/s2/s3/s4 are still amplitude-1. See [[aiesim-quantization-floor]].
+
+- **Flag-only make changes used to reuse a stale `libadf.a`** and produce convincing false
+  results; `%.flagstamp` prerequisites now force a rebuild. Still worth confirming
+  `aiecompiler.log` carries the flag you intended. See [[feedback-verify-the-build-ran]].

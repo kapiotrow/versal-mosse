@@ -31,14 +31,84 @@
  */
 
 #include "conv2d_kernel.h"
-#include "hanning_128.h"
 #include <cstring>
 
+// Include the Hanning table sized for this build's patch (square: PATCH_ROWS==PATCH_COLS).
+// HTAB aliases the size-specific symbol. Generate a table with: make weights PATCH_COLS=<n>
+#if   PATCH_COLS == 128
+#  include "hanning_128.h"
+#  define HTAB HANNING_128
+#elif PATCH_COLS == 64
+#  include "hanning_64.h"
+#  define HTAB HANNING_64
+#elif PATCH_COLS == 32
+#  include "hanning_32.h"
+#  define HTAB HANNING_32
+#else
+#  error "No Hanning table for this PATCH_COLS. Add a case here and run: make weights PATCH_COLS=<n>"
+#endif
+
+// PatchIn PLIO is 32-bit (plio_32_bits), carrying 4 densely-packed int8 pixels
+// per beat. The stream is consumed as int32 words and unpacked below, 1:1 with
+// PLIO beats: a scalar readincr on an int8 stream would pop a full 32-bit word
+// per call and starve the kernel 4:1. Requires PATCH_COLS % 4 == 0.
+//
+// aiesim stimulus must match this: gen_aiesim_vectors.py writes ONE packed int32
+// per line of patch_in.txt (the ISS parses that file in units of the port's
+// stream element type, and rejects 4-values-per-line with
+// "Invalid number of data samples on line 1, got 4 expected 1").
+// Build mode. Note there is no stream->window adapter in this path any more:
+// mosse_graph.h wires conv2d's output_buffer directly into fft2d.fft_row_in.
+// 0 = real 3x3 convolution
+// 1 = echo the input stream (isolates dataflow from conv/weights logic)
+// 2 = BISECT: synthesize output WITHOUT reading the stream at all. Distinguishes
+//     "conv2d is blocked on readincr" (PLIO not delivering) from "the blockage is
+//     downstream" (conv2d->fft_row_in window, row-FFT, or the GMIO drain).
+// Override from the Makefile with CONV2D_MODE=<n>.
+#ifndef CONV2D_ECHO_TEST
+#  define CONV2D_ECHO_TEST 1
+#endif
+
 void conv2d_kernel(
-    input_stream<int8>    *patch_in,
-    output_stream<cint16> *feature_out,
+    input_stream<int32>   *patch_in,
+    output_buffer<cint16> &feature_out,
     input_buffer<int8_t>  &weights)
 {
+#if CONV2D_ECHO_TEST == 2
+    // BISECT: fill the output window with a deterministic ramp and never touch
+    // patch_in. If gmio_fft_row_out now drains, conv2d was stuck on readincr and
+    // the fault is the PLIO stream. If it still hangs, the PLIO is not the
+    // blocker and the fault is downstream (window link / row-FFT / GMIO drain).
+    (void)weights;
+    {
+        cint16_t *out = feature_out.data();
+        for (int i = 0; i < CONV_OUT_CHUNK; i++)
+        chess_prepare_for_pipelining
+        chess_loop_range(CONV_OUT_CHUNK, CONV_OUT_CHUNK)
+        {
+            out[i].real = (int16_t)i;
+            out[i].imag = 0;
+        }
+    }
+    return;
+#elif CONV2D_ECHO_TEST == 1
+    // One invocation = one row-FFT window: read CONV_OUT_CHUNK/4 int32 words,
+    // unpack to CONV_OUT_CHUNK cint16 in the output window. Fires
+    // (PATCH_ROWS*PATCH_COLS)/CONV_OUT_CHUNK times to drain the full patch.
+    cint16_t *out = feature_out.data();
+
+    for (int i = 0; i < CONV_OUT_CHUNK / 4; i++)
+    chess_prepare_for_pipelining
+    chess_loop_range(CONV_OUT_CHUNK / 4, CONV_OUT_CHUNK / 4)
+    {
+        int32_t w = readincr(patch_in);
+        out[4 * i + 0].real = (int8_t)( w        & 0xFF);  out[4 * i + 0].imag = 0;
+        out[4 * i + 1].real = (int8_t)((w >>  8) & 0xFF);  out[4 * i + 1].imag = 0;
+        out[4 * i + 2].real = (int8_t)((w >> 16) & 0xFF);  out[4 * i + 2].imag = 0;
+        out[4 * i + 3].real = (int8_t)((w >> 24) & 0xFF);  out[4 * i + 3].imag = 0;
+    }
+    return;
+#else
     // ----------------------------------------------------------------
     // Load per-channel kernel parameters from the 64-byte weight buffer.
     // Layout (see conv2d_kernel.h):
@@ -74,11 +144,16 @@ void conv2d_kernel(
     // Phase 1: read first row — no output yet (need the row above row 0
     // to form a 3-row window; it is implicitly all-zeros from memset).
     // ----------------------------------------------------------------
-    for (int c = 0; c < PATCH_COLS; c++)
+    // Read one packed int32 (4 int8 pixels, little-endian) per iteration.
+    for (int c = 0; c < PATCH_COLS; c += 4)
     chess_prepare_for_pipelining
-    chess_loop_range(PATCH_COLS, PATCH_COLS)
+    chess_loop_range(PATCH_COLS / 4, PATCH_COLS / 4)
     {
-        buf[0][c + 1] = readincr(patch_in);
+        int32_t w = readincr(patch_in);
+        buf[0][c + 1] = (int8_t)( w        & 0xFF);
+        buf[0][c + 2] = (int8_t)((w >>  8) & 0xFF);
+        buf[0][c + 3] = (int8_t)((w >> 16) & 0xFF);
+        buf[0][c + 4] = (int8_t)((w >> 24) & 0xFF);
     }
 
     // ----------------------------------------------------------------
@@ -99,17 +174,21 @@ void conv2d_kernel(
 
         // -- Read row r --
         buf[cur][0]             = 0;    // already 0, written for clarity
-        for (int c = 0; c < PATCH_COLS; c++)
+        for (int c = 0; c < PATCH_COLS; c += 4)
         chess_prepare_for_pipelining
-        chess_loop_range(PATCH_COLS, PATCH_COLS)
+        chess_loop_range(PATCH_COLS / 4, PATCH_COLS / 4)
         {
-            buf[cur][c + 1] = readincr(patch_in);
+            int32_t w = readincr(patch_in);
+            buf[cur][c + 1] = (int8_t)( w        & 0xFF);
+            buf[cur][c + 2] = (int8_t)((w >>  8) & 0xFF);
+            buf[cur][c + 3] = (int8_t)((w >> 16) & 0xFF);
+            buf[cur][c + 4] = (int8_t)((w >> 24) & 0xFF);
         }
         buf[cur][PATCH_COLS + 1] = 0;
 
         // -- Output row r-1 --
         const int out_r = r - 1;
-        const int16_t h_r = HANNING_128[out_r];
+        const int16_t h_r = HTAB[out_r];
 
         const int8_t *row_top = buf[top];
         const int8_t *row_mid = buf[mid];
@@ -142,7 +221,7 @@ void conv2d_kernel(
 
             // Separable Hanning window (Q1.15 × Q1.15 → int16)
             // Two right-shifts of 15 apply both row and column weights.
-            int16_t h_c   = HANNING_128[c];
+            int16_t h_c   = HTAB[c];
             int32_t wnd   = ((int32_t)out16 * h_r) >> 15;
             wnd           = (wnd * h_c) >> 15;
             int16_t wnd16;
@@ -176,7 +255,7 @@ void conv2d_kernel(
     const int last_top = (PATCH_ROWS + 1) % 3;   // row PATCH_ROWS-2
     const int last_mid = (PATCH_ROWS + 2) % 3;   // row PATCH_ROWS-1
 
-    const int16_t h_last = HANNING_128[last_r];   // = 0
+    const int16_t h_last = HTAB[last_r];   // = 0
 
     const int8_t *row_top_last = buf[last_top];
     const int8_t *row_mid_last = buf[last_mid];
@@ -205,7 +284,7 @@ void conv2d_kernel(
         else if (shifted <=     0) out16 =  0;        // ReLU
         else                       out16 = (int16_t)shifted;
 
-        int16_t h_c   = HANNING_128[c];
+        int16_t h_c   = HTAB[c];
         int32_t wnd   = ((int32_t)out16 * h_last) >> 15;   // h_last = 0 → wnd = 0
         wnd           = (wnd * h_c) >> 15;
         int16_t wnd16;
@@ -218,4 +297,5 @@ void conv2d_kernel(
         result.imag = 0;
         writeincr(feature_out, result);
     }
+#endif  // CONV2D_ECHO_TEST
 }

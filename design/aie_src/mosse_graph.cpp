@@ -132,6 +132,26 @@ int main(int argc, char **argv)
         scenario_dir = "aiesim_data/s0";
     printf("[aiesim] scenario: %s\n", scenario_dir); fflush(stdout);
 
+    // Make every log self-describing about WHICH conv2d it was built with.
+    // Twice now, a run was interpreted against the wrong build: MODE=2 emits a
+    // synthetic ramp and ignores patch_in entirely, so scenario expectations
+    // cannot possibly match and the "failure" is meaningless. Printing the mode
+    // (and what it implies) makes that obvious from the log alone.
+#ifndef CONV2D_ECHO_TEST
+#  define CONV2D_ECHO_TEST (-1)
+#endif
+    printf("[aiesim] conv2d build mode: CONV2D_ECHO_TEST=%d  (%s)\n",
+           (int)CONV2D_ECHO_TEST,
+           (CONV2D_ECHO_TEST == 0) ? "real 3x3 convolution" :
+           (CONV2D_ECHO_TEST == 1) ? "echo patch_in (scenario values apply)" :
+           (CONV2D_ECHO_TEST == 2) ? "SYNTHETIC RAMP — ignores patch_in, "
+                                     "scenario expectations DO NOT APPLY" :
+                                     "unknown");
+    if (CONV2D_ECHO_TEST == 2)
+        printf("[aiesim] WARNING: MODE=2 is a dataflow bisect build. Any PASS/FAIL "
+               "against scenario data below is meaningless.\n");
+    fflush(stdout);
+
     // ----------------------------------------------------------------
     // GMIO::malloc buffers — aiesim requires DMA buffers to be allocated
     // via GMIO::malloc so the GMIO model can track their addresses.
@@ -225,6 +245,10 @@ int main(int argc, char **argv)
     // between run(-1) and the next API call, so there is no back-pressure
     // risk from the FFT's output FIFO filling before the DMA is armed.
     // ----------------------------------------------------------------
+    // NOTE: this pre-load satisfies conv2d's FIRST firing only. The `weights`
+    // input_buffer is acquired once per invocation, so the remaining
+    // CONV_INVOCATIONS-1 buffers must be fed as the kernel runs — see the
+    // per-invocation gm2aie_nb in the fft_row_out drain loop below.
     mosse_graph.gmio_weights.gm2aie_nb(weights_buf, 64);
     mosse_graph.gmio_weights.wait();   // completes while PLIO is idle (cores not yet enabled)
 
@@ -256,29 +280,53 @@ int main(int argc, char **argv)
 
     if (use_precomputed) {
         printf("[aiesim] step 2/3: loaded pre-computed fft_col_in from %s\n", fci_path);
-        // The conv2d → output_stream → fft_row_in (window) path uses a
-        // stream-to-window adapter kernel inserted by ADF.  In cycle-approximate
-        // aiesim this adapter exhibits the same wrong-delivery bug as the
-        // PLIO→stream→window path: the adapter never sets the input-window lock on
-        // the FFT row tile, so the row-FFT kernel never runs and gmio_fft_row_out
-        // never receives data.  The drain loop would hang forever.
+        // OBSOLETE BYPASS — kept only so existing scenarios still run unchanged.
         //
-        // Fix: skip the drain entirely.  The row-FFT tile stalls (its input lock
-        // is never set) but the col-FFT path is completely independent — different
-        // tiles (CR(24,1) vs CR(15,0)), different GMIOs (IO 23 vs IO 15), no shared
-        // buffers.  The stalled row-FFT does not affect col-FFT / cmul / IFFT.
-        printf("[aiesim] step 2/3: skipping row-FFT drain (stream→window ISS limitation)\n");
-        printf("[aiesim]           conv2d runs but its stream output is not visible to ISS;\n");
-        printf("[aiesim]           col-FFT is fed from pre-computed fft_col_in.bin instead.\n");
+        // This branch used to be justified by "the PLIO→stream→window adapter
+        // never sets the FFT row tile's input lock, so the drain hangs forever".
+        // That diagnosis was WRONG, and was disproved on 2026-07-30:
+        //   * the real cause of the hang was weights-buffer starvation — conv2d's
+        //     `weights` input_buffer is acquired once per FIRING, and the harness
+        //     supplied one buffer per PATCH (see the drain loop below);
+        //   * with weights fed per invocation, the drain completes normally;
+        //   * a row-FFT scan then put the s1 impulse's energy in row 17, exactly
+        //     where it belongs — so PatchIn delivers correctly AND in the right
+        //     order, including for off-centre impulses.
+        // There is also no stream-to-window adapter here any more: mosse_graph.h
+        // wires conv2d's output_buffer straight into fft_row_in.
+        //
+        // Consequence: taking this branch SKIPS the real PatchIn→conv2d→row-FFT
+        // path, so plain `make aiesim` proves nothing about it — which is exactly
+        // why aiesim "passed" for months while hw_emu hung. Use `make aiesim_plio`
+        // (deletes fft_col_in.bin) to exercise the real path.
+        printf("[aiesim] step 2/3: BYPASS — skipping the real PatchIn->conv2d->row-FFT path\n");
+        printf("[aiesim]           col-FFT is fed from pre-computed fft_col_in.bin.\n");
+        printf("[aiesim]           This run does NOT validate PatchIn; use 'make aiesim_plio'.\n");
         fflush(stdout);
     } else {
-        // Fallback: capture row-FFT output and transpose.
-        // Works for s0 (impulse at position 0) but fails for off-centre impulses.
+        // The REAL path: capture row-FFT output and transpose. This is what
+        // `make aiesim_plio` exercises, and it works for off-centre impulses too
+        // (verified with s1: impulse@(17,42) lands in row 17). The old claim that
+        // it "fails for off-centre impulses" was a symptom of weights starvation,
+        // not of PLIO sample ordering.
         constexpr int FFT_INV_BYTES = PATCH_COLS * FFT_ROW_WS * 4;
         constexpr int N_INV         = PATCH_ROWS / FFT_ROW_WS;
         printf("[aiesim] step 2: waiting for fft_row_out (%d × %d B) [fallback]...\n",
                N_INV, FFT_INV_BYTES); fflush(stdout);
         for (int inv = 0; inv < N_INV; ++inv) {
+            // conv2d's `weights` is an input_buffer, and ADF acquires every input
+            // buffer before each firing — so conv2d consumes ONE 64-byte weights
+            // buffer per invocation, not one per patch. The single pre-load above
+            // only satisfies firing 0; conv2d then blocks forever on the next
+            // acquire and the row-FFT starves, which is what made this drain hang
+            // (and hangs identically with CONV2D_MODE=2, where the kernel never
+            // even touches patch_in — proving it is the weights port, not the PLIO).
+            //
+            // Feeding one buffer per drained invocation keeps supply matched to
+            // consumption. No wait() on an input GMIO (see note below): waiting
+            // here would block until conv2d fires, which is what we are unblocking.
+            mosse_graph.gmio_weights.gm2aie_nb(weights_buf, 64);
+
             mosse_graph.gmio_fft_row_out.aie2gm_nb(
                 (int8_t*)fft_scratch + inv * FFT_INV_BYTES, FFT_INV_BYTES);
             mosse_graph.gmio_fft_row_out.wait();
@@ -287,6 +335,46 @@ int main(int argc, char **argv)
         printf("[aiesim] fft_row_out[0..3]: {%d,%d} {%d,%d} {%d,%d} {%d,%d}\n",
                fft_scratch[0], fft_scratch[1], fft_scratch[2], fft_scratch[3],
                fft_scratch[4], fft_scratch[5], fft_scratch[6], fft_scratch[7]);
+
+        // ------------------------------------------------------------
+        // Did the patch actually arrive over PatchIn, and at what offset?
+        //
+        // conv2d completing does NOT mean it got the right data — if the ISS
+        // PLIO model starts streaming patch_in.txt at init() (before run(-1)
+        // enables the cores), the leading words are consumed while nothing is
+        // reading, and conv2d ends up in the trailing zero padding. That looks
+        // identical to "delivered correctly" from the drain loop's point of view:
+        // no hang, just zeros.
+        //
+        // Scan the RAW row-FFT output (pre-transpose). For scenario s1 the
+        // impulse sits in row 17, so a correct delivery puts energy in row 17's
+        // 64 bins and nowhere else. The row we actually find the energy in gives
+        // the delivery offset in rows; all-zero means nothing arrived at all.
+        {
+            int nz = 0, max_abs = 0, max_idx = -1;
+            for (int i = 0; i < (int)PATCH_ELEMS; ++i) {
+                int re = fft_scratch[2*i], im = fft_scratch[2*i + 1];
+                int a  = (re < 0 ? -re : re) + (im < 0 ? -im : im);
+                if (a != 0) ++nz;
+                if (a > max_abs) { max_abs = a; max_idx = i; }
+            }
+            if (max_idx < 0) {
+                printf("[aiesim] row-FFT scan: ALL ZERO — nothing arrived over PatchIn\n");
+            } else {
+                // A single-impulse patch should light up exactly ONE row (its own)
+                // = PATCH_COLS non-zero bins. Far more than that means the input
+                // was not the expected impulse: e.g. 4096/4096 non-zero is the
+                // MODE=2 ramp, not any scenario patch.
+                printf("[aiesim] row-FFT scan: %d/%d non-zero, max|.|=%d at idx=%d "
+                       "(row=%d, bin=%d)  [impulse scenario expects %d non-zero, "
+                       "all in the impulse's row]\n",
+                       nz, (int)PATCH_ELEMS, max_abs, max_idx,
+                       max_idx / PATCH_COLS, max_idx % PATCH_COLS,
+                       (int)PATCH_COLS);
+            }
+            fflush(stdout);
+        }
+
         transpose_inplace(fft_scratch, PATCH_ROWS, PATCH_COLS);
         fflush(stdout);
     }
@@ -341,6 +429,48 @@ int main(int argc, char **argv)
     }
 
     // ----------------------------------------------------------------
+    // Saturation check.
+    //
+    // cmul_accum now clamps instead of wrapping (it used to sign-flip the whole
+    // spectrum on overflow). Clamping is the right failure mode, but it is still
+    // a failure: a clipped channel contributes less than it should, and the
+    // accumulated spectrum is wrong in a way that looks merely "disappointing"
+    // rather than broken.
+    //
+    // The kernel cannot report that it saturated, so detect it here: values
+    // sitting exactly at the int16 rails are the signature. This matters most for
+    // N_CHANNELS=16, where the DDR accumulator is cint16 and 16 x per-channel
+    // magnitude must fit 32767.
+    //
+    // Note a legitimate value can land on a rail by chance, so a tiny count is
+    // not proof of overflow — but any nonzero count on a scenario whose expected
+    // magnitudes are far from the rails is worth investigating.
+    bool sat_pass = true;   // folded into the OVERALL verdict at the end
+    {
+        int sat_re = 0, sat_im = 0, first_idx = -1;
+        for (int i = 0; i < PATCH_ELEMS; ++i) {
+            int re = accum_buf[i*2], im = accum_buf[i*2 + 1];
+            bool r = (re ==  32767 || re == -32768);
+            bool m = (im ==  32767 || im == -32768);
+            if (r) ++sat_re;
+            if (m) ++sat_im;
+            if ((r || m) && first_idx < 0) first_idx = i;
+        }
+        if (sat_re || sat_im) {
+            // Fail the run. None of the current scenarios legitimately reach the
+            // rails, and a saturation that only prints is exactly the kind of
+            // signal that gets scrolled past in a long log.
+            sat_pass = false;
+            printf("[aiesim] accum_out SATURATED: %d re + %d im elements at the int16 "
+                   "rails (first idx=%d, r=%d, c=%d) — accumulator headroom exceeded\n",
+                   sat_re, sat_im, first_idx,
+                   first_idx / PATCH_COLS, first_idx % PATCH_COLS);
+        } else
+            printf("[aiesim] accum_out saturation: none (headroom OK)\n");
+        fflush(stdout);
+    }
+
+    // ----------------------------------------------------------------
     // IFFT pass
     // ----------------------------------------------------------------
 
@@ -390,16 +520,41 @@ int main(int argc, char **argv)
     // ----------------------------------------------------------------
     // Optional: verify accum_out[0] against expected
     // ----------------------------------------------------------------
+    // Tolerance, not equality. This is a cint16 pipeline: the value crosses two
+    // FFT passes and a complex multiply, each rounding. Measured for the s1
+    // amplitude-100 impulse: 100 (input sum) -> 97 (row-FFT DC) -> 95 (after
+    // col-FFT + cmul), i.e. ~5% cumulative loss. That is the arithmetic working
+    // as designed, so an `==` assertion can never pass and only masks the checks
+    // below it.
+    //
+    // ACCUM0_TOL_PCT is a floor of 2 as well, so scenarios still calibrated at
+    // amplitude 1 (s0/s2/s3/s4) are not held to a sub-LSB tolerance.
+    bool acc0_pass = true;   // folded into the OVERALL verdict at the end
     if (exp.check_accum0) {
+        const int ACCUM0_TOL_PCT = 10;
         int got_re = accum_buf[0], got_im = accum_buf[1];
-        bool acc0_ok = (got_re == exp.accum0_re) && (got_im == exp.accum0_im);
-        printf("[aiesim] accum_out[0]: got={%d,%d}  expected={%d,%d}  %s\n",
-               got_re, got_im, exp.accum0_re, exp.accum0_im,
+
+        int tol_re = exp.accum0_re * ACCUM0_TOL_PCT / 100;
+        int tol_im = exp.accum0_im * ACCUM0_TOL_PCT / 100;
+        if (tol_re < 0) tol_re = -tol_re;
+        if (tol_im < 0) tol_im = -tol_im;
+        if (tol_re < 2) tol_re = 2;
+        if (tol_im < 2) tol_im = 2;
+
+        int d_re = got_re - exp.accum0_re; if (d_re < 0) d_re = -d_re;
+        int d_im = got_im - exp.accum0_im; if (d_im < 0) d_im = -d_im;
+
+        bool acc0_ok = (d_re <= tol_re) && (d_im <= tol_im);
+        printf("[aiesim] accum_out[0]: got={%d,%d}  expected={%d,%d} +/-{%d,%d}  %s\n",
+               got_re, got_im, exp.accum0_re, exp.accum0_im, tol_re, tol_im,
                acc0_ok ? "OK" : "FAIL"); fflush(stdout);
+        acc0_pass = acc0_ok;
         if (!acc0_ok) {
-            printf("  OVERALL: FAIL  (accum_out[0] mismatch)\n\n");
-            fflush(stdout);
-            _exit(1);
+            // Do NOT _exit() here: the response/peak checks below are the real
+            // end-to-end validation, and bailing out early means they never run.
+            // The result is still folded into OVERALL, so this cannot hide a failure.
+            printf("[aiesim] accum_out[0] outside tolerance — continuing to the "
+                   "peak check anyway\n"); fflush(stdout);
         }
     }
 
@@ -450,11 +605,12 @@ int main(int argc, char **argv)
                max_noise, exp.max_noise, snr_ok?"OK":"FAIL");
     else
         printf("  Noise: check skipped (uniform/broad response expected)\n");
-    printf("  location=%s  normalization=%s  imag=%s  SNR=%s\n",
+    printf("  location=%s  normalization=%s  imag=%s  SNR=%s  accum0=%s  saturation=%s\n",
            loc_ok?"OK":"FAIL", norm_ok?"OK":"FAIL",
-           imag_ok?"OK":"FAIL", snr_ok?"OK":"FAIL");
+           imag_ok?"OK":"FAIL", snr_ok?"OK":"FAIL", acc0_pass?"OK":"FAIL",
+           sat_pass?"OK":"FAIL");
 
-    bool pass = loc_ok && norm_ok && imag_ok && snr_ok;
+    bool pass = loc_ok && norm_ok && imag_ok && snr_ok && acc0_pass && sat_pass;
     printf("  OVERALL: %s\n\n", pass ? "PASS" : "FAIL");
 
     if (!norm_ok && resp_peak_re > 100)

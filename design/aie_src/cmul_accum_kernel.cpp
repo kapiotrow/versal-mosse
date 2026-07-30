@@ -7,7 +7,7 @@
  *          = { re_in*re_flt + im_in*im_flt,
  *              im_in*re_flt - re_in*im_flt }   (int32 intermediates)
  *   out[i] = (cint16){ accum_prev[i].re + A[i].re,
- *                      accum_prev[i].im + A[i].im }  (truncating to int16)
+ *                      accum_prev[i].im + A[i].im }  (SATURATING to int16)
  *
  * filter stores H (not pre-conjugated); conjugation is applied here via the
  * sign flip on the imaginary product.
@@ -32,6 +32,39 @@
 #include "cmul_accum_kernel.h"
 
 static constexpr int CMUL_N = PATCH_COLS * FFT_COL_WS;  // 256
+
+// Saturating narrow to int16.
+//
+// The accumulate step used to be a bare `(int16_t)(acc + re)` cast. `acc` is
+// int16 and `re` is int32, so the sum is computed in int32 and the cast WRAPS on
+// overflow: one channel too many flips the accumulated spectrum's sign instead of
+// clamping. That is silent and catastrophic for peak detection — the argmax moves
+// to a wrapped element. (The {-32768,0} values seen in the MODE=2 ramp runs are
+// consistent with exactly this.)
+//
+// Saturation is the right failure mode here: MOSSE only needs the argmax, so a
+// clamped peak still points at the correct location, while a wrapped one does not.
+// NOTE this makes overflow benign, not absent — with N_CHANNELS=16 the DDR
+// accumulator is still cint16, so 16 x per-channel magnitude must fit 32767 or
+// the sum clips. Sizing that headroom (or widening the accumulator to int32) is
+// a separate open task.
+// BRANCHLESS on purpose. The first version used early returns:
+//     if (v >  32767) return  32767;
+//     if (v < -32768) return -32768;
+// which emits control flow inside the inner loop and measurably slowed the
+// kernel (aiesim s0 went from completing comfortably to not finishing within the
+// 1200 s wall clock). This kernel is already documented as schedule-fragile —
+// see the note below about chess_prepare_for_pipelining and the assembler OOM.
+//
+// The min/max form compiles to two conditional selects with no branches, so the
+// hardware do-loop stays tight. Compare the reported cycles for the arithmetic
+// loop in aiecompiler.log against the branching version's 26.
+static inline int16_t sat16(int32_t v)
+{
+    v = (v >  32767) ?  32767 : v;
+    v = (v < -32768) ? -32768 : v;
+    return (int16_t)v;
+}
 
 // Tile-local scratch for filter and accumulator halves.
 // Placed in tile LDM (not stack) to avoid overflow; 2×1024 B is negligible.
@@ -72,7 +105,7 @@ void cmul_accum_kernel(
                    + (int32_t)in_ptr[i].imag * (int32_t)flt_local[i].imag;
         int32_t im = (int32_t)in_ptr[i].imag * (int32_t)flt_local[i].real
                    - (int32_t)in_ptr[i].real * (int32_t)flt_local[i].imag;
-        out_ptr[i].real = (int16_t)(acc_local[i].real + re);
-        out_ptr[i].imag = (int16_t)(acc_local[i].imag + im);
+        out_ptr[i].real = sat16((int32_t)acc_local[i].real + re);
+        out_ptr[i].imag = sat16((int32_t)acc_local[i].imag + im);
     }
 }

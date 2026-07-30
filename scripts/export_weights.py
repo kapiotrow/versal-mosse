@@ -316,6 +316,10 @@ def main():
     out_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else default_out
     out_dir.mkdir(parents=True, exist_ok=True)
 
+    # Patch size for the Hanning table (square patch: PATCH_ROWS == PATCH_COLS).
+    # Passed as argv[2] by `make weights` (= $(PATCH_COLS)); defaults to 128.
+    patch_size = int(sys.argv[2]) if len(sys.argv) > 2 else PATCH_SIZE
+
     # ------------------------------------------------------------------
     # 1. Load pretrained model
     # ------------------------------------------------------------------
@@ -426,11 +430,11 @@ def main():
     print(f"Wrote {h_path}  (C header)")
 
     # ------------------------------------------------------------------
-    # 8. Generate hanning_128.h
+    # 8. Generate hanning_<patch_size>.h
     # ------------------------------------------------------------------
-    hanning_path = repo_root / "design" / "aie_src" / f"hanning_{PATCH_SIZE}.h"
-    _gen_hanning_h(hanning_path, PATCH_SIZE)
-    print(f"Wrote {hanning_path}  (Q1.15 Hanning window, {PATCH_SIZE} points)")
+    hanning_path = repo_root / "design" / "aie_src" / f"hanning_{patch_size}.h"
+    _gen_hanning_h(hanning_path, patch_size)
+    print(f"Wrote {hanning_path}  (Q1.15 Hanning window, {patch_size} points)")
 
     print(f"\nDone. Max reconstruction error: {max_err:.5f}")
 

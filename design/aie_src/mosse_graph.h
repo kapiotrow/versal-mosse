@@ -100,7 +100,10 @@ public:
     MOSSE_graph()
     {
         // --- PLIO ---
-        patch_in = input_plio::create("PatchIn", plio_128_bits, "patch_in.txt");
+        // 32-bit width so conv2d's input_stream<int32> reads are 1:1 with PLIO
+        // beats (a 128-bit PLIO delivered one 128-bit beat per readincr, starving
+        // conv2d 4:1). roi_crop emits 32-bit AXIS beats (4 packed int8 each).
+        patch_in = input_plio::create("PatchIn", plio_32_bits, "patch_in.txt");
 
         // --- GMIO (burst_length = 64 bytes, bandwidth = 1000 MB/s estimate) ---
         gmio_weights     = input_gmio::create("gmio_weights",      64, 1000);
@@ -132,10 +135,12 @@ public:
         adf::connect<>(gmio_weights.out[0], conv2d.in[1]);
         adf::dimensions(conv2d.in[1]) = {CONV_WEIGHT_BYTES_PAD};  // 64 int8_t elements
 
-        // conv2d (stream) → fft2d row-FFT input (window)
-        // Use bare connect<> so ADF infers the stream→window adapter.
-        // The window<> template cannot be used when the source port is a stream.
+        // conv2d (window) → fft2d row-FFT input (window)
+        // conv2d now emits an output_buffer of exactly CONV_OUT_CHUNK samples =
+        // one row-FFT input window, so this is a direct window→window link with NO
+        // stream→window adapter (that adapter is the suspected hw_emu hang).
         adf::connect<>(conv2d.out[0], fft2d.fft_row_in);
+        adf::dimensions(conv2d.out[0]) = {CONV_OUT_CHUNK};
 
         // fft2d row-FFT output → GMIO (DDR, APU reads and transposes)
         adf::connect<>(fft2d.fft_row_out, gmio_fft_row_out.in[0]);

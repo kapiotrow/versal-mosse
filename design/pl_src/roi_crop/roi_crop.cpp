@@ -24,8 +24,8 @@
 #include "roi_crop.h"
 
 void roi_crop(
-    const ap_uint<8>                   *frame_buf,
-    hls::stream<ap_axiu<128,0,0,0>>   &patch_out,
+    const ap_uint<8>                  *frame_buf,
+    hls::stream<ap_axiu<32,0,0,0>>   &patch_out,
     int  frame_cols,
     int  roi_row,
     int  roi_col,
@@ -42,21 +42,21 @@ void roi_crop(
 #pragma HLS INTERFACE s_axilite port=return     bundle=control
 
     // Pre-compute total beats outside the pipeline
-    // >> 4 is bit-shift (divide by 16); no hardware divider
-    int total_beats = (patch_rows * patch_cols) >> 4;
+    // >> 2 is bit-shift (divide by 4); no hardware divider. 4 pixels per 32-bit beat.
+    int total_beats = (patch_rows * patch_cols) >> 2;
     int beat = 0;
 
     // Nested loops: row-major iteration without division inside pipeline
     for (int r = 0; r < patch_rows; ++r) {
-        for (int c = 0; c < patch_cols; c += 16) {
+        for (int c = 0; c < patch_cols; c += 4) {
 #pragma HLS PIPELINE II=1
-            ap_axiu<128,0,0,0> word;
-            word.keep = (ap_uint<16>)-1;
-            word.strb = (ap_uint<16>)-1;
+            ap_axiu<32,0,0,0> word;
+            word.keep = (ap_uint<4>)-1;
+            word.strb = (ap_uint<4>)-1;
             word.last = (beat == total_beats - 1) ? 1 : 0;
 
-            // Unroll inner pixel packing loop: 16 pixels read in parallel
-            for (int i = 0; i < 16; ++i) {
+            // Unroll inner pixel packing loop: 4 pixels read in parallel
+            for (int i = 0; i < 4; ++i) {
 #pragma HLS UNROLL
                 // Frame address: (roi_row + r) * frame_cols + (roi_col + c + i)
                 int frame_idx = (roi_row + r) * frame_cols + (roi_col + c + i);

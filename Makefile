@@ -53,6 +53,25 @@ EXEC_SCRIPTS   := $(DESIGN_REPO)/exec_scripts
 DSPLIB_ROOT    := $(DSPLIB_VITIS)/dsp
 
 # =========================================================
+# Root filesystem for packaging
+# =========================================================
+# v++ --package must NOT be pointed at $(COMMON_IMAGE_VERSAL)/rootfs.ext4 directly.
+# That image uses ext4 features (orphan_file, metadata_csum_seed, metadata_csum)
+# that the ext4 writer bundled with v++ does not understand.  It injects the boot
+# files anyway and silently shreds the filesystem — /usr/sbin drops from 582
+# entries to 6, /usr/sbin/init disappears, and the journal is left invalid, so the
+# target kernel panics at boot:
+#
+#     EXT4-fs (mmcblk0p2): Could not load journal inode
+#     Kernel panic - not syncing: VFS: Unable to mount root fs on "/dev/mmcblk0p2"
+#     Kernel panic - not syncing: No working init found.
+#
+# `make rootfs` produces a feature-downgraded copy that v++ can write safely.
+# The pristine image is never modified.
+ROOTFS_DIR     := build/rootfs
+ROOTFS         := $(ROOTFS_DIR)/rootfs_compat.ext4
+
+# =========================================================
 # Build output directories
 # =========================================================
 BUILD_DIR      := build/$(TARGET)/$(PATCH_ROWS)x$(PATCH_COLS)/ch$(N_CHANNELS)
@@ -86,6 +105,10 @@ AIE_FLAGS  += --Xpreproc="-DFFT_COL_CASCADE_LEN=$(FFT_COL_CASCADE_LEN)"
 AIE_FLAGS  += --Xpreproc="-DFFT_ROW_WS=$(FFT_ROW_WS)"
 AIE_FLAGS  += --Xpreproc="-DFFT_COL_WS=$(FFT_COL_WS)"
 AIE_FLAGS  += --Xpreproc="-DITER_CNT=$(ITER_CNT)"
+# conv2d build mode: 0=real conv, 1=echo stream, 2=synthesize without reading the
+# stream (bisect for "is conv2d blocked on readincr?"). See conv2d_kernel.cpp.
+CONV2D_MODE ?= 1
+AIE_FLAGS  += --Xpreproc="-DCONV2D_ECHO_TEST=$(CONV2D_MODE)"
 AIE_FLAGS  += --verbose
 AIE_FLAGS  += --log-level=5
 AIE_FLAGS  += --pl-freq=$(PL_FREQ)
@@ -213,9 +236,32 @@ $(CROP_XO): $(PL_SRC_REPO)/roi_crop/roi_crop.cpp
 # -------------------------------------------------------
 # AIE graph
 # -------------------------------------------------------
+# Flag stamps: rebuild when the compiler FLAGS change, not just the sources.
+#
+# CONV2D_MODE / SMOKE_SKIP_STREAM / etc. are make variables — changing one touches
+# no file, so a source-only prerequisite list happily reuses a stale libadf.a and
+# the simulation reports results from the PREVIOUS build's binary. That silently
+# cost a debug cycle: a CONV2D_MODE=1 run produced output byte-identical to the
+# CONV2D_MODE=2 build it had actually reused.
+#
+# The stamp is rewritten only when its contents change, so this does not force a
+# rebuild on every invocation.
+.PHONY: FORCE
+FORCE:
+
+%.flagstamp: FORCE
+	@mkdir -p $(dir $@)
+	@echo '$(FLAGS_FOR_STAMP)' | cmp -s - $@ || echo '$(FLAGS_FOR_STAMP)' > $@
+
+AIE_FLAGS_STAMP   := $(BUILD_DIR)/aie.flagstamp
+SMOKE_FLAGS_STAMP := $(SMOKE_BUILD)/aie.flagstamp
+$(AIE_FLAGS_STAMP):   FLAGS_FOR_STAMP := $(AIE_FLAGS)
+$(SMOKE_FLAGS_STAMP): FLAGS_FOR_STAMP := $(SMOKE_AIE_FLAGS)
+
 graph: $(LIBADF_A)
 
-$(LIBADF_A): $(AIE_SRC_REPO)/mosse_graph.cpp  \
+$(LIBADF_A): $(AIE_FLAGS_STAMP)                \
+             $(AIE_SRC_REPO)/mosse_graph.cpp  \
              $(AIE_SRC_REPO)/mosse_graph.h     \
              $(AIE_SRC_REPO)/fft_graph.h       \
              $(AIE_SRC_REPO)/ifft_graph.h      \
@@ -227,15 +273,44 @@ $(LIBADF_A): $(AIE_SRC_REPO)/mosse_graph.cpp  \
 	cd $(BUILD_DIR) && aiecompiler $(AIE_FLAGS) $(GRAPH_SRC_CPP) 2>&1 | tee aiecompiler.log
 
 weights:
-	cd $(PROJECT_REPO) && env PYTHONHOME= PYTHONPATH= uv run --extra weights python3 scripts/export_weights.py $(AIE_SRC_REPO)/weights
+	cd $(PROJECT_REPO) && env PYTHONHOME= PYTHONPATH= uv run --extra weights python3 scripts/export_weights.py $(AIE_SRC_REPO)/weights $(PATCH_COLS)
+
+# int8 samples per PatchIn beat. mosse_graph.h creates PatchIn as plio_32_bits,
+# so 4; change to 16 if the PLIO ever goes back to plio_128_bits.
+PLIO_BEAT_SAMPLES ?= 4
 
 gen_vectors:
-	cd $(PROJECT_REPO) && env PYTHONHOME= PYTHONPATH= uv run python3 scripts/gen_aiesim_vectors.py $(AIE_SRC_REPO)/aiesim_data
+	cd $(PROJECT_REPO) && env PYTHONHOME= PYTHONPATH= \
+	    GEN_PATCH_ROWS=$(PATCH_ROWS) \
+	    GEN_PATCH_COLS=$(PATCH_COLS) \
+	    GEN_PLIO_BEAT_SAMPLES=$(PLIO_BEAT_SAMPLES) \
+	    uv run python3 scripts/gen_aiesim_vectors.py $(AIE_SRC_REPO)/aiesim_data
 
 aiesim: graph gen_vectors
 	-cd $(BUILD_DIR) && AIESIM_SCENARIO_DIR=$(SCENARIO_DATA_DIR) \
 	    timeout 1200 aiesimulator $(AIE_SIM_FLAGS) 2>&1 | tee aiesim.log
 	@echo "--- aiesim done (SCENARIO=$(SCENARIO)); check $(BUILD_DIR)/aiesim.log for PASS/FAIL ---"
+
+# Decisive PatchIn test: does the PLIO deliver into conv2d on the AIE side, with
+# no PL, no v++, no shim involved?
+#
+# Plain `make aiesim` cannot answer this. When fft_col_in.bin exists the harness
+# in mosse_graph.cpp bypasses PatchIn -> conv2d -> row-FFT entirely and feeds the
+# col-FFT from that file, so the run completes even if conv2d is blocked forever
+# on readincr — which is exactly why aiesim has "passed" historically.
+#
+# Removing fft_col_in.bin forces the fallback branch, which drains
+# gmio_fft_row_out and therefore requires conv2d to have consumed the PLIO:
+#   "step 2: fft_row_out done" + sane values -> AIE-side PLIO works; the hw_emu
+#                                               fault is in the PL->shim link.
+#   hangs at "waiting for fft_row_out"       -> AIE-side stream path is broken,
+#                                               independent of any PL.
+.PHONY: aiesim_plio
+aiesim_plio: graph gen_vectors
+	rm -f $(SCENARIO_DATA_DIR)/fft_col_in.bin
+	-cd $(BUILD_DIR) && AIESIM_SCENARIO_DIR=$(SCENARIO_DATA_DIR) \
+	    timeout 1200 aiesimulator $(AIE_SIM_FLAGS) 2>&1 | tee aiesim_plio.log
+	@echo "--- aiesim_plio done (SCENARIO=$(SCENARIO)); look for 'step 2: fft_row_out done' in $(BUILD_DIR)/aiesim_plio.log ---"
 
 # -------------------------------------------------------
 # FFT-only aiesim — isolated DSPLib row-FFT smoke test
@@ -287,9 +362,20 @@ $(BUILD_DIR)/$(APP_ELF): $(HOST_APP_SRC)/mosse_tracker.cpp
 # -------------------------------------------------------
 EMBEDDED_PACKAGE_OUT := $(BUILD_DIR)/package
 
-package: $(BUILD_DIR)/$(APP_ELF) $(BUILD_DIR)/$(XSA) $(LIBADF_A)
+# Feature-downgraded rootfs copy that v++ can package without corrupting it.
+# See the ROOTFS comment near the top of this file for why this is necessary.
+.PHONY: rootfs
+rootfs: $(ROOTFS)
+$(ROOTFS): $(COMMON_IMAGE_VERSAL)/rootfs.ext4
+	mkdir -p $(ROOTFS_DIR)
+	cp $< $@
+	tune2fs -O ^orphan_file,^metadata_csum_seed,^metadata_csum $@
+	e2fsck -fy $@ || test $$? -lt 4
+	@echo "rootfs: $@ ready for packaging"
+
+package: $(BUILD_DIR)/$(APP_ELF) $(BUILD_DIR)/$(XSA) $(LIBADF_A) $(ROOTFS)
 	v++ --package $(VPP_FLAGS) \
-	    --package.rootfs $(COMMON_IMAGE_VERSAL)/rootfs.ext4 \
+	    --package.rootfs $(ROOTFS) \
 	    --package.kernel_image $(COMMON_IMAGE_VERSAL)/Image \
 	    --package.boot_mode=sd \
 	    --package.out_dir $(EMBEDDED_PACKAGE_OUT) \
@@ -297,6 +383,7 @@ package: $(BUILD_DIR)/$(APP_ELF) $(BUILD_DIR)/$(XSA) $(LIBADF_A)
 	    --package.sd_file $(BUILD_DIR)/$(APP_ELF) \
 	    --package.sd_file $(BUILD_DIR)/$(XSA) \
 	    --package.sd_file $(LIBADF_A) \
+	    --package.sd_file $(AIE_SRC_REPO)/weights/layer0_weights.bin \
 	    --package.sd_file $(EXEC_SCRIPTS)/run_script.sh \
 	    --package.defer_aie_run \
 	    $(BUILD_DIR)/$(XSA) $(LIBADF_A)
@@ -308,10 +395,98 @@ sd_card: kernels graph xsa application package
 # -------------------------------------------------------
 run_emu:
 ifeq ($(LAUNCH_HW_EMU_EXEC),1)
-	cd $(EMBEDDED_PACKAGE_OUT) && ./launch_hw_emu.sh -noc-ddr-only 1 -run-app $(EXEC_SCRIPTS)/run_script.sh 2>&1 | tee run_emu.log
+	cd $(EMBEDDED_PACKAGE_OUT) && ./launch_hw_emu.sh -no-reboot -run-app run_script.sh 2>&1 | tee run_emu.log
 else
 	@echo "Set LAUNCH_HW_EMU_EXEC=1 to auto-launch emulation"
 	@echo "Or run manually: cd $(EMBEDDED_PACKAGE_OUT) && ./launch_hw_emu.sh"
+endif
+
+# =========================================================
+# PLIO smoke test — minimal PL --AXIS--> PLIO --> AIE --> GMIO --> DDR
+#
+# Answers one question: can a PLIO deliver data from PL into an AIE kernel at
+# all in this toolchain/platform? The full design hangs because conv2d never
+# receives a word from its PatchIn PLIO. This strips everything else away.
+#
+#   make smoke_sd_card TARGET=hw_emu
+#   make smoke_run_emu LAUNCH_HW_EMU_EXEC=1
+# =========================================================
+SMOKE_N        := 256
+SMOKE_BUILD    := build/$(TARGET)/plio_smoke
+SMOKE_WORK     := $(SMOKE_BUILD)/Work
+SMOKE_XO       := $(SMOKE_BUILD)/stream_src.$(TARGET).xo
+SMOKE_LIBADF   := $(SMOKE_BUILD)/libadf.a
+SMOKE_XSA      := plio_smoke.$(TARGET).xsa
+SMOKE_ELF      := plio_smoke.elf
+SMOKE_PKG      := $(SMOKE_BUILD)/package
+
+# AIE flags: reuse the main ones but swap workdir, drop the PatchIn constraint
+# (SmokeIn is intentionally left unconstrained so the compiler places it).
+SMOKE_AIE_FLAGS := $(filter-out --workdir=$(WORK_DIR),$(AIE_FLAGS))
+SMOKE_AIE_FLAGS := $(filter-out --constraints $(AIE_SRC_REPO)/constraints.aiecst,$(SMOKE_AIE_FLAGS))
+SMOKE_AIE_FLAGS += --Xpreproc="-DSMOKE_N=$(SMOKE_N)"
+# SMOKE_SKIP_STREAM=1 builds the bisect variant: the kernel emits the expected
+# pattern without reading the PLIO stream. Distinguishes "PLIO never delivers"
+# from "the AIE core never runs" — see smoke_passthrough.cpp.
+SMOKE_SKIP_STREAM ?= 0
+SMOKE_AIE_FLAGS += --Xpreproc="-DSMOKE_SKIP_STREAM=$(SMOKE_SKIP_STREAM)"
+SMOKE_AIE_FLAGS += --workdir=$(SMOKE_WORK)
+
+SMOKE_VPP_FLAGS := -t $(TARGET) --platform $(PLATFORM) --save-temps --temp_dir $(SMOKE_BUILD)/_x
+
+.PHONY: smoke_kernels smoke_graph smoke_xsa smoke_app smoke_package smoke_sd_card smoke_run_emu
+
+smoke_kernels: $(SMOKE_XO)
+$(SMOKE_XO): $(PL_SRC_REPO)/stream_src/stream_src.cpp
+	mkdir -p $(SMOKE_BUILD)
+	v++ $(SMOKE_VPP_FLAGS) --hls.clock $(VPP_CLOCK_FREQ):stream_src -c -k stream_src $< -o $@
+
+smoke_graph: $(SMOKE_LIBADF)
+$(SMOKE_LIBADF): $(SMOKE_FLAGS_STAMP)                 \
+                 $(AIE_SRC_REPO)/plio_smoke_graph.cpp \
+                 $(AIE_SRC_REPO)/plio_smoke_graph.h   \
+                 $(AIE_SRC_REPO)/smoke_passthrough.cpp \
+                 $(AIE_SRC_REPO)/smoke_passthrough.h
+	mkdir -p $(SMOKE_BUILD)
+	cd $(SMOKE_BUILD) && aiecompiler $(SMOKE_AIE_FLAGS) \
+	    $(AIE_SRC_REPO)/plio_smoke_graph.cpp 2>&1 | tee aiecompiler.log
+
+smoke_xsa: $(SMOKE_BUILD)/$(SMOKE_XSA)
+$(SMOKE_BUILD)/$(SMOKE_XSA): $(SMOKE_XO) $(SMOKE_LIBADF)
+	v++ $(SMOKE_VPP_FLAGS) --vivado.synth.jobs 8 \
+	    --config $(SYS_CONFIGS)/plio_smoke.cfg \
+	    --clock.freqHz $(VPP_CLOCK_FREQ):stream_src_0 \
+	    -l $(SMOKE_XO) $(SMOKE_LIBADF) \
+	    -o $(SMOKE_BUILD)/$(SMOKE_XSA) 2>&1 | tee $(SMOKE_BUILD)/vpp_link.log
+
+smoke_app: $(SMOKE_BUILD)/$(SMOKE_ELF)
+$(SMOKE_BUILD)/$(SMOKE_ELF): $(HOST_APP_SRC)/plio_smoke_host.cpp
+	mkdir -p $(SMOKE_BUILD)
+	$(CXX) -O2 -std=c++17 -D__linux__ -D__PS_ENABLE_AIE__ -DSMOKE_N=$(SMOKE_N) \
+	    -I$(SDKTARGETSYSROOT)/usr/include/xrt -I$(XILINX_VITIS)/aietools/include/ \
+	    -I$(SDKTARGETSYSROOT)/usr/include -I$(AIE_SRC_REPO) \
+	    $< -L$(SDKTARGETSYSROOT)/usr/lib -L$(XILINX_VITIS)/aietools/lib/aarch64.o \
+	    -ladf_api_xrt -lxrt_coreutil -o $@
+
+smoke_package: $(SMOKE_BUILD)/$(SMOKE_ELF) $(SMOKE_BUILD)/$(SMOKE_XSA) $(SMOKE_LIBADF) $(ROOTFS)
+	v++ --package $(SMOKE_VPP_FLAGS) \
+	    --package.rootfs $(ROOTFS) \
+	    --package.kernel_image $(COMMON_IMAGE_VERSAL)/Image \
+	    --package.boot_mode=sd \
+	    --package.out_dir $(SMOKE_PKG) \
+	    --package.image_format=ext4 \
+	    --package.sd_file $(SMOKE_BUILD)/$(SMOKE_ELF) \
+	    --package.sd_file $(EXEC_SCRIPTS)/run_smoke.sh \
+	    --package.defer_aie_run \
+	    $(SMOKE_BUILD)/$(SMOKE_XSA) $(SMOKE_LIBADF)
+
+smoke_sd_card: smoke_kernels smoke_graph smoke_xsa smoke_app smoke_package
+
+smoke_run_emu:
+ifeq ($(LAUNCH_HW_EMU_EXEC),1)
+	cd $(SMOKE_PKG) && ./launch_hw_emu.sh -no-reboot -run-app run_smoke.sh 2>&1 | tee run_smoke.log
+else
+	@echo "Set LAUNCH_HW_EMU_EXEC=1 to auto-launch the smoke emulation"
 endif
 
 # -------------------------------------------------------

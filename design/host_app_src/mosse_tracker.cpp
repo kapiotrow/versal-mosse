@@ -61,6 +61,9 @@
 #ifndef FFT_COL_WS
 #  define FFT_COL_WS  2   // must match fft_graph.h FFT_COL_WS
 #endif
+#ifndef FFT_ROW_WS
+#  define FFT_ROW_WS  2   // must match fft_graph.h FFT_ROW_WS
+#endif
 #ifndef ITER_CNT
 #  define ITER_CNT    1
 #endif
@@ -69,6 +72,11 @@
 #endif
 #ifndef FRAME_COLS
 #  define FRAME_COLS  1920
+#endif
+// conv2d INT8 weights, produced by `make weights` and packaged onto the SD card
+// next to the ELF (run_script.sh runs from that directory).
+#ifndef WEIGHTS_FILE
+#  define WEIGHTS_FILE  "layer0_weights.bin"
 #endif
 
 // -----------------------------------------------------------------------
@@ -85,6 +93,11 @@ constexpr size_t RESP_BYTES        = PATCH_ELEMS * 4;
 constexpr size_t FRAME_BYTES       = (size_t)FRAME_ROWS * FRAME_COLS;  // single-channel grayscale uint8
 // conv2d weights: 3×3×3 INT8 = 27 bytes, padded to 64-byte GMIO alignment
 constexpr size_t WEIGHT_CH_BYTES   = 64;
+// conv2d emits one row-FFT window (PATCH_ROWS*FFT_ROW_WS samples) per invocation,
+// so it fires this many times per patch. Its `weights` input_buffer is consumed
+// once per invocation, so the host must send the weight buffer once per firing.
+constexpr int    CONV_OUT_CHUNK    = PATCH_ROWS * FFT_ROW_WS;
+constexpr int    CONV_INVOCATIONS  = (int)PATCH_ELEMS / CONV_OUT_CHUNK;
 
 // -----------------------------------------------------------------------
 // Helpers
@@ -111,12 +124,17 @@ static void transpose_inplace(void *buf, int rows, int cols, size_t elem_bytes)
 
 // Software peak detection on the real part of the IFFT response map.
 // Returns displacement relative to patch centre (range: [-rows/2, rows/2)).
-static void peak_detect_sw(const int16_t *resp_re, int rows, int cols,
+//
+// `resp` points at cint16 samples: {real, imag} interleaved, so sample i's real
+// part is resp[2*i]. Indexing it as resp[i] would scan the real AND imaginary
+// halves of only the first half of the map and report bogus peaks.
+static void peak_detect_sw(const int16_t *resp, int rows, int cols,
                             int *dr, int *dc)
 {
     int max_val = -32768, max_idx = 0;
     for (int i = 0; i < rows * cols; ++i) {
-        if (resp_re[i] > max_val) { max_val = resp_re[i]; max_idx = i; }
+        int16_t re = resp[2 * i];
+        if (re > max_val) { max_val = re; max_idx = i; }
     }
     int r = max_idx / cols;
     int c = max_idx % cols;
@@ -125,6 +143,31 @@ static void peak_detect_sw(const int16_t *resp_re, int rows, int cols,
     if (c > cols / 2) c -= cols;
     *dr = r;
     *dc = c;
+}
+
+// Load the INT8 conv2d weights exported by `make weights` into a host buffer.
+// Layout per channel (64 B, see design/aie_src/weights/layer0.h):
+//   [0:9] int8 3×3 kernel, [9] out_shift, [10:14] int32 bias_acc (LE)
+// The file ships 16 channels; a build with fewer uses the leading prefix.
+// Returns false (and leaves the buffer zeroed) if the file cannot be read, so a
+// missing weights file degrades to "output is zero" instead of garbage.
+static bool load_conv_weights(const char *path, uint8_t *dst, size_t bytes)
+{
+    memset(dst, 0, bytes);
+
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        fprintf(stderr, "WARNING: cannot open %s — conv2d weights left zeroed\n", path);
+        return false;
+    }
+    f.read(reinterpret_cast<char *>(dst), (std::streamsize)bytes);
+    size_t got = (size_t)f.gcount();
+    if (got != bytes) {
+        fprintf(stderr, "WARNING: %s short read (%zu of %zu bytes)\n", path, got, bytes);
+        return false;
+    }
+    printf("loaded %zu bytes of conv2d weights from %s\n", bytes, path);
+    return true;
 }
 
 // Filter update stub — TODO: implement with KissFFT on A72.
@@ -247,9 +290,21 @@ int main(int argc, char **argv)
     // ------------------------------------------------------------------
     // One-time init
     // ------------------------------------------------------------------
+    // conv2d weights: read the exported INT8 kernels into weights_bo and push
+    // them to the device. Without this the AIE reads whatever was in DDR.
+    // (No-op while conv2d is built with CONV2D_ECHO_TEST=1, which ignores them.)
+    load_conv_weights(WEIGHTS_FILE, weights_bo.map<uint8_t *>(),
+                      WEIGHT_CH_BYTES * N_CHANNELS);
+    weights_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+    // H_ch* is not computed yet (see filter_update_kissfft). Zero it explicitly
+    // so cmul_accum consumes a defined value; the response is then zero rather
+    // than garbage, which is a meaningful "pipeline ran end to end" result.
     // TODO: load first frame, select initial ROI, compute initial H_ch*
     //       and write to filter_bo.
-    printf("TODO: initialize filters from first frame\n");
+    memset(filter_bo.map<void *>(), 0, FILTER_BYTES * N_CHANNELS);
+    filter_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    printf("TODO: initialize filters from first frame (H_ch* zeroed for now)\n");
 
     // Tracked position (centre of search patch in frame coordinates)
     int pos_row = FRAME_ROWS / 2;
@@ -261,10 +316,15 @@ int main(int argc, char **argv)
     for (int frame = 0; frame < ITER_CNT; ++frame) {
 
         // 1. Camera capture → DDR frame buffer (zeros the buffer)
-        {
-            auto run = cam(frame_bo, FRAME_ROWS, FRAME_COLS);
-            run.wait();
-        }
+        // SKIPPED for hw_emu: camera_capture zeros the full 1080×1920 frame at
+        // II=1 (~2M PL cosim cycles), which dominates emulation runtime. The host
+        // fully initializes the frame below via inject_impulse_frame() +
+        // sync(TO_DEVICE), so this call is redundant. Re-enable when
+        // camera_capture becomes a real MIPI/V4L2 capture source.
+        // {
+        //     auto run = cam(frame_bo, FRAME_ROWS, FRAME_COLS);
+        //     run.wait();
+        // }
 
         // 1b. Inject test data into frame buffer (for hw_emu validation)
         // For functional testing, use an impulse at the tracked position.
@@ -283,19 +343,43 @@ int main(int argc, char **argv)
 
         for (int ch = 0; ch < N_CHANNELS; ++ch) {
 
-            // Load weights for channel ch
-            gm_weights.async(weights_bo, XCL_BO_SYNC_BO_GMIO_TO_AIE, WEIGHT_CH_BYTES, ch * WEIGHT_CH_BYTES);
-            gm_weights.wait();
+            printf("[ch %d] START\n", ch); fflush(stdout);
+
+            // ORDERING IS LOAD-BEARING — do not hoist the weights loop above this.
+            //
+            // conv2d consumes one `weights` buffer per firing, and a firing cannot
+            // complete until it has read its share of the patch from the PatchIn
+            // stream. Only ~2 weight buffers fit in flight (ping-pong), so sending
+            // all CONV_INVOCATIONS of them with a blocking wait *before* starting
+            // roi_crop deadlocks on the 2nd one: the host waits for the AIE to
+            // free a buffer, the AIE waits for patch data that the host has not
+            // sent yet. That deadlock previously looked like "the PatchIn PLIO
+            // never delivers".
+            //
+            // So: arm the output DMA, start the patch flowing, and only then feed
+            // weights — conv2d drains them as it consumes the patch.
+            gm_fft_row_out.async(row_bo, XCL_BO_SYNC_BO_AIE_TO_GMIO, FFT_BYTES, 0);
 
             // roi_crop → PatchIn PLIO → conv2d → fft_rows → gmio_fft_row_out
             auto crop_run = crop(frame_bo, FRAME_COLS,
                                  roi_row, roi_col, PATCH_ROWS, PATCH_COLS);
-            gm_fft_row_out.async(row_bo, XCL_BO_SYNC_BO_AIE_TO_GMIO, FFT_BYTES, 0);
+
+            // Load weights for channel ch — once per conv2d invocation, since the
+            // kernel's `weights` input_buffer is consumed on every firing.
+            for (int k = 0; k < CONV_INVOCATIONS; ++k) {
+                gm_weights.async(weights_bo, XCL_BO_SYNC_BO_GMIO_TO_AIE, WEIGHT_CH_BYTES, ch * WEIGHT_CH_BYTES);
+                gm_weights.wait();
+            }
+            printf("[ch %d] weights sent (%d buffers)\n", ch, CONV_INVOCATIONS); fflush(stdout);
+
             crop_run.wait();
+            printf("[ch %d] roi_crop done\n", ch); fflush(stdout);
             gm_fft_row_out.wait();
+            printf("[ch %d] fft_row_out received\n", ch); fflush(stdout);
 
             // APU: transpose row-FFT output in-place
             transpose_inplace(row_bo.map<void *>(), PATCH_ROWS, PATCH_COLS, 4);
+            printf("[ch %d] transpose done\n", ch); fflush(stdout);
 
             // Pack [filter_chunk_c | accum_chunk_c] into cmul_bo for all chunks.
             // For ch=0 the accum half is zeroed; for ch>0 it carries the running sum.
@@ -322,26 +406,33 @@ int main(int argc, char **argv)
             gm_cmul_in.async(cmul_bo, XCL_BO_SYNC_BO_GMIO_TO_AIE, CMUL_IN_BYTES, 0);
 
             gm_fft_col_in.wait();
+            printf("[ch %d] fft_col_in sent\n", ch); fflush(stdout);
             gm_cmul_in.wait();  // Wait for filter/accum data to reach AIE before accum reads
+            printf("[ch %d] cmul_in sent\n", ch); fflush(stdout);
 
             // Read updated partial accumulator
             gm_accum_out.async(accum_bo, XCL_BO_SYNC_BO_AIE_TO_GMIO, ACCUM_BYTES, 0);
             gm_accum_out.wait();
+            printf("[ch %d] accum_out received\n", ch); fflush(stdout);
         }
 
         // 3. IFFT: APU feeds accumulated spectrum to IFFT row input
+        printf("[ifft] START\n"); fflush(stdout);
         gm_ifft_row_in.async(accum_bo, XCL_BO_SYNC_BO_GMIO_TO_AIE, ACCUM_BYTES, 0);
         gm_ifft_row_out.async(row_bo, XCL_BO_SYNC_BO_AIE_TO_GMIO, FFT_BYTES, 0);
         gm_ifft_row_in.wait();
         gm_ifft_row_out.wait();
+        printf("[ifft] rows done\n"); fflush(stdout);
 
         // APU: transpose IFFT row output in-place
         transpose_inplace(row_bo.map<void *>(), PATCH_ROWS, PATCH_COLS, 4);
+        printf("[ifft] transpose done\n"); fflush(stdout);
 
         gm_ifft_col_in.async(row_bo, XCL_BO_SYNC_BO_GMIO_TO_AIE, FFT_BYTES, 0);
         gm_response.async(resp_bo, XCL_BO_SYNC_BO_AIE_TO_GMIO, RESP_BYTES, 0);
         gm_ifft_col_in.wait();
         gm_response.wait();
+        printf("[ifft] cols done → response received\n"); fflush(stdout);
 
         // 4. Peak detection — read real parts (stride-2 for cint16)
         int dr = 0, dc = 0;
