@@ -213,15 +213,38 @@ def pack_channel(w_int8_oc: np.ndarray, shift: int, bias_acc: int, scale: float)
 # ---------------------------------------------------------------------------
 
 def _gen_hanning_h(out_path: Path, n: int) -> None:
-    """Write a precomputed Q1.15 Hanning window header for an n-point patch."""
-    vals = [round(math.sin(math.pi * i / (n - 1)) ** 2 * 32767) for i in range(n)]
+    """Write a precomputed Q1.15 Hanning window header for an n-point patch.
+
+    PERIODIC window (denominator n), not the symmetric one (denominator n-1).
+    This is deliberate and load-bearing, not a style choice.
+
+    A Hann window is a 3-term cosine sum, so on the DFT grid the periodic form
+    has EXACTLY three non-zero bins: W[0] = n/2, W[±1] = -n/4, zero elsewhere.
+    Separable in 2D, that is exactly 9 non-zero bins at (r,c) in {0,±1}^2.
+
+    The host relies on that identity to cancel the pre-window feature mean in
+    the frequency domain: DFT(w*(f-µ)) = DFT(w*f) - µ*DFT(w), so removing µ
+    costs 9 complex subtractions instead of a spatial pass over the whole map.
+
+    The symmetric form (n-1) is aperiodic on the DFT grid and leaks across all
+    bins. Measured at n=128 in Q1.15, worst leaked bin sits only ~8.5 bits below
+    DC (ratio 373) versus ~18 bits (ratio 2.2e5) for the periodic form — so with
+    the symmetric window the 9-bin correction is NOT exact. Symmetric is the
+    right choice for filter design; periodic is the right choice for FFT work.
+    """
+    vals = [round(math.sin(math.pi * i / n) ** 2 * 32767) for i in range(n)]
 
     lines = [
         "/*",
         f" * hanning_{n}.h",
         f" * Precomputed separable Hanning window in Q1.15 for {n}-point patches.",
         " *",
-        f" * HANNING_{n}[i] = round(sin(π*i/{n-1})^2 * 32767)   for i = 0..{n-1}",
+        f" * HANNING_{n}[i] = round(sin(π*i/{n})^2 * 32767)   for i = 0..{n-1}",
+        " *",
+        " * PERIODIC window (denominator n). Its 2D DFT has exactly 9 non-zero bins,",
+        " * which is what lets the host cancel the pre-window mean in the frequency",
+        " * domain. Do not switch to the symmetric (n-1) form — see _gen_hanning_h",
+        " * in scripts/export_weights.py.",
         " *",
         f" * Usage in conv2d_kernel: out_windowed = (out * HANNING_{n}[r] / 32768)",
         f" *                                        * HANNING_{n}[c] / 32768",

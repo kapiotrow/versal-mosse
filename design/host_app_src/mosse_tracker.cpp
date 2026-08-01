@@ -67,6 +67,23 @@
 #ifndef ITER_CNT
 #  define ITER_CNT    1
 #endif
+// Offset of the synthetic test impulse from the tracked position, in frame
+// pixels. A correct pipeline must report exactly this displacement. Non-zero,
+// asymmetric and opposite-signed on purpose: (0,0) is indistinguishable from a
+// zero response, equal magnitudes would not catch a row/col transpose, and
+// same-signed values would not catch a sign flip.
+// Must stay within ±PATCH_ROWS/2 and ±PATCH_COLS/2 or the impulse falls outside
+// the cropped patch entirely.
+#ifndef IMPULSE_DR
+#  define IMPULSE_DR  10
+#endif
+#ifndef IMPULSE_DC
+#  define IMPULSE_DC  (-7)
+#endif
+static_assert(IMPULSE_DR >  -PATCH_ROWS/2 && IMPULSE_DR < PATCH_ROWS/2,
+              "IMPULSE_DR puts the test impulse outside the cropped patch");
+static_assert(IMPULSE_DC >  -PATCH_COLS/2 && IMPULSE_DC < PATCH_COLS/2,
+              "IMPULSE_DC puts the test impulse outside the cropped patch");
 #ifndef FRAME_ROWS
 #  define FRAME_ROWS  1080
 #endif
@@ -100,6 +117,40 @@ constexpr int    CONV_OUT_CHUNK    = PATCH_ROWS * FFT_ROW_WS;
 constexpr int    CONV_INVOCATIONS  = (int)PATCH_ELEMS / CONV_OUT_CHUNK;
 
 // -----------------------------------------------------------------------
+// AIE→DDR GMIO drain granularity
+// -----------------------------------------------------------------------
+// aie2gm_nb() moves ONE producing-kernel invocation per call — NOT the byte
+// count handed to it. A single async() for a whole buffer therefore drains only
+// the first window; the producer then blocks on a full output window and the
+// backpressure propagates all the way to roi_crop, which never asserts ap_done.
+// Measured in hw_emu 2026-08-01: with one async() for all of gmio_fft_row_out,
+// the design stalled after 6 of 64 weight buffers and the AIE DMA status register
+// froze for 243k consecutive polls.
+//
+// Every AIE→DDR GMIO must be drained one async/wait pair per invocation, with a
+// chunk equal to the producer's output window (cint16 = 4 B/sample):
+//   gmio_fft_row_out  <- FFTrows  window FFT_ROW_TP_WINDOW_VSIZE = PATCH_ROWS*FFT_ROW_WS
+//   gmio_accum_out    <- cmul     dimensions                     = PATCH_COLS*FFT_COL_WS
+//   gmio_ifft_row_out <- IFFTrows window FFT_ROW_TP_WINDOW_VSIZE
+//   gmio_response     <- IFFTcols window FFT_COL_TP_WINDOW_VSIZE
+constexpr size_t FFT_SAMPLE_BYTES  = 4;                                        // cint16
+constexpr size_t ROW_CHUNK_BYTES   = (size_t)PATCH_ROWS * FFT_ROW_WS * FFT_SAMPLE_BYTES;
+constexpr size_t COL_CHUNK_BYTES   = (size_t)PATCH_COLS * FFT_COL_WS * FFT_SAMPLE_BYTES;
+constexpr int    ROW_CHUNKS        = (int)(FFT_BYTES   / ROW_CHUNK_BYTES);
+constexpr int    COL_CHUNKS        = (int)(ACCUM_BYTES / COL_CHUNK_BYTES);
+
+static_assert(FFT_BYTES   % ROW_CHUNK_BYTES == 0,
+              "row-FFT buffer is not a whole number of kernel invocations");
+static_assert(ACCUM_BYTES % COL_CHUNK_BYTES == 0,
+              "col/accum buffer is not a whole number of kernel invocations");
+static_assert(RESP_BYTES  % COL_CHUNK_BYTES == 0,
+              "response buffer is not a whole number of kernel invocations");
+// conv2d fires once per row-FFT window, which is what lets the weights feed and
+// the row-FFT drain interleave 1:1 in a single loop below.
+static_assert(ROW_CHUNKS == CONV_INVOCATIONS,
+              "row-FFT drain count must match conv2d firing count");
+
+// -----------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------
 
@@ -128,13 +179,28 @@ static void transpose_inplace(void *buf, int rows, int cols, size_t elem_bytes)
 // `resp` points at cint16 samples: {real, imag} interleaved, so sample i's real
 // part is resp[2*i]. Indexing it as resp[i] would scan the real AND imaginary
 // halves of only the first half of the map and report bogus peaks.
-static void peak_detect_sw(const int16_t *resp, int rows, int cols,
-                            int *dr, int *dc)
+//
+// Scans |real|, not real. Before Stage B1 the feature map was non-negative
+// (ReLU), so a correlation peak was always positive and a signed maximum was
+// fine. Mean subtraction makes the map bipolar: the strongest correlation is now
+// as likely to be a trough as a crest — the aiesim s6 scenario peaks at
+// {-417,0}. A signed max would walk straight past it and return whatever the
+// largest positive sidelobe happened to be.
+// Returns the peak |real| magnitude, which the caller MUST report.
+//
+// Without it a zero response is indistinguishable from a correct answer: with
+// H_ch* zeroed the response is identically zero, and then only i=0 satisfies
+// `mag > max_val` (0 > -1), so max_idx stays 0 and the wrap below maps it to
+// displacement (0,0) — the right answer for a centred target, produced without
+// looking at the data at all. peak == 0 means the result is meaningless.
+static int peak_detect_sw(const int16_t *resp, int rows, int cols,
+                          int *dr, int *dc)
 {
-    int max_val = -32768, max_idx = 0;
+    int max_val = -1, max_idx = 0;
     for (int i = 0; i < rows * cols; ++i) {
-        int16_t re = resp[2 * i];
-        if (re > max_val) { max_val = re; max_idx = i; }
+        int re  = (int)resp[2 * i];
+        int mag = (re < 0) ? -re : re;
+        if (mag > max_val) { max_val = mag; max_idx = i; }
     }
     int r = max_idx / cols;
     int c = max_idx % cols;
@@ -143,6 +209,7 @@ static void peak_detect_sw(const int16_t *resp, int rows, int cols,
     if (c > cols / 2) c -= cols;
     *dr = r;
     *dc = c;
+    return max_val;
 }
 
 // Load the INT8 conv2d weights exported by `make weights` into a host buffer.
@@ -170,7 +237,116 @@ static bool load_conv_weights(const char *path, uint8_t *dst, size_t bytes)
     return true;
 }
 
+// -----------------------------------------------------------------------
+// Stage B — feature-map normalization (see conv2d_kernel.h for the rationale)
+// -----------------------------------------------------------------------
+
+// Per-channel window-weighted feature mean, fed back to conv2d as mean_prev in
+// the next frame's weight buffer (bytes [18:22]). Zero on the first frame.
+static int32_t g_mean_prev[N_CHANNELS] = {0};
+// Per-channel spectral energy, for the B3 filter scaling.
+static double  g_energy[N_CHANNELS]    = {0.0};
+
+// Q1.15 periodic Hann, regenerated by `make weights` into hanning_<N>.h.
+// The host needs the same table the kernel uses: B2's correction is built from
+// this window's DFT.
+#include "hanning_128.h"
+#define HTAB HANNING_128
+
+// Measure the window-weighted feature mean from the row-FFT output.
+//
+// The row-FFT DC bin of row r is Σ_c w_r·w_c·g[r,c], where g is whatever conv2d
+// emitted (the post-ReLU map with mean_prev already removed). Summing over rows
+// gives Σ(w⊗w)·g exactly, so this recovers the window-weighted mean with 128
+// adds per channel over data the APU is about to transpose anyway — no extra
+// traffic, no extra pass.
+//
+// Called BEFORE transpose_inplace(), while the layout is still row-major:
+// element [r][k] lives at index r*PATCH_COLS + k, so the row DC bins are at
+// stride PATCH_COLS.
+static int32_t measure_window_mean(const int16_t *row_fft, int32_t mean_prev)
+{
+    // Σw over one axis, in Q1.15 units; the 2D weight sum is its square.
+    int64_t sum_w = 0;
+    for (int i = 0; i < PATCH_COLS; ++i) sum_w += (int64_t)HTAB[i];
+
+    int64_t dc_sum = 0;
+    for (int r = 0; r < PATCH_ROWS; ++r)
+        dc_sum += (int64_t)row_fft[2 * (r * PATCH_COLS)];   // real part of bin 0
+
+    // conv2d applies two >>15 stages, so the emitted sample is
+    // g·w_r·w_c / 2^30; scale back to recover Σ(w⊗w)·g / (Σw)².
+    const double sw = (double)sum_w / 32768.0;              // Σw in window units
+    if (sw <= 0.0) return mean_prev;
+    const double residual = (double)dc_sum / (sw * sw);
+
+    // conv2d subtracted mean_prev before windowing, so what we just measured is
+    // the mean of (f - mean_prev). Add it back to get the absolute mean. This is
+    // a feedback loop: even if the scale factor above is slightly off, mean_prev
+    // converges to the true window-weighted mean over a few frames.
+    return mean_prev + (int32_t)llround(residual);
+}
+
+// Stage B2 — cancel the residual mean in the frequency domain.
+//
+// conv2d removed mean_prev, but the true mean is mean_now, so the spectrum still
+// carries (mean_now - mean_prev)·W where W = DFT(w⊗w). For the PERIODIC Hann, W
+// has exactly 9 non-zero bins at (r,c) ∈ {0,±1}², so the correction is 9 complex
+// subtractions per channel — and because correlation is linear, they can be
+// applied once to the ACCUMULATED spectrum rather than per channel:
+//
+//   Σ_ch (X_ch - µ_ch·W) ⊙ H_ch*  =  Σ_ch X_ch ⊙ H_ch*  -  Σ_ch µ_ch · W ⊙ H_ch*
+//
+// NOT bit-exact: the two >>15 truncations in conv2d's window multiply are
+// nonlinear, so linearity holds only up to quantization. Measured relative error
+// after correction is ~1e-3, versus 2.5e-2 .. 9.9 without it.
+static void apply_dc_correction(int16_t *accum, const int16_t *filter_all,
+                                const double *residual_mean)
+{
+    // W[k] for a periodic Hann of length L: W[0] = L/2, W[±1] = -L/4, else 0.
+    // The two axes have different lengths when the patch is not square.
+    const double wrow[3] = { PATCH_ROWS * 0.5, -PATCH_ROWS * 0.25, -PATCH_ROWS * 0.25 };
+    const double wcol[3] = { PATCH_COLS * 0.5, -PATCH_COLS * 0.25, -PATCH_COLS * 0.25 };
+    const int    ridx[3] = { 0, 1, PATCH_ROWS - 1 };   // row-frequency index
+    const int    kidx[3] = { 0, 1, PATCH_COLS - 1 };   // column index
+
+    for (int a = 0; a < 3; ++a) {
+        for (int b = 0; b < 3; ++b) {
+            // accum is in the TRANSPOSED layout the col-FFT produced:
+            // element [c * PATCH_ROWS + r] is 2D spectrum bin (r, c).
+            // Indexing it row-major (r * PATCH_COLS + c) happens to give the
+            // same answer on a square patch — the bin set is transpose-symmetric
+            // and the separable coefficient is symmetric in (a,b) — but it is
+            // wrong the moment PATCH_ROWS != PATCH_COLS.
+            const int    bin = kidx[b] * PATCH_ROWS + ridx[a];
+            const double Wrc = wrow[a] * wcol[b] / (double)(PATCH_ROWS * PATCH_COLS);
+
+            double corr_re = 0.0, corr_im = 0.0;
+            for (int ch = 0; ch < N_CHANNELS; ++ch) {
+                // µ_ch · W ⊙ H_ch*  (H stored un-conjugated; cmul conjugates)
+                const int16_t hr = filter_all[2 * (ch * PATCH_ELEMS + bin)];
+                const int16_t hi = filter_all[2 * (ch * PATCH_ELEMS + bin) + 1];
+                const double  m  = residual_mean[ch] * Wrc;
+                corr_re += m * hr;
+                corr_im -= m * hi;      // conj
+            }
+
+            int32_t re = (int32_t)accum[2 * bin]     - (int32_t)llround(corr_re);
+            int32_t im = (int32_t)accum[2 * bin + 1] - (int32_t)llround(corr_im);
+            accum[2 * bin]     = (int16_t)(re >  32767 ?  32767 : (re < -32768 ? -32768 : re));
+            accum[2 * bin + 1] = (int16_t)(im >  32767 ?  32767 : (im < -32768 ? -32768 : im));
+        }
+    }
+}
+
 // Filter update stub — TODO: implement with KissFFT on A72.
+//
+// Stage B3 belongs here: correlation is linear in the patch, so normalizing each
+// channel to unit energy is identical to scaling H_ch* by 1/σ_ch. Fold
+// 1.0/sqrt(g_energy[ch]) into H_ch* as it is built — zero AIE cost, no extra DDR
+// traffic. Cannot be done yet because H_ch* is not computed at all (it is
+// memset to zero at startup); g_energy[] is already being measured so the hook
+// is ready the moment the filter update lands.
 static void filter_update_kissfft(/* ... */) { /* TODO */ }
 
 // Compute ideal Gaussian response G (spatial domain); kept as a utility.
@@ -327,19 +503,36 @@ int main(int argc, char **argv)
         // }
 
         // 1b. Inject test data into frame buffer (for hw_emu validation)
-        // For functional testing, use an impulse at the tracked position.
+        //
+        // The impulse is placed OFF-CENTRE, at pos + (IMPULSE_DR, IMPULSE_DC).
+        // A centred impulse is useless as a test: the expected displacement is
+        // then (0,0), which is also exactly what peak_detect_sw returns for an
+        // all-zero response — so it passes without the data being looked at.
+        // Off-centre, a correct pipeline MUST report (IMPULSE_DR, IMPULSE_DC).
+        //
+        // The defaults are deliberately asymmetric — different magnitudes and
+        // opposite signs — so a row/col swap (a transpose bug) and a sign flip
+        // are both caught, not just "something non-zero came out".
         // TODO: Replace with real video capture loop (OpenCV, V4L2).
         {
             uint8_t *frame_ptr = frame_bo.map<uint8_t *>();
-            int test_row = pos_row;
-            int test_col = pos_col;
+            int test_row = pos_row + IMPULSE_DR;
+            int test_col = pos_col + IMPULSE_DC;
             inject_impulse_frame(frame_ptr, FRAME_ROWS, FRAME_COLS, test_row, test_col, 200);
             frame_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);  // Flush host → device
+            printf("Frame %d: impulse at pos+(%d,%d) = (%d,%d)\n",
+                   frame, IMPULSE_DR, IMPULSE_DC, test_row, test_col);
+            fflush(stdout);
         }
 
         // 2. Per-channel: conv2d + FFT2D + cmul_accum
         int roi_row = pos_row - PATCH_ROWS / 2;
         int roi_col = pos_col - PATCH_COLS / 2;
+
+        // Stage B2: per-channel mean that conv2d did NOT remove this frame,
+        // filled in as each channel's row-FFT comes back and applied once to the
+        // accumulated spectrum after the loop.
+        double residual_mean[N_CHANNELS] = {0.0};
 
         for (int ch = 0; ch < N_CHANNELS; ++ch) {
 
@@ -356,26 +549,98 @@ int main(int argc, char **argv)
             // sent yet. That deadlock previously looked like "the PatchIn PLIO
             // never delivers".
             //
-            // So: arm the output DMA, start the patch flowing, and only then feed
-            // weights — conv2d drains them as it consumes the patch.
-            gm_fft_row_out.async(row_bo, XCL_BO_SYNC_BO_AIE_TO_GMIO, FFT_BYTES, 0);
-
+            // So: start the patch flowing, then feed weights and drain the
+            // row-FFT output together — conv2d drains the weights as it consumes
+            // the patch, and fft_rows drains into DDR as conv2d feeds it.
+            //
             // roi_crop → PatchIn PLIO → conv2d → fft_rows → gmio_fft_row_out
-            auto crop_run = crop(frame_bo, FRAME_COLS,
-                                 roi_row, roi_col, PATCH_ROWS, PATCH_COLS);
+            //
+            // recompute = (ch == 0): Stage A (resample + log + zero-mean +
+            // unit-L2 + int8 quantize) depends only on the frame and the ROI,
+            // not on the channel, so it runs once per frame and the remaining
+            // channels re-stream the cached patch. See roi_crop.h.
+            //
+            // roi_h/roi_w are the ROI's size in FRAME pixels; roi_crop resamples
+            // that to PATCH_ROWS × PATCH_COLS. They are fixed to the patch size
+            // here because scale estimation is not implemented yet — once it is,
+            // this is where the estimated target size goes.
+            // Arguments MUST be set by explicit index, NOT positionally via
+            // `crop(...)`. roi_crop's AXIS port sits in the MIDDLE of the
+            // argument list, and xrt::kernel::operator() assigns positionally
+            // from index 0 — including over the stream port, which is not a
+            // settable register. kernel.xml:
+            //     id=0  frame_buf   (m_axi)
+            //     id=1  patch_out   (AXIS  <-- consumes a positional slot)
+            //     id=2  frame_rows      id=3  frame_cols
+            //     id=4  roi_row         id=5  roi_col
+            //     id=6  roi_h           id=7  roi_w
+            //     id=8  patch_rows      id=9  patch_cols
+            //     id=10 recompute
+            // The old positional call shifted everything after frame_buf down by
+            // one: patch_cols received (ch==0)?1:0 and recompute was never set at
+            // all, so roi_crop emitted ~nothing and always skipped Stage A. That
+            // is what produced "PL->AIE PLIO delivers nothing" and 0.00 MBps on
+            // S00_AXIS. Confirmed on the plio_smoke testcase, which had the same
+            // bug in miniature: TVALID never asserted while TREADY stayed high.
+            xrt::run crop_run(crop);
+            crop_run.set_arg(0,  frame_bo);
+            crop_run.set_arg(2,  (uint32_t)FRAME_ROWS);
+            crop_run.set_arg(3,  (uint32_t)FRAME_COLS);
+            crop_run.set_arg(4,  (uint32_t)roi_row);
+            crop_run.set_arg(5,  (uint32_t)roi_col);
+            crop_run.set_arg(6,  (uint32_t)PATCH_ROWS);   // roi_h
+            crop_run.set_arg(7,  (uint32_t)PATCH_COLS);   // roi_w
+            crop_run.set_arg(8,  (uint32_t)PATCH_ROWS);
+            crop_run.set_arg(9,  (uint32_t)PATCH_COLS);
+            crop_run.set_arg(10, (uint32_t)((ch == 0) ? 1 : 0));
+            crop_run.start();
 
-            // Load weights for channel ch — once per conv2d invocation, since the
-            // kernel's `weights` input_buffer is consumed on every firing.
+            // Feed one weight buffer per conv2d firing AND drain one row-FFT
+            // window per firing, in the same loop.
+            //
+            // These MUST interleave. Draining after the weights loop deadlocks
+            // (fft_rows fills its one armed output window, blocks conv2d, and the
+            // weights queue freezes — the observed 6-of-64 stall). Draining before
+            // it deadlocks the other way, waiting on data conv2d has not been fed.
+            // The two counts are equal by construction (static_assert above), so
+            // one loop serves both.
             for (int k = 0; k < CONV_INVOCATIONS; ++k) {
-                gm_weights.async(weights_bo, XCL_BO_SYNC_BO_GMIO_TO_AIE, WEIGHT_CH_BYTES, ch * WEIGHT_CH_BYTES);
+                // Arm this firing's drain before feeding the weights that trigger
+                // it, so the output window is never the thing that blocks.
+                gm_fft_row_out.async(row_bo, XCL_BO_SYNC_BO_AIE_TO_GMIO,
+                                     ROW_CHUNK_BYTES, k * ROW_CHUNK_BYTES);
+                gm_weights.async(weights_bo, XCL_BO_SYNC_BO_GMIO_TO_AIE,
+                                 WEIGHT_CH_BYTES, ch * WEIGHT_CH_BYTES);
                 gm_weights.wait();
+                gm_fft_row_out.wait();
             }
-            printf("[ch %d] weights sent (%d buffers)\n", ch, CONV_INVOCATIONS); fflush(stdout);
+            printf("[ch %d] weights sent + row-FFT drained (%d x %zu B)\n",
+                   ch, CONV_INVOCATIONS, ROW_CHUNK_BYTES); fflush(stdout);
 
             crop_run.wait();
             printf("[ch %d] roi_crop done\n", ch); fflush(stdout);
-            gm_fft_row_out.wait();
             printf("[ch %d] fft_row_out received\n", ch); fflush(stdout);
+
+            // Stage B: measure this channel's window-weighted feature mean and
+            // spectral energy BEFORE transposing, while the row-major layout
+            // still puts each row's DC bin at stride PATCH_COLS.
+            {
+                const int16_t *rf = row_bo.map<int16_t *>();
+                const int32_t  mean_now = measure_window_mean(rf, g_mean_prev[ch]);
+                // B2 needs what conv2d failed to remove this frame.
+                residual_mean[ch] = (double)(mean_now - g_mean_prev[ch]);
+                g_mean_prev[ch]   = mean_now;
+
+                // B3: Parseval energy, for the filter scaling in the update step.
+                double e = 0.0;
+                for (int i = 0; i < PATCH_ELEMS; ++i)
+                    e += (double)rf[2*i] * rf[2*i] + (double)rf[2*i+1] * rf[2*i+1];
+                g_energy[ch] = e / (double)PATCH_ELEMS;
+
+                // Feed mean_now back as the next frame's mean_prev (bytes 18:22).
+                uint8_t *wb = weights_bo.map<uint8_t *>() + ch * WEIGHT_CH_BYTES;
+                memcpy(wb + 18, &mean_now, sizeof(int32_t));
+            }
 
             // APU: transpose row-FFT output in-place
             transpose_inplace(row_bo.map<void *>(), PATCH_ROWS, PATCH_COLS, 4);
@@ -405,42 +670,86 @@ int main(int argc, char **argv)
             gm_fft_col_in.async(row_bo, XCL_BO_SYNC_BO_GMIO_TO_AIE, FFT_BYTES, 0);
             gm_cmul_in.async(cmul_bo, XCL_BO_SYNC_BO_GMIO_TO_AIE, CMUL_IN_BYTES, 0);
 
+            // Drain the accumulator WHILE the inputs are still in flight.
+            //
+            // This must not be sequenced after the two input waits: cmul stalls on
+            // a full output window, which stalls the column FFT that feeds it,
+            // which stalls the very input DMAs we would be waiting on. Draining
+            // first breaks that cycle.
+            for (int k = 0; k < COL_CHUNKS; ++k) {
+                gm_accum_out.async(accum_bo, XCL_BO_SYNC_BO_AIE_TO_GMIO,
+                                   COL_CHUNK_BYTES, k * COL_CHUNK_BYTES);
+                gm_accum_out.wait();
+            }
+            printf("[ch %d] accum_out received (%d x %zu B)\n",
+                   ch, COL_CHUNKS, COL_CHUNK_BYTES); fflush(stdout);
+
             gm_fft_col_in.wait();
             printf("[ch %d] fft_col_in sent\n", ch); fflush(stdout);
-            gm_cmul_in.wait();  // Wait for filter/accum data to reach AIE before accum reads
+            gm_cmul_in.wait();
             printf("[ch %d] cmul_in sent\n", ch); fflush(stdout);
-
-            // Read updated partial accumulator
-            gm_accum_out.async(accum_bo, XCL_BO_SYNC_BO_AIE_TO_GMIO, ACCUM_BYTES, 0);
-            gm_accum_out.wait();
-            printf("[ch %d] accum_out received\n", ch); fflush(stdout);
         }
+
+        // Stage B2: cancel the residual pre-window mean on the accumulated
+        // spectrum. 9 bins × N_CHANNELS complex MACs — 144 operations for the
+        // whole frame. Must run before the IFFT consumes accum_bo.
+        apply_dc_correction(accum_bo.map<int16_t *>(),
+                            filter_bo.map<int16_t *>(),
+                            residual_mean);
+
+        // Push the updated mean_prev values (written into bytes [18:22] of each
+        // channel's weight buffer above) so the NEXT frame's conv2d sees them.
+        weights_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
         // 3. IFFT: APU feeds accumulated spectrum to IFFT row input
         printf("[ifft] START\n"); fflush(stdout);
         gm_ifft_row_in.async(accum_bo, XCL_BO_SYNC_BO_GMIO_TO_AIE, ACCUM_BYTES, 0);
-        gm_ifft_row_out.async(row_bo, XCL_BO_SYNC_BO_AIE_TO_GMIO, FFT_BYTES, 0);
+        // Drain per invocation, and before waiting on the input — see the
+        // accum_out loop above for why the input wait cannot come first.
+        for (int k = 0; k < ROW_CHUNKS; ++k) {
+            gm_ifft_row_out.async(row_bo, XCL_BO_SYNC_BO_AIE_TO_GMIO,
+                                  ROW_CHUNK_BYTES, k * ROW_CHUNK_BYTES);
+            gm_ifft_row_out.wait();
+        }
         gm_ifft_row_in.wait();
-        gm_ifft_row_out.wait();
-        printf("[ifft] rows done\n"); fflush(stdout);
+        printf("[ifft] rows done (%d x %zu B)\n", ROW_CHUNKS, ROW_CHUNK_BYTES);
+        fflush(stdout);
 
         // APU: transpose IFFT row output in-place
         transpose_inplace(row_bo.map<void *>(), PATCH_ROWS, PATCH_COLS, 4);
         printf("[ifft] transpose done\n"); fflush(stdout);
 
         gm_ifft_col_in.async(row_bo, XCL_BO_SYNC_BO_GMIO_TO_AIE, FFT_BYTES, 0);
-        gm_response.async(resp_bo, XCL_BO_SYNC_BO_AIE_TO_GMIO, RESP_BYTES, 0);
+        for (int k = 0; k < COL_CHUNKS; ++k) {
+            gm_response.async(resp_bo, XCL_BO_SYNC_BO_AIE_TO_GMIO,
+                              COL_CHUNK_BYTES, k * COL_CHUNK_BYTES);
+            gm_response.wait();
+        }
         gm_ifft_col_in.wait();
-        gm_response.wait();
-        printf("[ifft] cols done → response received\n"); fflush(stdout);
+        printf("[ifft] cols done → response received (%d x %zu B)\n",
+               COL_CHUNKS, COL_CHUNK_BYTES); fflush(stdout);
 
         // 4. Peak detection — read real parts (stride-2 for cint16)
         int dr = 0, dc = 0;
-        peak_detect_sw(resp_bo.map<int16_t *>(), PATCH_ROWS, PATCH_COLS, &dr, &dc);
+        int peak = peak_detect_sw(resp_bo.map<int16_t *>(), PATCH_ROWS, PATCH_COLS, &dr, &dc);
         pos_row += dr;
         pos_col += dc;
-        printf("Frame %d: displacement (%d,%d) → pos (%d,%d)\n",
-               frame, dr, dc, pos_row, pos_col);
+
+        // peak==0 means the response map is identically zero, so the (0,0)
+        // displacement below carries no information — say so rather than
+        // printing a plausible-looking position. Expected while H_ch* is
+        // zeroed (see the filter_bo memset above).
+        const bool ok = (peak > 0 && dr == IMPULSE_DR && dc == IMPULSE_DC);
+        printf("Frame %d: displacement (%d,%d) → pos (%d,%d)  peak|re|=%d  [%s]\n",
+               frame, dr, dc, pos_row, pos_col, peak,
+               peak == 0   ? "VOID: zero response — result carries no information"
+               : ok        ? "OK: matches injected offset"
+                           : "MISMATCH vs injected offset");
+        if (peak == 0)
+            printf("       (expected while H_ch* is zeroed — initialize the filter "
+                   "to make this test meaningful)\n");
+        else if (!ok)
+            printf("       expected displacement (%d,%d)\n", IMPULSE_DR, IMPULSE_DC);
 
         // 5. Filter update (PS-side, stub)
         filter_update_kissfft();

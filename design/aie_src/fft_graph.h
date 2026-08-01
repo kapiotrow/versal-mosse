@@ -37,8 +37,15 @@ namespace dsplib = xf::dsp::aie;
 #define FFT_COL_TP_POINT_SIZE  PATCH_ROWS   // 1D FFT across rows    (one col at a time)
 
 #define FFT_2D_TP_FFT_NIFFT    1            // 1 = forward FFT
-#define FFT_2D_TP_SHIFT        0            // no shift on forward pass
 #define FFT_2D_TP_DYN_PT_SIZE  0            // fixed point size
+
+// Forward-FFT output shift. Overridable from the Makefile (FFT_SHIFT) so the
+// normalization can be swept without editing source — same pattern as
+// FFT_ROW_CASCADE_LEN below. Default 0: no shift on the forward pass, so the
+// spectrum keeps full precision and all normalization happens on the IFFT side.
+#ifndef FFT_2D_TP_SHIFT
+#  define FFT_2D_TP_SHIFT      0
+#endif
 
 // Cascade lengths (increase for cfloat or large point sizes)
 #ifndef FFT_ROW_CASCADE_LEN

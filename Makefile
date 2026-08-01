@@ -36,6 +36,24 @@ FFT_COL_CASCADE_LEN := 1
 FFT_ROW_WS          := 2
 FFT_COL_WS          := 2
 
+# FFT/IFFT output shifts. The invariant is
+#     2*FFT_SHIFT + IFFT_ROW_SHIFT + IFFT_COL_SHIFT = 12
+# which fixes the response scale, so weight can be moved between the forward and
+# inverse passes without recalibrating any expected value.
+#
+# DEFAULT 4/2/2 is the REAL design point: validated with s6 at CONV2D_MODE=0 and
+# N_CHANNELS=16 (accum 7728, row IFFT 8805, response 6692, err=0 px, no stage above
+# 27% of cint16). Do not set IFFT_ROW_SHIFT=0 at high channel counts — the row IFFT
+# takes the accumulated spectrum and overflows (~101000) with no attenuation.
+#
+# ECHO-MODE SCENARIOS (s0-s4, CONV2D_MODE=1) need 0/0/12 instead: their magnitudes
+# are ~100, and a forward shift of 4 divides the spectrum by 256 and crushes them to
+# zero. Run them as:
+#   make aiesim_plio CONV2D_MODE=1 SCENARIO=s1 FFT_SHIFT=0 IFFT_ROW_SHIFT=0 IFFT_COL_SHIFT=12
+FFT_SHIFT           ?= 4
+IFFT_ROW_SHIFT      ?= 2
+IFFT_COL_SHIFT      ?= 2
+
 # =========================================================
 # Paths
 # =========================================================
@@ -105,6 +123,15 @@ AIE_FLAGS  += --Xpreproc="-DFFT_COL_CASCADE_LEN=$(FFT_COL_CASCADE_LEN)"
 AIE_FLAGS  += --Xpreproc="-DFFT_ROW_WS=$(FFT_ROW_WS)"
 AIE_FLAGS  += --Xpreproc="-DFFT_COL_WS=$(FFT_COL_WS)"
 AIE_FLAGS  += --Xpreproc="-DITER_CNT=$(ITER_CNT)"
+# FFT/IFFT normalization shifts. IFFT_COL_SHIFT is the consequential one: it was
+# calibrated for BROADBAND spectra and destroys DC-concentrated ones (see the
+# warning in ifft_graph.h). SINGLE SOURCE OF TRUTH — the same values are passed to
+# gen_aiesim_vectors.py in the gen_vectors target, because the expected peak values
+# scale by 2^(12-IFFT_COL_SHIFT). If the graph and the vectors ever disagree about
+# the shift, every expected value is silently wrong.
+AIE_FLAGS  += --Xpreproc="-DFFT_2D_TP_SHIFT=$(FFT_SHIFT)"
+AIE_FLAGS  += --Xpreproc="-DFFT_2D_TP_IFFT_ROW_SHIFT=$(IFFT_ROW_SHIFT)"
+AIE_FLAGS  += --Xpreproc="-DFFT_2D_TP_IFFT_COL_SHIFT=$(IFFT_COL_SHIFT)"
 # conv2d build mode: 0=real conv, 1=echo stream, 2=synthesize without reading the
 # stream (bisect for "is conv2d blocked on readincr?"). See conv2d_kernel.cpp.
 CONV2D_MODE ?= 1
@@ -120,7 +147,10 @@ AIE_FLAGS  += --workdir=$(WORK_DIR)
 GRAPH_SRC_CPP := $(AIE_SRC_REPO)/mosse_graph.cpp
 
 # Test scenario — selects aiesim_data/<SCENARIO>/ for PLIO and GMIO data.
-# Scenarios: s0 (default/baseline), s1 (off-centre), s2 (DC), s3 (imag filter), s4 (Gaussian)
+# Scenarios: s0 (baseline), s1 (off-centre impulse), s2 (constant/DC), s3 (imag filter),
+#            s4 (Gaussian filter), s6 (FULL preprocessing path — Stage A -> conv2d -> B1)
+# s0-s4 are raw-patch scenarios: run them with CONV2D_MODE=1 (echo). Only s6 feeds a
+# Stage-A-preprocessed patch, so it is the only valid scenario for CONV2D_MODE=0.
 SCENARIO         ?= s0
 SCENARIO_DATA_DIR = $(AIE_SRC_REPO)/aiesim_data/$(SCENARIO)
 
@@ -132,7 +162,22 @@ AIE_SIM_FLAGS += -i=$(SCENARIO_DATA_DIR)
 # tile 13_0 = 4096 loads.  Cycle-approximate ISS models cross-tile vector loads
 # at ~20K cycles each → ~82M cycles total.  500M gives a 6× safety margin and
 # won't fire before the 1200s wall-clock kills a genuinely hung simulation.
-AIE_SIM_FLAGS += --simulation-cycle-timeout=500000000
+# Both timeouts scale with N_CHANNELS: the harness now loops cmul_accum once per
+# channel, and cmul is the dominant cost (~82M cycles for 64 invocations). At 16
+# channels that is ~1.3B cycles, which would blow through a fixed 500M cap and the
+# fixed 1200s wall clock and look like a hang rather than a slow run.
+# aiesimulator parses --simulation-cycle-timeout as a 32-bit int, so the value must
+# stay under INT32_MAX (2147483647). 500M x 16 channels = 8e9 is rejected outright:
+#   "the argument ('8000000000') for option '--simulation-cycle-timeout' is invalid"
+# Clamp to 2e9. Estimated need at 16 channels is ~1.3B cycles (~82M per channel), so
+# that leaves ~1.5x margin — thinner than the 6x the single-channel default had. If a
+# long run dies, check the log for the simulator's cycle-timeout message before
+# assuming a hang.
+SIM_CYCLE_MAX     := 2000000000
+SIM_CYCLE_TIMEOUT ?= $(shell v=$$(expr 500000000 \* $(N_CHANNELS)); \
+                             if [ $$v -gt $(SIM_CYCLE_MAX) ]; then echo $(SIM_CYCLE_MAX); else echo $$v; fi)
+SIM_WALL_TIMEOUT  ?= $(shell expr 1200 \* $(N_CHANNELS))
+AIE_SIM_FLAGS += --simulation-cycle-timeout=$(SIM_CYCLE_TIMEOUT)
 
 # =========================================================
 # v++ common flags
@@ -160,6 +205,14 @@ GCC_FLAGS  += -DPATCH_ROWS=$(PATCH_ROWS)
 GCC_FLAGS  += -DPATCH_COLS=$(PATCH_COLS)
 GCC_FLAGS  += -DN_CHANNELS=$(N_CHANNELS)
 GCC_FLAGS  += -DITER_CNT=$(ITER_CNT)
+# Offset of the synthetic test impulse from the tracked position. A correct
+# pipeline must report exactly this displacement; (0,0) would be untestable
+# because it is also what a zero response yields. Sweep to check other offsets:
+#   make application IMPULSE_DR=-20 IMPULSE_DC=31
+IMPULSE_DR ?= 10
+IMPULSE_DC ?= -7
+GCC_FLAGS  += -DIMPULSE_DR=$(IMPULSE_DR)
+GCC_FLAGS  += "-DIMPULSE_DC=($(IMPULSE_DC))"
 GCC_FLAGS  += -DFRAME_ROWS=1080
 GCC_FLAGS  += -DFRAME_COLS=1920
 
@@ -254,9 +307,12 @@ FORCE:
 	@echo '$(FLAGS_FOR_STAMP)' | cmp -s - $@ || echo '$(FLAGS_FOR_STAMP)' > $@
 
 AIE_FLAGS_STAMP   := $(BUILD_DIR)/aie.flagstamp
-SMOKE_FLAGS_STAMP := $(SMOKE_BUILD)/aie.flagstamp
 $(AIE_FLAGS_STAMP):   FLAGS_FOR_STAMP := $(AIE_FLAGS)
-$(SMOKE_FLAGS_STAMP): FLAGS_FOR_STAMP := $(SMOKE_AIE_FLAGS)
+# NOTE: SMOKE_FLAGS_STAMP lives in the PLIO smoke section below — it cannot be
+# defined here. SMOKE_BUILD/SMOKE_AIE_FLAGS are declared ~160 lines further down,
+# and `:=` expands immediately, so defining it here silently produced
+# `/aie.flagstamp` with an empty flag list (the recipe then died on "Permission
+# denied" at the filesystem root, and the SMOKE_SKIP_STREAM guard never armed).
 
 graph: $(LIBADF_A)
 
@@ -284,11 +340,14 @@ gen_vectors:
 	    GEN_PATCH_ROWS=$(PATCH_ROWS) \
 	    GEN_PATCH_COLS=$(PATCH_COLS) \
 	    GEN_PLIO_BEAT_SAMPLES=$(PLIO_BEAT_SAMPLES) \
+	    GEN_IFFT_COL_SHIFT=$(IFFT_COL_SHIFT) \
+	    GEN_IFFT_ROW_SHIFT=$(IFFT_ROW_SHIFT) \
+	    GEN_FFT_SHIFT=$(FFT_SHIFT) \
 	    uv run python3 scripts/gen_aiesim_vectors.py $(AIE_SRC_REPO)/aiesim_data
 
 aiesim: graph gen_vectors
 	-cd $(BUILD_DIR) && AIESIM_SCENARIO_DIR=$(SCENARIO_DATA_DIR) \
-	    timeout 1200 aiesimulator $(AIE_SIM_FLAGS) 2>&1 | tee aiesim.log
+	    timeout $(SIM_WALL_TIMEOUT) aiesimulator $(AIE_SIM_FLAGS) 2>&1 | tee aiesim.log
 	@echo "--- aiesim done (SCENARIO=$(SCENARIO)); check $(BUILD_DIR)/aiesim.log for PASS/FAIL ---"
 
 # Decisive PatchIn test: does the PLIO deliver into conv2d on the AIE side, with
@@ -309,7 +368,7 @@ aiesim: graph gen_vectors
 aiesim_plio: graph gen_vectors
 	rm -f $(SCENARIO_DATA_DIR)/fft_col_in.bin
 	-cd $(BUILD_DIR) && AIESIM_SCENARIO_DIR=$(SCENARIO_DATA_DIR) \
-	    timeout 1200 aiesimulator $(AIE_SIM_FLAGS) 2>&1 | tee aiesim_plio.log
+	    timeout $(SIM_WALL_TIMEOUT) aiesimulator $(AIE_SIM_FLAGS) 2>&1 | tee aiesim_plio.log
 	@echo "--- aiesim_plio done (SCENARIO=$(SCENARIO)); look for 'step 2: fft_row_out done' in $(BUILD_DIR)/aiesim_plio.log ---"
 
 # -------------------------------------------------------
@@ -401,6 +460,45 @@ else
 	@echo "Or run manually: cd $(EMBEDDED_PACKAGE_OUT) && ./launch_hw_emu.sh"
 endif
 
+# -------------------------------------------------------
+# Waveform probing for the MAIN design
+#
+#   make debug_sim                 # re-elaborate this package with trace enabled
+#   make probe_emu                 # run it with the roi_crop AXIS probe armed
+#
+# `debug_sim` must be re-run after every `make package` — packaging regenerates
+# elaborate.sh with --debug off and a fresh (untraced) snapshot.
+#
+# PROBE_CU/PROBE_PORT default to roi_crop_0 / patch_out, i.e. the PL->AIE PLIO
+# link. Override to probe a different kernel:
+#   make probe_emu PROBE_CU=camera_capture_0 PROBE_PORT=<axis port>
+# -------------------------------------------------------
+XSIM_DIR   := $(EMBEDDED_PACKAGE_OUT)/sim/behav_waveform/xsim
+PROBE_CU   ?= roi_crop_0
+PROBE_PORT ?= patch_out
+# roi_crop packs 4 int8 pixels per 32-bit AXIS word (conv2d reads int32), so a
+# full patch is PATCH_ROWS*PATCH_COLS/4 beats — 4096 at 128x128.
+PROBE_BEATS := $(shell echo $$(( $(PATCH_ROWS) * $(PATCH_COLS) / 4 )))
+
+.PHONY: debug_sim probe_emu probe_report
+debug_sim:
+	$(call REELABORATE_WITH_DEBUG,$(XSIM_DIR),$(BUILD_DIR))
+
+probe_emu:
+	rm -f $(XSIM_DIR)/plio_probe.vcd
+	@grep -q -- '--debug typical' $(XSIM_DIR)/elaborate.sh 2>/dev/null || \
+	    { echo "ERROR: snapshot has no trace info — run 'make debug_sim' first"; exit 1; }
+	cd $(EMBEDDED_PACKAGE_OUT) && USER_PRE_SIM_SCRIPT=$(EXEC_SCRIPTS)/plio_probe.tcl \
+	    PROBE_CU=$(PROBE_CU) PROBE_PORT=$(PROBE_PORT) \
+	    ./launch_hw_emu.sh -no-reboot -run-app run_script.sh 2>&1 | tee run_emu.log
+	$(MAKE) probe_report
+
+# Analyse whatever the probe captured. Safe to run on a truncated VCD from a
+# killed emulation — that is the normal case when chasing a hang.
+probe_report:
+	python3 $(PROJECT_REPO)/scripts/analyze_plio_vcd.py \
+	    $(XSIM_DIR)/plio_probe.vcd $(PROBE_BEATS)
+
 # =========================================================
 # PLIO smoke test — minimal PL --AXIS--> PLIO --> AIE --> GMIO --> DDR
 #
@@ -431,6 +529,11 @@ SMOKE_AIE_FLAGS += --Xpreproc="-DSMOKE_N=$(SMOKE_N)"
 SMOKE_SKIP_STREAM ?= 0
 SMOKE_AIE_FLAGS += --Xpreproc="-DSMOKE_SKIP_STREAM=$(SMOKE_SKIP_STREAM)"
 SMOKE_AIE_FLAGS += --workdir=$(SMOKE_WORK)
+
+# Flag stamp for the smoke graph. Must be defined HERE, after SMOKE_BUILD and
+# SMOKE_AIE_FLAGS exist — see the note next to AIE_FLAGS_STAMP.
+SMOKE_FLAGS_STAMP := $(SMOKE_BUILD)/aie.flagstamp
+$(SMOKE_FLAGS_STAMP): FLAGS_FOR_STAMP := $(SMOKE_AIE_FLAGS)
 
 SMOKE_VPP_FLAGS := -t $(TARGET) --platform $(PLATFORM) --save-temps --temp_dir $(SMOKE_BUILD)/_x
 
@@ -481,6 +584,61 @@ smoke_package: $(SMOKE_BUILD)/$(SMOKE_ELF) $(SMOKE_BUILD)/$(SMOKE_XSA) $(SMOKE_L
 	    $(SMOKE_BUILD)/$(SMOKE_XSA) $(SMOKE_LIBADF)
 
 smoke_sd_card: smoke_kernels smoke_graph smoke_xsa smoke_app smoke_package
+
+SMOKE_XSIM_DIR := $(SMOKE_PKG)/sim/behav_waveform/xsim
+
+# =========================================================
+# Waveform-debug re-elaboration (shared by both designs)
+#
+# v++ --package generates elaborate.sh with `xelab --incr --debug off`, so xsim
+# has NO trace information: open_vcd/log_vcd fail with
+#   [Simulator 45-10] The current simulation was compiled without trace information
+# and since simulate.sh passes `-onerror quit`, that error aborts the emulation
+# before Linux even boots. Signal probing is impossible without this step.
+#
+# `--incr` is dropped deliberately: incremental reuse across a changed --debug
+# setting is what produces a snapshot that still lacks trace data.
+#
+# Also: elaborate.sh carries RELATIVE include paths (../../../../prj.ip_user_files/...)
+# that resolve only in the Vivado project tree where v++ originally ran it. In the
+# copied package/ tree they dangle, and xelab then fails to compile the SystemC
+# interface ("vitis_design_CIPS_0_0.h: No such file or directory") while STILL
+# printing "Built simulation snapshot" — a broken snapshot that looks successful.
+# From <xsim dir>, ../../../../ is the build dir, so the prj.* trees are linked there.
+#
+# Must run AFTER the package step (packaging regenerates elaborate.sh, dropping
+# the patch and the fresh snapshot).
+#
+#   $(1) = xsim directory      $(2) = build directory holding _x/
+# =========================================================
+define REELABORATE_WITH_DEBUG
+	@test -f $(1)/elaborate.sh || \
+	    { echo "ERROR: $(1)/elaborate.sh missing — run the package step first"; exit 1; }
+	cp -f $(1)/elaborate.sh $(1)/elaborate.sh.orig
+	sed -i 's/xelab --incr --debug off /xelab --debug typical /g' $(1)/elaborate.sh
+	@grep -q -- '--debug typical' $(1)/elaborate.sh || \
+	    { echo "ERROR: elaborate.sh did not match the expected xelab flags — inspect it by hand"; exit 1; }
+	ln -sfn _x/link/vivado/vpl/prj/prj.ip_user_files $(2)/prj.ip_user_files
+	ln -sfn _x/link/vivado/vpl/prj/prj.gen           $(2)/prj.gen
+	rm -rf $(1)/xsim.dir/tb_behav
+	cd $(1) && ./elaborate.sh 2>&1 | tee elaborate_debug.log
+	@grep -qi "No such file or directory" $(1)/elaborate_debug.log && \
+	    { echo "ERROR: elaboration still has unresolved includes — snapshot is not trustworthy"; exit 1; } || true
+endef
+
+.PHONY: smoke_debug_sim smoke_probe_emu
+smoke_debug_sim:
+	$(call REELABORATE_WITH_DEBUG,$(SMOKE_XSIM_DIR),$(SMOKE_BUILD))
+
+# Run the smoke emulation with the PL->AIE AXIS handshake probe armed.
+# Requires smoke_debug_sim to have run against the current package.
+smoke_probe_emu:
+	rm -f $(SMOKE_XSIM_DIR)/plio_probe.vcd
+	cd $(SMOKE_PKG) && USER_PRE_SIM_SCRIPT=$(EXEC_SCRIPTS)/plio_probe.tcl \
+	    PROBE_CU=stream_src_0 PROBE_PORT=out_r \
+	    ./launch_hw_emu.sh -no-reboot -run-app run_smoke.sh 2>&1 | tee run_smoke.log
+	python3 $(PROJECT_REPO)/scripts/analyze_plio_vcd.py \
+	    $(SMOKE_XSIM_DIR)/plio_probe.vcd $(SMOKE_N)
 
 smoke_run_emu:
 ifeq ($(LAUNCH_HW_EMU_EXEC),1)

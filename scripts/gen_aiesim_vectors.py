@@ -39,7 +39,76 @@ import numpy as np
 PATCH_ROWS = int(os.environ.get('GEN_PATCH_ROWS', 128))
 PATCH_COLS = int(os.environ.get('GEN_PATCH_COLS', 128))
 N = PATCH_ROWS * PATCH_COLS
-IFFT_SHIFT_COL = 12   # matches ifft_graph.h FFT_2D_TP_IFFT_COL_SHIFT
+# MUST match ifft_graph.h FFT_2D_TP_IFFT_COL_SHIFT. The Makefile feeds both from
+# the single IFFT_COL_SHIFT variable — never set them independently, because every
+# expected response peak scales by 2^(REF-shift) and a mismatch silently invalidates
+# all of them.
+IFFT_SHIFT_COL = int(os.environ.get('GEN_IFFT_COL_SHIFT', 12))
+IFFT_SHIFT_ROW = int(os.environ.get('GEN_IFFT_ROW_SHIFT', 0))
+FFT_SHIFT      = int(os.environ.get('GEN_FFT_SHIFT', 0))
+
+# Additive DC-bin loss per cint16 FFT pass, measured at 64-point / TP_SHIFT=0.
+# See the long note in main()'s S2 section for why this is additive, not a gain
+# factor. Module scope because S2_CONST is derived from it.
+FFT_DC_TRUNC = 21
+
+# Response magnitude depends on the TOTAL normalization budget, not on the col shift
+# alone. The forward FFT applies FFT_SHIFT on BOTH the row and col pass, so:
+#
+#     total = 2*FFT_SHIFT + IFFT_SHIFT_ROW + IFFT_SHIFT_COL
+#
+# The scenarios were calibrated at total = 12 (FFT_SHIFT=0, row=0, col=12). Any
+# budget summing to 12 leaves the response scale unchanged — which is exactly how
+# normalization gets moved onto the forward pass (real conv2d output overflows the
+# cint16 FFT at FFT_SHIFT=0) without recalibrating every expected value.
+#
+# Scaling on the col shift alone would be silently wrong: moving the budget to
+# FFT_SHIFT=6 / col=0 would inflate every expected peak by 4096x.
+#
+# accum0 values are NOT response-domain — but they ARE affected by FFT_SHIFT, since
+# they are read after the forward FFT. See the note at the accum0 definitions.
+IFFT_REF_TOTAL   = 12
+IFFT_SHIFT_TOTAL = 2 * FFT_SHIFT + IFFT_SHIFT_ROW + IFFT_SHIFT_COL
+# Shift applied by the INVERSE transform alone (both passes). Distinct from
+# IFFT_SHIFT_TOTAL, which also counts the two forward passes. Use this for values
+# read in the response domain but derived from an accumulator-domain quantity —
+# the forward shift is already baked into the accumulator, so counting it twice
+# would double-scale.
+IFFT_SHIFT_IFFT  = IFFT_SHIFT_ROW + IFFT_SHIFT_COL
+
+
+def scale_peak(v: int) -> int:
+    """Scale a total-budget-12 response magnitude to the configured shift budget."""
+    d = IFFT_REF_TOTAL - IFFT_SHIFT_TOTAL
+    return (int(v) << d) if d >= 0 else (int(v) >> -d)
+
+
+def scale_accum(v: int) -> int:
+    """Scale a pre-IFFT (accumulator-domain) value for the forward FFT shift.
+
+    accum0 is read after both forward passes, so it scales by 2^(2*FFT_SHIFT).
+    """
+    return int(v) >> (2 * FFT_SHIFT)
+
+
+def peak_lo(v: int) -> int:
+    """Loss-tolerant lower bound, scaled to the configured shift.
+
+    A full round trip rounds at every cint16 stage (row-FFT -> col-FFT -> cmul ->
+    row-IFFT -> col-IFFT); measured loss is ~2%, so a bound at the exact ideal
+    value fails. Allow 10%, floor of 1.
+    """
+    return max(1, scale_peak(max(1, (9 * int(v)) // 10)))
+
+
+def peak_hi(v: int) -> int:
+    """Upper bound, scaled and clamped to what cint16 can actually represent."""
+    return min(32767, max(1, scale_peak(int(v))))
+
+
+def peak_sym(v: int) -> int:
+    """Symmetric (+/-) bound magnitude, scaled and clamped to int16."""
+    return min(32767, max(1, scale_peak(abs(int(v)))))
 
 # int8 samples per PLIO beat: plio_128_bits → 16, plio_32_bits → 4.
 PLIO_BEAT_SAMPLES   = int(os.environ.get('GEN_PLIO_BEAT_SAMPLES', 16))
@@ -52,8 +121,12 @@ PLIO_PADDING_FRAMES = 4    # zero-pad frames to prevent PLIO starvation in cycle
 # Hanning window (matches hanning_128.h — DO NOT edit independently)
 # ---------------------------------------------------------------------------
 import math as _math
+# PERIODIC window (denominator PATCH_ROWS), matching _gen_hanning_h in
+# scripts/export_weights.py. Its 2D DFT has exactly 9 non-zero bins, which the
+# host relies on to cancel the pre-window feature mean in the frequency domain.
+# The symmetric (n-1) form leaks across all bins and breaks that identity.
 HANNING = np.array(
-    [round(_math.sin(_math.pi * i / (PATCH_ROWS - 1)) ** 2 * 32767) for i in range(PATCH_ROWS)],
+    [round(_math.sin(_math.pi * i / PATCH_ROWS) ** 2 * 32767) for i in range(PATCH_ROWS)],
     dtype=np.int32
 )
 
@@ -62,22 +135,17 @@ HANNING = np.array(
 # Conv2d kernel simulation (matches conv2d_kernel.cpp exactly)
 # ---------------------------------------------------------------------------
 
-def simulate_conv2d(patch_int8: np.ndarray, weights_64b: bytes) -> np.ndarray:
-    """Apply one channel of conv2d_kernel: 3×3 INT8 MAC + separable Hanning window.
+def conv2d_relu_map(patch_int8: np.ndarray, weights_64b: bytes) -> np.ndarray:
+    """The post-ReLU, pre-window feature map — conv2d_kernel.cpp up to line 226.
 
-    Replicates the integer arithmetic in conv2d_kernel.cpp exactly:
-      acc = bias_acc + Σ_{kr,kc} w[kr][kc] * x_pad[r+kr, c+kc]
-      out16 = saturate_int16(acc >> out_shift)
-      wnd = ((out16 * h_r) >> 15 * h_c) >> 15
-
-    Returns float64 array shape (PATCH_ROWS, PATCH_COLS) representing the
-    real part of the cint16 output (imag = 0 as per the kernel).
+    Split out from simulate_conv2d because Stage B1 needs this map's mean: the
+    host feeds the previous frame's value back as mean_prev.
     """
-    w    = np.frombuffer(weights_64b[0:9], dtype=np.int8).reshape(3, 3).astype(np.int64)
+    w     = np.frombuffer(weights_64b[0:9], dtype=np.int8).reshape(3, 3).astype(np.int64)
     shift = int(weights_64b[9])
     bias  = struct.unpack_from('<i', weights_64b, 10)[0]
 
-    x = patch_int8.reshape(PATCH_ROWS, PATCH_COLS).astype(np.int64)
+    x  = patch_int8.reshape(PATCH_ROWS, PATCH_COLS).astype(np.int64)
     xp = np.pad(x, 1, mode='constant')     # zero-padding = conv padding=1
 
     acc = np.full((PATCH_ROWS, PATCH_COLS), bias, dtype=np.int64)
@@ -85,13 +153,37 @@ def simulate_conv2d(patch_int8: np.ndarray, weights_64b: bytes) -> np.ndarray:
         for kc in range(3):
             acc += w[kr, kc] * xp[kr:kr + PATCH_ROWS, kc:kc + PATCH_COLS]
 
-    out = acc >> shift
-    out = np.clip(out, -32768, 32767)       # saturate_int16
+    shifted = acc >> shift
+    # ReLU + saturate, matching conv2d_kernel.cpp:224-227 exactly. NOTE this
+    # used to be a bare clip(-32768, 32767): the model was missing the ReLU
+    # entirely and so did not describe the kernel it claimed to replicate.
+    out = np.where(shifted > 32767, 32767, np.where(shifted <= 0, 0, shifted))
+    return out.astype(np.int64)
 
-    # Separable Hanning window (Q1.15 integer arithmetic)
+
+def simulate_conv2d(patch_int8: np.ndarray, weights_64b: bytes,
+                    mean_prev: int = 0) -> np.ndarray:
+    """Apply one channel of conv2d_kernel: 3×3 INT8 MAC + ReLU + B1 + Hanning.
+
+    Replicates the integer arithmetic in conv2d_kernel.cpp exactly:
+      acc     = bias_acc + Σ_{kr,kc} w[kr][kc] * x_pad[r+kr, c+kc]
+      out16   = 0 if (acc >> out_shift) <= 0 else saturate_int16(acc >> out_shift)
+      centred = saturate_int16(out16 - mean_prev)          # Stage B1
+      wnd     = (((centred * h_r) >> 15) * h_c) >> 15
+
+    Returns float64 array shape (PATCH_ROWS, PATCH_COLS) representing the
+    real part of the cint16 output (imag = 0 as per the kernel).
+    """
+    out = conv2d_relu_map(patch_int8, weights_64b)
+
+    # Stage B1: remove the previous frame's mean BEFORE the window.
+    centred = np.clip(out - int(mean_prev), -32768, 32767)
+
+    # Separable Hanning window (Q1.15 integer arithmetic).
+    # NumPy >> on negative int64 is arithmetic, matching signed C++ >>.
     h_r = HANNING[:, None]   # [128, 1]
     h_c = HANNING[None, :]   # [1, 128]
-    wnd = (out * h_r) >> 15
+    wnd = (centred * h_r) >> 15
     wnd = (wnd * h_c) >> 15
     wnd = np.clip(wnd, -32768, 32767)
 
@@ -159,6 +251,7 @@ def write_expected_txt(path: str, *,
                        peak_re_lo: int, peak_re_hi: int,
                        peak_im_lo: int, peak_im_hi: int,
                        max_noise: int,
+                       peak_tol: int = 0,
                        skip_snr: bool = False,
                        check_accum0: bool = False,
                        accum0_re: int = 0,
@@ -171,6 +264,10 @@ def write_expected_txt(path: str, *,
         f.write(f"peak_im_lo   {peak_im_lo}\n")
         f.write(f"peak_im_hi   {peak_im_hi}\n")
         f.write(f"max_noise    {max_noise}\n")
+        # Allowed peak displacement in PIXELS (Chebyshev radius). 0 = exact argmax.
+        # Smooth responses have near-flat peaks, so an exact-argmax assertion tests
+        # rounding luck rather than correctness; +/-1 px is the real tracking criterion.
+        f.write(f"peak_tol     {peak_tol}\n")
         f.write(f"skip_snr     {1 if skip_snr else 0}\n")
         f.write(f"check_accum0 {1 if check_accum0 else 0}\n")
         f.write(f"accum0_re    {accum0_re}\n")
@@ -219,20 +316,24 @@ def generate_scenario(out_dir: str, name: str, patch_int8: np.ndarray,
                       H_re: np.ndarray, H_im: np.ndarray,
                       acc_re: np.ndarray, acc_im: np.ndarray,
                       weights_64b: bytes = None,
+                      use_conv2d: bool = False,
+                      mean_prev: int = 0,
                       **kwargs) -> None:
     """Write all files for one scenario into out_dir/name/.
 
-    fft_col_in.bin is always computed from the raw patch (no conv2d simulation).
-    This keeps the expected test values stable and analytically predictable
+    fft_col_in.bin is computed from the raw patch by default (no conv2d
+    simulation). This keeps the expected test values analytically predictable
     regardless of which conv2d weights are in use.
+
+    use_conv2d=True instead routes the patch through simulate_conv2d (3×3 MAC +
+    ReLU + Stage B1 mean subtraction + Hanning window), so fft_col_in.bin
+    represents what the real kernel emits. That makes `make aiesim` agree with
+    `make aiesim_plio` for the scenario instead of testing a different signal.
+    Used by s6.
 
     weights_ch0.bin is written when weights_64b is provided so that mosse_graph.cpp
     can load real weights for the GMIO transfer, exercising the weight-load path even
     though the conv2d output is discarded via the bypass mechanism.
-
-    A future add-on: a separate 'conv2d_check' scenario that uses simulate_conv2d()
-    to generate fft_col_in.bin from the actual kernel output and calibrates the
-    expected values from a first exploratory sim run.
     """
     sdir = os.path.join(out_dir, name)
     os.makedirs(sdir, exist_ok=True)
@@ -240,13 +341,24 @@ def generate_scenario(out_dir: str, name: str, patch_int8: np.ndarray,
     write_cint16_bin(os.path.join(sdir, 'cmul_filter.bin'), H_re, H_im)
     write_cint16_bin(os.path.join(sdir, 'cmul_accum.bin'), acc_re, acc_im)
     write_expected_txt(os.path.join(sdir, 'expected.txt'), **kwargs)
-    # Pre-computed col-FFT input: computed from the raw patch (bypasses PLIO→conv2d→row_FFT).
-    fci_re, fci_im = compute_fft_col_in(patch_int8)   # raw patch, no conv2d
+    # Pre-computed col-FFT input.
+    if use_conv2d:
+        if weights_64b is None:
+            raise ValueError("use_conv2d=True requires weights_64b")
+        x = simulate_conv2d(patch_int8, weights_64b, mean_prev).reshape(PATCH_ROWS, PATCH_COLS)
+        F_T = np.fft.fft(x, axis=1).T.flatten()
+        fci_re, fci_im = F_T.real, F_T.imag
+    else:
+        # Raw patch (bypasses PLIO→conv2d→row_FFT).
+        fci_re, fci_im = compute_fft_col_in(patch_int8)
     write_cint16_bin(os.path.join(sdir, 'fft_col_in.bin'), fci_re, fci_im)
     # Single-channel weight buffer: mosse_graph.cpp loads this instead of zeroing.
+    # Stage B1's mean_prev lives in bytes [18:22] — see conv2d_kernel.h.
     if weights_64b is not None:
+        wb = bytearray(weights_64b)
+        struct.pack_into('<i', wb, 18, int(mean_prev))
         with open(os.path.join(sdir, 'weights_ch0.bin'), 'wb') as f:
-            f.write(weights_64b)
+            f.write(bytes(wb))
     desc = kwargs.get('description', '')
     print(f"  Written: {sdir}/  [{desc}]")
 
@@ -318,19 +430,21 @@ def main():
     AMP = int(os.environ.get('GEN_IMPULSE_AMP', 100))
     assert 1 <= AMP <= 127, "impulse amplitude must fit in int8"
 
-    # Loss-tolerant lower bound: a full round trip rounds at every cint16 stage
-    # (row-FFT -> col-FFT -> cmul -> row-IFFT -> col-IFFT). Measured loss is ~2%,
-    # so a bound of exactly the ideal value fails. Allow 10%, floor of 1.
-    def lo(v):
-        return max(1, (9 * int(v)) // 10)
-
     impulse = np.zeros(N, dtype=np.int8); impulse[0] = AMP
     write_plio_txt(os.path.join(out_dir, "patch_in.txt"), impulse)
 
-    # s2 constant-patch level. The DC bin is (gain * N * S2_CONST), so this cannot
-    # be scaled like the impulse scenarios: at 64x64, S2_CONST=7 puts accum0 near
-    # 19k and 12 would saturate cint16. 7 is the practical maximum here.
-    S2_CONST = 7
+    # s2 constant-patch level. The DC bin is ~N * S2_CONST, so this cannot be
+    # scaled like the impulse scenarios — it must shrink as the patch grows.
+    #
+    # DERIVED, not hardcoded. It used to be a literal 7, calibrated at 64x64,
+    # which made `make gen_vectors` fail outright at the Makefile's DEFAULT
+    # 128x128 geometry: accum0 came out at 111979, well past cint16, and the
+    # assertion below aborted the whole generator. (Pre-existing, and unrelated
+    # to preprocessing — it just went unnoticed because every build on disk was
+    # 64x64.) Inverting the accum0 formula against a target that leaves margin
+    # below 32767 reproduces the calibrated 7 at 64x64 and yields 1 at 128x128.
+    S2_DC_TARGET = 28000
+    S2_CONST = max(1, int((S2_DC_TARGET / PATCH_ROWS + FFT_DC_TRUNC) / PATCH_COLS))
     const_img = np.full(N, S2_CONST, dtype=np.int8)
     write_plio_txt(os.path.join(out_dir, "patch_in_const.txt"), const_img)
 
@@ -358,10 +472,10 @@ def main():
         # Peak is the round-tripped impulse (~AMP) plus the acc_prev contribution.
         # Upper bound kept generous — the acc term's exact IFFT scaling is not
         # analytically pinned down; tighten after a calibration run if desired.
-        peak_re_lo=lo(AMP), peak_re_hi=6 * AMP + 8,
-        peak_im_lo=-3 * AMP, peak_im_hi=3 * AMP,
-        max_noise=AMP // 2, skip_snr=False,
-        check_accum0=True, accum0_re=AMP + 1, accum0_im=0,
+        peak_re_lo=peak_lo(AMP), peak_re_hi=peak_hi(6 * AMP + 8),
+        peak_im_lo=-peak_sym(3 * AMP), peak_im_hi=peak_sym(3 * AMP),
+        max_noise=peak_sym(AMP // 2), skip_snr=False,
+        check_accum0=True, accum0_re=scale_accum(AMP + 1), accum0_im=0,
         description="impulse@(0,0), H*={1,0}, acc={1,0} — baseline accumulation test",
     )
 
@@ -386,13 +500,13 @@ def main():
         # in cint16; measured end-to-end for AMP=100 the peak comes back as 98.
         # A bound of exactly 1*AMP assumes lossless arithmetic and fails by 2%.
         # 0.9*AMP keeps the test meaningful while tolerating the real error.
-        peak_re_lo=lo(AMP), peak_re_hi=6 * AMP,
-        peak_im_lo=-4 * AMP, peak_im_hi=4 * AMP,
+        peak_re_lo=peak_lo(AMP), peak_re_hi=peak_hi(6 * AMP),
+        peak_im_lo=-peak_sym(4 * AMP), peak_im_hi=peak_sym(4 * AMP),
         # 6*AMP would be 6x the peak itself — a threshold that passes even when the
         # peak is buried in noise, i.e. no test at all. Measured noise floor is 2
         # against a peak of 98, so AMP/2 asserts a real >=2:1 SNR with ~25x margin.
-        max_noise=AMP // 2, skip_snr=False,
-        check_accum0=True, accum0_re=AMP, accum0_im=0,   # F[0,0] = sum of patch = AMP
+        max_noise=peak_sym(AMP // 2), skip_snr=False,
+        check_accum0=True, accum0_re=scale_accum(AMP), accum0_im=0,   # F[0,0]=sum=AMP
         description="impulse@(17,42), H*={1,0}, acc={0,0} — spatial localisation",
     )
 
@@ -427,7 +541,7 @@ def main():
     #
     #    21 is measured for 64-point cint16 at TP_SHIFT=0 and will likely differ at
     #    other point sizes — re-measure if PATCH_ROWS/COLS change.
-    FFT_DC_TRUNC = 21
+    #    (FFT_DC_TRUNC is defined at module scope; S2_CONST is derived from it.)
     s2_row_dc = PATCH_COLS * S2_CONST - FFT_DC_TRUNC     # row pass (PATCH_COLS-pt)
     s2_accum0 = PATCH_ROWS * s2_row_dc  - FFT_DC_TRUNC   # col pass (PATCH_ROWS-pt)
     assert s2_accum0 < 32768, \
@@ -444,10 +558,20 @@ def main():
         # shift of 12 assumes it does — see the narrowband note in ifft_graph.h.
         # At S2_CONST=1 the response was exactly 0 (2731 >> 12 == 0); S2_CONST=7
         # lifts it to ~4 so this scenario asserts something again.
-        peak_re_lo=1, peak_re_hi=10,
-        peak_im_lo=-4, peak_im_hi=4,
+        # Uniform response of accum0 >> (IFFT_SHIFT_ROW + IFFT_SHIFT_COL). Derived
+        # from the measured accum0 rather than hardcoded, so it tracks the shift
+        # being swept: at col shift 12 this is ~6, at col shift 6 it would be ~426.
+        #
+        # BOTH IFFT passes shift, so both belong here. This used to use
+        # IFFT_SHIFT_COL alone, which is correct only while IFFT_SHIFT_ROW == 0 —
+        # its default, which is why it never bit. It would silently inflate s2's
+        # expected bounds by 2^IFFT_SHIFT_ROW the moment the row shift is used to
+        # carry part of the budget.
+        peak_re_lo=max(1, (scale_accum(s2_accum0) >> IFFT_SHIFT_IFFT) * 9 // 10),
+        peak_re_hi=min(32767, (scale_accum(s2_accum0) >> IFFT_SHIFT_IFFT) * 2 + 8),
+        peak_im_lo=-peak_sym(4), peak_im_hi=peak_sym(4),
         max_noise=0, skip_snr=True,   # uniform response: all elements ≈ equal
-        check_accum0=True, accum0_re=s2_accum0, accum0_im=0,
+        check_accum0=True, accum0_re=scale_accum(s2_accum0), accum0_im=0,
         description="constant patch, H*={1,0}, acc={0,0} — DC/large-value path",
     )
 
@@ -466,11 +590,11 @@ def main():
         peak_idx=0,
         # Real part must stay near zero *relative to* the signal, not within a
         # fixed +/-4 that scaling would make trivially satisfiable.
-        peak_re_lo=-AMP // 4, peak_re_hi=AMP // 4,
+        peak_re_lo=-peak_sym(AMP // 4), peak_re_hi=peak_sym(AMP // 4),
         # Sign test: must remain strictly negative, magnitude ~AMP.
-        peak_im_lo=-8 * AMP, peak_im_hi=-lo(AMP),
-        max_noise=AMP // 2, skip_snr=False,
-        check_accum0=True, accum0_re=0, accum0_im=-AMP,
+        peak_im_lo=-peak_sym(8 * AMP), peak_im_hi=-peak_lo(AMP),
+        max_noise=peak_sym(AMP // 2), skip_snr=False,
+        check_accum0=True, accum0_re=0, accum0_im=-scale_accum(AMP),
         description="impulse@(0,0), H*={0,1}, acc={0,0} — imaginary cross-term sign",
     )
 
@@ -506,10 +630,90 @@ def main():
         # catch gross breakage. Tighten from a calibration run if s4 is to be a real
         # numerical test.
         peak_re_lo=1, peak_re_hi=32767,
-        peak_im_lo=-2 * H_MAX, peak_im_hi=2 * H_MAX,
+        peak_im_lo=-peak_sym(2 * H_MAX), peak_im_hi=peak_sym(2 * H_MAX),
         max_noise=0, skip_snr=True,        # Gaussian has non-zero off-peak values
-        check_accum0=True, accum0_re=AMP * H_MAX, accum0_im=0,
+        check_accum0=True, accum0_re=scale_accum(AMP * H_MAX), accum0_im=0,
         description=f"impulse@(0,0), H*=Gaussian(σ={sigma:.0f},max={H_MAX}), acc={{0,0}} — per-element flt_local",
+    )
+
+    # ------------------------------------------------------------------
+    # S6 — Full preprocessing path: Stage A output → conv2d → ReLU → B1 → Hanning
+    # ------------------------------------------------------------------
+    # Every other scenario feeds a synthetic patch straight to the FFT and skips
+    # conv2d, so none of them exercise the preprocessing chain at all. s6 is the
+    # one that does:
+    #   - the patch is what roi_crop's Stage A actually emits (log → zero mean →
+    #     unit L2 × ROI_NORM_Q → clip to int8), not an impulse or a constant
+    #   - fft_col_in.bin is generated through simulate_conv2d, so `make aiesim`
+    #     and `make aiesim_plio` are testing the same signal
+    #   - mean_prev is non-zero, so Stage B1's subtraction is live
+    #
+    # H* = {1,0} makes the response a round trip, so the peak must land on the
+    # brightest point of the windowed feature map. That location comes from the
+    # golden model rather than a closed form — the 3×3 MobileNet kernel plus the
+    # Hanning taper has no analytic argmax.
+    ROI_NORM_Q = 32          # must match roi_crop.h
+    s6_rng = np.random.default_rng(20260731)
+    # Blob geometry is a FRACTION of the patch, not absolute pixels. Hardcoding
+    # (44,76) put the target at column 76 — off the edge of a 64×64 patch, so the
+    # scenario silently degraded to "gradient plus the tail of a blob" at any
+    # geometry other than 128×128. Same trap that had S2_CONST calibrated at one
+    # patch size and broken at the other.
+    s6_r = int(round(0.35 * PATCH_ROWS))
+    s6_c = int(round(0.60 * PATCH_COLS))
+    s6_sigma = PATCH_COLS / 9.0
+    rr6 = np.arange(PATCH_ROWS, dtype=np.float64).reshape(-1, 1)
+    cc6 = np.arange(PATCH_COLS, dtype=np.float64).reshape(1, -1)
+    # Target blob + illumination gradient + sensor noise, i.e. something with a
+    # non-trivial mean and contrast — the case a bare impulse never covers.
+    s6_img = (180.0 * np.exp(-(((rr6 - s6_r) ** 2 + (cc6 - s6_c) ** 2) / (2.0 * s6_sigma ** 2)))
+              + 0.12 * cc6 + 0.06 * rr6 + 30.0
+              + 5.0 * s6_rng.standard_normal((PATCH_ROWS, PATCH_COLS)))
+    # Stage A, in float — the fixed-point version is verified separately by the
+    # roi_crop C simulation.
+    s6_log = np.log1p(np.clip(s6_img, 0.0, 255.0))
+    s6_z   = (s6_log - s6_log.mean()) / s6_log.std()
+    s6_patch = np.clip(np.round(s6_z * ROI_NORM_Q), -127, 127).astype(np.int8).flatten()
+
+    # mean_prev = window-weighted mean of the post-ReLU map (see conv2d_kernel.h).
+    # Using the exact current-frame value here; on hardware it lags by one frame
+    # and the host's 9-bin correction absorbs the difference.
+    s6_relu = conv2d_relu_map(s6_patch, weights_ch0)
+    s6_w2d  = np.outer(HANNING, HANNING).astype(np.float64)
+    s6_mean_prev = int(round(float((s6_w2d * s6_relu).sum()) / float(s6_w2d.sum())))
+
+    s6_feat = simulate_conv2d(s6_patch, weights_ch0, s6_mean_prev)
+    s6_peak_idx = int(np.argmax(np.abs(s6_feat)))
+    assert int(np.abs(s6_patch).max()) <= 127, "s6 patch violates the int8 contract"
+
+    # The response is SIGNED once Stage B1 is active, and the peak here is in fact
+    # negative. Every other scenario can assume a positive peak because ReLU left
+    # the feature map non-negative; subtracting the mean makes it bipolar, so the
+    # largest-magnitude point is as likely to be a trough as a crest.
+    # Bounds follow the sign the golden model predicts, which keeps the "response
+    # was not crushed to zero" floor AND additionally asserts the sign is right.
+    s6_peak_negative = bool(s6_feat.flatten()[s6_peak_idx] < 0)
+    s6_re_lo, s6_re_hi = (-32767, -1) if s6_peak_negative else (1, 32767)
+
+    generate_scenario(
+        out_dir, "s6",
+        s6_patch,
+        H_re=ones_re,    H_im=zeros_re,
+        acc_re=zeros_re, acc_im=zeros_re,
+        weights_64b=weights_ch0,
+        use_conv2d=True,
+        mean_prev=s6_mean_prev,
+        peak_idx=s6_peak_idx,
+        # Location and sign are the assertions. Magnitude depends on the shift
+        # settings and the conv weights, neither of which this scenario calibrates.
+        peak_re_lo=s6_re_lo, peak_re_hi=s6_re_hi,
+        peak_im_lo=-32768, peak_im_hi=32767,
+        max_noise=0, skip_snr=True,
+        peak_tol=1,
+        check_accum0=False,
+        description=f"Stage A patch → conv2d+ReLU+B1(mean_prev={s6_mean_prev})+Hanning "
+                    f"— FULL preprocessing path, peak@{s6_peak_idx} "
+                    f"({'negative' if s6_peak_negative else 'positive'})",
     )
 
     # ------------------------------------------------------------------

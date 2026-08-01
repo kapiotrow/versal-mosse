@@ -28,3 +28,4 @@ design/aie_src/aiesim_data/
 v++.package_summary
 a.xclbin
 analyzer_input/
+*__pycache__*

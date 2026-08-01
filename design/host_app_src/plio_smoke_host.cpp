@@ -54,7 +54,23 @@ int main(int argc, char **argv)
     gm_out.async(out_bo, XCL_BO_SYNC_BO_AIE_TO_GMIO, OUT_BYTES, 0);
 
     printf("[smoke] launching stream_src (%d words)\n", SMOKE_N); fflush(stdout);
-    auto run = src(SMOKE_N);
+    // MUST use an explicit set_arg on index 1, NOT `src(SMOKE_N)`.
+    //
+    // kernel.xml for stream_src:
+    //     arg id=0  out   addressQualifier=4  (AXIS stream, port OUT_R)
+    //     arg id=1  n     addressQualifier=0  (scalar, s_axi_control offset 0x10)
+    //
+    // xrt::kernel::operator() assigns its parameters POSITIONALLY starting at
+    // index 0, and the AXIS port still occupies index 0 even though it is not a
+    // settable register. So `src(SMOKE_N)` wrote 256 into the stream port and left
+    // `n` at its reset value of 0. The kernel then ran a zero-trip loop: measured
+    // in hw_emu, ap_done asserted 3 clock cycles after ap_start and out_r_TVALID
+    // NEVER asserted, while the AIE side held TREADY high the whole time. That is
+    // the real cause of the "PL->AIE PLIO delivers nothing / 0.00 MBps" symptom —
+    // the PLIO was always fine, the producer simply never produced.
+    xrt::run run(src);
+    run.set_arg(1, (uint32_t)SMOKE_N);
+    run.start();
     run.wait();
     printf("[smoke] stream_src done\n"); fflush(stdout);
 

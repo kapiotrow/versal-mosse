@@ -66,6 +66,12 @@ struct ScenarioExpected {
     int peak_re_lo, peak_re_hi;
     int peak_im_lo, peak_im_hi;
     int max_noise;
+    // Allowed peak displacement in PIXELS (Chebyshev radius). 0 = exact argmax.
+    // Smooth responses (e.g. s6's) have near-flat peaks: for a sigma=8 Gaussian the
+    // true maximum exceeded its neighbour by 0.78%, i.e. under 1 LSB at low
+    // amplitude, so the argmax was decided by rounding. Exact equality there tests
+    // luck, not correctness; +/-1 px is what a tracker actually needs.
+    int peak_tol;
     int skip_snr;
     int check_accum0;
     int accum0_re, accum0_im;
@@ -83,6 +89,7 @@ static bool load_expected(const char *path, ScenarioExpected *e)
     e->peak_re_lo = 1; e->peak_re_hi = 100;
     e->peak_im_lo = -10; e->peak_im_hi = 10;
     e->max_noise  = 4;
+    e->peak_tol   = 0;   // default: exact argmax, preserving s0-s4 behaviour
     e->skip_snr   = 0;
     e->check_accum0 = 0;
     e->accum0_re  = 0; e->accum0_im = 0;
@@ -98,6 +105,7 @@ static bool load_expected(const char *path, ScenarioExpected *e)
         if (!strcmp(key, "peak_im_lo"))   e->peak_im_lo   = val;
         if (!strcmp(key, "peak_im_hi"))   e->peak_im_hi   = val;
         if (!strcmp(key, "max_noise"))    e->max_noise     = val;
+        if (!strcmp(key, "peak_tol"))     e->peak_tol      = val;
         if (!strcmp(key, "skip_snr"))     e->skip_snr      = val;
         if (!strcmp(key, "check_accum0")) e->check_accum0  = val;
         if (!strcmp(key, "accum0_re"))    e->accum0_re     = val;
@@ -139,6 +147,9 @@ int main(int argc, char **argv)
     // (and what it implies) makes that obvious from the log alone.
 #ifndef CONV2D_ECHO_TEST
 #  define CONV2D_ECHO_TEST (-1)
+#endif
+#ifndef N_CHANNELS
+#  define N_CHANNELS 1
 #endif
     printf("[aiesim] conv2d build mode: CONV2D_ECHO_TEST=%d  (%s)\n",
            (int)CONV2D_ECHO_TEST,
@@ -214,16 +225,9 @@ int main(int argc, char **argv)
            exp.peak_im_lo, exp.peak_im_hi, exp.max_noise,
            exp.skip_snr ? "  (SNR check skipped)" : ""); fflush(stdout);
 
-    // Build combined cmul input: interleave filter and accum_prev by chunk.
+    // cmul_in ([filter | accum_prev] interleaved by chunk) is packed inside the
+    // channel loop in step 4/5, because accum_prev changes on every channel.
     memset(cmul_in_buf, 0, CMUL_IN_BYTES);
-    for (int c = 0; c < N_CHUNKS; ++c) {
-        memcpy((int8_t*)cmul_in_buf + (size_t)c * 2 * CHUNK_BYTES,
-               (int8_t*)filter_buf  + (size_t)c * CHUNK_BYTES,
-               CHUNK_BYTES);
-        memcpy((int8_t*)cmul_in_buf + (size_t)c * 2 * CHUNK_BYTES + CHUNK_BYTES,
-               (int8_t*)accum_prev_buf + (size_t)c * CHUNK_BYTES,
-               CHUNK_BYTES);
-    }
 
     mosse_graph.init();
 
@@ -393,17 +397,76 @@ int main(int argc, char **argv)
     constexpr int CMUL_INV_BYTES  = PATCH_COLS * FFT_COL_WS * 4;       // 1024 B per invocation
     constexpr int CMUL_IN_INV_BYTES = CMUL_INV_BYTES * 2;               // 2048 B (filter+accum)
     constexpr int N_CMUL_INV      = PATCH_ROWS / FFT_COL_WS;            // 64
-    printf("[aiesim] step 4/5: waiting for accum_out (%d × %d B)...\n",
-           N_CMUL_INV, CMUL_INV_BYTES); fflush(stdout);
-    for (int inv = 0; inv < N_CMUL_INV; ++inv) {
-        mosse_graph.gmio_accum_out.aie2gm_nb(
-            (int8_t*)accum_buf    + inv * CMUL_INV_BYTES,   CMUL_INV_BYTES);
-        mosse_graph.gmio_cmul_in.gm2aie_nb(
-            (int8_t*)cmul_in_buf  + inv * CMUL_IN_INV_BYTES, CMUL_IN_INV_BYTES);
-        mosse_graph.gmio_fft_col_in.gm2aie_nb(
-            (int8_t*)fft_scratch  + inv * CMUL_INV_BYTES,   CMUL_INV_BYTES);
-        mosse_graph.gmio_accum_out.wait();
+    // ----------------------------------------------------------------
+    // Channel loop.
+    //
+    // The real host processes channels serially, re-running cmul_accum per channel
+    // and carrying the accumulator through DDR. This harness had NO channel loop at
+    // all, so N_CHANNELS was never exercised and the cint16 DDR accumulator's
+    // headroom was pure speculation.
+    //
+    // SCOPE — this measures ACCUMULATOR HEADROOM, not 16 distinct channels:
+    // the same col-FFT spectrum and the same filter are reused for every channel,
+    // because producing 16 genuinely different spectra would need 16 patches through
+    // conv2d (16x the PLIO stimulus and weights). That is deliberate and it makes
+    // the test STRONGER for this purpose: with identical channels the answer is known
+    // in closed form — after channel k the accumulator must be exactly (k+1)x the
+    // single-channel value — so any deviation is overflow or arithmetic error, not
+    // an artifact of channel-to-channel variation.
+    //
+    // Real filters differ per channel and partially cancel, so this is the COHERENT
+    // WORST CASE for headroom. If it fits here, it fits in practice.
+    printf("[aiesim] step 4/5: %d channel(s) x %d invocations x %d B\n",
+           (int)N_CHANNELS, N_CMUL_INV, CMUL_INV_BYTES); fflush(stdout);
+    if (N_CHANNELS > 1)
+        printf("[aiesim]   NOTE: scenario expectations are calibrated for ONE channel;\n"
+               "[aiesim]         with N_CHANNELS>1 read the per-channel table, not PASS/FAIL.\n");
+
+    int  first_sat_ch = -1;
+    for (int ch = 0; ch < (int)N_CHANNELS; ++ch) {
+
+        // Pack [filter | accum_prev] per chunk. Channel 0 uses the scenario's
+        // accum_prev from file; later channels carry forward the previous result.
+        const int16_t *acc_prev = (ch == 0) ? accum_prev_buf : accum_buf;
+        for (int c = 0; c < N_CHUNKS; ++c) {
+            memcpy((int8_t*)cmul_in_buf + (size_t)c * 2 * CHUNK_BYTES,
+                   (const int8_t*)filter_buf + (size_t)c * CHUNK_BYTES, CHUNK_BYTES);
+            memcpy((int8_t*)cmul_in_buf + (size_t)c * 2 * CHUNK_BYTES + CHUNK_BYTES,
+                   (const int8_t*)acc_prev + (size_t)c * CHUNK_BYTES, CHUNK_BYTES);
+        }
+
+        for (int inv = 0; inv < N_CMUL_INV; ++inv) {
+            mosse_graph.gmio_accum_out.aie2gm_nb(
+                (int8_t*)accum_buf    + inv * CMUL_INV_BYTES,   CMUL_INV_BYTES);
+            mosse_graph.gmio_cmul_in.gm2aie_nb(
+                (int8_t*)cmul_in_buf  + inv * CMUL_IN_INV_BYTES, CMUL_IN_INV_BYTES);
+            mosse_graph.gmio_fft_col_in.gm2aie_nb(
+                (int8_t*)fft_scratch  + inv * CMUL_INV_BYTES,   CMUL_INV_BYTES);
+            mosse_graph.gmio_accum_out.wait();
+        }
+
+        // Per-channel saturation, not just at the end: a later channel can pull a
+        // clipped element back below the rail, so a final-state-only check would
+        // miss that information was already lost.
+        int ch_sat = 0, ch_max = 0;
+        for (int i = 0; i < PATCH_ELEMS; ++i) {
+            int re = accum_buf[i*2], im = accum_buf[i*2 + 1];
+            if (re == 32767 || re == -32768 || im == 32767 || im == -32768) ++ch_sat;
+            int a = (re < 0 ? -re : re) + (im < 0 ? -im : im);
+            if (a > ch_max) ch_max = a;
+        }
+        if (ch_sat && first_sat_ch < 0) first_sat_ch = ch;
+
+        // With identical channels accum[0] must be exactly (ch+1)x the ch-0 value.
+        printf("[aiesim]   ch %2d: accum[0]={%d,%d}  max|.|=%d  rails=%d%s\n",
+               ch, accum_buf[0], accum_buf[1], ch_max, ch_sat,
+               ch_sat ? "   <-- SATURATED" : "");
+        fflush(stdout);
     }
+    if (first_sat_ch >= 0)
+        printf("[aiesim] HEADROOM EXCEEDED: first saturation at channel %d of %d — the "
+               "cint16 DDR accumulator cannot hold this many channels\n",
+               first_sat_ch, (int)N_CHANNELS);
     printf("[aiesim] step 4/5: accum_out done\n"); fflush(stdout);
 
     printf("[aiesim] accum_out[0..3]:   {%d,%d} {%d,%d} {%d,%d} {%d,%d}\n",
@@ -494,6 +557,40 @@ int main(int argc, char **argv)
            fft_scratch[4], fft_scratch[5],
            fft_scratch[6], fft_scratch[7]);
 
+    // ----------------------------------------------------------------
+    // Row-IFFT saturation — THE BLIND SPOT.
+    //
+    // accum_out and response are both checked, but this stage sits BETWEEN them
+    // and was unchecked, so a failure here was invisible from either end. That is
+    // exactly what happened at N_CHANNELS=16 with budget 3/0/6: the accumulator
+    // was clean (30864, rails=0) and the response showed no rails, yet the row
+    // IFFT was running at ~101000 against a 32767 ceiling. The only visible
+    // symptom was the response scaling 8.8x instead of 16x and the peak drifting
+    // 6 px — neither of which names the guilty stage.
+    //
+    // The row IFFT is the natural place to overflow: its input is the ACCUMULATED
+    // spectrum (N_CHANNELS x one channel) and IFFT_ROW_SHIFT defaults to 0, so it
+    // takes the full summation growth of the pass with no attenuation.
+    bool ifft_row_sat_pass = true;
+    {
+        int sat = 0, mx = 0;
+        for (int i = 0; i < PATCH_ELEMS; ++i) {
+            int re = fft_scratch[i*2], im = fft_scratch[i*2 + 1];
+            if (re == 32767 || re == -32768 || im == 32767 || im == -32768) ++sat;
+            int a = (re < 0 ? -re : re) + (im < 0 ? -im : im);
+            if (a > mx) mx = a;
+        }
+        printf("[aiesim] ifft_row_out range: max|.|=%d  rails=%d%s\n", mx, sat,
+               sat ? "   <-- SATURATED" : "");
+        if (sat) {
+            ifft_row_sat_pass = false;
+            printf("[aiesim] ROW-IFFT SATURATED: %d elements clipped — raise "
+                   "IFFT_ROW_SHIFT (or FFT_SHIFT) and lower IFFT_COL_SHIFT to keep "
+                   "2*FFT_SHIFT + IFFT_ROW + IFFT_COL = 12\n", sat);
+        }
+        fflush(stdout);
+    }
+
     // Step 7: APU transpose for IFFT
     transpose_inplace(fft_scratch, PATCH_ROWS, PATCH_COLS);
 
@@ -518,6 +615,42 @@ int main(int argc, char **argv)
            resp_buf[6], resp_buf[7]);
 
     // ----------------------------------------------------------------
+    // Response saturation + dynamic-range report.
+    //
+    // The col IFFT shift (FFT_2D_TP_IFFT_COL_SHIFT) trades two failure modes off
+    // against each other, and BOTH are silent without this:
+    //   shift too HIGH -> a concentrated spectrum is divided into nothing; the
+    //                     response goes all-zero and the argmax is meaningless.
+    //                     (This is what shift=12 does to scenario s2.)
+    //   shift too LOW  -> the response clips at the int16 rails; the peak flattens
+    //                     into a plateau and the argmax moves to whichever clipped
+    //                     element happens to come first.
+    // Peak location can look "OK" in the second case purely by tie-breaking, so the
+    // rail count is the real signal when sweeping the shift.
+    bool resp_sat_pass = true;
+    {
+        int sat = 0, nz = 0, peak_abs = 0;
+        for (int i = 0; i < PATCH_ELEMS; ++i) {
+            int re = resp_buf[i*2], im = resp_buf[i*2 + 1];
+            if (re ==  32767 || re == -32768 || im == 32767 || im == -32768) ++sat;
+            if (re || im) ++nz;
+            int a = (re < 0 ? -re : re) + (im < 0 ? -im : im);
+            if (a > peak_abs) peak_abs = a;
+        }
+        printf("[aiesim] response range: %d/%d non-zero, max|.|=%d\n",
+               nz, (int)PATCH_ELEMS, peak_abs);
+        if (sat) {
+            resp_sat_pass = false;
+            printf("[aiesim] response SATURATED: %d elements at the int16 rails — "
+                   "IFFT col shift too LOW for this input\n", sat);
+        }
+        if (nz == 0)
+            printf("[aiesim] response ALL ZERO — IFFT col shift too HIGH for this "
+                   "spectrum (concentrated spectra get no summation gain)\n");
+        fflush(stdout);
+    }
+
+    // ----------------------------------------------------------------
     // Optional: verify accum_out[0] against expected
     // ----------------------------------------------------------------
     // Tolerance, not equality. This is a cint16 pipeline: the value crosses two
@@ -534,19 +667,35 @@ int main(int argc, char **argv)
         const int ACCUM0_TOL_PCT = 10;
         int got_re = accum_buf[0], got_im = accum_buf[1];
 
-        int tol_re = exp.accum0_re * ACCUM0_TOL_PCT / 100;
-        int tol_im = exp.accum0_im * ACCUM0_TOL_PCT / 100;
+        // Scale the single-channel expectation by the channel count.
+        //
+        // Valid because this harness reuses ONE spectrum and ONE filter for every
+        // channel (see the channel-loop note), so the accumulator is exactly N x the
+        // single-channel result. That is not an assumption — it was measured:
+        // accum[0] ran 95, 190, 285, 380 over 4 channels, and max|.| ran
+        // 143, 286, 429, 572. Perfectly linear, no drift.
+        //
+        // Without this, every multi-channel run reports a spurious accum0 FAIL and
+        // the check becomes noise that gets ignored — which is exactly how real
+        // failures slip past.
+        int exp_re = exp.accum0_re * (int)N_CHANNELS;
+        int exp_im = exp.accum0_im * (int)N_CHANNELS;
+
+        int tol_re = exp_re * ACCUM0_TOL_PCT / 100;
+        int tol_im = exp_im * ACCUM0_TOL_PCT / 100;
         if (tol_re < 0) tol_re = -tol_re;
         if (tol_im < 0) tol_im = -tol_im;
         if (tol_re < 2) tol_re = 2;
         if (tol_im < 2) tol_im = 2;
 
-        int d_re = got_re - exp.accum0_re; if (d_re < 0) d_re = -d_re;
-        int d_im = got_im - exp.accum0_im; if (d_im < 0) d_im = -d_im;
+        int d_re = got_re - exp_re; if (d_re < 0) d_re = -d_re;
+        int d_im = got_im - exp_im; if (d_im < 0) d_im = -d_im;
 
         bool acc0_ok = (d_re <= tol_re) && (d_im <= tol_im);
-        printf("[aiesim] accum_out[0]: got={%d,%d}  expected={%d,%d} +/-{%d,%d}  %s\n",
-               got_re, got_im, exp.accum0_re, exp.accum0_im, tol_re, tol_im,
+        printf("[aiesim] accum_out[0]: got={%d,%d}  expected={%d,%d} +/-{%d,%d}"
+               "  (%d ch x {%d,%d})  %s\n",
+               got_re, got_im, exp_re, exp_im, tol_re, tol_im,
+               (int)N_CHANNELS, exp.accum0_re, exp.accum0_im,
                acc0_ok ? "OK" : "FAIL"); fflush(stdout);
         acc0_pass = acc0_ok;
         if (!acc0_ok) {
@@ -588,29 +737,53 @@ int main(int argc, char **argv)
     int resp_peak_im = resp_buf[dom_idx * 2 + 1];
 
     // Load per-scenario checks
-    bool loc_ok  = (dom_idx == exp.peak_idx);
-    bool norm_ok = (resp_peak_re >= exp.peak_re_lo) && (resp_peak_re <= exp.peak_re_hi);
-    bool imag_ok = (resp_peak_im >= exp.peak_im_lo) && (resp_peak_im <= exp.peak_im_hi);
-    bool snr_ok  = exp.skip_snr || (max_noise <= exp.max_noise);
+    // Location within peak_tol pixels (Chebyshev distance in the 2-D map, NOT a
+    // flat-index difference — a 1-row error is 64 in flat index but 1 pixel).
+    int dom_r = dom_idx / PATCH_COLS,       dom_c = dom_idx % PATCH_COLS;
+    int exp_r = exp.peak_idx / PATCH_COLS,  exp_c = exp.peak_idx % PATCH_COLS;
+    int dr = dom_r - exp_r; if (dr < 0) dr = -dr;
+    int dc = dom_c - exp_c; if (dc < 0) dc = -dc;
+    int loc_err  = (dr > dc) ? dr : dc;
+    bool loc_ok  = (loc_err <= exp.peak_tol);
+    // Response magnitude scales with the channel count for the same reason accum0
+    // does — identical channels accumulate linearly (measured: peak 98 at 1 ch,
+    // 394 at 4 ch). Scale the bounds so a multi-channel run is a real test rather
+    // than a guaranteed FAIL. Clamped to what cint16 can represent.
+    auto sc = [](int v) {
+        long s = (long)v * (long)N_CHANNELS;
+        if (s >  32767) return  32767;
+        if (s < -32768) return -32768;
+        return (int)s;
+    };
+    int re_lo = sc(exp.peak_re_lo), re_hi = sc(exp.peak_re_hi);
+    int im_lo = sc(exp.peak_im_lo), im_hi = sc(exp.peak_im_hi);
+    int noise_lim = sc(exp.max_noise);
+
+    bool norm_ok = (resp_peak_re >= re_lo) && (resp_peak_re <= re_hi);
+    bool imag_ok = (resp_peak_im >= im_lo) && (resp_peak_im <= im_hi);
+    bool snr_ok  = exp.skip_snr || (max_noise <= noise_lim);
 
     printf("\n=== scenario result ===\n");
-    printf("  Peak:  {%d,%d} at flat index %d (r=%d, c=%d)  expected idx=%d  %s\n",
-           resp_peak_re, resp_peak_im, dom_idx,
-           dom_idx / PATCH_COLS, dom_idx % PATCH_COLS,
-           exp.peak_idx, loc_ok ? "OK" : "FAIL");
-    printf("  re in [%d,%d]: %s\n", exp.peak_re_lo, exp.peak_re_hi, norm_ok?"OK":"FAIL");
-    printf("  im in [%d,%d]: %s\n", exp.peak_im_lo, exp.peak_im_hi, imag_ok?"OK":"FAIL");
+    printf("  Peak:  {%d,%d} at flat index %d (r=%d, c=%d)  expected idx=%d (r=%d, c=%d)"
+           "  err=%d px (tol=%d)  %s\n",
+           resp_peak_re, resp_peak_im, dom_idx, dom_r, dom_c,
+           exp.peak_idx, exp_r, exp_c,
+           loc_err, exp.peak_tol, loc_ok ? "OK" : "FAIL");
+    printf("  re in [%d,%d]: %s\n", re_lo, re_hi, norm_ok?"OK":"FAIL");
+    printf("  im in [%d,%d]: %s\n", im_lo, im_hi, imag_ok?"OK":"FAIL");
     if (!exp.skip_snr)
         printf("  Noise: max |non-peak| = %d (threshold = %d)  %s\n",
-               max_noise, exp.max_noise, snr_ok?"OK":"FAIL");
+               max_noise, noise_lim, snr_ok?"OK":"FAIL");
     else
         printf("  Noise: check skipped (uniform/broad response expected)\n");
-    printf("  location=%s  normalization=%s  imag=%s  SNR=%s  accum0=%s  saturation=%s\n",
+    printf("  location=%s  normalization=%s  imag=%s  SNR=%s  accum0=%s  "
+           "accum_sat=%s  resp_sat=%s  ifftrow_sat=%s\n",
            loc_ok?"OK":"FAIL", norm_ok?"OK":"FAIL",
            imag_ok?"OK":"FAIL", snr_ok?"OK":"FAIL", acc0_pass?"OK":"FAIL",
-           sat_pass?"OK":"FAIL");
+           sat_pass?"OK":"FAIL", resp_sat_pass?"OK":"FAIL", ifft_row_sat_pass?"OK":"FAIL");
 
-    bool pass = loc_ok && norm_ok && imag_ok && snr_ok && acc0_pass && sat_pass;
+    bool pass = loc_ok && norm_ok && imag_ok && snr_ok && acc0_pass
+                && sat_pass && resp_sat_pass && ifft_row_sat_pass;
     printf("  OVERALL: %s\n\n", pass ? "PASS" : "FAIL");
 
     if (!norm_ok && resp_peak_re > 100)

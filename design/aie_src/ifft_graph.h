@@ -36,8 +36,25 @@ namespace dsplib = xf::dsp::aie;
 // For 128-point: log2(128) = 7; total = 14.
 // Apply entire shift on col pass so row output stays at full precision.
 // ---------------------------------------------------------------
-#define FFT_2D_TP_IFFT_ROW_SHIFT   0    // no shift on row IFFT
-#define FFT_2D_TP_IFFT_COL_SHIFT  12    // empirically calibrated: row-IFFT gives ~43 per row; col raw acc ~5120; 5120>>12=1
+// Both overridable from the Makefile (IFFT_ROW_SHIFT / IFFT_COL_SHIFT) so the
+// normalization can be swept without editing source.
+//
+// WARNING — the col shift is NOT a free parameter. It was calibrated so that a
+// BROADBAND (impulse) spectrum round-trips to 1, which assumes the IFFT gets ~64x
+// summation gain from energy spread across all bins. A narrowband / DC-concentrated
+// spectrum gets no such gain, and shift=12 then destroys it outright: scenario s2
+// (constant patch, DC bin only) produced an identically ZERO response.
+// Real image patches are DC-dominated, so this matters beyond the tests.
+//
+// If you change this, regenerate the aiesim vectors with the SAME value —
+// gen_aiesim_vectors.py scales every expected peak by 2^(12-shift). The Makefile
+// feeds both from one variable; do not set them independently.
+#ifndef FFT_2D_TP_IFFT_ROW_SHIFT
+#  define FFT_2D_TP_IFFT_ROW_SHIFT 0    // no shift on row IFFT
+#endif
+#ifndef FFT_2D_TP_IFFT_COL_SHIFT
+#  define FFT_2D_TP_IFFT_COL_SHIFT 12   // empirically calibrated for BROADBAND input only
+#endif
 
 #define FFT_2D_TP_IFFT_NIFFT       0    // 0 = inverse FFT
 

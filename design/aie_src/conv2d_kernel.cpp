@@ -115,6 +115,8 @@ void conv2d_kernel(
     //   [0:9]   int8  w[KSIZE][KSIZE]   9 bytes, row-major
     //   [9]     int8  out_shift
     //   [10:14] int32 bias_acc (LE)
+    //   [14:18] float32 dequant_scale (LE)  — host-only, unused here
+    //   [18:22] int32 mean_prev (LE)        — Stage B1
     // ----------------------------------------------------------------
     const int8_t *wb = weights.data();
 
@@ -131,68 +133,84 @@ void conv2d_kernel(
     bias |= (int32_t)(uint8_t)wb[12] << 16;
     bias |= (int32_t)(uint8_t)wb[13] << 24;
 
-    // ----------------------------------------------------------------
-    // 3-row circular line buffer.
-    // Each row stores [0-pad | PATCH_COLS pixels | 0-pad] → PATCH_COLS+2 bytes.
-    // Initialised to 0: the zero-pad bytes remain 0 throughout, providing
-    // implicit zero-padding at the left and right borders.
-    // ----------------------------------------------------------------
-    int8_t buf[3][PATCH_COLS + 2];
-    memset(buf, 0, sizeof(buf));
+    // Stage B1: previous frame's post-ReLU feature mean for this channel.
+    // Subtracted after the ReLU and before the window. Zero on the first frame,
+    // which simply degrades to the old behaviour for that one frame.
+    int32_t mean_prev;
+    mean_prev  = (int32_t)(uint8_t)wb[18];
+    mean_prev |= (int32_t)(uint8_t)wb[19] << 8;
+    mean_prev |= (int32_t)(uint8_t)wb[20] << 16;
+    mean_prev |= (int32_t)(uint8_t)wb[21] << 24;
 
     // ----------------------------------------------------------------
-    // Phase 1: read first row — no output yet (need the row above row 0
-    // to form a 3-row window; it is implicitly all-zeros from memset).
+    // STATEFUL ACROSS INVOCATIONS.
+    //
+    // The graph fires this kernel once per row-FFT input window
+    // (CONV_OUT_CHUNK samples = ROWS_PER_INV rows), NOT once per patch. The
+    // previous implementation assumed one invocation = one whole patch: it read
+    // all PATCH_ROWS rows and emitted PATCH_ELEMS samples via writeincr() on a
+    // stream. That stopped compiling when feature_out became an output_buffer
+    // (writeincr has no buffer overload), and it had never been updated for the
+    // chunked firing model — emitting PATCH_ELEMS samples into a CONV_OUT_CHUNK
+    // buffer would have overrun it regardless. So MODE=0 has been dead code since
+    // the stream->window adapter was removed from mosse_graph.h.
+    //
+    // The 3-row sliding window and the row counters therefore have to persist
+    // between firings, in tile-local static storage.
     // ----------------------------------------------------------------
-    // Read one packed int32 (4 int8 pixels, little-endian) per iteration.
-    for (int c = 0; c < PATCH_COLS; c += 4)
-    chess_prepare_for_pipelining
-    chess_loop_range(PATCH_COLS / 4, PATCH_COLS / 4)
-    {
-        int32_t w = readincr(patch_in);
-        buf[0][c + 1] = (int8_t)( w        & 0xFF);
-        buf[0][c + 2] = (int8_t)((w >>  8) & 0xFF);
-        buf[0][c + 3] = (int8_t)((w >> 16) & 0xFF);
-        buf[0][c + 4] = (int8_t)((w >> 24) & 0xFF);
+    constexpr int ROWS_PER_INV = CONV_OUT_CHUNK / PATCH_COLS;
+    static_assert(CONV_OUT_CHUNK % PATCH_COLS == 0,
+                  "output window must be a whole number of rows");
+    static_assert(PATCH_ROWS % ROWS_PER_INV == 0,
+                  "patch must divide evenly into output windows");
+
+    // buf[r % 3] holds input row r. zrow supplies the implicit zero rows above
+    // row 0 and below row PATCH_ROWS-1 (padding=1, matching the model's 'same'
+    // convolution). The [0] and [PATCH_COLS+1] slots are the left/right zero pad.
+    static int8_t buf[3][PATCH_COLS + 2];
+    static int8_t zrow[PATCH_COLS + 2];
+    static int    rows_read = 0;   // input rows consumed from patch_in this patch
+    static int    rows_out  = 0;   // output rows produced this patch
+
+    if (rows_out == 0) {           // first firing of a new patch
+        memset(buf,  0, sizeof(buf));
+        memset(zrow, 0, sizeof(zrow));
+        rows_read = 0;
     }
 
-    // ----------------------------------------------------------------
-    // Phase 2: main loop — read row r, output row r-1.
-    //
-    // At iteration r (r = 1 .. PATCH_ROWS-1):
-    //   cur  = r % 3          — slot we write into (row r)
-    //   mid  = (r + 2) % 3   — slot holding row r-1  (output row)
-    //   top  = (r + 1) % 3   — slot holding row r-2
-    //   bot  = cur            — slot we just wrote (row r = "row below" output row)
-    // ----------------------------------------------------------------
-    for (int r = 1; r < PATCH_ROWS; r++) {
+    cint16_t *out = feature_out.data();
+    int o = 0;
 
-        const int cur = r % 3;
-        const int top = (r + 1) % 3;   // row r-2
-        const int mid = (r + 2) % 3;   // row r-1  (output row index = r-1)
-        // bot = cur (row r)
+    for (int k = 0; k < ROWS_PER_INV; ++k) {
 
-        // -- Read row r --
-        buf[cur][0]             = 0;    // already 0, written for clarity
-        for (int c = 0; c < PATCH_COLS; c += 4)
-        chess_prepare_for_pipelining
-        chess_loop_range(PATCH_COLS / 4, PATCH_COLS / 4)
-        {
-            int32_t w = readincr(patch_in);
-            buf[cur][c + 1] = (int8_t)( w        & 0xFF);
-            buf[cur][c + 2] = (int8_t)((w >>  8) & 0xFF);
-            buf[cur][c + 3] = (int8_t)((w >> 16) & 0xFF);
-            buf[cur][c + 4] = (int8_t)((w >> 24) & 0xFF);
+        const int out_r = rows_out;
+
+        // Read forward until the row BELOW out_r is in the buffer. Rows arrive in
+        // order, so the three slots then hold out_r-1, out_r, out_r+1.
+        // Read counts per firing are uneven (3 rows for the first, 1 for the last)
+        // but total exactly PATCH_ROWS over the patch.
+        while (rows_read <= out_r + 1 && rows_read < PATCH_ROWS) {
+            int8_t *dst = buf[rows_read % 3];
+            dst[0] = 0;                       // left zero pad
+            for (int c = 0; c < PATCH_COLS; c += 4)
+            chess_prepare_for_pipelining
+            chess_loop_range(PATCH_COLS / 4, PATCH_COLS / 4)
+            {
+                int32_t w = readincr(patch_in);
+                dst[c + 1] = (int8_t)( w        & 0xFF);
+                dst[c + 2] = (int8_t)((w >>  8) & 0xFF);
+                dst[c + 3] = (int8_t)((w >> 16) & 0xFF);
+                dst[c + 4] = (int8_t)((w >> 24) & 0xFF);
+            }
+            dst[PATCH_COLS + 1] = 0;          // right zero pad
+            ++rows_read;
         }
-        buf[cur][PATCH_COLS + 1] = 0;
 
-        // -- Output row r-1 --
-        const int out_r = r - 1;
+        const int8_t *row_top = (out_r >= 1)              ? buf[(out_r - 1) % 3] : zrow;
+        const int8_t *row_mid =                             buf[ out_r      % 3];
+        const int8_t *row_bot = (out_r + 1 < PATCH_ROWS)  ? buf[(out_r + 1) % 3] : zrow;
+
         const int16_t h_r = HTAB[out_r];
-
-        const int8_t *row_top = buf[top];
-        const int8_t *row_mid = buf[mid];
-        const int8_t *row_bot = buf[cur];
 
         for (int c = 0; c < PATCH_COLS; c++)
         chess_prepare_for_pipelining
@@ -219,83 +237,30 @@ void conv2d_kernel(
             else if (shifted <=     0) out16 =  0;        // ReLU
             else                       out16 = (int16_t)shifted;
 
+            // Stage B1: remove the previous frame's mean BEFORE the window.
+            // Order matters — w*(f-µ) is what we want; windowing first and
+            // subtracting after would leave µ smeared across the spectrum by W.
+            // Output is now signed, so the negative window clamp below is live.
+            int32_t centred = (int32_t)out16 - mean_prev;
+            if      (centred >  32767) centred =  32767;
+            else if (centred < -32768) centred = -32768;
+
             // Separable Hanning window (Q1.15 × Q1.15 → int16)
-            // Two right-shifts of 15 apply both row and column weights.
             int16_t h_c   = HTAB[c];
-            int32_t wnd   = ((int32_t)out16 * h_r) >> 15;
+            int32_t wnd   = (centred * h_r) >> 15;
             wnd           = (wnd * h_c) >> 15;
             int16_t wnd16;
             if      (wnd >  32767) wnd16 =  32767;
             else if (wnd < -32768) wnd16 = -32768;
             else                   wnd16 = (int16_t)wnd;
 
-            cint16_t result;
-            result.real = wnd16;
-            result.imag = 0;
-            writeincr(feature_out, result);
+            out[o].real = wnd16;
+            out[o].imag = 0;
+            ++o;
         }
-    }
 
-    // ----------------------------------------------------------------
-    // Phase 3: output the last row (PATCH_ROWS - 1).
-    //
-    // The "row below" (row PATCH_ROWS) doesn't exist; we need zeros there.
-    // Conveniently, buf[PATCH_ROWS % 3] was last written at row r where
-    // r % 3 == PATCH_ROWS % 3.  For PATCH_ROWS=128: that slot was last
-    // used at r = 125.  Zero it out so the bottom border is correct.
-    //
-    // HANNING_128[PATCH_ROWS-1] = HANNING_128[127] = 0, so the entire
-    // last row output is zero.  We still write PATCH_COLS zero samples
-    // to keep the downstream FFT's sample count correct.
-    // ----------------------------------------------------------------
-    const int last_bot = PATCH_ROWS % 3;
-    memset(buf[last_bot], 0, PATCH_COLS + 2);
-
-    const int last_r   = PATCH_ROWS - 1;
-    const int last_top = (PATCH_ROWS + 1) % 3;   // row PATCH_ROWS-2
-    const int last_mid = (PATCH_ROWS + 2) % 3;   // row PATCH_ROWS-1
-
-    const int16_t h_last = HTAB[last_r];   // = 0
-
-    const int8_t *row_top_last = buf[last_top];
-    const int8_t *row_mid_last = buf[last_mid];
-    const int8_t *row_bot_last = buf[last_bot];   // zeroed above
-
-    for (int c = 0; c < PATCH_COLS; c++)
-    chess_prepare_for_pipelining
-    chess_loop_range(PATCH_COLS, PATCH_COLS)
-    {
-        const int c1 = c + 1;
-
-        int32_t acc = bias;
-        acc += (int32_t)w00 * row_top_last[c1 - 1];
-        acc += (int32_t)w01 * row_top_last[c1];
-        acc += (int32_t)w02 * row_top_last[c1 + 1];
-        acc += (int32_t)w10 * row_mid_last[c1 - 1];
-        acc += (int32_t)w11 * row_mid_last[c1];
-        acc += (int32_t)w12 * row_mid_last[c1 + 1];
-        acc += (int32_t)w20 * row_bot_last[c1 - 1];
-        acc += (int32_t)w21 * row_bot_last[c1];
-        acc += (int32_t)w22 * row_bot_last[c1 + 1];
-
-        int32_t shifted = acc >> out_shift;
-        int16_t out16;
-        if      (shifted >  32767) out16 =  32767;
-        else if (shifted <=     0) out16 =  0;        // ReLU
-        else                       out16 = (int16_t)shifted;
-
-        int16_t h_c   = HTAB[c];
-        int32_t wnd   = ((int32_t)out16 * h_last) >> 15;   // h_last = 0 → wnd = 0
-        wnd           = (wnd * h_c) >> 15;
-        int16_t wnd16;
-        if      (wnd >  32767) wnd16 =  32767;
-        else if (wnd < -32768) wnd16 = -32768;
-        else                   wnd16 = (int16_t)wnd;
-
-        cint16_t result;
-        result.real = wnd16;
-        result.imag = 0;
-        writeincr(feature_out, result);
+        ++rows_out;
+        if (rows_out >= PATCH_ROWS) rows_out = 0;   // patch complete — rearm
     }
 #endif  // CONV2D_ECHO_TEST
 }
