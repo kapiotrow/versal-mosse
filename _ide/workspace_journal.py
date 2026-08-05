@@ -1,6 +1,8 @@
-# 2026-08-01T17:56:44.928514313
+# 2026-08-05T18:09:35.031838962
 import vitis
 
 client = vitis.create_client()
 client.set_workspace(path="versal-mosse")
+
+vitis.dispose()
 

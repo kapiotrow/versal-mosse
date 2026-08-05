@@ -25,6 +25,14 @@ s1  Off-centre: impulse@(17,42), H*={1,0}, acc={0,0}.  Tests spatial localisatio
 s2  Constant patch: H*={1,0}, acc={0,0}.  Tests DC/large-value cmul path.
 s3  Imaginary filter: impulse@(0,0), H*={0,1}, acc={0,0}.  Tests sign of im cross-term.
 s4  Gaussian filter: impulse@(0,0), H*=2D-Gaussian(σ=4), acc={0,0}.  Tests non-uniform flt.
+s6  Stage-A patch through the REAL conv2d path (CONV2D_MODE=0), H=unity.
+s7  s6's patch through a REAL MOSSE filter (per-bin complex H, Q1.15), target
+    off-centre. The only scenario that exercises H_SHIFT with a non-identity filter,
+    and the only one that asserts a peak-to-sidelobe ratio.
+
+Filters are written in Q1.15: cmul_accum computes (F*H + rnd) >> H_SHIFT, so
+"unity gain" is H_UNITY (32767), not the integer 1. See the H_SHIFT block in the
+Makefile.
 """
 
 import sys
@@ -46,6 +54,24 @@ N = PATCH_ROWS * PATCH_COLS
 IFFT_SHIFT_COL = int(os.environ.get('GEN_IFFT_COL_SHIFT', 12))
 IFFT_SHIFT_ROW = int(os.environ.get('GEN_IFFT_ROW_SHIFT', 0))
 FFT_SHIFT      = int(os.environ.get('GEN_FFT_SHIFT', 0))
+# MUST match CMUL_H_SHIFT in cmul_accum_kernel.cpp — the Makefile feeds both from
+# the single H_SHIFT variable. The kernel computes (F*H + rnd) >> H_SHIFT, so a
+# filter that is meant to be UNITY GAIN is not the integer 1 any more; it is
+# H_UNITY below. Every scenario written before this shift existed passed a literal
+# 1, which now multiplies the spectrum by 1/32768 and produces an all-zero
+# response — hence H_UNITY rather than a hand-edited constant per scenario.
+H_SHIFT = int(os.environ.get('GEN_H_SHIFT', 15))
+
+# Q1.15 representation of 1.0, clamped to int16. At H_SHIFT=15 this is 32767, so
+# the effective gain is 32767/32768 — one part in 32768 below unity, which is far
+# under the ~2% round-trip loss the peak bounds already tolerate. At H_SHIFT=0 it
+# degenerates to the literal 1 the old scenarios used, so setting H_SHIFT=0
+# reproduces the pre-shift behaviour exactly for bisection.
+H_UNITY = min(32767, max(1, 1 << H_SHIFT))
+assert H_SHIFT <= 15, (
+    f"H_SHIFT={H_SHIFT} cannot represent unity gain in int16 "
+    f"(needs {1 << H_SHIFT} > 32767); scenarios would all under-scale"
+)
 
 # Additive DC-bin loss per cint16 FFT pass, measured at 64-point / TP_SHIFT=0.
 # See the long note in main()'s S2 section for why this is additive, not a gain
@@ -109,6 +135,17 @@ def peak_hi(v: int) -> int:
 def peak_sym(v: int) -> int:
     """Symmetric (+/-) bound magnitude, scaled and clamped to int16."""
     return min(32767, max(1, scale_peak(abs(int(v)))))
+
+
+def q15_gain(f: int, h: int) -> int:
+    """One cmul product exactly as cmul_accum_kernel.cpp computes it.
+
+    (f*h + rnd) >> H_SHIFT, with round-to-nearest. Mirrors CMUL_RND in the kernel;
+    keeping the two in one place is the point — an expected accumulator value that
+    models the multiply differently from the kernel is worse than no check at all.
+    """
+    rnd = (1 << (H_SHIFT - 1)) if H_SHIFT > 0 else 0
+    return (int(f) * int(h) + rnd) >> H_SHIFT
 
 # int8 samples per PLIO beat: plio_128_bits → 16, plio_32_bits → 4.
 PLIO_BEAT_SAMPLES   = int(os.environ.get('GEN_PLIO_BEAT_SAMPLES', 16))
@@ -253,6 +290,8 @@ def write_expected_txt(path: str, *,
                        max_noise: int,
                        peak_tol: int = 0,
                        skip_snr: bool = False,
+                       snr_ratio_pct: int = 0,
+                       fcol_corr_pct: int = 0,
                        check_accum0: bool = False,
                        accum0_re: int = 0,
                        accum0_im: int = 0,
@@ -269,6 +308,14 @@ def write_expected_txt(path: str, *,
         # rounding luck rather than correctness; +/-1 px is the real tracking criterion.
         f.write(f"peak_tol     {peak_tol}\n")
         f.write(f"skip_snr     {1 if skip_snr else 0}\n")
+        # RELATIVE peak-to-sidelobe assertion, in percent: the measured peak must
+        # be at least this fraction of the largest non-peak element. Scale-invariant,
+        # so unlike max_noise it survives a change to the shift budget. 0 disables.
+        f.write(f"snr_ratio_pct {snr_ratio_pct}\n")
+        # Minimum normalized correlation (percent) between the drained
+        # gmio_fft_col_out tap and fft_col_out.bin. 0 disables. See the note in
+        # generate_scenario() for why this is a correlation and not an equality.
+        f.write(f"fcol_corr_pct {fcol_corr_pct}\n")
         f.write(f"check_accum0 {1 if check_accum0 else 0}\n")
         f.write(f"accum0_re    {accum0_re}\n")
         f.write(f"accum0_im    {accum0_im}\n")
@@ -352,6 +399,19 @@ def generate_scenario(out_dir: str, name: str, patch_int8: np.ndarray,
         # Raw patch (bypasses PLIO→conv2d→row_FFT).
         fci_re, fci_im = compute_fft_col_in(patch_int8)
     write_cint16_bin(os.path.join(sdir, 'fft_col_in.bin'), fci_re, fci_im)
+
+    # Golden col-FFT OUTPUT — the full 2-D spectrum F_ch, in the same layout the
+    # new gmio_fft_col_out tap delivers:
+    #     fft_col_out[k*PATCH_ROWS + m] = F2d[m, k]
+    # The harness compares its drained tap against this by normalized correlation
+    # rather than element-wise: cint16 rounding and DSPLib's additive DC loss make
+    # an exact match impossible, but a shuffled, aliased or empty tap drops the
+    # correlation immediately. This is what makes the tap's ORDERING testable.
+    fci = (np.asarray(fci_re, dtype=np.float64)
+           + 1j * np.asarray(fci_im, dtype=np.float64)).reshape(PATCH_COLS, PATCH_ROWS)
+    # fci is already transposed (col-major); the column FFT runs along axis=1.
+    fco = np.fft.fft(fci, axis=1).flatten() / float(1 << (2 * FFT_SHIFT))
+    write_cint16_bin(os.path.join(sdir, 'fft_col_out.bin'), fco.real, fco.imag)
     # Single-channel weight buffer: mosse_graph.cpp loads this instead of zeroing.
     # Stage B1's mean_prev lives in bytes [18:22] — see conv2d_kernel.h.
     if weights_64b is not None:
@@ -450,8 +510,11 @@ def main():
 
     print(f"\nGenerating aiesim scenarios in: {out_dir}/")
 
-    # uniform arrays used in multiple scenarios
-    ones_re  = np.ones(N,  dtype=np.float64)
+    # uniform arrays used in multiple scenarios.
+    # ones_re is UNITY GAIN in the kernel's Q1.15 filter format, not the integer 1
+    # — see H_UNITY. Every expected value below was calibrated against a gain of
+    # exactly 1 and stays valid, because H_UNITY/2^H_SHIFT = 32767/32768.
+    ones_re  = np.full(N, float(H_UNITY), dtype=np.float64)
     zeros_re = np.zeros(N, dtype=np.float64)
 
     # ------------------------------------------------------------------
@@ -609,12 +672,13 @@ def main():
     k2_c = np.where(k2 > PATCH_ROWS // 2, k2 - PATCH_ROWS, k2)
     K1, K2 = np.meshgrid(k1_c, k2_c, indexing='ij')   # shape (PATCH_COLS, PATCH_ROWS)
     sigma = 4.0
-    # H_MAX must be chosen against AMP, not fixed. cmul is an integer multiply, so
-    # accum_out[0] = F[0,0] * H[0,0] = AMP * H_MAX. The original 4096 was safe only
-    # because AMP was 1; at AMP=100 it would be 409600 and saturate cint16 (32767),
-    # turning this scenario into a saturation test instead of a filter-shape test.
-    # Cap the product at ~20000 to leave headroom.
-    H_MAX = max(1, 20000 // AMP)
+    # Peak of the filter is full-scale Q1.15, i.e. a gain of 1.0 at the DC bin.
+    # cmul now computes (F*H + rnd) >> H_SHIFT, so accum_out[0] = AMP, and the
+    # headroom question this used to hand-tune (H_MAX = 20000 // AMP, chosen so the
+    # raw integer product stayed under 32767) no longer exists: Q1.15 caps the gain
+    # at 1 by construction, so the product can never exceed |F|.
+    H_MAX = H_UNITY
+    s4_accum0 = q15_gain(AMP, H_MAX)
     H_gauss = np.exp(-(K1**2 + K2**2) / (2.0 * sigma**2)) * H_MAX
     H_gauss_flat = H_gauss.flatten()   # row-major of (PATCH_COLS, PATCH_ROWS)
     generate_scenario(
@@ -630,10 +694,11 @@ def main():
         # catch gross breakage. Tighten from a calibration run if s4 is to be a real
         # numerical test.
         peak_re_lo=1, peak_re_hi=32767,
-        peak_im_lo=-peak_sym(2 * H_MAX), peak_im_hi=peak_sym(2 * H_MAX),
+        peak_im_lo=-peak_sym(2 * s4_accum0), peak_im_hi=peak_sym(2 * s4_accum0),
         max_noise=0, skip_snr=True,        # Gaussian has non-zero off-peak values
-        check_accum0=True, accum0_re=scale_accum(AMP * H_MAX), accum0_im=0,
-        description=f"impulse@(0,0), H*=Gaussian(σ={sigma:.0f},max={H_MAX}), acc={{0,0}} — per-element flt_local",
+        check_accum0=True, accum0_re=scale_accum(s4_accum0), accum0_im=0,
+        description=f"impulse@(0,0), H*=Gaussian(σ={sigma:.0f},Q1.15 peak gain 1.0), "
+                    f"acc={{0,0}} — per-element flt_local",
     )
 
     # ------------------------------------------------------------------
@@ -710,10 +775,152 @@ def main():
         peak_im_lo=-32768, peak_im_hi=32767,
         max_noise=0, skip_snr=True,
         peak_tol=1,
+        # Check the gmio_fft_col_out tap on the two scenarios whose signal the
+        # golden model reproduces exactly. Left off for s0-s4: they run in echo
+        # mode, where the col-FFT input comes from file and the tap check would be
+        # asserting something the scenario was not built to test.
+        fcol_corr_pct=95,
         check_accum0=False,
         description=f"Stage A patch → conv2d+ReLU+B1(mean_prev={s6_mean_prev})+Hanning "
                     f"— FULL preprocessing path, peak@{s6_peak_idx} "
                     f"({'negative' if s6_peak_negative else 'positive'})",
+    )
+
+    # ------------------------------------------------------------------
+    # S7 — s6's patch driven through a REAL MOSSE filter
+    # ------------------------------------------------------------------
+    # Everything before this passes H = unity (or an ad-hoc Gaussian), so no
+    # scenario has ever exercised cmul with a filter that varies per bin in both
+    # real and imaginary parts — which is the only kind a real tracker produces,
+    # and the only kind that tests H_SHIFT for anything beyond "did not crash".
+    #
+    # H is built exactly as mosse_filter.cpp builds it on the host:
+    #     H = G * conj(F) / (F*conj(F) + eps)     then normalized to Q1.15
+    # so this scenario also pins down the host's quantization convention. If the
+    # two ever disagree about conjugation or scale, s7 fails and the hw_emu run
+    # does not have to be the thing that discovers it.
+    #
+    # The target G is a Gaussian placed OFF-CENTRE at (IMPULSE_DR, IMPULSE_DC) =
+    # (10,-7), matching the host's synthetic test offset. Centring it would put the
+    # expected peak at flat index 0 — indistinguishable from an all-zero response,
+    # which is precisely the degenerate test CLAUDE.md warns about. The two offsets
+    # differ in magnitude and sign so a row/col transpose and a sign flip both fail.
+    S7_DR, S7_DC = 10, -7
+    s7_sigma = 2.0
+
+    # Spatial Gaussian target, wrapped (circular), centred at (S7_DR, S7_DC).
+    rr7 = np.arange(PATCH_ROWS, dtype=np.float64).reshape(-1, 1)
+    cc7 = np.arange(PATCH_COLS, dtype=np.float64).reshape(1, -1)
+    dr7 = np.minimum((rr7 - S7_DR) % PATCH_ROWS, (S7_DR - rr7) % PATCH_ROWS)
+    dc7 = np.minimum((cc7 - S7_DC) % PATCH_COLS, (S7_DC - cc7) % PATCH_COLS)
+    g7  = np.exp(-(dr7**2 + dc7**2) / (2.0 * s7_sigma**2))
+    G7  = np.fft.fft2(g7)                       # shape (PATCH_ROWS, PATCH_COLS)
+
+    # F: the 2-D spectrum of the same Stage-A → conv2d → B1 → Hanning feature map
+    # s6 uses, so the PLIO path feeds s7 a signal the golden model knows exactly.
+    s7_feat = simulate_conv2d(s6_patch, weights_ch0, s6_mean_prev).reshape(PATCH_ROWS, PATCH_COLS)
+    F7 = np.fft.fft2(s7_feat)
+
+    # MOSSE closed form for a single training image (Bolme eq. 6 with N=1), which
+    # is exactly what filter_init() computes on frame 0.
+    #
+    # CONJUGATION. Bolme writes the filter as H* = G ⊙ F* / (F ⊙ F*), because the
+    # correlation he forms is F ⊙ H*. cmul_accum applies the conjugation itself, so
+    # what gets STORED is H, not H*:
+    #     F ⊙ conj(H_stored) = G   =>   H_stored = conj(G) ⊙ F / (|F|² + ε)
+    # Storing Bolme's expression verbatim gives F ⊙ conj(H) = conj(G)·F/conj(F),
+    # whose phase is garbage — the response then peaks at an arbitrary bin. The
+    # assertion below caught exactly that. The distinction is invisible for a
+    # CENTRED real target (conj(G) = G), which is another reason this scenario puts
+    # the target off-centre.
+    s7_eps = 1e-3 * float(np.mean(np.abs(F7) ** 2))
+    H7 = np.conj(G7) * F7 / (np.abs(F7) ** 2 + s7_eps)
+
+    # Normalize the largest |H| bin to FULL int16 scale — 32767, NOT H_UNITY.
+    # Same rule as filter_quantize_q15() in mosse_filter.cpp, and the distinction
+    # matters: H_UNITY is the value that represents a GAIN OF ONE (2^H_SHIFT), which
+    # is what the unity-filter scenarios s0-s6 need. A real filter instead wants
+    # every one of the 15 bits, and lets H_SHIFT decide where the product lands.
+    # Using H_UNITY here would drop H to H_SHIFT bits of resolution.
+    s7_scale = 32767.0 / float(np.max(np.abs(H7)))
+    H7q = H7 * s7_scale
+
+    # Layout: the filter is consumed in the col-FFT output order, i.e.
+    # element [k*PATCH_ROWS + m] is spectrum bin (m, k) — the transpose of the
+    # natural row-major order. Getting this wrong is a silent transpose bug, and it
+    # only shows up on a non-square patch or an asymmetric target like this one.
+    H7_flat = H7q.T.flatten()
+
+    # Golden response: correlation is IFFT(F * conj(H)) — cmul conjugates the
+    # stored filter, so the stored value is H itself, un-conjugated.
+    s7_resp = np.real(np.fft.ifft2(F7 * np.conj(H7q)))
+    s7_peak_idx = int(np.argmax(np.abs(s7_resp)))
+    s7_exp_idx  = (S7_DR % PATCH_ROWS) * PATCH_COLS + (S7_DC % PATCH_COLS)
+    assert s7_peak_idx == s7_exp_idx, (
+        f"s7 golden model peaks at {s7_peak_idx}, not the target offset "
+        f"{s7_exp_idx} — the filter construction is wrong, not the hardware"
+    )
+
+    # Peak-to-sidelobe ratio, Bolme §3.5: the sidelobe region EXCLUDES an 11×11
+    # window around the peak. Without that exclusion the "largest non-peak element"
+    # of a smooth σ=2 Gaussian is simply its neighbour at exp(-1/8) = 0.88 of the
+    # peak, giving a ratio of 1.13 — an assertion that passes on any blurry blob
+    # and tests nothing. Excluding the mainlobe is what makes PSR discriminative.
+    s7_absr = np.abs(s7_resp)
+    s7_peak_mag = float(s7_absr.flat[s7_peak_idx])
+    s7_mask = np.ones_like(s7_absr, dtype=bool)
+    _pr, _pc = s7_peak_idx // PATCH_COLS, s7_peak_idx % PATCH_COLS
+    for _dr in range(-5, 6):
+        for _dc in range(-5, 6):
+            s7_mask[(_pr + _dr) % PATCH_ROWS, (_pc + _dc) % PATCH_COLS] = False
+    s7_sidelobe = float(np.max(s7_absr[s7_mask]))
+    s7_positive = bool(s7_resp.flat[s7_peak_idx] > 0)
+
+    generate_scenario(
+        out_dir, "s7",
+        s6_patch,
+        H_re=H7_flat.real, H_im=H7_flat.imag,
+        acc_re=zeros_re,   acc_im=zeros_re,
+        weights_64b=weights_ch0,
+        use_conv2d=True,
+        mean_prev=s6_mean_prev,
+        peak_idx=s7_exp_idx,
+        # Sign comes from the golden model, as in s6 — Stage B1 makes the response
+        # bipolar, so a positive peak cannot be assumed.
+        peak_re_lo=(1 if s7_positive else -32767),
+        peak_re_hi=(32767 if s7_positive else -1),
+        peak_im_lo=-32768, peak_im_hi=32767,
+        # The absolute noise bound is useless here — the response magnitude depends
+        # on the shift budget, which this scenario deliberately does not calibrate.
+        # Assert the peak-to-sidelobe RATIO instead: scale-invariant, and the thing
+        # that actually distinguishes a matched filter from a filter that localises
+        # by luck.
+        #
+        # THRESHOLD IS MEASURED, NOT A FRACTION OF THE GOLDEN IDEAL. The first
+        # version used 0.7 x golden on the assumption that fixed point would retain
+        # 70% of the float ratio. That assumption was never checked and is wrong:
+        # measured at 64x64 / FFT_SHIFT=3-0-6 / H_SHIFT=10 / ch1, the golden 38x
+        # comes back as 19.6x, i.e. ~51%.
+        #
+        # The gap is SPECTRAL QUANTIZATION, not a defect. The accumulator peaks at
+        # 466 of 32767, so the spectrum carries ~9 bits and its rounding noise
+        # spreads over the whole response, lifting the sidelobe to 40 where the true
+        # value is ~20. More gain would fix it (H_SHIFT=8 quadruples the signal while
+        # the noise stays absolute) but rails the accumulator at 16 channels — and
+        # ch1 is the WORST case here, since channels add coherently and their
+        # quantization noise does not.
+        #
+        # 15x keeps this a real assertion: it still fails a ~25% regression, and it
+        # is far above Bolme's own failure indicator (§3.5: PSR ~7 means occluded or
+        # lost, 20-60 is healthy tracking). Re-measure if the shift budget moves.
+        max_noise=0, skip_snr=True,
+        snr_ratio_pct=1500,
+        peak_tol=1,
+        fcol_corr_pct=95,
+        check_accum0=False,
+        description=f"s6 patch + REAL MOSSE filter H=conj(G)·F/(|F|²+ε) in Q1.15 "
+                    f"(H_SHIFT={H_SHIFT}), target off-centre at ({S7_DR},{S7_DC}) "
+                    f"→ idx {s7_exp_idx}, PSR {s7_peak_mag / max(s7_sidelobe, 1e-12):.1f}",
     )
 
     # ------------------------------------------------------------------

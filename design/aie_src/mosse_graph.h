@@ -14,6 +14,7 @@
  *     DDR → gmio_fft_col_in ↓
  *   fft2d.fft_cols — PATCH_ROWS-point col FFT (DSPLib)
  *     ↓ (internal)
+ *     ↓ gmio_fft_col_out → DDR   (broadcast tap: F_ch for the PS filter update)
  *   cmul_accum_kernel — H_ch* ⊙ F_ch + accumulate
  *     ← gmio_cmul_in     ([H_ch* | prev_Σ] packed, per channel)
  *     ↓ gmio_accum_out → DDR
@@ -27,12 +28,16 @@
  *     DDR → gmio_ifft_col_in ↓
  *   ifft2d.ifft_cols — PATCH_ROWS-point col IFFT (DSPLib)
  *     ↓ gmio_response → DDR
- *   APU: peak_detect_sw() + filter_update_kissfft()
+ *   APU: peak_detect_sw() + filter_init/filter_update (mosse_filter.h)
  *
- * GMIO summary (9 ports: 5 input + 4 output):
+ * GMIO summary (10 ports: 5 input + 5 output):
  *   IN:  gmio_weights, gmio_fft_col_in, gmio_cmul_in,
  *        gmio_ifft_row_in, gmio_ifft_col_in
- *   OUT: gmio_fft_row_out, gmio_accum_out, gmio_ifft_row_out, gmio_response
+ *   OUT: gmio_fft_row_out, gmio_fft_col_out, gmio_accum_out,
+ *        gmio_ifft_row_out, gmio_response
+ *
+ * gmio_fft_col_out is a broadcast tap on the col-FFT output carrying the full
+ * 2-D spectrum F_ch. The PS-side filter update needs it; nothing else consumes it.
  *
  * gmio_cmul_in carries [H_ch* | prev_Σ] packed per chunk — see cmul_accum_kernel.h.
  *
@@ -62,7 +67,7 @@ public:
     input_plio  patch_in;   // "PatchIn" ← roi_crop PL kernel
 
     // -------------------------------------------------------
-    // GMIO (6 input + 4 output = 10 total)
+    // GMIO (5 input + 5 output = 10 total)
     // -------------------------------------------------------
     // conv2d weights: loaded once per channel before conv starts
     input_gmio  gmio_weights;
@@ -70,6 +75,16 @@ public:
     // Forward FFT transpose scratch (shared serially across channels)
     output_gmio gmio_fft_row_out;   // row-FFT output → DDR (APU transposes)
     input_gmio  gmio_fft_col_in;    // DDR (transposed) → col-FFT input
+
+    // Per-channel 2-D spectrum tap.
+    //
+    // The filter update needs F_ch, and until this port existed nothing exposed
+    // it: fft_col_out went only to cmul, so the host could see the half-transformed
+    // row FFT and the accumulated Σ H*⊙F but never F_ch itself. This is a pure
+    // broadcast — cmul's connection is unchanged — and it drains 1:1 with
+    // gmio_accum_out, so the host folds it into the existing chunk loop rather
+    // than adding a new synchronisation structure.
+    output_gmio gmio_fft_col_out;   // F_ch (full 2-D spectrum) → DDR (APU reads)
 
     // cmul_accum combined input and output (shared serially)
     input_gmio  gmio_cmul_in;       // [H_ch* | prev_Σ] packed per chunk ← DDR (APU writes)
@@ -109,6 +124,7 @@ public:
         gmio_weights     = input_gmio::create("gmio_weights",      64, 1000);
         gmio_fft_row_out = output_gmio::create("gmio_fft_row_out", 64, 1000);
         gmio_fft_col_in  = input_gmio::create("gmio_fft_col_in",   64, 1000);
+        gmio_fft_col_out = output_gmio::create("gmio_fft_col_out", 64, 1000);
         gmio_cmul_in     = input_gmio::create("gmio_cmul_in",       64, 1000);
         gmio_accum_out   = output_gmio::create("gmio_accum_out",   64, 1000);
         gmio_ifft_row_in = input_gmio::create("gmio_ifft_row_in",  64, 1000);
@@ -155,6 +171,27 @@ public:
         // tile-to-tile lock fires first in the iteration — see cmul_accum_kernel.h note.
         adf::connect<>(fft2d.fft_col_out, cmul.in[0]);
         adf::dimensions(cmul.in[0]) = {PATCH_COLS * FFT_COL_WS};
+
+        // Broadcast the same col-FFT output to DDR so the APU can run the filter
+        // update on F_ch. Declared AFTER the cmul connection so cmul's fft_col_in
+        // keeps in[0] — the port order that cmul_accum_kernel.h documents as
+        // load-bearing.
+        //
+        // MEASURED 2026-08-05: this fan-out DOES change the mapping. cmul.pi0 goes
+        // from a direct tile-to-tile buffer
+        //     fft_cols...po0 -> cmul.pi0        @ tile (22,0)
+        // to a DMA path
+        //     mosse_graph._dma[0].po0 -> cmul.pi0  @ tile (24,0)
+        // with fft_cols relocated to (29,0). Same at 64x64 and 128x128.
+        //
+        // cmul_accum_kernel.h warns that the aiesim ISS only delivers the cmul_in
+        // GMIO lock after the tile-to-tile lock fires, so this looked like it would
+        // break the workaround. It does NOT: the 64x64 s6 run reached step 6
+        // (row-IFFT) with the tap in place, i.e. the col FFT, the tap drain and
+        // cmul all completed. Both apparent "hangs" during this work were the
+        // aiesim wall clock, not a deadlock — see the SIM_WALL_TIMEOUT note in
+        // the Makefile before diagnosing one.
+        adf::connect<>(fft2d.fft_col_out, gmio_fft_col_out.in[0]);
 
         // gmio_cmul_in → cmul.in[1] ([filter | accum_prev] packed; single GMIO lock)
         adf::connect<>(gmio_cmul_in.out[0], cmul.in[1]);

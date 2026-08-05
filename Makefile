@@ -54,6 +54,46 @@ FFT_SHIFT           ?= 4
 IFFT_ROW_SHIFT      ?= 2
 IFFT_COL_SHIFT      ?= 2
 
+# cmul_accum filter-product shift. INDEPENDENT of the invariant above.
+#
+# cmul_accum used to multiply F by H with no shift, on the strength of a comment
+# saying "PS pre-scales H" — a contract nothing implemented. Every scenario passed
+# a literal H = 1, so the whole budget above was calibrated at a filter gain of
+# ONE and says nothing about a real filter. At that scaling a real H would need
+# |H| <= 4 to keep the accumulator off the rails: two bits of resolution.
+#
+# H is now Q1.15 (the host normalizes max|H| -> 32767) and the kernel shifts the
+# product right by H_SHIFT. Because |H|/2^15 <= 1, the product can only be SMALLER
+# than the old H=1 case, so 4/2/2 above remains valid as an upper bound and needs
+# no re-sweep for safety. The new risk runs the other way: a spiky H leaves most
+# bins far below the rails, which is why the host reports max|response|.
+#
+# H_SHIFT is NOT the filter's quantization ceiling. H is always normalized to the
+# full int16 range (32767) for maximum resolution; H_SHIFT only decides where the
+# product F*H lands in the cint16 accumulator. Tying the two together throws away
+# one bit of filter precision per bit of gain — see filter_quantize_q15().
+#
+# DEFAULT 10, calibrated 2026-08-05 against aiesim s7 (the first scenario with a
+# REAL MOSSE filter). 15 was the naive choice — "H is Q1.15" — and it is wrong,
+# because a MOSSE filter is spiky: max|H| sits where |F| is SMALLEST, since that is
+# where the regularized inverse peaks, so normalizing the peak bin to full scale
+# leaves every informative bin far below it. Measured at H_SHIFT=15, 64x64,
+# FFT_SHIFT=3/0/6, ch1: accum 15/32767, response 21 LSB. It still localised
+# exactly (err=0 px) but PSR collapsed to 5.2x against a golden 38x.
+#
+# Scaling from those measurements (every stage is linear in 2^-H_SHIFT):
+#   H_SHIFT   accum(ch1)  accum(ch16)  rowIFFT  response
+#      15          15          240        173        21   response at the floor
+#      12         120         1920       1384       168   response at the floor
+#      10         480         7680       5536       672   <-- 4x margin everywhere
+#       8        1920        30719      22143      2688   accum ~94% of rail at ch16
+# The ch16 column at H_SHIFT=10 (7680) lands on the 7728 already recorded as the
+# validated 16-channel accumulator, which is a useful independent check.
+#
+# SINGLE SOURCE OF TRUTH — reaches the AIE kernel, the host app and the vector
+# generator from this one line.
+H_SHIFT             ?= 10
+
 # =========================================================
 # Paths
 # =========================================================
@@ -132,6 +172,7 @@ AIE_FLAGS  += --Xpreproc="-DITER_CNT=$(ITER_CNT)"
 AIE_FLAGS  += --Xpreproc="-DFFT_2D_TP_SHIFT=$(FFT_SHIFT)"
 AIE_FLAGS  += --Xpreproc="-DFFT_2D_TP_IFFT_ROW_SHIFT=$(IFFT_ROW_SHIFT)"
 AIE_FLAGS  += --Xpreproc="-DFFT_2D_TP_IFFT_COL_SHIFT=$(IFFT_COL_SHIFT)"
+AIE_FLAGS  += --Xpreproc="-DCMUL_H_SHIFT=$(H_SHIFT)"
 # conv2d build mode: 0=real conv, 1=echo stream, 2=synthesize without reading the
 # stream (bisect for "is conv2d blocked on readincr?"). See conv2d_kernel.cpp.
 CONV2D_MODE ?= 1
@@ -148,9 +189,11 @@ GRAPH_SRC_CPP := $(AIE_SRC_REPO)/mosse_graph.cpp
 
 # Test scenario — selects aiesim_data/<SCENARIO>/ for PLIO and GMIO data.
 # Scenarios: s0 (baseline), s1 (off-centre impulse), s2 (constant/DC), s3 (imag filter),
-#            s4 (Gaussian filter), s6 (FULL preprocessing path — Stage A -> conv2d -> B1)
-# s0-s4 are raw-patch scenarios: run them with CONV2D_MODE=1 (echo). Only s6 feeds a
-# Stage-A-preprocessed patch, so it is the only valid scenario for CONV2D_MODE=0.
+#            s4 (Gaussian filter), s6 (FULL preprocessing path — Stage A -> conv2d -> B1),
+#            s7 (s6 + a REAL MOSSE filter: non-uniform complex H, off-centre target)
+# s0-s4 are raw-patch scenarios: run them with CONV2D_MODE=1 (echo). s6 and s7 feed a
+# Stage-A-preprocessed patch, so they are the only valid scenarios for CONV2D_MODE=0.
+# s7 is the only scenario that exercises H_SHIFT with a filter that is not identity.
 SCENARIO         ?= s0
 SCENARIO_DATA_DIR = $(AIE_SRC_REPO)/aiesim_data/$(SCENARIO)
 
@@ -176,7 +219,16 @@ AIE_SIM_FLAGS += -i=$(SCENARIO_DATA_DIR)
 SIM_CYCLE_MAX     := 2000000000
 SIM_CYCLE_TIMEOUT ?= $(shell v=$$(expr 500000000 \* $(N_CHANNELS)); \
                              if [ $$v -gt $(SIM_CYCLE_MAX) ]; then echo $(SIM_CYCLE_MAX); else echo $$v; fi)
-SIM_WALL_TIMEOUT  ?= $(shell expr 1200 \* $(N_CHANNELS))
+# The wall clock must scale with PATCH AREA as well as with the channel count.
+# It used to be 1200 x N_CHANNELS only, which is the 64x64 budget applied
+# unchanged to a 128x128 build carrying 4x the data — conv2d alone goes from 32 to
+# 64 invocations over 4x the pixels. Measured 2026-08-05: s6 at 128x128 ch1 was
+# killed by `timeout` (exit 124) while still in step 2, and the log looked
+# identical to a deadlock. Every aiesim_plio PASS recorded in CLAUDE.md before that
+# date is a 64x64 run, so the 128x128 path had simply never been given time to
+# finish. Baseline 1200 s at 64x64 = 4096 elements.
+SIM_PATCH_SCALE   := $(shell expr \( $(PATCH_ROWS) \* $(PATCH_COLS) + 4095 \) / 4096)
+SIM_WALL_TIMEOUT  ?= $(shell expr 1200 \* $(N_CHANNELS) \* $(SIM_PATCH_SCALE))
 AIE_SIM_FLAGS += --simulation-cycle-timeout=$(SIM_CYCLE_TIMEOUT)
 
 # =========================================================
@@ -215,6 +267,9 @@ GCC_FLAGS  += -DIMPULSE_DR=$(IMPULSE_DR)
 GCC_FLAGS  += "-DIMPULSE_DC=($(IMPULSE_DC))"
 GCC_FLAGS  += -DFRAME_ROWS=1080
 GCC_FLAGS  += -DFRAME_COLS=1920
+# The host builds H in Q1.15 to match the shift cmul_accum applies to the product.
+# Same value as the AIE_FLAGS line above — see the H_SHIFT comment block.
+GCC_FLAGS  += -DCMUL_H_SHIFT=$(H_SHIFT)
 
 GCC_INC    := -I$(SDKTARGETSYSROOT)/usr/include/xrt
 GCC_INC    += -I$(XILINX_VITIS)/aietools/include/
@@ -222,8 +277,9 @@ GCC_INC    += -I$(SDKTARGETSYSROOT)/usr/include
 GCC_INC    += -I$(AIE_SRC_REPO)
 GCC_INC    += -I$(HOST_APP_SRC)
 GCC_INC    += -I$(DSPLIB_ROOT)/L2/include/aie
-# TODO: add KissFFT include path for PS-side filter update
-# GCC_INC  += -I$(KISSFFT_ROOT)
+# No FFT library is needed on the host. The filter update consumes F_ch straight
+# from the AIE column FFT (gmio_fft_col_out), and the Gaussian target spectrum has
+# a closed form — see gaussian_target_spectrum() in mosse_filter.h.
 
 GCC_LIBS   := -L$(SDKTARGETSYSROOT)/usr/lib
 GCC_LIBS   += -L$(XILINX_VITIS)/aietools/lib/aarch64.o
@@ -248,7 +304,7 @@ KERNEL_XOS := $(CAM_XO) $(CROP_XO)
 # =========================================================
 # Rules
 # =========================================================
-.PHONY: help kernels graph gen_vectors aiesim graph_fft aiesim_fft xsa application package sd_card run_emu weights cleanall
+.PHONY: help kernels graph gen_vectors aiesim graph_fft aiesim_fft xsa application package sd_card run_emu weights test_host cleanall
 
 help:
 	@echo ""
@@ -262,6 +318,7 @@ help:
 	@echo "  make aiesim_fft   — run FFT-only aiesim (2-GMIO, no PLIO)"
 	@echo "  make xsa          — link → .xsa"
 	@echo "  make application  — cross-compile host ELF"
+	@echo "  make test_host    — native unit test for the filter init/update math"
 	@echo "  make package      — package SD card image"
 	@echo "  make sd_card      — kernels + graph + xsa + application + package"
 	@echo "  make run_emu      — launch hw emulator"
@@ -270,6 +327,7 @@ help:
 	@echo "Key parameters (pass on command line):"
 	@echo "  TARGET=$(TARGET)  PATCH_ROWS=$(PATCH_ROWS)  PATCH_COLS=$(PATCH_COLS)"
 	@echo "  N_CHANNELS=$(N_CHANNELS)  FFT_2D_DT=$(FFT_2D_DT)  ITER_CNT=$(ITER_CNT)"
+	@echo "  FFT_SHIFT=$(FFT_SHIFT)  IFFT_ROW_SHIFT=$(IFFT_ROW_SHIFT)  IFFT_COL_SHIFT=$(IFFT_COL_SHIFT)  H_SHIFT=$(H_SHIFT)"
 
 print-%: ; @echo $* = $($*)
 
@@ -343,6 +401,7 @@ gen_vectors:
 	    GEN_IFFT_COL_SHIFT=$(IFFT_COL_SHIFT) \
 	    GEN_IFFT_ROW_SHIFT=$(IFFT_ROW_SHIFT) \
 	    GEN_FFT_SHIFT=$(FFT_SHIFT) \
+	    GEN_H_SHIFT=$(H_SHIFT) \
 	    uv run python3 scripts/gen_aiesim_vectors.py $(AIE_SRC_REPO)/aiesim_data
 
 aiesim: graph gen_vectors
@@ -412,9 +471,47 @@ $(BUILD_DIR)/$(XSA): $(KERNEL_XOS) $(LIBADF_A)
 # -------------------------------------------------------
 application: $(BUILD_DIR)/$(APP_ELF)
 
-$(BUILD_DIR)/$(APP_ELF): $(HOST_APP_SRC)/mosse_tracker.cpp
+# The ELF gets a flag stamp for the same reason libadf.a does: N_CHANNELS,
+# ITER_CNT, IMPULSE_DR/DC and now CMUL_H_SHIFT are make variables that touch no
+# source file, so a source-only prerequisite list silently reuses the previous
+# build's binary. That trap already existed here; adding CMUL_H_SHIFT (which the
+# host uses to scale H) makes it load-bearing.
+APP_FLAGS_STAMP := $(BUILD_DIR)/app.flagstamp
+$(APP_FLAGS_STAMP): FLAGS_FOR_STAMP := $(GCC_FLAGS)
+
+$(BUILD_DIR)/$(APP_ELF): $(APP_FLAGS_STAMP)                 \
+                         $(HOST_APP_SRC)/mosse_tracker.cpp  \
+                         $(HOST_APP_SRC)/mosse_filter.cpp   \
+                         $(HOST_APP_SRC)/mosse_filter.h
 	mkdir -p $(BUILD_DIR)
-	$(CXX) $(GCC_FLAGS) $(GCC_INC) $< $(GCC_LIBS) -o $@
+	$(CXX) $(GCC_FLAGS) $(GCC_INC) \
+	    $(HOST_APP_SRC)/mosse_tracker.cpp $(HOST_APP_SRC)/mosse_filter.cpp \
+	    $(GCC_LIBS) -o $@
+
+# -------------------------------------------------------
+# Native host-side unit test
+# -------------------------------------------------------
+# The filter init/update math is the one part of the host app that can be tested
+# without hardware: mosse_filter.{h,cpp} deliberately includes NO XRT or ADF
+# header, so it builds with the system g++ and runs in seconds. The alternative
+# is a ~90 min hw_emu frame or a multi-hour aiesim, which is no way to debug
+# arithmetic.
+#
+# The golden data is regenerated every run so the reference and the code cannot
+# drift apart the way the shift budget and the vector generator once did.
+TEST_HOST_DIR := $(HOST_APP_SRC)/test
+
+.PHONY: test_host
+test_host:
+	mkdir -p $(BUILD_DIR)
+	cd $(PROJECT_REPO) && env PYTHONHOME= PYTHONPATH= \
+	    GEN_H_SHIFT=$(H_SHIFT) \
+	    uv run python3 scripts/gen_filter_golden.py $(TEST_HOST_DIR)/golden
+	g++ -O2 -std=c++17 -Wall -Wextra -I$(HOST_APP_SRC) \
+	    -DCMUL_H_SHIFT=$(H_SHIFT) \
+	    $(HOST_APP_SRC)/mosse_filter.cpp $(TEST_HOST_DIR)/test_mosse_filter.cpp \
+	    -o $(BUILD_DIR)/test_host
+	$(BUILD_DIR)/test_host $(TEST_HOST_DIR)/golden
 
 # -------------------------------------------------------
 # Package

@@ -18,11 +18,17 @@
  *     6. APU: transpose_inplace() on IFFT row output
  *     7. APU: write transposed data via gmio_ifft_col_in → IFFT cols → gmio_response
  *     8. APU: peak_detect_sw() → displacement → update position
- *     9. APU: filter_update_kissfft() (stub)
+ *     9. APU: filter_init() on frame 0, filter_update() thereafter (mosse_filter.h)
+ *
+ * The filter maths lives in mosse_filter.{h,cpp}, which includes no XRT header so
+ * `make test_host` can check it natively against a NumPy golden in seconds.
+ *
+ * F_ch reaches the host through gmio_fft_col_out, a broadcast tap on the column
+ * FFT added for exactly this purpose — before it, the host could see the
+ * half-transformed row FFT and the accumulated Σ H*⊙F but never F_ch itself.
  *
  * TODO: add OpenCV or V4L2 video capture loop.
- * TODO: implement first-frame filter initialization (compute H from Gaussian target).
- * TODO: implement PS-side filter update (KissFFT for A_ch, B, H_ch*).
+ * TODO: affine perturbations for initialisation (Bolme §3.4); this is the N=1 case.
  */
 
 #include <stdio.h>
@@ -43,8 +49,7 @@
 #include "xrt/xrt_aie.h"
 #include "experimental/xrt_aie.h"
 
-// TODO: include KissFFT for PS-side filter update
-// #include "kiss_fft.h"
+#include "mosse_filter.h"
 
 // -----------------------------------------------------------------------
 // Build-time constants (set via Makefile -D flags)
@@ -339,19 +344,60 @@ static void apply_dc_correction(int16_t *accum, const int16_t *filter_all,
     }
 }
 
-// Filter update stub — TODO: implement with KissFFT on A72.
-//
-// Stage B3 belongs here: correlation is linear in the patch, so normalizing each
-// channel to unit energy is identical to scaling H_ch* by 1/σ_ch. Fold
-// 1.0/sqrt(g_energy[ch]) into H_ch* as it is built — zero AIE cost, no extra DDR
-// traffic. Cannot be done yet because H_ch* is not computed at all (it is
-// memset to zero at startup); g_energy[] is already being measured so the hook
-// is ready the moment the filter update lands.
-static void filter_update_kissfft(/* ... */) { /* TODO */ }
+// Persistent filter state (A_ch, B) across frames. See mosse_filter.h.
+static mosse::FilterState g_filter;
+// Target spectrum G — constant for the whole run, so it is built once at startup
+// from the closed form rather than transformed per frame.
+static std::vector<mosse::cfloat> g_target(PATCH_ELEMS);
+// Per-channel 2-D spectra drained from gmio_fft_col_out this frame.
+static std::vector<mosse::cfloat> g_F_all((size_t)N_CHANNELS * PATCH_ELEMS);
 
-// Compute ideal Gaussian response G (spatial domain); kept as a utility.
-// TODO: implement using KissFFT to obtain G_star = conj(FFT(G)).
-static void compute_gaussian_response(/* ... */) { /* TODO */ }
+// Convert one channel's cint16 tap output into the float spectrum the filter
+// maths consumes. The tap delivers the col-FFT layout — element
+// [k*PATCH_ROWS + m] is spectrum bin (m, k) — which is the TRANSPOSE of row-major.
+// Un-transposing here means everything downstream (G, A, H) is row-major, and the
+// filter written back to filter_bo has to be re-transposed on the way out. Doing
+// it in one place beats carrying two layouts through the maths.
+static void unpack_spectrum(const int16_t *src, mosse::cfloat *dst)
+{
+    for (int k = 0; k < PATCH_COLS; ++k)
+        for (int m = 0; m < PATCH_ROWS; ++m) {
+            const size_t s = (size_t)k * PATCH_ROWS + m;
+            dst[(size_t)m * PATCH_COLS + k] =
+                mosse::cfloat((float)src[2 * s], (float)src[2 * s + 1]);
+        }
+}
+
+// Write the quantized filter into filter_bo, converting row-major back to the
+// col-FFT layout cmul_accum consumes. Inverse of unpack_spectrum().
+static void pack_filter(const int16_t *rowmajor, int16_t *dst_bo)
+{
+    for (int ch = 0; ch < N_CHANNELS; ++ch) {
+        const int16_t *s = rowmajor + (size_t)ch * PATCH_ELEMS * 2;
+        int16_t       *d = dst_bo   + (size_t)ch * PATCH_ELEMS * 2;
+        for (int m = 0; m < PATCH_ROWS; ++m)
+            for (int k = 0; k < PATCH_COLS; ++k) {
+                const size_t si = (size_t)m * PATCH_COLS + k;
+                const size_t di = (size_t)k * PATCH_ROWS + m;
+                d[2 * di]     = s[2 * si];
+                d[2 * di + 1] = s[2 * si + 1];
+            }
+    }
+}
+
+// Build H from the current filter state and push it to the device.
+// Reports the Q1.15 scale and the peak magnitude: a spiky filter that leaves the
+// response far below the cint16 rails shows up here and nowhere else.
+static void publish_filter(xrt::bo &filter_bo, std::vector<int16_t> &scratch)
+{
+    float scale = 0.0f, max_abs = 0.0f;
+    mosse::filter_quantize_q15(g_filter, g_energy, mosse::DEFAULT_EPS_REL,
+                               scratch.data(), &scale, &max_abs);
+    pack_filter(scratch.data(), filter_bo.map<int16_t *>());
+    filter_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    printf("  filter: Q1.15 scale %.4g, max|H| %.4g\n", (double)scale, (double)max_abs);
+    fflush(stdout);
+}
 
 // -----------------------------------------------------------------------
 // Test data injection (for hw_emu validation)
@@ -425,6 +471,7 @@ int main(int argc, char **argv)
     xrt::aie::buffer gm_weights     (device, uuid, "gmio_weights");
     xrt::aie::buffer gm_fft_row_out (device, uuid, "gmio_fft_row_out");
     xrt::aie::buffer gm_fft_col_in  (device, uuid, "gmio_fft_col_in");
+    xrt::aie::buffer gm_fft_col_out (device, uuid, "gmio_fft_col_out");
     xrt::aie::buffer gm_cmul_in     (device, uuid, "gmio_cmul_in");
     xrt::aie::buffer gm_accum_out   (device, uuid, "gmio_accum_out");
     xrt::aie::buffer gm_ifft_row_in (device, uuid, "gmio_ifft_row_in");
@@ -456,6 +503,9 @@ int main(int argc, char **argv)
     // Correlation response map (cint16, 64 KB)
     auto resp_bo    = xrt::bo(device, RESP_BYTES,
                                xrt::bo::flags::normal, 0);
+    // Per-channel 2-D spectrum F_ch, drained from the gmio_fft_col_out tap
+    auto fcol_bo    = xrt::bo(device, FFT_BYTES,
+                               xrt::bo::flags::normal, 0);
 
     // ------------------------------------------------------------------
     // PL kernel handles
@@ -473,14 +523,31 @@ int main(int argc, char **argv)
                       WEIGHT_CH_BYTES * N_CHANNELS);
     weights_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
-    // H_ch* is not computed yet (see filter_update_kissfft). Zero it explicitly
-    // so cmul_accum consumes a defined value; the response is then zero rather
-    // than garbage, which is a meaningful "pipeline ran end to end" result.
-    // TODO: load first frame, select initial ROI, compute initial H_ch*
-    //       and write to filter_bo.
+    // Frame 0 runs with a zeroed filter on purpose: it is the INITIALISATION pass,
+    // whose only job is to produce F_ch so filter_init() has something to learn
+    // from. Its response is discarded — with H = 0 it is identically zero, and
+    // peak_detect_sw would report a meaningless (0,0).
     memset(filter_bo.map<void *>(), 0, FILTER_BYTES * N_CHANNELS);
     filter_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    printf("TODO: initialize filters from first frame (H_ch* zeroed for now)\n");
+
+    // Target spectrum: closed form, no FFT (see mosse_filter.h). CENTRED — a
+    // target displaced by (dr,dc) must produce a peak at (dr,dc), so G itself
+    // carries no offset. Constant for the whole run.
+    mosse::gaussian_target_spectrum(g_target.data(), PATCH_ROWS, PATCH_COLS,
+                                    mosse::DEFAULT_SIGMA, 0, 0);
+
+    // Scratch for the row-major quantized filter, before pack_filter() converts
+    // it to the col-FFT layout.
+    std::vector<int16_t> filter_scratch((size_t)N_CHANNELS * PATCH_ELEMS * 2);
+
+    if (ITER_CNT < 2)
+        printf("WARNING: ITER_CNT=%d. Frame 0 is consumed by filter initialisation,\n"
+               "         so a single-frame run cannot test localisation. Build with\n"
+               "         ITER_CNT=2 or more for a meaningful result.\n", ITER_CNT);
+    printf("filter: sigma=%.1f eta=%.3f H_SHIFT=%d — frame 0 initialises, "
+           "frame 1+ tracks\n",
+           (double)mosse::DEFAULT_SIGMA, (double)mosse::DEFAULT_ETA, CMUL_H_SHIFT);
+    fflush(stdout);
 
     // Tracked position (centre of search patch in frame coordinates)
     int pos_row = FRAME_ROWS / 2;
@@ -514,14 +581,30 @@ int main(int argc, char **argv)
         // opposite signs — so a row/col swap (a transpose bug) and a sign flip
         // are both caught, not just "something non-zero came out".
         // TODO: Replace with real video capture loop (OpenCV, V4L2).
+        //
+        // Frame 0 is the exception: the impulse goes at pos EXACTLY. That frame
+        // trains the filter, and G is centred, so the target it learns must sit at
+        // the patch centre. Injecting it off-centre on frame 0 would teach the
+        // filter that the target IS the offset, and frame 1 would then correctly
+        // report (0,0) — a passing-looking result from a filter trained on the
+        // wrong thing.
         {
             uint8_t *frame_ptr = frame_bo.map<uint8_t *>();
-            int test_row = pos_row + IMPULSE_DR;
-            int test_col = pos_col + IMPULSE_DC;
+            // Keyed off the filter state, not off `frame == 0`. The two agree in
+            // the current flow, but "is the filter trained yet" is the condition
+            // that actually decides where the target must be, and the init branch
+            // at the bottom of the loop uses the same one.
+            const bool init_frame = !g_filter.initialized;
+            int test_row = pos_row + (init_frame ? 0 : IMPULSE_DR);
+            int test_col = pos_col + (init_frame ? 0 : IMPULSE_DC);
             inject_impulse_frame(frame_ptr, FRAME_ROWS, FRAME_COLS, test_row, test_col, 200);
             frame_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);  // Flush host → device
-            printf("Frame %d: impulse at pos+(%d,%d) = (%d,%d)\n",
-                   frame, IMPULSE_DR, IMPULSE_DC, test_row, test_col);
+            if (init_frame)
+                printf("Frame %d: [INIT] impulse CENTRED at (%d,%d)\n",
+                       frame, test_row, test_col);
+            else
+                printf("Frame %d: impulse at pos+(%d,%d) = (%d,%d)\n",
+                       frame, IMPULSE_DR, IMPULSE_DC, test_row, test_col);
             fflush(stdout);
         }
 
@@ -676,13 +759,30 @@ int main(int argc, char **argv)
             // a full output window, which stalls the column FFT that feeds it,
             // which stalls the very input DMAs we would be waiting on. Draining
             // first breaks that cycle.
+            // The F_ch tap drains in the SAME loop: gmio_fft_col_out and
+            // gmio_accum_out are driven 1:1 by the same col-FFT invocation, so
+            // this adds one async/wait per iteration rather than a second loop
+            // (~1024 more per frame, about +16% on the host's DMA transactions).
+            // It must be armed here for the same reason accum_out is — an
+            // un-drained output window stalls the col FFT, which stalls the input
+            // DMAs we would otherwise be waiting on.
             for (int k = 0; k < COL_CHUNKS; ++k) {
                 gm_accum_out.async(accum_bo, XCL_BO_SYNC_BO_AIE_TO_GMIO,
                                    COL_CHUNK_BYTES, k * COL_CHUNK_BYTES);
+                gm_fft_col_out.async(fcol_bo, XCL_BO_SYNC_BO_AIE_TO_GMIO,
+                                     COL_CHUNK_BYTES, k * COL_CHUNK_BYTES);
+                gm_fft_col_out.wait();
                 gm_accum_out.wait();
             }
-            printf("[ch %d] accum_out received (%d x %zu B)\n",
+            printf("[ch %d] accum_out + F_ch received (%d x %zu B)\n",
                    ch, COL_CHUNKS, COL_CHUNK_BYTES); fflush(stdout);
+
+            // Stash this channel's spectrum for the filter update after the loop.
+            // Converted out of the col-FFT layout here so all the filter maths
+            // works in one consistent row-major order.
+            fcol_bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+            unpack_spectrum(fcol_bo.map<int16_t *>(),
+                            g_F_all.data() + (size_t)ch * PATCH_ELEMS);
 
             gm_fft_col_in.wait();
             printf("[ch %d] fft_col_in sent\n", ch); fflush(stdout);
@@ -730,29 +830,54 @@ int main(int argc, char **argv)
                COL_CHUNKS, COL_CHUNK_BYTES); fflush(stdout);
 
         // 4. Peak detection — read real parts (stride-2 for cint16)
-        int dr = 0, dc = 0;
-        int peak = peak_detect_sw(resp_bo.map<int16_t *>(), PATCH_ROWS, PATCH_COLS, &dr, &dc);
-        pos_row += dr;
-        pos_col += dc;
+        //
+        // Skipped entirely on frame 0: the filter is zero there by construction,
+        // so the response is identically zero and any displacement it reports is
+        // an artifact of peak_detect_sw's scan order, not a measurement.
+        if (!g_filter.initialized) {
+            printf("Frame %d: [INIT] response not evaluated — filter is being "
+                   "trained from this frame\n", frame);
+        } else {
+            int dr = 0, dc = 0;
+            int peak = peak_detect_sw(resp_bo.map<int16_t *>(),
+                                      PATCH_ROWS, PATCH_COLS, &dr, &dc);
+            pos_row += dr;
+            pos_col += dc;
 
-        // peak==0 means the response map is identically zero, so the (0,0)
-        // displacement below carries no information — say so rather than
-        // printing a plausible-looking position. Expected while H_ch* is
-        // zeroed (see the filter_bo memset above).
-        const bool ok = (peak > 0 && dr == IMPULSE_DR && dc == IMPULSE_DC);
-        printf("Frame %d: displacement (%d,%d) → pos (%d,%d)  peak|re|=%d  [%s]\n",
-               frame, dr, dc, pos_row, pos_col, peak,
-               peak == 0   ? "VOID: zero response — result carries no information"
-               : ok        ? "OK: matches injected offset"
-                           : "MISMATCH vs injected offset");
-        if (peak == 0)
-            printf("       (expected while H_ch* is zeroed — initialize the filter "
-                   "to make this test meaningful)\n");
-        else if (!ok)
-            printf("       expected displacement (%d,%d)\n", IMPULSE_DR, IMPULSE_DC);
+            // peak==0 means the response map is identically zero, so the (0,0)
+            // displacement carries no information — say so rather than printing a
+            // plausible-looking position. Now that the filter is real this should
+            // no longer happen; if it does, the filter or the shift budget is
+            // wrong, not the test.
+            const bool ok = (peak > 0 && dr == IMPULSE_DR && dc == IMPULSE_DC);
+            printf("Frame %d: displacement (%d,%d) → pos (%d,%d)  peak|re|=%d  [%s]\n",
+                   frame, dr, dc, pos_row, pos_col, peak,
+                   peak == 0   ? "VOID: zero response — result carries no information"
+                   : ok        ? "OK: matches injected offset"
+                               : "MISMATCH vs injected offset");
+            if (peak == 0)
+                printf("       (filter is non-zero now, so this points at the shift "
+                       "budget or the filter scale — check the Q1.15 report above)\n");
+            else if (!ok)
+                printf("       expected displacement (%d,%d)\n", IMPULSE_DR, IMPULSE_DC);
+        }
 
-        // 5. Filter update (PS-side, stub)
-        filter_update_kissfft();
+        // 5. Filter init / update (PS-side). Bolme eq. 10-12; see mosse_filter.h.
+        //
+        // Runs AFTER peak detection so the filter used for this frame's response
+        // is the one learned from previous frames — updating first would leak the
+        // current frame into its own detection and make tracking look better than
+        // it is.
+        if (!g_filter.initialized) {
+            mosse::filter_init(g_filter, g_F_all.data(), g_target.data(),
+                               N_CHANNELS, PATCH_ROWS, PATCH_COLS);
+            printf("  filter: INITIALISED from frame %d (single patch, no affine "
+                   "perturbations)\n", frame);
+        } else {
+            mosse::filter_update(g_filter, g_F_all.data(), g_target.data(),
+                                 mosse::DEFAULT_ETA);
+        }
+        publish_filter(filter_bo, filter_scratch);
     }
 
     // ------------------------------------------------------------------

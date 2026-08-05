@@ -25,8 +25,9 @@ This script sets all required env vars (same as tutorial):
 | `PATCH_COLS` | `128` | Must be a power of 2 |
 | `N_CHANNELS` | `16` | Number of conv feature channels |
 | `FFT_2D_DT` | `0` | 0=cint16, 1=cfloat |
-| `ITER_CNT` | `1` | Frames to process in hw_emu |
+| `ITER_CNT` | `1` | Frames to process in hw_emu. **Needs ≥2** — frame 0 initialises the filter |
 | `PL_FREQ` | `312.5` | PL kernel frequency in MHz |
+| `H_SHIFT` | `15` | cmul_accum filter-product shift; H is Q1.15. Independent of the FFT budget |
 
 Build artifacts land under `build/$(TARGET)/$(PATCH_ROWS)x$(PATCH_COLS)/ch$(N_CHANNELS)/`.
 
@@ -62,13 +63,14 @@ AIE — single instances, serial per-channel processing
 This name must match between `mosse_graph.h` (`input_plio::create("PatchIn", ...)`) and
 `mosse_x1.cfg` (`stream_connect=roi_crop_0.patch_out:ai_engine_0.PatchIn`).
 
-### GMIO ports (9 total: 5 input + 4 output)
+### GMIO ports (10 total: 5 input + 5 output)
 
 | Name | Dir | Purpose |
 |---|---|---|
 | `gmio_weights` | DDR→AIE | conv2d INT8 weights per channel |
 | `gmio_fft_row_out` | AIE→DDR | fft_rows output; APU transposes |
 | `gmio_fft_col_in` | DDR→AIE | APU-transposed data → fft_cols |
+| `gmio_fft_col_out` | AIE→DDR | **Broadcast tap** on fft_cols: F_ch for the PS filter update |
 | `gmio_cmul_in` | DDR→AIE | [H_ch* \| prev_Σ] packed per chunk (replaces separate gmio_filter/gmio_accum_in) |
 | `gmio_accum_out` | AIE→DDR | Updated partial sum after cmul_accum |
 | `gmio_ifft_row_in` | DDR→AIE | Accumulated spectrum → ifft_rows |
@@ -106,8 +108,23 @@ After all channels:
 - **Accumulator in DDR**: The partial accumulator (128×128 cint16 = 64 KB) lives in DDR
   (gmio_accum_out/gmio_accum_in). Fits easily; on-tile storage would require a Memory Tile.
 
-- **Filter update on PS**: A_ch[], B[], H_ch* computation runs on the A72 using KissFFT.
-  Move to AIE if PS becomes a bottleneck.
+- **Filter init/update on PS, and no FFT library**: `mosse_filter.{h,cpp}` implements
+  Bolme eq. 10–12 with a *shared* denominator (Danelljan/DSST form — one reciprocal map
+  per frame instead of 16, and better conditioned). It needs no FFT: `F_ch` arrives
+  already transformed via `gmio_fft_col_out`, and the target spectrum `G` has a closed
+  form (the DFT of a wrapped Gaussian is a Gaussian). KissFFT was removed from the plan
+  entirely. Placement rationale: the update is ~2 M MAC/frame, roughly 5% of the
+  pipeline's arithmetic, so it is not the bottleneck; PL would be the right home if the
+  A72 saturates, and AIE would be the *worst* — the 2 MB of filter state does not fit
+  on-tile, so it would pay the highest GMIO orchestration cost of the three while
+  converting a problem that is trivial in fp32 into another fixed-point calibration.
+
+- **The filter update runs AFTER peak detection.** Updating first leaks the current frame
+  into its own detection and makes tracking look better than it is.
+
+- **`mosse_filter.{h,cpp}` includes no XRT/ADF header** so `make test_host` can compile it
+  with the system g++ and check it against a NumPy golden in seconds. The alternative for
+  a sign error is a ~90 min hw_emu frame.
 
 - **IFFT normalization**: Row IFFT shift = 0; col IFFT shift = 14 (= log2(128)+log2(128)).
   If aiesim response is 2^14× too large, set col shift to 0 and apply >>14 in APU after
@@ -153,6 +170,7 @@ Export and quantize via `make weights`:
 make weights                       # export MobileNet-v3 Small layer 1 (INT8 weights + hanning table)
 make gen_vectors                   # generate aiesim test vectors
 make graph                         # compile AIE graph only
+make test_host                     # native unit test for the filter math (seconds, no hardware)
 make aiesim                        # run AIE simulator — NOTE: bypasses PatchIn→conv2d→row-FFT
 make aiesim_plio                   # same, but deletes fft_col_in.bin to force the REAL PatchIn path
 make aiesim_plio CONV2D_MODE=2     # bisect: conv2d synthesizes output, never reads the stream
@@ -186,13 +204,21 @@ design/
 │   └── aiesim_data/
 │       └── s*/                # Test scenarios, written by `make gen_vectors`:
 │                              #   s0-s4  raw patches — CONV2D_MODE=1 (echo) only
-│                              #   s6     Stage-A preprocessed — the only valid
-│                              #          scenario for CONV2D_MODE=0 (real conv)
+│                              #   s6     Stage-A preprocessed, H=unity — real conv path
+│                              #   s7     s6 + a REAL MOSSE filter (per-bin complex H,
+│                              #          off-centre target). The only scenario that
+│                              #          exercises H_SHIFT with a non-identity filter,
+│                              #          asserts a PSR, and checks the F_ch tap.
 ├── pl_src/
 │   ├── camera_capture/        # Zero-fill frame buffer stub
 │   └── roi_crop/              # Extract patch, stream to PatchIn PLIO
 ├── host_app_src/
-│   └── mosse_tracker.cpp      # GMIO-driven XRT tracking loop
+│   ├── mosse_tracker.cpp      # GMIO-driven XRT tracking loop
+│   ├── mosse_filter.h/.cpp    # MOSSE init/update/Q1.15 export — NO XRT include,
+│   │                          # so `make test_host` builds it with the system g++
+│   └── test/
+│       ├── test_mosse_filter.cpp  # native unit test
+│       └── golden/                # NumPy reference (scripts/gen_filter_golden.py)
 ├── system_configs/
 │   └── mosse_x1.cfg           # v++ linker: camera_capture + roi_crop + PatchIn
 ├── profiling_configs/         # xrt.ini (trace settings)
@@ -243,12 +269,77 @@ design/
       0..255 into a port `conv2d_kernel.cpp:105-108` reads as `(int8_t)`, so every pixel
       ≥128 silently wrapped negative
 
+- [x] **Filter init + update implemented (2026-08-05)** — `design/host_app_src/mosse_filter.{h,cpp}`.
+      Bolme eq. 10–12, shared denominator, Stage B3 energy folding, Q1.15 export.
+      `filter_init` on frame 0, `filter_update` (η=0.125) thereafter, both driven from
+      `mosse_tracker.cpp`. No FFT library: `F_ch` comes from the new `gmio_fft_col_out`
+      tap and `G` is closed-form. Verified by `make test_host` against a NumPy golden
+      (`scripts/gen_filter_golden.py`) — all six comparisons at ≤1.5e-7 relative,
+      quantized filter bit-exact (0 of 8192 int16 differ).
+- [x] **`cmul_accum` H_SHIFT added (2026-08-05)** — the kernel multiplied F by H with no
+      shift, and every scenario passed a literal H=1, so the whole shift budget was
+      calibrated at a filter gain of one. H is now Q1.15 with a rounding `>>H_SHIFT`.
+- [x] **aiesim scenario s7 (2026-08-05)** — first scenario with a real per-bin complex
+      filter and an off-centre target, asserting location, sign, a PSR of ≥20× (11×11
+      mainlobe excluded, Bolme §3.5) and the `gmio_fft_col_out` tap's correlation.
+
+- [x] **s6 regression PASSES with H_SHIFT + the F_ch tap (2026-08-05)** —
+      `make aiesim_plio SCENARIO=s6 CONV2D_MODE=0 PATCH_ROWS=64 PATCH_COLS=64
+      FFT_SHIFT=3 IFFT_ROW_SHIFT=0 IFFT_COL_SHIFT=6 SIM_WALL_TIMEOUT=5400`.
+      `OVERALL: PASS`, `err=0 px`, every sub-check OK.
+      The numbers are **bit-identical to the pre-change baseline**: `max|accum|=1929`
+      and peak `{-417,0}`, both exactly as recorded before H_SHIFT existed. That is the
+      evidence that Q1.15 unity (`H=32767`, `>>15`) reproduces the old literal `H=1`
+      and leaves the shift budget untouched.
+      `F_ch tap: correlation with golden = 0.9998` — `gmio_fft_col_out` delivers the
+      right spectrum in the right order.
+
+- [x] **s7 proved a real MOSSE filter localises exactly on hardware (2026-08-05)** —
+      `err=0 px` at the off-centre target (10,−7), flat index 697, through
+      Stage A → conv2d → B1 → FFT → cmul(H_SHIFT) → IFFT. That validates the
+      conjugation convention, the Q1.15 export and the tap end to end.
+      It also FAILED its PSR check at `H_SHIFT=15`, which is what exposed the
+      quantization-ceiling bug above. At `H_SHIFT=10`: **`OVERALL: PASS`** —
+      accum 466, row IFFT 5817, response 785, PSR 19.6×, `err=0 px`, `rails=0`
+      at every stage, `F_ch tap` correlation 0.9998, all ten sub-checks OK.
+      Every stage matched the linear prediction to within 6%.
+
+      **s7's PSR threshold is measured, not derived.** It was first set to
+      `0.7 × golden` on the untested assumption that fixed point retains 70% of the
+      float ratio; it retains ~51% (golden 38× → measured 19.6×). The gap is
+      spectral quantization: the accumulator sits at 466/32767, so the spectrum
+      carries ~9 bits and its rounding noise lifts the sidelobe to 40 where the
+      true value is ~20. More gain fixes it (`H_SHIFT=8` quadruples the signal
+      while the noise stays absolute) but rails the accumulator at 16 channels.
+      **ch1 is the WORST case for PSR** — channels add coherently, their
+      quantization noise does not. Threshold now 15×, which still fails a ~25%
+      regression and sits well above Bolme's §3.5 failure indicator of ~7.
+
 ### In Progress / Next
+- [ ] **s7 at N_CHANNELS=16** — the real design point, and the case `H_SHIFT=10` was
+      chosen for. Predicted accumulator 7456 (23% of range); PSR should be markedly
+      better than ch1's 19.6× since channels add coherently and quantization noise
+      does not. Note the harness reuses one spectrum for all channels, so it is the
+      coherent best case for SNR and the coherent worst case for headroom.
+      Wall clock ~5 h at 64×64 ch16 (`SIM_WALL_TIMEOUT` scales with N_CHANNELS).
+- [ ] Re-run s6 at `H_SHIFT=10` — it passed at 15; unity-gain scenarios are
+      H_SHIFT-independent by construction (`H_UNITY = 2^H_SHIFT`) but confirm it
+- [ ] Re-validate the shift budget at the 128×128 / 4-2-2 design point. `H_SHIFT=10`
+      was calibrated at 64×64 / 3-0-6 / ch1. The response scale transfers (same total
+      of 12) and `IFFT_ROW_SHIFT=2` makes the row IFFT 4× safer, but that is an
+      inference, not a measurement.
+- [ ] **hw_emu with `ITER_CNT=2`** — the only test that exercises the tracker's runtime
+      behaviour (frame 0 init → frame 1 track). Everything in `mosse_tracker.cpp` is
+      compile-verified only. Needs a full xsa + package; hours.
+- [ ] hw_emu end-to-end with `ITER_CNT=2` to confirm localisation flips VOID → OK
 - [ ] aiesim N_CHANNELS=16: test multi-channel accumulation
 - [ ] mosse_tracker.cpp: add video decode loop (OpenCV or V4L2)
-- [ ] mosse_tracker.cpp: implement first-frame filter initialization
-- [ ] mosse_tracker.cpp: implement PS-side filter update (KissFFT for A_ch, B, H_ch*)
+- [ ] Affine perturbations for init (Bolme §3.4) — currently the N=1 case
 - [ ] mosse_tracker.cpp: implement `transpose_inplace()` (currently stub)
+- [ ] **Measure real per-`async`/`wait` driver cost on hardware.** ~6500 host DMA
+      transactions per frame at 16 channels; at 2–10 µs each that is 13–65 ms, which
+      would dominate the 33 ms budget and outweigh every compute-placement decision.
+      This measurement gates whether the transposes should move off the APU.
 - [ ] Validate IFFT normalization shift (col_shift=12 empirically tuned; see ifft_graph.h)
 - [x] **N_CHANNELS=16 validated end to end (2026-08-01)** — s6, `CONV2D_MODE=0`, budget
       `FFT_SHIFT=4 IFFT_ROW_SHIFT=2 IFFT_COL_SHIFT=2`, `OVERALL: PASS`, `err=0 px`.
@@ -261,12 +352,105 @@ design/
       `[smoke] PASS — all 256 words correct`, and the waveform confirms **256/256 beats**
       at the shim boundary. This closes the "PL→AIE PLIO delivers nothing" issue: the
       PLIO mechanism works in hw_emu, the bug was the host's argument indexing.
-- [ ] hw_emu: verify single-channel end-to-end (`make sd_card TARGET=hw_emu N_CHANNELS=1 ITER_CNT=1`).
-      **`roi_crop`'s arg-index fix in `mosse_tracker.cpp` is NOT yet exercised in hw_emu** —
-      it is the same bug the smoke test proved and fixed, but the full design has not been
-      rebuilt and rerun since. That is the next run.
+- [x] **hw_emu single-channel end-to-end PASSES (2026-08-01)** — `N_CHANNELS=1 ITER_CNT=1`.
+      The whole chain runs: `roi_crop` → PatchIn PLIO → conv2d → row FFT → transpose →
+      col FFT → cmul_accum → IFFT rows → transpose → IFFT cols → response → peak detect.
+      All four output GMIOs drained 64 × 1024 B. Both blocking bugs are fixed and
+      validated on hardware: the XRT arg-index bug and the `aie2gm_nb` chunking/ordering
+      bug. Timing reference: `roi_crop` `ap_done` at **766 µs** of simulated time; one
+      frame is ~90 min wall at 128×128 with `--debug typical`.
+- [ ] **hw_emu localisation is NOT yet validated.** *(Updated 2026-08-05: the cause below
+      is fixed — the filter is now computed — but the hw_emu run confirming it has not
+      been done. Frame 0 is the init pass and its response is deliberately not evaluated,
+      so this needs `ITER_CNT=2`, ~3 h.)* Historical description follows.
+      `H_ch*` used to be `memset` to zero
+      (`mosse_tracker.cpp`, "initialize filters from first frame"), so `cmul_accum`
+      multiplies by zero and the response map is identically zero. Confirmed empirically:
+      `peak|re|=0`. The test now injects the impulse OFF-CENTRE at
+      `pos + (IMPULSE_DR, IMPULSE_DC)` = (10,-7) and prints `[VOID/OK/MISMATCH]`, so this
+      degenerate case reports honestly instead of printing a plausible position.
+      Unblocked by first-frame filter init; the cheap interim is to set `H_ch*` to the
+      conjugate spectrum of the same patch (matched filter → genuine peak at the offset).
 
 ### Known Issues
+
+- **`SIM_WALL_TIMEOUT` did not scale with patch area, and a timeout looks exactly like a
+  deadlock.** It was `1200 × N_CHANNELS` — the 64×64 budget applied unchanged to a
+  128×128 build carrying 4× the data. Measured 2026-08-05: `aiesim_plio SCENARIO=s6` at
+  128×128 ch1 was killed by `timeout` (make reports `Error 124`) while still printing
+  `step 2: waiting for fft_row_out`, which is byte-identical to what a genuine deadlock
+  looks like. **Every `aiesim_plio` PASS recorded above before that date is a 64×64 run** —
+  the 128×128 PLIO path had never been given enough wall clock to finish, so "it hangs at
+  128×128" was never a real finding. Now scaled by `PATCH_ROWS*PATCH_COLS/4096`
+  (`SIM_PATCH_SCALE`): 4800 s at 128×128 ch1. Before concluding "deadlock", check for
+  `Error 124` and for the simulator's own cycle-timeout message.
+
+  **Check the right process before calling something hung.** `ps -C aiesimulator` shows
+  only the two bash wrapper scripts, which sit at 0.0% CPU for the whole run. The actual
+  simulator is `aie2simmsm` (`aietools/bin/unwrapped/lnx64.o/`), and a healthy run holds
+  ~190% CPU and ~2.5 GB RSS. A quiet log is normal — step 4/5 can go 10+ minutes between
+  prints because the ISS models cross-tile vector loads at ~20k cycles each.
+
+- **The `gmio_fft_col_out` broadcast changes the tile mapping but does NOT break the
+  aiesim lock ordering.** Adding the tap moves `cmul.pi0` from a direct tile-to-tile
+  buffer (`fft_cols...po0 → cmul.pi0`, tile 22,0) to a DMA path
+  (`mosse_graph._dma[0].po0 → cmul.pi0`, tile 24,0), with fft_cols relocated to (29,0);
+  same at both geometries. Since `cmul_accum_kernel.h` documents the ISS as delivering
+  the `cmul_in` GMIO lock only after the tile-to-tile lock fires, this looked fatal.
+  Measured 2026-08-05: it is not — a 64×64 s6 run with the tap in place reached **step 6**
+  (row-IFFT), so the col FFT, the tap drain and cmul all completed.
+
+- **The shift budget was calibrated at a filter gain of ONE — FIXED 2026-08-05, but read
+  this before trusting any pre-2026-08 measurement.** `cmul_accum` multiplied F by H with
+  no shift, justified by a comment saying "PS pre-scales H", a contract nothing
+  implemented (the host `memset` the filter to zero). Every aiesim scenario passed
+  `H_re=ones_re`, i.e. a literal integer 1. So `accum peak 7728` and the 4/2/2 budget
+  measured what the pipeline does with *no filter at all*. At that scaling a real filter
+  would have needed `|H| ≲ 4` to stay off the rails — two bits of resolution.
+
+  H is now Q1.15 (host normalizes `max|H| → 32767` across all channels) and the kernel
+  applies a round-to-nearest `>>H_SHIFT`. **The old budget survives unchanged as an upper
+  bound**, because `|H|/2^15 ≤ 1` makes the product no larger than the old H=1 case — so
+  4/2/2 needs no re-sweep for *safety*. The risk now runs the other way: a spiky filter
+  leaves most bins far below the rails, so the host prints the Q1.15 scale and `max|H|`
+  every frame, and `test_host` asserts the quantized filter actually reaches full scale.
+  Note the normalization is by complex MAGNITUDE, so the largest single int16 component
+  is typically below 32767 (a bin at 45° of phase puts 32767/√2 in each part).
+
+- **H's quantization ceiling is NOT `2^H_SHIFT` — and a MOSSE filter is spiky.**
+  `filter_quantize_q15()` originally derived the ceiling from `CMUL_H_SHIFT`, which
+  looked right only because `(1<<15)-1 == 32767`. They are independent:
+  the ceiling sets H's *resolution* (always use all 15 bits), `H_SHIFT` sets the
+  *product scale*. Coupled, the knob traded one bit of filter precision for each bit
+  of accumulator gain — i.e. it did nothing. Fixed in all four places that encode the
+  contract: `mosse_filter.cpp`, `gen_filter_golden.py`, `test_mosse_filter.cpp`, and
+  s7 in `gen_aiesim_vectors.py`.
+
+  The reason it matters: **max|H| sits where |F| is SMALLEST**, because that is where
+  the regularized inverse `conj(G)F/(|F|²+ε)` peaks. Normalizing that bin to full scale
+  leaves every informative bin far below it. Measured at `H_SHIFT=15`, s7, 64×64,
+  `FFT_SHIFT=3/0/6`, ch1: accumulator reached 15 of 32767 and the response was 21 LSB.
+  It still localised **exactly** (`err=0 px`) — the failure was PSR collapsing to 5.2×
+  against a golden 38× — which is why a location-only test would have called this a pass.
+  `H_SHIFT` default is now **10**; see the calibration table in the Makefile.
+  ε is a second lever (measured: `eps_rel` 0.001→3 moves the float accumulator
+  674→23386 with `err=0 px` throughout) and is still at its default.
+
+- **Conjugation: the stored filter is H, not Bolme's H*.** Bolme writes
+  `H* = G ⊙ conj(F) / (F ⊙ conj(F))` because the correlation he forms is `F ⊙ H*`.
+  `cmul_accum` applies the conjugation itself, so what the host stores is
+  `H = conj(G) ⊙ F / (B + ε)`. Storing Bolme's expression verbatim gives
+  `F ⊙ conj(H) = conj(G)·F/conj(F)`, whose phase is noise — the response then peaks at an
+  arbitrary bin. **This is invisible whenever the target is centred**, because a centred
+  real Gaussian has `conj(G) = G`; that is precisely why s7 puts its target off-centre,
+  and the s7 generator's own assertion is what caught the mistake during implementation.
+
+- **PSR must exclude the mainlobe or it asserts nothing.** A "largest non-peak element"
+  check on a smooth σ=2 Gaussian response finds the peak's immediate neighbour at
+  `exp(-1/8) = 0.88` of the peak, giving a ratio of 1.13 that passes on any blurry blob.
+  Bolme §3.5 excludes an 11×11 window; with that exclusion s7's golden ratio is 28.9.
+  The harness's `snr_ratio_pct` check does the exclusion with circular distance, since
+  the response map wraps and a peak near an edge has its mainlobe split.
 
 - **conv2d weights are consumed per FIRING, not per patch.** `weights` is an `input_buffer`,
   and ADF acquires every input buffer before every invocation. conv2d fires
@@ -336,6 +520,23 @@ design/
   xsim also gave `stream_src_0/out_r_TVALID` and `VitisRegion/out_r_tvalid` the SAME
   VCD identifier, proving they are one net with no FIFO in between that could have
   hidden the data. See [[plio-was-never-broken-xrt-arg-index]].
+
+- **A centred test impulse cannot validate localisation.** `peak_detect_sw` starts at
+  `max_val = -1`, so on an all-zero response only `i=0` satisfies `mag > max_val`; the
+  index stays 0 and the wrap maps it to displacement `(0,0)` — the correct answer for a
+  centred target, produced without reading the data. With `H_ch*` zeroed the response IS
+  identically zero, so the old centred test printed a plausible position that was
+  independent of its input. The impulse is now injected at `pos + (IMPULSE_DR, IMPULSE_DC)`
+  (default 10,-7 — asymmetric and opposite-signed so a row/col transpose and a sign flip
+  are both caught), and `peak_detect_sw` returns the peak magnitude so `peak == 0` is
+  reported as `VOID` rather than as a pass. Note the detector scans `|real|`, so a
+  legitimately negative peak (which Stage B1 makes possible) still classifies OK.
+
+- **The host does not exit after the last frame.** `gr.run()` starts the graph
+  free-running and `gr.end(0)` is documented as "block until graph completes", which never
+  happens — the app prints every result, then sits in teardown forever. Cosmetic (all data
+  is already out) but it means `run_script.sh` never reports RC and the emulation must be
+  killed by hand.
 
 - **Probing PL↔AIE signals in hw_emu takes three non-obvious steps.**
   1. `ai_engine_0.S00_AXIS` is a **SystemC/TLM socket**, not RTL — `vitis_design.protoinst`

@@ -12,7 +12,14 @@
  * filter stores H (not pre-conjugated); conjugation is applied here via the
  * sign flip on the imaginary product.
  *
- * No >>15 shift: PS pre-scales H so products stay within int16 range.
+ * H is Q1.15: the host normalizes max|H| to 32767 across all channels, and the
+ * product is shifted right by CMUL_H_SHIFT (default 15, set from the Makefile)
+ * with round-to-nearest. Earlier revisions did NO shift, on the strength of a
+ * comment claiming the PS pre-scaled H — nothing implemented that, and every
+ * aiesim scenario passed a literal H = 1, so the shift budget in the Makefile
+ * was calibrated at a filter gain of one. With Q1.15 the product is |H|/2^15 <= 1
+ * times the old value, so that budget still holds as an upper bound.
+ *
  * APU sends a zero buffer for accum_prev on ch=0 to initialise the accumulator.
  *
  * Memory tile access strategy:
@@ -32,6 +39,12 @@
 #include "cmul_accum_kernel.h"
 
 static constexpr int CMUL_N = PATCH_COLS * FFT_COL_WS;  // 256
+
+// Round-to-nearest bias. A bare arithmetic >> truncates toward -infinity, which
+// biases every negative bin of the spectrum by up to one LSB in the same
+// direction — a systematic DC offset in the response, not just noise. One add
+// per product removes it, and it is branchless so the do-loop stays tight.
+static constexpr int32_t CMUL_RND = (CMUL_H_SHIFT > 0) ? (1 << (CMUL_H_SHIFT - 1)) : 0;
 
 // Saturating narrow to int16.
 //
@@ -105,7 +118,9 @@ void cmul_accum_kernel(
                    + (int32_t)in_ptr[i].imag * (int32_t)flt_local[i].imag;
         int32_t im = (int32_t)in_ptr[i].imag * (int32_t)flt_local[i].real
                    - (int32_t)in_ptr[i].real * (int32_t)flt_local[i].imag;
-        out_ptr[i].real = sat16((int32_t)acc_local[i].real + re);
-        out_ptr[i].imag = sat16((int32_t)acc_local[i].imag + im);
+        out_ptr[i].real = sat16((int32_t)acc_local[i].real
+                                + ((re + CMUL_RND) >> CMUL_H_SHIFT));
+        out_ptr[i].imag = sat16((int32_t)acc_local[i].imag
+                                + ((im + CMUL_RND) >> CMUL_H_SHIFT));
     }
 }

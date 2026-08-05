@@ -9,6 +9,11 @@
  *                 Next  PATCH_COLS*FFT_COL_WS elements = accum_prev
  *   - accum_out:  updated accumulator written to DDR via gmio_accum_out
  *
+ * H is Q1.15 (host normalizes max|H| across all channels to 32767) and the
+ * product is shifted right by CMUL_H_SHIFT with round-to-nearest. See the
+ * H_SHIFT block in the Makefile for why, and why the existing FFT/IFFT shift
+ * budget survives the change unmodified.
+ *
  * After all N_CHANNELS channels the accumulator holds Σ_c H_c* ⊙ F_c,
  * which the APU feeds to the IFFT via gmio_ifft_row_in.
  *
@@ -35,6 +40,15 @@
 
 #include <adf.h>
 using namespace adf;
+
+// Filter-product shift, from the Makefile (H_SHIFT). 15 = H is Q1.15.
+// 0 reproduces the historical no-shift behaviour, kept reachable for bisection.
+// Defined in the header, not the .cpp, so the aiesim harness can report the value
+// its binary was actually built with.
+#ifndef CMUL_H_SHIFT
+#  define CMUL_H_SHIFT 15
+#endif
+static_assert(CMUL_H_SHIFT >= 0 && CMUL_H_SHIFT <= 30, "CMUL_H_SHIFT out of range");
 
 void cmul_accum_kernel(
     input_buffer<cint16_t>  &fft_col_in,  // in[0]: F_ch ← fft2d.fft_col_out (tile-to-tile, must be first)
