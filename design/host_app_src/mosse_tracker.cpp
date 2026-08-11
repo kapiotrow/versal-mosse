@@ -217,6 +217,121 @@ static int peak_detect_sw(const int16_t *resp, int rows, int cols,
     return max_val;
 }
 
+// -----------------------------------------------------------------------
+// Diagnostics
+// -----------------------------------------------------------------------
+// A hw_emu frame costs ~45 min, so a run that only reports a displacement
+// wastes most of what it computed. These print the numbers needed to tell
+// "H is wrong" from "the response is wrong" from "F_ch arrives scrambled"
+// WITHOUT another run, and cost nothing measurable.
+//
+// Two channels on purpose: the binary dumps are richer but land on the SD card
+// mount, which may be read-only under QEMU, whereas stdout is captured in
+// run_emu.log unconditionally. Anything decisive is printed, not just dumped.
+#ifndef DUMP_BUFFERS
+#  define DUMP_BUFFERS 1
+#endif
+
+// Best-effort binary dump. Tries the cwd (SD card) first, then /tmp on the
+// target. Never fatal: losing a dump must not abort a 90-minute run.
+static void dump_buffer(const char *tag, int frame, const void *p, size_t bytes)
+{
+#if DUMP_BUFFERS
+    char path[128];
+    snprintf(path, sizeof(path), "%s_f%d.bin", tag, frame);
+    FILE *f = fopen(path, "wb");
+    if (!f) {
+        snprintf(path, sizeof(path), "/tmp/%s_f%d.bin", tag, frame);
+        f = fopen(path, "wb");
+    }
+    if (!f) {
+        printf("  [dump] %s: no writable location — stdout diagnostics only\n", tag);
+        return;
+    }
+    const size_t wrote = fwrite(p, 1, bytes, f);
+    fclose(f);
+    printf("  [dump] %s -> %s (%zu of %zu B)\n", tag, path, wrote, bytes);
+#else
+    (void)tag; (void)frame; (void)p; (void)bytes;
+#endif
+}
+
+// Peak magnitude and saturation count for a cint16 buffer. `rails > 0` means the
+// stage clipped, which is the failure mode the shift budget exists to prevent.
+// Indices are reported in the buffer's own layout — the caller says which.
+static void report_cint16(const char *tag, const int16_t *b, int rows, int cols,
+                          const char *layout)
+{
+    double max_m = -1.0;
+    int    max_i = 0, rails = 0;
+    for (int i = 0; i < rows * cols; ++i) {
+        const double re = b[2 * i], im = b[2 * i + 1];
+        const double m  = re * re + im * im;
+        if (m > max_m) { max_m = m; max_i = i; }
+        if (re >= 32767.0 || re <= -32768.0 || im >= 32767.0 || im <= -32768.0) ++rails;
+    }
+    printf("  [diag] %-9s max|.|=%7.0f at %s idx %d (%d,%d)  rails=%d\n",
+           tag, sqrt(max_m), layout, max_i, max_i / cols, max_i % cols, rails);
+}
+
+// The decisive report: where the response actually peaks, and — the number that
+// settles it — what the response is AT the injected offset.
+//
+// If (IMPULSE_DR, IMPULSE_DC) is a strong local peak that merely lost a contest
+// against something else, the correlation is working and an artifact is winning.
+// If it is at the noise floor, the displacement information never arrived, which
+// is a different bug entirely. The old pass/fail line could not tell these apart.
+static void report_response(const int16_t *resp, int rows, int cols)
+{
+    // Top 5 by |real| — peak_detect_sw's own metric, so these are exactly the
+    // candidates it chose between. Selection sort over 5 ranks: 5 linear passes
+    // with an explicit exclusion list, which avoids sorting the whole map.
+    constexpr int NTOP = 5;
+    int taken[NTOP];
+    int ntaken = 0;
+    for (int rank = 0; rank < NTOP; ++rank) {
+        long best = -1;
+        int  best_i = -1;
+        for (int i = 0; i < rows * cols; ++i) {
+            bool skip = false;
+            for (int t = 0; t < ntaken; ++t)
+                if (taken[t] == i) { skip = true; break; }
+            if (skip) continue;
+            const long re  = resp[2 * i];
+            const long mag = (re < 0) ? -re : re;
+            if (mag > best) { best = mag; best_i = i; }
+        }
+        if (best_i < 0) break;
+        taken[ntaken++] = best_i;
+        int r = best_i / cols, c = best_i % cols;
+        if (r > rows / 2) r -= rows;
+        if (c > cols / 2) c -= cols;
+        printf("  [diag] resp rank %d: (%3d,%3d) |re|=%ld\n", rank, r, c, best);
+    }
+
+    // Value at the injected offset, and at a few reference bins.
+    const int er = ((IMPULSE_DR % rows) + rows) % rows;
+    const int ec = ((IMPULSE_DC % cols) + cols) % cols;
+    auto at = [&](int r, int c) {
+        const long re = resp[2 * (r * cols + c)];
+        return (long)((re < 0) ? -re : re);
+    };
+    printf("  [diag] resp at injected (%d,%d) = %ld   |   (0,0) = %ld, "
+           "(%d,0) = %ld, (0,%d) = %ld\n",
+           IMPULSE_DR, IMPULSE_DC, at(er, ec), at(0, 0),
+           IMPULSE_DR, at(er, 0), IMPULSE_DC, at(0, ec));
+
+    // Profiles through the injected row and column: this is what distinguishes
+    // "the column axis carries no information" (flat profile) from "the peak
+    // moved" (sharp profile in the wrong place). Printed coarsely to keep the
+    // log readable — every 4th bin.
+    printf("  [diag] row %d profile (every 4th col): ", IMPULSE_DR);
+    for (int c = 0; c < cols; c += 4) printf("%ld ", at(er, c));
+    printf("\n  [diag] col %d profile (every 4th row): ", IMPULSE_DC);
+    for (int r = 0; r < rows; r += 4) printf("%ld ", at(r, ec));
+    printf("\n");
+}
+
 // Load the INT8 conv2d weights exported by `make weights` into a host buffer.
 // Layout per channel (64 B, see design/aie_src/weights/layer0.h):
 //   [0:9] int8 3×3 kernel, [9] out_shift, [10:14] int32 bias_acc (LE)
@@ -255,8 +370,22 @@ static double  g_energy[N_CHANNELS]    = {0.0};
 // Q1.15 periodic Hann, regenerated by `make weights` into hanning_<N>.h.
 // The host needs the same table the kernel uses: B2's correction is built from
 // this window's DFT.
-#include "hanning_128.h"
-#define HTAB HANNING_128
+//
+// Selected by geometry, mirroring conv2d_kernel.cpp — the two MUST resolve to the
+// same table. This used to be a hardcoded hanning_128.h, which the header's own
+// PATCH_ROWS guard turned into a compile error on any non-128 build.
+#if   PATCH_COLS == 128
+#  include "hanning_128.h"
+#  define HTAB HANNING_128
+#elif PATCH_COLS == 64
+#  include "hanning_64.h"
+#  define HTAB HANNING_64
+#elif PATCH_COLS == 32
+#  include "hanning_32.h"
+#  define HTAB HANNING_32
+#else
+#  error "No Hanning table for this PATCH_COLS. Add a case here and run: make weights PATCH_COLS=<n>"
+#endif
 
 // Measure the window-weighted feature mean from the row-FFT output.
 //
@@ -416,6 +545,58 @@ static void inject_impulse_frame(uint8_t *frame_buf, int rows, int cols,
     if (impulse_row >= 0 && impulse_row < rows &&
         impulse_col >= 0 && impulse_col < cols) {
         frame_buf[impulse_row * cols + impulse_col] = value;
+    }
+}
+
+// Generate a synthetic test frame: an ASYMMETRIC structured target centred at
+// (tr, tc) on a flat background.
+//
+// This replaces the single-pixel impulse as the tracking test pattern, for two
+// independent reasons:
+//
+// 1. A one-pixel impulse is a degenerate MOSSE training image. After Stage A's
+//    zero-mean/unit-L2 normalisation an isolated bright pixel on a zero field
+//    quantizes to exactly one non-zero int8 sample (the background sits ~4000x
+//    below it and rounds away), so the filter is trained on a single sample.
+//
+// 2. More importantly, it is SYMMETRIC, and that hides bugs. A centred impulse
+//    gives a spectrum invariant under both transposition and conjugation, so a
+//    transposed pack_filter()/unpack_spectrum() or a wrong conjugation produces
+//    byte-identical results to the correct code. This was verified against a
+//    float model: every one of those mistakes still localises perfectly on an
+//    impulse. It is the same degeneracy mosse_filter.h warns about and the
+//    reason aiesim s7 puts its target off-centre — frame 0 cannot be moved
+//    off-centre here (G is centred), so the asymmetry must live in the target.
+//
+// The shape is asymmetric in three independent ways:
+//   - extents differ between axes (11 rows x 5 cols), so a transpose is visible;
+//   - the spur is on one side only, so point-symmetry is broken and a
+//     conjugation error shows up;
+//   - the two features have different amplitudes.
+//
+// The background is flat: Stage A removes the mean anyway, and flat background
+// keeps the patch spectrum analysable. Every pixel is a function of (r-tr, c-tc)
+// alone, so a later frame is EXACTLY the earlier frame translated — which makes
+// the expected displacement unambiguous.
+static void inject_target_frame(uint8_t *frame_buf, int rows, int cols,
+                                int tr, int tc)
+{
+    constexpr uint8_t BACKGROUND = 40;
+    constexpr uint8_t BAR_VALUE  = 220;
+    constexpr uint8_t SPUR_VALUE = 150;
+
+    memset(frame_buf, BACKGROUND, (size_t)rows * cols);
+
+    for (int r = 0; r < rows; ++r) {
+        const int dr = r - tr;
+        if (dr < -5 || dr > 5) continue;          // bar and spur both fit in |dr| <= 5
+        for (int c = 0; c < cols; ++c) {
+            const int dc = c - tc;
+            uint8_t v = 0;
+            if (dc >= -2 && dc <= 2)                       v = BAR_VALUE;   // 11 x 5
+            else if (dr >= 2 && dc >= 3 && dc <= 8)        v = SPUR_VALUE;  // one side only
+            if (v) frame_buf[(size_t)r * cols + c] = v;
+        }
     }
 }
 
@@ -597,13 +778,17 @@ int main(int argc, char **argv)
             const bool init_frame = !g_filter.initialized;
             int test_row = pos_row + (init_frame ? 0 : IMPULSE_DR);
             int test_col = pos_col + (init_frame ? 0 : IMPULSE_DC);
-            inject_impulse_frame(frame_ptr, FRAME_ROWS, FRAME_COLS, test_row, test_col, 200);
+            // Asymmetric structured target, not a single-pixel impulse: an
+            // impulse is symmetric, and a symmetric training patch makes a
+            // transposed pack_filter() and a wrong conjugation both invisible.
+            // See inject_target_frame().
+            inject_target_frame(frame_ptr, FRAME_ROWS, FRAME_COLS, test_row, test_col);
             frame_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);  // Flush host → device
             if (init_frame)
-                printf("Frame %d: [INIT] impulse CENTRED at (%d,%d)\n",
+                printf("Frame %d: [INIT] target CENTRED at (%d,%d)\n",
                        frame, test_row, test_col);
             else
-                printf("Frame %d: impulse at pos+(%d,%d) = (%d,%d)\n",
+                printf("Frame %d: target at pos+(%d,%d) = (%d,%d)\n",
                        frame, IMPULSE_DR, IMPULSE_DC, test_row, test_col);
             fflush(stdout);
         }
@@ -784,6 +969,16 @@ int main(int argc, char **argv)
             unpack_spectrum(fcol_bo.map<int16_t *>(),
                             g_F_all.data() + (size_t)ch * PATCH_ELEMS);
 
+            // F_ch is the filter's only input. If it is wrong, everything
+            // downstream is wrong for a reason that has nothing to do with the
+            // filter maths — so check it before trusting any later number.
+            // Reported in the col-FFT layout it arrives in: idx = v*ROWS + u.
+            if (ch == 0) {
+                report_cint16("F_ch", fcol_bo.map<int16_t *>(),
+                              PATCH_ROWS, PATCH_COLS, "colFFT");
+                dump_buffer("F_ch", frame, fcol_bo.map<void *>(), FFT_BYTES);
+            }
+
             gm_fft_col_in.wait();
             printf("[ch %d] fft_col_in sent\n", ch); fflush(stdout);
             gm_cmul_in.wait();
@@ -800,6 +995,13 @@ int main(int argc, char **argv)
         // Push the updated mean_prev values (written into bytes [18:22] of each
         // channel's weight buffer above) so the NEXT frame's conv2d sees them.
         weights_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+        // The accumulated spectrum, after B2, as the IFFT will see it. Same
+        // col-FFT layout as F_ch. `rails > 0` here is the saturation the shift
+        // budget exists to prevent.
+        report_cint16("accum", accum_bo.map<int16_t *>(),
+                      PATCH_ROWS, PATCH_COLS, "colFFT");
+        dump_buffer("accum", frame, accum_bo.map<void *>(), ACCUM_BYTES);
 
         // 3. IFFT: APU feeds accumulated spectrum to IFFT row input
         printf("[ifft] START\n"); fflush(stdout);
@@ -828,6 +1030,16 @@ int main(int argc, char **argv)
         gm_ifft_col_in.wait();
         printf("[ifft] cols done → response received (%d x %zu B)\n",
                COL_CHUNKS, COL_CHUNK_BYTES); fflush(stdout);
+
+        // Response diagnostics run on EVERY frame, including frame 0. Frame 0's
+        // response is not a tracking result (the filter is zero, so it should be
+        // ~0), but "is it actually zero" is worth knowing: a non-zero frame-0
+        // response would mean the filter buffer is not what the host thinks.
+        report_cint16("response", resp_bo.map<int16_t *>(),
+                      PATCH_ROWS, PATCH_COLS, "rowmajor");
+        dump_buffer("resp", frame, resp_bo.map<void *>(), RESP_BYTES);
+        if (g_filter.initialized)
+            report_response(resp_bo.map<int16_t *>(), PATCH_ROWS, PATCH_COLS);
 
         // 4. Peak detection — read real parts (stride-2 for cint16)
         //
@@ -878,6 +1090,16 @@ int main(int argc, char **argv)
                                  mosse::DEFAULT_ETA);
         }
         publish_filter(filter_bo, filter_scratch);
+
+        // The quantized filter, row-major, as filter_quantize_q15() produced it —
+        // i.e. BEFORE pack_filter() converts it to the col-FFT layout. Dumping
+        // this side of the conversion is deliberate: comparing it against a
+        // NumPy H built from the dumped F_ch isolates the filter maths from the
+        // layout conversion, which are the two remaining untested steps.
+        report_cint16("H(q15)", filter_scratch.data(),
+                      PATCH_ROWS, PATCH_COLS, "rowmajor");
+        dump_buffer("H_q15", frame, filter_scratch.data(),
+                    (size_t)N_CHANNELS * PATCH_ELEMS * 2 * sizeof(int16_t));
     }
 
     // ------------------------------------------------------------------
