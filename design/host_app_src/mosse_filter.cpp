@@ -6,6 +6,7 @@
 
 #include "mosse_filter.h"
 
+#include <climits>
 #include <cmath>
 #include <cstring>
 
@@ -22,6 +23,147 @@ inline int signed_freq(int k, int n)
 constexpr float kTwoPi = 6.283185307179586f;
 
 }  // namespace
+
+// -----------------------------------------------------------------------
+// Peak-to-sidelobe ratio and update gating — Bolme §3.5. See mosse_filter.h.
+// -----------------------------------------------------------------------
+// Lives here rather than in mosse_tracker.cpp so `make test_host` covers it:
+// this file includes no XRT header, so the gate policy is checkable natively in
+// seconds instead of in a ~26 min hw_emu frame. That matters more for the gate
+// than for anything else in this file, because the gate CANNOT fire on the
+// current synthetic test data (PSR ~172 against a threshold of 7) — the unit
+// tests are the only place its failure paths are exercised at all.
+PsrResult compute_psr(const int16_t *resp, int rows, int cols, bool use_abs)
+{
+    const int EXCL_HALF = PSR_EXCL_HALF;    // 11x11 window, Bolme §3.5
+
+    long best = LONG_MIN;
+    int  pr = 0, pc = 0;
+    for (int i = 0; i < rows * cols; ++i) {
+        const long re = resp[2 * i];
+        const long v  = use_abs ? ((re < 0) ? -re : re) : re;
+        if (v > best) { best = v; pr = i / cols; pc = i % cols; }
+    }
+
+    // Sidelobe membership test, factored out so the two passes cannot disagree.
+    auto in_sidelobe = [&](int r, int c) {
+        int ddr = r - pr; if (ddr < 0) ddr = -ddr;
+        if (rows - ddr < ddr) ddr = rows - ddr;       // circular distance
+        int ddc = c - pc; if (ddc < 0) ddc = -ddc;
+        if (cols - ddc < ddc) ddc = cols - ddc;
+        return !(ddr <= EXCL_HALF && ddc <= EXCL_HALF);
+    };
+
+    // TWO passes for the variance, not the single-pass sum2/n - mean^2 form.
+    // The sidelobe can sit on a large DC pedestal, i.e. exactly the mean >> sdev
+    // regime where single-pass variance loses precision to cancellation. This is
+    // the instrument the gate is judged by, so it is computed the stable way;
+    // two extra passes over 16K elements once per frame costs nothing measurable.
+    double sum = 0.0, smax = 0.0;
+    long   n   = 0;
+    for (int r = 0; r < rows; ++r)
+        for (int c = 0; c < cols; ++c) {
+            if (!in_sidelobe(r, c)) continue;
+            const double v = (double)resp[2 * (r * cols + c)];
+            sum += v; ++n;
+            const double a = (v < 0.0) ? -v : v;
+            if (a > smax) smax = a;
+        }
+
+    PsrResult out{};
+    out.peak     = (long)resp[2 * (pr * cols + pc)];
+    out.n_side   = n;
+    out.mean     = n ? sum / n : 0.0;
+
+    double ss = 0.0;
+    for (int r = 0; r < rows; ++r)
+        for (int c = 0; c < cols; ++c) {
+            if (!in_sidelobe(r, c)) continue;
+            const double d = (double)resp[2 * (r * cols + c)] - out.mean;
+            ss += d * d;
+        }
+    const double var = n ? ss / n : 0.0;
+    out.sdev     = var > 0.0 ? std::sqrt(var) : 0.0;
+    // sdev/side_max == 0 means a perfectly flat sidelobe — an all-zero response,
+    // not an infinitely good peak. Report 0 so it reads as failure, not success.
+    out.psr      = (out.sdev > 0.0) ? ((double)out.peak - out.mean) / out.sdev : 0.0;
+    out.side_max = smax;
+    const double pabs = (out.peak < 0) ? -(double)out.peak : (double)out.peak;
+    out.ratio    = (smax > 0.0) ? pabs / smax : 0.0;
+    out.dr       = (pr > rows / 2) ? pr - rows : pr;
+    out.dc       = (pc > cols / 2) ? pc - cols : pc;
+    return out;
+}
+
+GateDecision psr_gate(const PsrResult &p, float psr_min)
+{
+    GateDecision g{};
+    g.psr       = p.psr;
+    g.threshold = psr_min;
+
+    // Most-specific first; the first hit wins and is the reported reason. The
+    // structural cases are separated from LowPsr on purpose: compute_psr reports
+    // psr = 0 for a degenerate sidelobe, which would read as "occluded" when in
+    // fact the PIPELINE produced nothing — a shift-budget or filter-scale fault,
+    // not a scene event. Those need different responses from a reader.
+    if (p.n_side == 0)      { g.reason = GateReason::EmptySidelobe; return g; }
+    if (p.peak   == 0)      { g.reason = GateReason::ZeroResponse;  return g; }
+    if (p.sdev   <= 0.0)    { g.reason = GateReason::FlatSidelobe;  return g; }
+    // The target g is a POSITIVE Gaussian by construction, so the strongest
+    // structure being negative is anti-correlation, not a detection. Acting on it
+    // would train the filter to invert itself.
+    if (p.peak    < 0)      { g.reason = GateReason::NegativePeak;  return g; }
+
+    // Placed AFTER the structural checks so those still veto (and still report
+    // their own reason) even with the threshold test switched off.
+    if (psr_min <= 0.0f) { g.accept = true; g.reason = GateReason::Disabled; return g; }
+
+    // `>=` matches report_psr's classifier boundary; using `>` there and `>=`
+    // here would make the two lines contradict each other at exactly 7.00.
+    if (p.psr >= (double)psr_min) { g.accept = true; g.reason = GateReason::Accept; }
+    else                          {                  g.reason = GateReason::LowPsr; }
+    return g;
+}
+
+const char *gate_reason_tag(GateReason r)
+{
+    switch (r) {
+        case GateReason::Accept:        return "ACCEPT";
+        case GateReason::Disabled:      return "ACCEPT(gate disabled)";
+        case GateReason::ZeroResponse:  return "ZERO_RESPONSE";
+        case GateReason::EmptySidelobe: return "EMPTY_SIDELOBE";
+        case GateReason::FlatSidelobe:  return "FLAT_SIDELOBE";
+        case GateReason::NegativePeak:  return "NEGATIVE_PEAK";
+        case GateReason::LowPsr:        return "LOW_PSR";
+    }
+    return "?";
+}
+
+const char *gate_reason_why(GateReason r)
+{
+    switch (r) {
+        case GateReason::Accept:
+            return "PSR is at or above the threshold — normal tracking.";
+        case GateReason::Disabled:
+            return "PSR threshold disabled (PSR_GATE_MIN <= 0); report-only mode.";
+        case GateReason::ZeroResponse:
+            return "the response map is identically zero — the pipeline produced "
+                   "nothing. Check the filter scale and the shift budget, not the scene.";
+        case GateReason::EmptySidelobe:
+            return "the patch is not larger than the 11x11 exclusion window, so "
+                   "there is no sidelobe to measure. This is a geometry error.";
+        case GateReason::FlatSidelobe:
+            return "the sidelobe is perfectly constant, so PSR is undefined (not "
+                   "infinite). Usually a railed or saturated response.";
+        case GateReason::NegativePeak:
+            return "the strongest response is NEGATIVE, i.e. anti-correlation. The "
+                   "target output g is a positive Gaussian, so this is not a detection.";
+        case GateReason::LowPsr:
+            return "Bolme §3.5: PSR at or below ~7 indicates the object is occluded "
+                   "or tracking has failed. Holding position and freezing the filter.";
+    }
+    return "";
+}
 
 void FilterState::resize(int rows_, int cols_, int channels_)
 {

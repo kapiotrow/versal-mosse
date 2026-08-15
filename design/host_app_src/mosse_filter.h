@@ -65,6 +65,22 @@
 #  define CMUL_H_SHIFT 10
 #endif
 
+// Bolme §3.5's occlusion / tracking-failure threshold, on the PSR statistic
+// (g_max - mu_sl)/sigma_sl. Fed from the Makefile's PSR_GATE_MIN; the default
+// matches the paper so a standalone native build behaves the same.
+//
+// SEMANTICS: <= 0 DISABLES the threshold test — structural failures (zero
+// response, flat sidelobe, negative peak) are still reported and still veto, but
+// a merely weak peak no longer does. That is the report-only / pre-gating
+// behaviour, and it makes the A/B lever one make variable instead of an #if.
+//
+// NOTE this threshold applies to Bolme's PSR ONLY, never to the |peak|/max|side|
+// ratio that gen_aiesim_vectors.py calls PSR. They are different statistics and
+// differ by several times — see the note on PsrResult below.
+#ifndef PSR_GATE_MIN
+#  define PSR_GATE_MIN 7.0
+#endif
+
 namespace mosse {
 
 using cfloat = std::complex<float>;
@@ -79,6 +95,98 @@ constexpr float DEFAULT_SIGMA = 2.0f;
 // epsilon would silently become either a no-op or a dominant term after any
 // recalibration.
 constexpr float DEFAULT_EPS_REL = 1e-3f;
+
+// Half-width of the excluded window around the peak, Bolme §3.5's 11x11.
+constexpr int   PSR_EXCL_HALF   = 5;
+// Build-configured gate threshold. Written as a cast rather than a suffixed
+// literal so `make ... PSR_GATE_MIN=20` and `=7.5` both compile.
+constexpr float DEFAULT_PSR_MIN = (float)(PSR_GATE_MIN);
+
+// -----------------------------------------------------------------------
+// Peak-to-sidelobe ratio — Bolme §3.5
+// -----------------------------------------------------------------------
+// "the correlation output g is split into the peak which is the maximum value and
+//  the sidelobe which is the rest of the pixels excluding an 11x11 window around
+//  the peak. The PSR is then defined as (g_max - mu_sl) / sigma_sl."
+//
+// Bolme reports 20.0-60.0 under normal tracking and ~7.0 as the occlusion /
+// failure indicator. This is the metric `err=0 px` cannot see: aiesim s7
+// localised EXACTLY while its PSR collapsed to 5.2 against a golden 38.
+//
+// Two things this implementation is careful about:
+//
+//   * The exclusion window uses CIRCULAR distance. The response map wraps, so a
+//     peak near an edge has its mainlobe split across the boundary and a linear
+//     window would leave half the mainlobe in the sidelobe statistics.
+//   * Without the exclusion the check asserts nothing at all. On a smooth
+//     sigma=2 Gaussian the peak's immediate neighbour sits at exp(-1/8) = 0.88 of
+//     the peak, so a "largest non-peak element" ratio is 1.13 on any blurry blob.
+//
+// TWO statistics, because the project has two and they are NOT the same number:
+//
+//   psr   = (g_peak - mu_sl) / sigma_sl        <- Bolme §3.5, literally.
+//           Comparable to his published 20.0-60.0 range and ~7.0 failure mark.
+//   ratio = |g_peak| / max|sidelobe|           <- what gen_aiesim_vectors.py calls
+//           PSR and asserts as `snr_ratio_pct` (s7's "19.6x", golden "38x").
+//
+// Both use the same 11x11 circular exclusion, but max|sidelobe| is roughly
+// mu + 3..4 sigma for a noise-like sidelobe, so the two differ by several times.
+// Do not compare one against the other's thresholds.
+//
+// `resp` is cint16 with {re,im} interleaved: sample i's real part is resp[2*i].
+// The detector scans the REAL part only — Stage B1 makes the response bipolar,
+// so a legitimately negative peak is possible and `use_abs` decides whether it
+// is found. Reading resp[i] instead of resp[2*i] is a real bug this guards.
+struct PsrResult {
+    int    dr, dc;      // displacement of the located peak (wrapped to +/- N/2)
+    long   peak;        // SIGNED response value there
+    double mean, sdev;  // sidelobe statistics
+    double psr;         // Bolme §3.5
+    double side_max;    // max |sidelobe|
+    double ratio;       // |peak| / max|sidelobe|  (the aiesim harness's metric)
+    long   n_side;      // sidelobe sample count (should be rows*cols - 121)
+};
+
+// g_peak is the SIGNED response value, per Bolme. `use_abs` selects only how the
+// peak is LOCATED: true finds the largest MAGNITUDE (the peak the tracker acts
+// on), false is the paper-literal signed maximum. Computing both is how a sign
+// problem becomes visible.
+PsrResult compute_psr(const int16_t *resp, int rows, int cols, bool use_abs);
+
+// Why a frame was or was not allowed to train the filter.
+//
+// An enum rather than a bool because "HOLD" alone is unactionable: a flat
+// sidelobe means the pipeline produced nothing, a negative peak means the filter
+// has the wrong sign, and a low PSR means occlusion. Those demand different
+// responses from whoever reads the log, and on this project a ~26 min frame must
+// never report a verdict without its reason.
+enum class GateReason {
+    Accept,        // psr >= threshold, peak positive, sidelobe non-degenerate
+    Disabled,      // psr_min <= 0: threshold test off, accepted by policy
+    ZeroResponse,  // peak == 0: the map is identically zero, no information
+    EmptySidelobe, // n_side == 0: geometry smaller than the exclusion window
+    FlatSidelobe,  // sdev == 0: constant map; PSR undefined, not infinite
+    NegativePeak,  // largest |real| is negative => anti-correlation
+    LowPsr,        // Bolme's occlusion / failure indicator
+};
+
+struct GateDecision {
+    // Default FALSE on purpose: an unset decision must never train the filter.
+    bool       accept    = false;
+    GateReason reason    = GateReason::ZeroResponse;
+    double     psr       = 0.0;
+    float      threshold = 0.0f;
+};
+
+// Bolme §3.5 update gating. `p` must come from compute_psr(..., use_abs=true),
+// i.e. the peak the tracker actually acted on.
+//
+// The threshold is a PARAMETER rather than being read from DEFAULT_PSR_MIN
+// internally, so the unit tests can sweep it without depending on the build's -D.
+GateDecision psr_gate(const PsrResult &p, float psr_min);
+
+const char *gate_reason_tag(GateReason r);   // "ACCEPT" / "LOW_PSR" / ...
+const char *gate_reason_why(GateReason r);   // one sentence, for the log
 
 struct FilterState {
     int    rows      = 0;

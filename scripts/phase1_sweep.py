@@ -1,0 +1,419 @@
+#!/usr/bin/env python3
+"""
+scripts/phase1_sweep.py
+
+Phase 1 offline decision tool: pick the bias_acc/out_shift variant AND the shift
+budget, in seconds, without a single simulation.
+
+Companion to check_collapse.py, which answers "what is wrong with the feature
+bank" (Q1-Q4). This answers "what should we change it to, and what does the shift
+budget have to become as a result" — the two are coupled, because every variant
+makes the conv output LARGER and the response scales with it.
+
+Why this can be trusted
+-----------------------
+It runs the same integer datapath the kernel runs. As of 2026-08-14 that model is
+VERIFIED, not assumed: `make x86sim_check KUT=conv2d SCENARIO=s6 CONV2D_MODE=0`
+diffs gen_aiesim_vectors.simulate_conv2d against the real kernel under x86sim and
+reports 16384/16384 samples identical, with Stage B1 active. Before that check
+existed this script would have been guesswork dressed as measurement.
+
+What it still approximates — read before trusting a number to better than ~10%:
+  * DSPLib's cint16 FFT is modelled as an exact float FFT with a rounding
+    quantization per pass. The real kernel also loses ~21 LSB additively on a
+    summed DC bin (FFT_DC_TRUNC in gen_aiesim_vectors.py).
+  * Rounding is np.round (banker's) rather than the hardware's round-half-away.
+  * The filter is trained and evaluated on the SAME patch, so absolute PSR is
+    optimistic. Budget COMPARISONS are unaffected, which is what this is for.
+  The recorded model-vs-hardware agreement is ~6% (CLAUDE.md, s7). Size the
+  budget with headroom rather than trying to land the response on the rail.
+
+Variants (see the bias_acc entry in CLAUDE.md Known Issues)
+------------------------------------------------------------
+  base  what ships today: bias_acc = b_fold*127/scale
+  a     bias_acc = b_fold*ROI_NORM_Q/scale  -- data-only, no AIE rebuild
+  b     (a) + >>out_shift moved AFTER B1's mean subtraction -- kernel edit
+  c     drop ReLU and zero the bias -- diverges from Danelljan §3.3
+
+Usage
+-----
+  uv run python3 scripts/phase1_sweep.py                  # all variants, default grid
+  uv run python3 scripts/phase1_sweep.py --variant a b    # subset
+  uv run python3 scripts/phase1_sweep.py --budgets 4,2,2 4,3,4
+"""
+
+import argparse
+import os
+import struct
+import sys
+from pathlib import Path
+
+import numpy as np
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+
+# gen_aiesim_vectors reads geometry from the environment at import time. Force
+# the design point unless the caller has already chosen one, so a bare run
+# describes the real 128x128 build rather than whatever was last exported.
+os.environ.setdefault('GEN_PATCH_ROWS', '128')
+os.environ.setdefault('GEN_PATCH_COLS', '128')
+os.environ.setdefault('GEN_H_SHIFT', '10')
+
+import gen_aiesim_vectors as G          # noqa: E402
+import gen_filter_golden as FG          # noqa: E402
+
+KSIZE = 3
+N_OUT = 16
+ROI_NORM_Q = 32          # roi_crop.h — the int8 scale conv2d actually receives
+FULL_SCALE = 127         # what export_weights.py assumed instead
+ACC_MAX_THEORY = KSIZE * KSIZE * 127 * 127
+
+WEIGHTS_BIN = Path("design/aie_src/weights/layer0_weights.bin")
+SCENARIO = Path("design/aie_src/aiesim_data/s6")
+
+HANN = G.HANNING.astype(np.int64)
+R, C = G.PATCH_ROWS, G.PATCH_COLS
+H_SHIFT = G.H_SHIFT
+
+
+# ---------------------------------------------------------------------------
+# helpers
+# ---------------------------------------------------------------------------
+
+def q16(z):
+    """Quantize a complex array to cint16 with saturation. Returns (arr, n_railed)."""
+    re = np.round(z.real)
+    im = np.round(z.imag)
+    railed = int(np.sum((re > 32767) | (re < -32768) | (im > 32767) | (im < -32768)))
+    return np.clip(re, -32768, 32767) + 1j * np.clip(im, -32768, 32767), railed
+
+
+def wmean(f):
+    """Window-weighted mean, the constant that actually zeros the DC bin.
+
+    Bolme's text says plain mean, but the plain mean does not zero a
+    window-weighted DC sum — see the Stage B1 note in conv2d_kernel.h. This is
+    the fixed point mean_prev converges to, so using it here models the steady
+    state rather than frame 0.
+    """
+    w = HANN[:, None] * HANN[None, :]
+    return float(np.sum(w * f)) / float(np.sum(HANN)) ** 2
+
+
+def out_shift_for(max_val):
+    """export_weights.compute_acc_params' rule, factored out."""
+    return int(np.ceil(np.log2(max(max_val / 32767.0, 1.0))))
+
+
+def load_channels():
+    b = WEIGHTS_BIN.read_bytes()
+    chans = []
+    for oc in range(len(b) // 64):
+        r = b[oc * 64:(oc + 1) * 64]
+        w = np.frombuffer(r[0:9], dtype=np.int8).astype(np.int64).reshape(3, 3)
+        chans.append((w, int(r[9]), struct.unpack("<i", r[10:14])[0]))
+    return chans
+
+
+def load_patch():
+    """The Stage-A preprocessed int8 patch, decoded from the PLIO stimulus."""
+    words = np.loadtxt(SCENARIO / "patch_in.txt", dtype=np.int64)[: (R * C) // 4]
+    u = words.astype(np.uint32)
+    px = np.zeros(R * C, dtype=np.int8)
+    for k in range(4):
+        px[k::4] = ((u >> (8 * k)) & 0xFF).astype(np.uint8).view(np.int8)
+    return px.astype(np.int64).reshape(R, C)
+
+
+def window(v):
+    """conv2d's separable Hann, with BOTH >>15 truncations. Not srs rounding."""
+    wnd = (v * HANN[:, None]) >> 15
+    wnd = (wnd * HANN[None, :]) >> 15
+    return np.clip(wnd, -32768, 32767)
+
+
+# ---------------------------------------------------------------------------
+# the four conv2d variants
+# ---------------------------------------------------------------------------
+
+# A variant is three independent choices, not a single knob. Naming them
+# separately is what makes the bias question separable from the ReLU question —
+# and that separation turned out to matter: see the a-vs-a_nr pair.
+#   bias : 127 (as shipped) | 32 (ROI_NORM_Q, the contract fix) | 0
+#   relu : on | off
+#   late : shift AFTER the B1 mean subtraction (recovers the pedestal's bits)
+VARIANTS = {
+    'base':  dict(bias=127, relu=True,  late=False),   # what ships today
+    'a':     dict(bias=32,  relu=True,  late=False),   # contract fix, data-only
+    'b':     dict(bias=32,  relu=True,  late=True),    # a + kernel edit
+    'c':     dict(bias=0,   relu=False, late=False),   # drop ReLU, zero bias
+    # Isolating runs. 'a' and 'c' differ in TWO things at once (bias scale and
+    # ReLU), so neither can be blamed without these.
+    'a_nr':  dict(bias=32,  relu=False, late=False),   # a, ReLU removed
+    'b_nr':  dict(bias=32,  relu=False, late=True),    # b, ReLU removed
+    'base_nr': dict(bias=127, relu=False, late=False), # base, ReLU removed
+}
+
+
+def variant_params(w, shift, bias, variant):
+    """Return (bias, out_shift) for the variant, plus the max AC swing."""
+    spec = VARIANTS[variant]
+    max_ac = 127 * int(np.abs(w).sum())
+
+    if spec['bias'] == 127:
+        b = bias
+    elif spec['bias'] == 32:
+        b = int(round(bias * ROI_NORM_Q / FULL_SCALE))
+    else:
+        b = 0
+
+    if variant == 'base':
+        return b, shift, max_ac          # keep the shipped shift exactly
+    if spec['late'] or spec['bias'] == 0:
+        # The DC pedestal is gone before the shift (or never existed), so the
+        # shift only has to accommodate the AC swing. This is where the bits are.
+        return b, out_shift_for(max_ac), max_ac
+    return b, out_shift_for(abs(b) + ACC_MAX_THEORY), max_ac
+
+
+def conv_variant(patch, w, shift, bias, variant):
+    """One channel through conv2d, returning the windowed int16 feature map.
+
+    'base' is byte-for-byte the datapath in conv2d_kernel.cpp (and is checked
+    against it by check_kernel_bitexact.py). The others differ only where the
+    variant says they do.
+    """
+    spec = VARIANTS[variant]
+    xp = np.pad(patch, 1)
+    acc = np.full((R, C), bias, dtype=np.int64)
+    for kr in range(KSIZE):
+        for kc in range(KSIZE):
+            acc += w[kr, kc] * xp[kr:kr + R, kc:kc + C]
+
+    if spec['late']:
+        # Nonlinearity (if any) and mean removal both in the accumulator domain,
+        # shift last.
+        v = np.maximum(acc, 0) if spec['relu'] else acc
+        mp = int(round(wmean(v)))
+        out = np.clip((v - mp) >> shift, -32768, 32767)
+        return window(out), mp
+
+    sh = acc >> shift
+    if spec['relu']:
+        out16 = np.where(sh > 32767, 32767, np.where(sh <= 0, 0, sh))
+    else:
+        out16 = np.clip(sh, -32768, 32767)
+
+    mp = int(round(wmean(out16)))
+    centred = np.clip(out16 - mp, -32768, 32767)
+    return window(centred), mp
+
+
+# ---------------------------------------------------------------------------
+# the pipeline
+# ---------------------------------------------------------------------------
+
+def forward_fft(feats, fft_shift):
+    """conv output -> row FFT -> col FFT, cint16 after each pass."""
+    F_all, energy = [], []
+    row_rail = col_rail = 0
+    for f in feats:
+        A, r1 = q16(np.fft.fft(f.astype(np.float64), axis=1) / (1 << fft_shift))
+        row_rail += r1
+        energy.append(float(np.mean(np.abs(A) ** 2)))       # Stage B3, from row FFT
+        Fc, r2 = q16(np.fft.fft(A, axis=0) / (1 << fft_shift))
+        col_rail += r2
+        F_all.append(Fc)
+    return np.array(F_all), np.array(energy), row_rail, col_rail
+
+
+def run_pipeline(feats, fft_shift, ifft_row_shift, ifft_col_shift,
+                 feats_eval=None):
+    """conv output -> FFT -> MOSSE filter -> cmul -> B2 -> IFFT -> response.
+
+    feats trains the filter. feats_eval, if given, is what the filter is then
+    applied to — a HELD-OUT evaluation. Without it the filter is applied to its
+    own training patch, which makes a matched filter exactly optimal and
+    therefore flatters a linear pipeline specifically. Since the headline result
+    here is "remove the nonlinearity", that self-evaluation is the objection the
+    finding has to survive, so it is worth running both ways.
+    """
+    n_ch = len(feats)
+    rails = {}
+
+    F_all, energy, row_rail, col_rail = forward_fft(feats, fft_shift)
+    rails['fft_row'], rails['fft_col'] = row_rail, col_rail
+
+    if feats_eval is None:
+        F_eval = F_all
+    else:
+        F_eval, _, r1, r2 = forward_fft(feats_eval, fft_shift)
+        rails['fft_row'] += r1
+        rails['fft_col'] += r2
+
+    # Filter: init (eta=1 against a zeroed state), centred G, exactly as the
+    # tracker does on frame 0.
+    Gt = FG.gaussian_target_spectrum(R, C, FG.SIGMA, 0, 0)
+    A_f, B_f = FG.filter_update(np.zeros_like(F_all), np.zeros((R, C)),
+                                F_all, Gt, 1.0)
+    hq, _, _ = FG.quantize_q15(A_f, B_f, energy, FG.EPS_REL)
+    Hq = (hq[0::2].astype(np.int64).reshape(n_ch, R, C)
+          + 1j * hq[1::2].astype(np.int64).reshape(n_ch, R, C))
+
+    # cmul: saturating accumulate, channel by channel — the same order and the
+    # same clamp the kernel applies. simulate_cmul is the verified model.
+    acc_re = np.zeros((R, C), dtype=np.int64)
+    acc_im = np.zeros((R, C), dtype=np.int64)
+    for ch in range(n_ch):
+        acc_re, acc_im = G.simulate_cmul(
+            F_eval[ch].real.astype(np.int64), F_eval[ch].imag.astype(np.int64),
+            Hq[ch].real.astype(np.int64), Hq[ch].imag.astype(np.int64),
+            acc_re, acc_im)
+    accum = acc_re + 1j * acc_im
+    rails['accum'] = int(np.sum((np.abs(acc_re) >= 32767) | (np.abs(acc_im) >= 32767)))
+
+    # Stage B2, B2_NULL_BINS=1: zero the 9 low-frequency bins.
+    b2_removed = 0.0
+    for a in (0, 1, R - 1):
+        for b in (0, 1, C - 1):
+            b2_removed = max(b2_removed, abs(accum[a, b]))
+            accum[a, b] = 0
+
+    # Inverse: row IFFT then col IFFT. *N undoes numpy's 1/N, matching DSPLib.
+    Yr, r3 = q16(np.fft.ifft(accum, axis=1) * C / (1 << ifft_row_shift))
+    rails['ifft_row'] = r3
+    Y, r4 = q16(np.fft.ifft(Yr, axis=0) * R / (1 << ifft_col_shift))
+    rails['response'] = r4
+
+    return Y.real, accum, np.abs(Yr).max(), rails, b2_removed
+
+
+def psr(resp):
+    """Both statistics, because neither one's thresholds transfer to the other.
+
+    Bolme §3.5 is (g_max - mu_sl)/sigma_sl; the aiesim harness reports
+    |peak|/max|sidelobe|. Same 11x11 circular exclusion, different numbers —
+    measured 7.2x apart on real data.
+    """
+    idx = np.unravel_index(np.argmax(np.abs(resp)), resp.shape)
+    peak = resp[idx]
+    rr = np.minimum((np.arange(R) - idx[0]) % R, (idx[0] - np.arange(R)) % R)
+    cc = np.minimum((np.arange(C) - idx[1]) % C, (idx[1] - np.arange(C)) % C)
+    mask = (rr[:, None] <= 5) & (cc[None, :] <= 5)
+    sl = resp[~mask]
+    if sl.size == 0 or sl.std() == 0:
+        return idx, peak, 0.0, 0.0
+    bolme = (peak - sl.mean()) / sl.std()
+    ratio = abs(peak) / max(np.abs(sl).max(), 1e-9)
+    return idx, peak, bolme, ratio
+
+
+# ---------------------------------------------------------------------------
+
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument('--variant', nargs='+', default=['base', 'a', 'b', 'c'])
+    ap.add_argument('--budgets', nargs='+', default=None,
+                    help='comma triples FFT,IFFT_ROW,IFFT_COL, e.g. 4,2,2')
+    ap.add_argument('--channels', type=int, default=None,
+                    help='use only the first N channels. The accumulator and the '
+                         'response do NOT simply scale with this — H is renormalised '
+                         'to full scale for whatever set of channels it is built '
+                         'from — so a ch1 prediction has to be computed, not divided.')
+    ap.add_argument('--holdout', nargs=2, type=int, metavar=('DR', 'DC'),
+                    default=None,
+                    help='train on the patch, evaluate on a circular shift of it '
+                         '(the peak must then land at DR,DC). Guards against the '
+                         'self-evaluation bias that flatters a linear pipeline.')
+    args = ap.parse_args()
+
+    if args.budgets:
+        budgets = [tuple(int(x) for x in b.split(',')) for b in args.budgets]
+    else:
+        budgets = [(4, 2, 2), (4, 3, 3), (4, 3, 4), (5, 3, 4), (5, 4, 4), (5, 4, 5)]
+
+    chans = load_channels()
+    if args.channels:
+        chans = chans[:args.channels]
+    patch = load_patch()
+    patch_ev = None
+    expect = (0, 0)
+    if args.holdout:
+        dr, dc = args.holdout
+        patch_ev = np.roll(patch, (dr, dc), axis=(0, 1))
+        expect = (dr % R, dc % C)
+
+    print(f"geometry {R}x{C}  channels {len(chans)}  H_SHIFT {H_SHIFT}  "
+          f"eps_rel {FG.EPS_REL}")
+    print(f"patch: {SCENARIO}  range [{patch.min()},{patch.max()}]  "
+          f"std {patch.std():.1f}")
+    if patch_ev is not None:
+        print(f"HELD-OUT eval: filter trained on the patch, applied to a "
+              f"circular shift of {tuple(args.holdout)} -> peak must land at {expect}")
+    print()
+
+    for variant in args.variant:
+        print("=" * 78)
+        print(f"VARIANT {variant}")
+        print("=" * 78)
+
+        feats, feats_ev, dead, relu_never, bits = [], [], [], [], []
+        for oc, (w, shift, bias) in enumerate(chans):
+            b, sh, max_ac = variant_params(w, shift, bias, variant)
+            if VARIANTS[variant]['relu'] and b + max_ac <= 0:
+                dead.append(oc)
+            if VARIANTS[variant]['relu'] and b - max_ac >= 0:
+                relu_never.append(oc)
+            bits.append(np.log2(max(max_ac >> sh, 1)))
+            f, _ = conv_variant(patch, w, sh, b, variant)
+            feats.append(f)
+            if patch_ev is not None:
+                fe, _ = conv_variant(patch_ev, w, sh, b, variant)
+                feats_ev.append(fe)
+
+        bits = np.array(bits)
+        print(f"  structurally dead : {dead if dead else 'none'}")
+        print(f"  ReLU never active : {len(relu_never)} of {len(chans)} "
+              f"{relu_never if relu_never else ''}")
+        print(f"  signal resolution : {bits.min():.1f}-{bits.max():.1f} bits of 15 "
+              f"(mean {bits.mean():.1f})")
+        fm = np.array([np.abs(f).max() for f in feats])
+        print(f"  conv output max|.|: {fm.min():.0f}-{fm.max():.0f} "
+              f"(mean {fm.mean():.0f})")
+        print()
+        print("  budget      accum      %rail   ifftrow    response    %rail  "
+              "PSR(Bolme)  ratio   peak@")
+        print("  " + "-" * 88)
+
+        for (fs, irs, ics) in budgets:
+            resp, accum, ifftrow, rails, b2 = run_pipeline(
+                feats, fs, irs, ics, feats_ev if patch_ev is not None else None)
+            amax = float(np.abs(accum).max())
+            rmax = float(np.abs(resp).max())
+            idx, peak, bol, rat = psr(resp)
+            flag = ""
+            if any(rails[k] for k in ('fft_row', 'fft_col', 'accum',
+                                      'ifft_row', 'response')):
+                bad = [k for k in rails if rails[k]]
+                flag = f"  <-- RAILED: {','.join(bad)}"
+            if tuple(int(v) for v in idx) != expect:
+                flag += f"  <-- PEAK MISPLACED (want {expect})"
+            print(f"  {fs}-{irs}-{ics}   {amax:9.0f}  {100*amax/32767:6.1f}%  "
+                  f"{ifftrow:9.0f}  {rmax:9.0f}  {100*rmax/32767:6.1f}%  "
+                  f"{bol:9.1f}  {rat:6.2f}  {idx}{flag}")
+        print()
+
+    print("=" * 78)
+    print("How to read this")
+    print("=" * 78)
+    print("Pick the budget whose RESPONSE lands near 50% of range with nothing railed.")
+    print("The model agrees with hardware to ~6%, and hw_emu measured the response at")
+    print("99.69% of the rail under the old 4-2-2 budget, so a target of 'just under")
+    print("100%' is not a target — it is a clipped peak one modelling error away.")
+    print()
+    print("PSR here is trained and evaluated on the same patch, so its ABSOLUTE value")
+    print("is optimistic. Compare budgets against each other, not against Bolme's 20-60.")
+
+
+if __name__ == '__main__':
+    main()

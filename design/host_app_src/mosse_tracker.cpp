@@ -42,6 +42,7 @@
 #include <string>
 #include <stdexcept>
 #include <fstream>
+#include <chrono>
 
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_kernel.h"
@@ -89,6 +90,22 @@ static_assert(IMPULSE_DR >  -PATCH_ROWS/2 && IMPULSE_DR < PATCH_ROWS/2,
               "IMPULSE_DR puts the test impulse outside the cropped patch");
 static_assert(IMPULSE_DC >  -PATCH_COLS/2 && IMPULSE_DC < PATCH_COLS/2,
               "IMPULSE_DC puts the test impulse outside the cropped patch");
+// Occlusion injection, for testing the PSR gate. Bitmask over frame index: bit f
+// set => frame f gets a checkerboard instead of the target, i.e. the object is
+// behind something. A MASK rather than a single index because the interesting
+// test is CONSECUTIVE occlusion (does it still reacquire after two gated
+// frames?), which a mask expresses without a second parameter.
+//
+// Bit 0 is ignored: frame 0 trains the filter, so occluding it produces a filter
+// trained on a checkerboard — not a test of the gate, just a broken run.
+//
+// The occlude-then-reacquire test is:  ITER_CNT=3 OCCLUDE_MASK=0x2
+#ifndef OCCLUDE_MASK
+#  define OCCLUDE_MASK  0
+#endif
+#ifndef OCCLUDE_SQUARE
+#  define OCCLUDE_SQUARE  8
+#endif
 #ifndef FRAME_ROWS
 #  define FRAME_ROWS  1080
 #endif
@@ -156,6 +173,86 @@ static_assert(ROW_CHUNKS == CONV_INVOCATIONS,
               "row-FFT drain count must match conv2d firing count");
 
 // -----------------------------------------------------------------------
+// GMIO transaction cost instrumentation
+// -----------------------------------------------------------------------
+// The open question this answers: the per-frame async/wait count is ~6500 at 16
+// channels, and at a plausible 2-10 µs of driver cost each that is 13-65 ms —
+// which would blow the whole 33 ms budget and outweigh every compute-placement
+// decision in the design. It has never been measured. This measures it, at the
+// cost of two clock reads per transaction.
+//
+// Deliberately NOT a wrapper around the GMIO objects: the async/wait ORDER in the
+// loops below is load-bearing (three documented deadlocks came from getting it
+// wrong), so the macros leave every call site textually where it was and only
+// bracket it with a timer. `DMA_TX` also counts the transaction and is used on
+// `async` only; `DMA_T` adds time without counting and is used on `wait`. So
+// `calls` is the transaction count and `us` is total host time in async+wait.
+enum {
+    DMA_WEIGHTS, DMA_FFT_ROW_OUT, DMA_FFT_COL_IN, DMA_FFT_COL_OUT, DMA_CMUL_IN,
+    DMA_ACCUM_OUT, DMA_IFFT_ROW_IN, DMA_IFFT_ROW_OUT, DMA_IFFT_COL_IN,
+    DMA_RESPONSE, DMA_N
+};
+
+struct DmaStat {
+    const char   *name;
+    unsigned long calls;
+    double        us;
+};
+
+static DmaStat g_dma[DMA_N] = {
+    {"gmio_weights",      0, 0.0}, {"gmio_fft_row_out",  0, 0.0},
+    {"gmio_fft_col_in",   0, 0.0}, {"gmio_fft_col_out",  0, 0.0},
+    {"gmio_cmul_in",      0, 0.0}, {"gmio_accum_out",    0, 0.0},
+    {"gmio_ifft_row_in",  0, 0.0}, {"gmio_ifft_row_out", 0, 0.0},
+    {"gmio_ifft_col_in",  0, 0.0}, {"gmio_response",     0, 0.0},
+};
+static DmaStat g_dma_total[DMA_N];
+
+#define DMA_T(slot, stmt) do {                                                  \
+        const auto _t0 = std::chrono::steady_clock::now();                       \
+        stmt;                                                                    \
+        g_dma[slot].us += std::chrono::duration<double, std::micro>(              \
+            std::chrono::steady_clock::now() - _t0).count();                      \
+    } while (0)
+
+#define DMA_TX(slot, stmt) do {                                                 \
+        DMA_T(slot, stmt);                                                        \
+        ++g_dma[slot].calls;                                                      \
+    } while (0)
+
+static void dma_reset_frame(void)
+{
+    for (int i = 0; i < DMA_N; ++i) { g_dma[i].calls = 0; g_dma[i].us = 0.0; }
+}
+
+// Per-frame breakdown. The number that decides whether the transposes have to
+// move off the APU is the total, against 33 ms.
+static void dma_report_frame(int frame)
+{
+    double        tot_us = 0.0;
+    unsigned long tot_n  = 0;
+    printf("[dma] frame %d per-port cost:\n", frame);
+    for (int i = 0; i < DMA_N; ++i) {
+        if (!g_dma[i].calls && g_dma[i].us == 0.0) continue;
+        const double per = g_dma[i].calls ? g_dma[i].us / g_dma[i].calls : 0.0;
+        printf("  %-18s %6lu tx  %9.3f ms  %7.2f us/tx\n",
+               g_dma[i].name, g_dma[i].calls, g_dma[i].us / 1000.0, per);
+        tot_us += g_dma[i].us;
+        tot_n  += g_dma[i].calls;
+        g_dma_total[i].name   = g_dma[i].name;
+        g_dma_total[i].calls += g_dma[i].calls;
+        g_dma_total[i].us    += g_dma[i].us;
+    }
+    printf("  %-18s %6lu tx  %9.3f ms  %7.2f us/tx  = %.1f%% of a 33 ms frame\n",
+           "TOTAL", tot_n, tot_us / 1000.0,
+           tot_n ? tot_us / tot_n : 0.0, 100.0 * tot_us / 33000.0);
+    printf("  NOTE: hw_emu wall time is not real hardware time. Treat the "
+           "tx COUNT and the\n        per-port split as the real findings; the "
+           "us/tx figure needs a `TARGET=hw` run.\n");
+    fflush(stdout);
+}
+
+// -----------------------------------------------------------------------
 // Helpers
 // -----------------------------------------------------------------------
 
@@ -178,43 +275,173 @@ static void transpose_inplace(void *buf, int rows, int cols, size_t elem_bytes)
     memcpy(buf, tmp.data(), total);
 }
 
-// Software peak detection on the real part of the IFFT response map.
-// Returns displacement relative to patch centre (range: [-rows/2, rows/2)).
+// Peak detection used to live here as peak_detect_sw(). It is gone: it performed
+// a bit-identical |real| scan to mosse::compute_psr(..., use_abs=true) — same
+// strict-`>` first-wins tie-break, same wrap arithmetic — so keeping both meant
+// two independent scans that could silently decide different things, one driving
+// the position and the other driving the gate. The tracker now takes its
+// displacement from the same PsrResult the gate judges.
 //
-// `resp` points at cint16 samples: {real, imag} interleaved, so sample i's real
-// part is resp[2*i]. Indexing it as resp[i] would scan the real AND imaginary
-// halves of only the first half of the map and report bogus peaks.
+// The rationale that lived on it is preserved on compute_psr in mosse_filter.h:
+// the scan is over |real| because Stage B1 makes the response bipolar (aiesim s6
+// peaks at {-417,0}), and `resp[2*i]` rather than `resp[i]` because the map is
+// interleaved cint16. A zero response, which used to be indistinguishable from a
+// correct centred answer, is now GateReason::ZeroResponse.
+
+// PsrResult and compute_psr() moved to mosse_filter.{h,cpp} on 2026-08-15.
+// They are pure (no XRT, no ADF), so living there puts them under `make
+// test_host` — seconds instead of a ~26 min hw_emu frame. That matters more for
+// the gate than for anything else in this file: the gate CANNOT fire on the
+// current synthetic test data (PSR ~172 against a threshold of 7), so the native
+// tests are the only place its failure paths are exercised at all.
 //
-// Scans |real|, not real. Before Stage B1 the feature map was non-negative
-// (ReLU), so a correlation peak was always positive and a signed maximum was
-// fine. Mean subtraction makes the map bipolar: the strongest correlation is now
-// as likely to be a trough as a crest — the aiesim s6 scenario peaks at
-// {-417,0}. A signed max would walk straight past it and return whatever the
-// largest positive sidelobe happened to be.
-// Returns the peak |real| magnitude, which the caller MUST report.
+// Call them FULLY QUALIFIED (mosse::compute_psr). A leftover file-static copy
+// here would win by unqualified lookup, link cleanly, run correctly, and mean
+// the unit tests were validating a different function than the hardware runs.
+
+// Prints the PSR at both peak definitions and classifies against Bolme's ranges.
 //
-// Without it a zero response is indistinguishable from a correct answer: with
-// H_ch* zeroed the response is identically zero, and then only i=0 satisfies
-// `mag > max_val` (0 > -1), so max_idx stays 0 and the wrap below maps it to
-// displacement (0,0) — the right answer for a centred target, produced without
-// looking at the data at all. peak == 0 means the result is meaningless.
-static int peak_detect_sw(const int16_t *resp, int rows, int cols,
-                          int *dr, int *dc)
+// Takes the results rather than the response map: the caller computes them once
+// and feeds the SAME objects to this and to the gate, so what is printed and what
+// is acted on cannot drift apart. (This used to rescan the map twice on its own,
+// and peak_detect_sw scanned it a third time.)
+//
+// Presentation only — the policy is mosse::psr_gate() in mosse_filter.cpp, and
+// the authoritative verdict is printed by the caller AFTER this.
+static void report_psr(const mosse::PsrResult &a,   // argmax|re| — what we act on
+                       const mosse::PsrResult &s)   // argmax re  — paper-literal
 {
-    int max_val = -1, max_idx = 0;
-    for (int i = 0; i < rows * cols; ++i) {
-        int re  = (int)resp[2 * i];
-        int mag = (re < 0) ? -re : re;
-        if (mag > max_val) { max_val = mag; max_idx = i; }
+    printf("  [psr] at argmax|re| (%d,%d): peak %ld  sidelobe mu %.1f sd %.1f "
+           "max %.1f  PSR %.2f (Bolme)  ratio %.2fx (aiesim metric)  n=%ld\n",
+           a.dr, a.dc, a.peak, a.mean, a.sdev, a.side_max, a.psr, a.ratio, a.n_side);
+    printf("  [psr] at argmax re  (%d,%d): peak %ld  sidelobe mu %.1f sd %.1f "
+           "max %.1f  PSR %.2f (Bolme)  ratio %.2fx\n",
+           s.dr, s.dc, s.peak, s.mean, s.sdev, s.side_max, s.psr, s.ratio);
+
+    if (a.dr != s.dr || a.dc != s.dc)
+        printf("  [psr] DISAGREE: the |real| scan and the signed max pick "
+               "DIFFERENT peaks. The tracker acted on (%d,%d) with value %ld; "
+               "the paper-literal peak is (%d,%d) with %ld.\n",
+               a.dr, a.dc, a.peak, s.dr, s.dc, s.peak);
+    else
+        printf("  [psr] peak definitions agree.\n");
+
+    if (a.peak < 0)
+        printf("  [psr] WARNING: the acted-on peak is NEGATIVE (%ld). The target "
+               "output g is a positive Gaussian, so a negative peak is "
+               "anti-correlation, not a detection.\n", a.peak);
+
+    // Classified on Bolme's PSR only. His 20-60 / ~7 numbers do NOT apply to the
+    // `ratio` column — that is a different statistic (see the note on PsrResult).
+    //
+    // The >60 band is separate on purpose: Bolme's 20-60 comes from real video with
+    // background clutter, and this harness injects a synthetic target onto an
+    // otherwise empty frame. A near-empty sidelobe inflates PSR well past his range
+    // (measured 125.0 at 128x128/ch16), which is a property of the TEST INPUT, not
+    // evidence of a better tracker. So PSR here is a good RELATIVE metric for
+    // comparing builds and a bad absolute one; it only becomes comparable to the
+    // paper once real video is feeding it.
+    const double p = a.psr;
+    const char *verdict =
+        (a.sdev <= 0.0) ? "VOID — flat sidelobe, the response carries nothing"
+        : (p > 60.0)    ? "ABOVE Bolme's 20-60 range — expected on a synthetic "
+                          "target with no clutter; use only as a relative metric"
+        : (p >= 20.0)   ? "OK — inside Bolme's normal 20-60 range"
+        : (p >= 7.0)    ? "WEAK — below Bolme's normal range, above his ~7 failure mark"
+                        : "FAIL — at or below Bolme's ~7.0 occlusion/failure indicator";
+    printf("  [psr] verdict: %s\n", verdict);
+    printf("  [psr]          (Bolme PSR only — his thresholds do NOT apply to the "
+           "ratio column)\n");
+    fflush(stdout);
+}
+
+// -----------------------------------------------------------------------
+// Update gating — Bolme §3.5 (the control path; the policy is mosse::psr_gate)
+// -----------------------------------------------------------------------
+// "when PSR drops to around 7.0 it is an indication that the object is occluded
+//  or tracking has failed" — at which point the tracker stops the online update
+//  and reacquires when the appearance returns.
+//
+// Before this existed, filter_update ran unconditionally at eta=0.125 every
+// frame, so an occluded frame trained the filter on background and the target was
+// lost irrecoverably — the failure mode Bolme's Fig. 5 shows for the *Naive*
+// filter and that MOSSE exists to avoid.
+//
+// Reacquisition needs no code of its own: a gated frame HOLDS the position, so
+// the ROI stays on the last known good location and the filter keeps being
+// applied there. When the target reappears PSR recovers and tracking resumes. The
+// alternative — moving to the peak anyway — walks the ROI off the target on noise
+// and it can never re-enter the search window.
+static int    g_gate_run   = 0;    // consecutive gated frames, current run
+static int    g_gate_worst = 0;    // longest such run
+static int    g_gate_eval  = 0;    // frames the gate actually judged
+static int    g_gate_hold  = 0;    // of those, how many were gated out
+static int    g_gate_reason_n[8] = {0};
+static double g_psr_min = 0.0, g_psr_max = 0.0, g_psr_sum = 0.0;
+
+// Consecutive gated frames after which the run is called lost. REPORT ONLY —
+// nothing changes behaviour at this count. A "lost" state that stopped holding,
+// reset the position or widened the search would break the reacquisition
+// property above, and Bolme defines no such state. Report it now so a real policy
+// can be calibrated against data later, alongside the scale search.
+#define PSR_LOST_FRAMES 5
+
+static void gate_track(int frame, const mosse::GateDecision &g)
+{
+    if (g_gate_eval == 0) { g_psr_min = g_psr_max = g.psr; }
+    else { if (g.psr < g_psr_min) g_psr_min = g.psr;
+           if (g.psr > g_psr_max) g_psr_max = g.psr; }
+    ++g_gate_eval;
+    g_psr_sum += g.psr;
+    ++g_gate_reason_n[(int)g.reason];
+
+    printf("  [gate] frame %d: %s  reason=%s  psr=%.2f  threshold=%.2f\n",
+           frame, g.accept ? "ACCEPT" : "HOLD",
+           mosse::gate_reason_tag(g.reason), g.psr, (double)g.threshold);
+    printf("  [gate]         %s\n", mosse::gate_reason_why(g.reason));
+
+    if (g.accept) {
+        // The line that proves the hold-position policy works: the target came
+        // back and was re-detected without any reacquisition search.
+        if (g_gate_run > 0)
+            printf("  [gate]         REACQUIRED after %d gated frame(s)\n", g_gate_run);
+        g_gate_run = 0;
+    } else {
+        ++g_gate_hold;
+        ++g_gate_run;
+        if (g_gate_run > g_gate_worst) g_gate_worst = g_gate_run;
+        printf("  [gate]         position HELD; filter A/B frozen; H not "
+               "republished. Consecutive gated frames: %d\n", g_gate_run);
+        if (g_gate_run == PSR_LOST_FRAMES)
+            printf("  [gate]         LOST: %d consecutive gated frames — the target "
+                   "has not been re-detected (report only, nothing changes)\n",
+                   g_gate_run);
     }
-    int r = max_idx / cols;
-    int c = max_idx % cols;
-    // Wrap: centre of response map is dc-shifted to (0,0)
-    if (r > rows / 2) r -= rows;
-    if (c > cols / 2) c -= cols;
-    *dr = r;
-    *dc = c;
-    return max_val;
+    fflush(stdout);
+}
+
+static void gate_report_run(int frames)
+{
+    printf("\n[gate] SUMMARY over %d frame(s): %d evaluated, %d accepted, %d gated\n",
+           frames, g_gate_eval, g_gate_eval - g_gate_hold, g_gate_hold);
+    if (g_gate_eval == 0) {
+        // ITER_CNT=1 lands here: frame 0 is consumed by initialisation, so the
+        // gate never judged anything. The warning at startup says the same.
+        printf("[gate]   no frames were evaluated — frame 0 initialises the filter, "
+               "so a meaningful run needs ITER_CNT >= 2\n");
+        fflush(stdout);
+        return;
+    }
+    printf("[gate]   reasons:");
+    for (int i = 0; i < 8; ++i)
+        if (g_gate_reason_n[i])
+            printf("  %s x%d", mosse::gate_reason_tag((mosse::GateReason)i),
+                   g_gate_reason_n[i]);
+    printf("\n[gate]   longest gated run: %d    threshold %.2f\n",
+           g_gate_worst, (double)mosse::DEFAULT_PSR_MIN);
+    printf("[gate]   PSR  min %.2f / mean %.2f / max %.2f  (evaluated frames only)\n",
+           g_psr_min, g_psr_sum / g_gate_eval, g_psr_max);
+    fflush(stdout);
 }
 
 // -----------------------------------------------------------------------
@@ -421,37 +648,105 @@ static int32_t measure_window_mean(const int16_t *row_fft, int32_t mean_prev)
     return mean_prev + (int32_t)llround(residual);
 }
 
-// Stage B2 — cancel the residual mean in the frequency domain.
+// Stage B2 — remove the residual pre-window mean from the accumulated spectrum.
 //
 // conv2d removed mean_prev, but the true mean is mean_now, so the spectrum still
 // carries (mean_now - mean_prev)·W where W = DFT(w⊗w). For the PERIODIC Hann, W
-// has exactly 9 non-zero bins at (r,c) ∈ {0,±1}², so the correction is 9 complex
-// subtractions per channel — and because correlation is linear, they can be
-// applied once to the ACCUMULATED spectrum rather than per channel:
+// has exactly 9 non-zero bins at (r,c) ∈ {0,±1}², so only those 9 need touching,
+// and because correlation is linear they can be handled once on the ACCUMULATED
+// spectrum rather than per channel.
 //
+// TWO MODES. The default changed on 2026-08-11 from SUBTRACT to NULL:
+//
+// B2_NULL_BINS=0 — SUBTRACT (the original design)
 //   Σ_ch (X_ch - µ_ch·W) ⊙ H_ch*  =  Σ_ch X_ch ⊙ H_ch*  -  Σ_ch µ_ch · W ⊙ H_ch*
+//   Not bit-exact: conv2d's window multiply has two >>15 truncations, which are
+//   nonlinear, so linearity holds only up to quantization. Measured relative
+//   error after correction ~1e-3, versus 2.5e-2 .. 9.9 without.
 //
-// NOT bit-exact: the two >>15 truncations in conv2d's window multiply are
-// nonlinear, so linearity holds only up to quantization. Measured relative error
-// after correction is ~1e-3, versus 2.5e-2 .. 9.9 without it.
+// B2_NULL_BINS=1 — NULL (default)
+//   Zero the 9 bins outright.
+//
+// HISTORY — read this before changing the default back.
+//
+// The subtracting mode was BROKEN until 2026-08-11: it omitted the >>H_SHIFT that
+// matches cmul_accum's output scale (see the fix inside the loop below), so the
+// correction landed 1024x oversized and SATURATED the very bins it was meant to
+// clean. Measured in hw_emu at 64x64/ch1: the DC bin came out of cmul at 4000,
+// the subtraction added ~28767, and the bin railed at 32767 every frame. That
+// rail produced a response pedestal which at 3/0/6 left the true peak only 1.43x
+// above it, and at 4/2/2 BEAT it outright — reported displacement (6,-1) with the
+// top five peaks within 4% of each other, a broad hump rather than a peak.
+//
+// Note what this means for the diagnosis: the accumulator was never railed by the
+// pipeline. cmul's output matches (F ⊙ conj(H)) >> H_SHIFT to within 1 LSB across
+// the whole map. The corruption was injected HERE, on the host, after the FFT,
+// which is why no FFT_SHIFT setting could fix it.
+//
+// WHY NULL IS STILL THE DEFAULT NOW THAT SUBTRACT IS FIXED: the correction, once
+// correctly scaled, is only ~28 against a DC bin of 4000 — so it does not remove
+// the pedestal, because most of that DC is NOT the residual window mean. It is
+// the genuine DC that conv2d's ReLU creates by making the feature map
+// non-negative, which Stage B1 only partly removes (CLAUDE.md records 5.4 bits
+// of DC/AC remaining; measured 5.1 here). Nulling removes it; subtracting cannot.
+//
+// Measured on the device with nulling active, 64x64/ch1/4-2-2:
+//   displacement (10,-7) exact, peak 12618, PSR 22.7, peak/pedestal 8.2x
+// against PSR 2.1 for the same build without it. (Bolme §3.5 puts the failure
+// indicator at ~7; aiesim s7 measures 19.6.)
+//
+// COST: nulling also discards genuine target energy — at sigma=2 the Gaussian G
+// is broad in frequency, so bins (0,±1) carry real signal, and the DC bin held
+// 4000. It is a workaround for the ReLU-driven DC, not a fix for it. The real fix
+// is upstream: stop the feature map's mean from reaching the FFT at all. Note
+// gmio_fft_col_out still reports rails=5 per frame, which is that same upstream
+// DC and is NOT addressed by anything in this function.
+#ifndef B2_NULL_BINS
+#  define B2_NULL_BINS 1
+#endif
 static void apply_dc_correction(int16_t *accum, const int16_t *filter_all,
                                 const double *residual_mean)
 {
+    // The 9 bins where DFT(w⊗w) is non-zero for a PERIODIC Hann, in the
+    // TRANSPOSED layout the col-FFT produced: element [c * PATCH_ROWS + r] is
+    // 2D spectrum bin (r, c). Indexing it row-major (r * PATCH_COLS + c) happens
+    // to give the same answer on a square patch — the bin set is transpose-
+    // symmetric — but it is wrong the moment PATCH_ROWS != PATCH_COLS.
+    const int ridx[3] = { 0, 1, PATCH_ROWS - 1 };   // row-frequency index
+    const int kidx[3] = { 0, 1, PATCH_COLS - 1 };   // column-frequency index
+
+#if B2_NULL_BINS
+    (void)filter_all;
+    (void)residual_mean;
+
+    // Report the magnitude being discarded. If these come back near 32767 the
+    // bins were railed, which is the condition this mode exists for — and if
+    // they are ever SMALL, the railing has been fixed upstream and the
+    // subtracting mode becomes viable again. This one number tells you which.
+    long max_removed = 0;
+    for (int a = 0; a < 3; ++a) {
+        for (int b = 0; b < 3; ++b) {
+            const int  bin = kidx[b] * PATCH_ROWS + ridx[a];
+            const long re  = accum[2 * bin];
+            const long im  = accum[2 * bin + 1];
+            const long m   = (long)llround(sqrt((double)(re * re + im * im)));
+            if (m > max_removed) max_removed = m;
+            accum[2 * bin]     = 0;
+            accum[2 * bin + 1] = 0;
+        }
+    }
+    printf("  [B2] nulled 9 low-frequency bins, max|removed|=%ld%s\n",
+           max_removed,
+           max_removed >= 32000 ? "  (RAILED — as expected)"
+                                : "  (not railed — reconsider B2_NULL_BINS=0)");
+#else
     // W[k] for a periodic Hann of length L: W[0] = L/2, W[±1] = -L/4, else 0.
     // The two axes have different lengths when the patch is not square.
     const double wrow[3] = { PATCH_ROWS * 0.5, -PATCH_ROWS * 0.25, -PATCH_ROWS * 0.25 };
     const double wcol[3] = { PATCH_COLS * 0.5, -PATCH_COLS * 0.25, -PATCH_COLS * 0.25 };
-    const int    ridx[3] = { 0, 1, PATCH_ROWS - 1 };   // row-frequency index
-    const int    kidx[3] = { 0, 1, PATCH_COLS - 1 };   // column index
 
     for (int a = 0; a < 3; ++a) {
         for (int b = 0; b < 3; ++b) {
-            // accum is in the TRANSPOSED layout the col-FFT produced:
-            // element [c * PATCH_ROWS + r] is 2D spectrum bin (r, c).
-            // Indexing it row-major (r * PATCH_COLS + c) happens to give the
-            // same answer on a square patch — the bin set is transpose-symmetric
-            // and the separable coefficient is symmetric in (a,b) — but it is
-            // wrong the moment PATCH_ROWS != PATCH_COLS.
             const int    bin = kidx[b] * PATCH_ROWS + ridx[a];
             const double Wrc = wrow[a] * wcol[b] / (double)(PATCH_ROWS * PATCH_COLS);
 
@@ -465,12 +760,32 @@ static void apply_dc_correction(int16_t *accum, const int16_t *filter_all,
                 corr_im -= m * hi;      // conj
             }
 
+            // MATCH cmul_accum's OUTPUT SCALE. The kernel emits
+            // (F ⊙ conj(H)) >> H_SHIFT, so a correction built from the raw Q1.15
+            // filter is 2^H_SHIFT too large and must be shifted the same way.
+            //
+            // This was missing until 2026-08-11 and it was not a rounding-level
+            // mistake: at H_SHIFT=10 the correction landed 1024x oversized and
+            // SATURATED the bins it was supposed to clean. Measured in hw_emu at
+            // 64x64/ch1 — the DC bin came out of cmul at 4000, this subtraction
+            // added ~28767, and the bin railed at 32767 every frame. That rail
+            // was the source of the response pedestal that beat the true peak at
+            // 4/2/2, and no FFT_SHIFT could fix it because the corruption was
+            // injected on the HOST, after the FFT. Correctly scaled the same
+            // correction is ~28 against a bin of 4000.
+            //
+            // The error scales with N_CHANNELS (the sum above runs over
+            // channels), so it is worse at the ch16 design point than at ch1.
+            corr_re /= (double)(1 << CMUL_H_SHIFT);
+            corr_im /= (double)(1 << CMUL_H_SHIFT);
+
             int32_t re = (int32_t)accum[2 * bin]     - (int32_t)llround(corr_re);
             int32_t im = (int32_t)accum[2 * bin + 1] - (int32_t)llround(corr_im);
             accum[2 * bin]     = (int16_t)(re >  32767 ?  32767 : (re < -32768 ? -32768 : re));
             accum[2 * bin + 1] = (int16_t)(im >  32767 ?  32767 : (im < -32768 ? -32768 : im));
         }
     }
+#endif
 }
 
 // Persistent filter state (A_ch, B) across frames. See mosse_filter.h.
@@ -702,6 +1017,43 @@ int main(int argc, char **argv)
     // (No-op while conv2d is built with CONV2D_ECHO_TEST=1, which ignores them.)
     load_conv_weights(WEIGHTS_FILE, weights_bo.map<uint8_t *>(),
                       WEIGHT_CH_BYTES * N_CHANNELS);
+
+    // SEED mean_prev BEFORE FRAME 0. Without this Stage B1 is INERT on the one
+    // frame the filter is trained from, and at 16 channels that is fatal.
+    //
+    // layer0_weights.bin has bytes [18:22] = 0, so frame 0 ran with mean_prev=0
+    // and conv2d emitted its full DC pedestal (bias_acc >> out_shift ~ 24689 for
+    // ch0). filter_init then learned from a DC-dominated spectrum, and frame 1 —
+    // where B1 IS active — applies a filter matched to features that no longer
+    // exist. Modelled at the real design point (scripts/phase1_sweep.py on the
+    // actual inject_target_frame patch), ch16, budget 5-2-2:
+    //     mean_prev=0        response RAILED, peak/sidelobe ratio 1.00, peak
+    //                        displaced to (8,120) — a flat saturated map
+    //     seeded (this fix)  ratio 36.81, peak (10,121), response profile
+    //                        d=2 0.5994 / d=6 -0.0087 against an ideal sigma=2
+    //                        Gaussian's 0.6065 / 0.0111
+    // The same model reproduces the measured hw_emu ch1 numbers to within a few
+    // percent once mean_prev=0 is modelled (response 20263 vs 19668 measured,
+    // ratio 3.89 vs 3.59), which is what identified this.
+    //
+    // bias_acc >> out_shift is the right seed because Stage A delivers a
+    // zero-mean patch, so the post-conv mean is the bias term alone. Measured
+    // against the converged value on ch0: 24689 predicted vs 24686 actual.
+    {
+        uint8_t *wb = weights_bo.map<uint8_t *>();
+        for (int ch = 0; ch < N_CHANNELS; ++ch) {
+            uint8_t *w = wb + ch * WEIGHT_CH_BYTES;
+            int32_t bias;
+            memcpy(&bias, w + 10, sizeof(int32_t));
+            const int shift = (int)w[9];
+            const int32_t seed = bias >> shift;
+            memcpy(w + 18, &seed, sizeof(int32_t));
+            g_mean_prev[ch] = seed;
+        }
+        printf("mean_prev seeded from bias_acc>>out_shift: ch0=%d ch%d=%d "
+               "(Stage B1 is active on frame 0)\n",
+               g_mean_prev[0], N_CHANNELS - 1, g_mean_prev[N_CHANNELS - 1]);
+    }
     weights_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
     // Frame 0 runs with a zeroed filter on purpose: it is the INITIALISATION pass,
@@ -739,6 +1091,8 @@ int main(int argc, char **argv)
     // ------------------------------------------------------------------
     for (int frame = 0; frame < ITER_CNT; ++frame) {
 
+        dma_reset_frame();
+
         // 1. Camera capture → DDR frame buffer (zeros the buffer)
         // SKIPPED for hw_emu: camera_capture zeros the full 1080×1920 frame at
         // II=1 (~2M PL cosim cycles), which dominates emulation runtime. The host
@@ -769,6 +1123,10 @@ int main(int argc, char **argv)
         // filter that the target IS the offset, and frame 1 would then correctly
         // report (0,0) — a passing-looking result from a filter trained on the
         // wrong thing.
+        //
+        // `occluded` outlives the block: the diagnostics further down report
+        // against the injected offset, which does not exist on an occluded frame.
+        bool occluded = false;
         {
             uint8_t *frame_ptr = frame_bo.map<uint8_t *>();
             // Keyed off the filter state, not off `frame == 0`. The two agree in
@@ -778,13 +1136,36 @@ int main(int argc, char **argv)
             const bool init_frame = !g_filter.initialized;
             int test_row = pos_row + (init_frame ? 0 : IMPULSE_DR);
             int test_col = pos_col + (init_frame ? 0 : IMPULSE_DC);
-            // Asymmetric structured target, not a single-pixel impulse: an
-            // impulse is symmetric, and a symmetric training patch makes a
-            // transposed pack_filter() and a wrong conjugation both invisible.
-            // See inject_target_frame().
-            inject_target_frame(frame_ptr, FRAME_ROWS, FRAME_COLS, test_row, test_col);
+
+            // Occlusion test for the PSR gate. Guarded on !init_frame so bit 0 is
+            // a no-op — see the OCCLUDE_MASK comment at the top of this file.
+            occluded = !init_frame && (((OCCLUDE_MASK) >> frame) & 1);
+
+            if (occluded) {
+                // A checkerboard, not a flat fill: full-scale structure with real
+                // spectral content in every band, so Stage A's zero-mean/unit-L2
+                // does not degenerate, and no copy of the target anywhere. That
+                // makes it the honest "the object is behind something" case, and
+                // it exercises Bolme's ACTUAL threshold. A flat occluder would
+                // produce a near-zero response and trip ZeroResponse or
+                // FlatSidelobe instead, which tests the structural guards rather
+                // than the PSR one.
+                inject_checkerboard_frame(frame_ptr, FRAME_ROWS, FRAME_COLS,
+                                          OCCLUDE_SQUARE);
+            } else {
+                // Asymmetric structured target, not a single-pixel impulse: an
+                // impulse is symmetric, and a symmetric training patch makes a
+                // transposed pack_filter() and a wrong conjugation both invisible.
+                // See inject_target_frame().
+                inject_target_frame(frame_ptr, FRAME_ROWS, FRAME_COLS,
+                                    test_row, test_col);
+            }
             frame_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);  // Flush host → device
-            if (init_frame)
+            if (occluded)
+                printf("Frame %d: [OCCLUDED] checkerboard (square %d) — no target "
+                       "in frame. The gate MUST hold position and freeze the "
+                       "filter.\n", frame, OCCLUDE_SQUARE);
+            else if (init_frame)
                 printf("Frame %d: [INIT] target CENTRED at (%d,%d)\n",
                        frame, test_row, test_col);
             else
@@ -875,12 +1256,14 @@ int main(int argc, char **argv)
             for (int k = 0; k < CONV_INVOCATIONS; ++k) {
                 // Arm this firing's drain before feeding the weights that trigger
                 // it, so the output window is never the thing that blocks.
-                gm_fft_row_out.async(row_bo, XCL_BO_SYNC_BO_AIE_TO_GMIO,
-                                     ROW_CHUNK_BYTES, k * ROW_CHUNK_BYTES);
-                gm_weights.async(weights_bo, XCL_BO_SYNC_BO_GMIO_TO_AIE,
-                                 WEIGHT_CH_BYTES, ch * WEIGHT_CH_BYTES);
-                gm_weights.wait();
-                gm_fft_row_out.wait();
+                DMA_TX(DMA_FFT_ROW_OUT,
+                    gm_fft_row_out.async(row_bo, XCL_BO_SYNC_BO_AIE_TO_GMIO,
+                                         ROW_CHUNK_BYTES, k * ROW_CHUNK_BYTES));
+                DMA_TX(DMA_WEIGHTS,
+                    gm_weights.async(weights_bo, XCL_BO_SYNC_BO_GMIO_TO_AIE,
+                                     WEIGHT_CH_BYTES, ch * WEIGHT_CH_BYTES));
+                DMA_T(DMA_WEIGHTS,     gm_weights.wait());
+                DMA_T(DMA_FFT_ROW_OUT, gm_fft_row_out.wait());
             }
             printf("[ch %d] weights sent + row-FFT drained (%d x %zu B)\n",
                    ch, CONV_INVOCATIONS, ROW_CHUNK_BYTES); fflush(stdout);
@@ -935,8 +1318,10 @@ int main(int argc, char **argv)
             }
 
             // Feed transposed data to col-FFT + combined [filter|accum] to cmul_accum
-            gm_fft_col_in.async(row_bo, XCL_BO_SYNC_BO_GMIO_TO_AIE, FFT_BYTES, 0);
-            gm_cmul_in.async(cmul_bo, XCL_BO_SYNC_BO_GMIO_TO_AIE, CMUL_IN_BYTES, 0);
+            DMA_TX(DMA_FFT_COL_IN,
+                gm_fft_col_in.async(row_bo, XCL_BO_SYNC_BO_GMIO_TO_AIE, FFT_BYTES, 0));
+            DMA_TX(DMA_CMUL_IN,
+                gm_cmul_in.async(cmul_bo, XCL_BO_SYNC_BO_GMIO_TO_AIE, CMUL_IN_BYTES, 0));
 
             // Drain the accumulator WHILE the inputs are still in flight.
             //
@@ -952,12 +1337,14 @@ int main(int argc, char **argv)
             // un-drained output window stalls the col FFT, which stalls the input
             // DMAs we would otherwise be waiting on.
             for (int k = 0; k < COL_CHUNKS; ++k) {
-                gm_accum_out.async(accum_bo, XCL_BO_SYNC_BO_AIE_TO_GMIO,
-                                   COL_CHUNK_BYTES, k * COL_CHUNK_BYTES);
-                gm_fft_col_out.async(fcol_bo, XCL_BO_SYNC_BO_AIE_TO_GMIO,
-                                     COL_CHUNK_BYTES, k * COL_CHUNK_BYTES);
-                gm_fft_col_out.wait();
-                gm_accum_out.wait();
+                DMA_TX(DMA_ACCUM_OUT,
+                    gm_accum_out.async(accum_bo, XCL_BO_SYNC_BO_AIE_TO_GMIO,
+                                       COL_CHUNK_BYTES, k * COL_CHUNK_BYTES));
+                DMA_TX(DMA_FFT_COL_OUT,
+                    gm_fft_col_out.async(fcol_bo, XCL_BO_SYNC_BO_AIE_TO_GMIO,
+                                         COL_CHUNK_BYTES, k * COL_CHUNK_BYTES));
+                DMA_T(DMA_FFT_COL_OUT, gm_fft_col_out.wait());
+                DMA_T(DMA_ACCUM_OUT,   gm_accum_out.wait());
             }
             printf("[ch %d] accum_out + F_ch received (%d x %zu B)\n",
                    ch, COL_CHUNKS, COL_CHUNK_BYTES); fflush(stdout);
@@ -979,9 +1366,9 @@ int main(int argc, char **argv)
                 dump_buffer("F_ch", frame, fcol_bo.map<void *>(), FFT_BYTES);
             }
 
-            gm_fft_col_in.wait();
+            DMA_T(DMA_FFT_COL_IN, gm_fft_col_in.wait());
             printf("[ch %d] fft_col_in sent\n", ch); fflush(stdout);
-            gm_cmul_in.wait();
+            DMA_T(DMA_CMUL_IN, gm_cmul_in.wait());
             printf("[ch %d] cmul_in sent\n", ch); fflush(stdout);
         }
 
@@ -1005,15 +1392,17 @@ int main(int argc, char **argv)
 
         // 3. IFFT: APU feeds accumulated spectrum to IFFT row input
         printf("[ifft] START\n"); fflush(stdout);
-        gm_ifft_row_in.async(accum_bo, XCL_BO_SYNC_BO_GMIO_TO_AIE, ACCUM_BYTES, 0);
+        DMA_TX(DMA_IFFT_ROW_IN,
+            gm_ifft_row_in.async(accum_bo, XCL_BO_SYNC_BO_GMIO_TO_AIE, ACCUM_BYTES, 0));
         // Drain per invocation, and before waiting on the input — see the
         // accum_out loop above for why the input wait cannot come first.
         for (int k = 0; k < ROW_CHUNKS; ++k) {
-            gm_ifft_row_out.async(row_bo, XCL_BO_SYNC_BO_AIE_TO_GMIO,
-                                  ROW_CHUNK_BYTES, k * ROW_CHUNK_BYTES);
-            gm_ifft_row_out.wait();
+            DMA_TX(DMA_IFFT_ROW_OUT,
+                gm_ifft_row_out.async(row_bo, XCL_BO_SYNC_BO_AIE_TO_GMIO,
+                                      ROW_CHUNK_BYTES, k * ROW_CHUNK_BYTES));
+            DMA_T(DMA_IFFT_ROW_OUT, gm_ifft_row_out.wait());
         }
-        gm_ifft_row_in.wait();
+        DMA_T(DMA_IFFT_ROW_IN, gm_ifft_row_in.wait());
         printf("[ifft] rows done (%d x %zu B)\n", ROW_CHUNKS, ROW_CHUNK_BYTES);
         fflush(stdout);
 
@@ -1021,13 +1410,15 @@ int main(int argc, char **argv)
         transpose_inplace(row_bo.map<void *>(), PATCH_ROWS, PATCH_COLS, 4);
         printf("[ifft] transpose done\n"); fflush(stdout);
 
-        gm_ifft_col_in.async(row_bo, XCL_BO_SYNC_BO_GMIO_TO_AIE, FFT_BYTES, 0);
+        DMA_TX(DMA_IFFT_COL_IN,
+            gm_ifft_col_in.async(row_bo, XCL_BO_SYNC_BO_GMIO_TO_AIE, FFT_BYTES, 0));
         for (int k = 0; k < COL_CHUNKS; ++k) {
-            gm_response.async(resp_bo, XCL_BO_SYNC_BO_AIE_TO_GMIO,
-                              COL_CHUNK_BYTES, k * COL_CHUNK_BYTES);
-            gm_response.wait();
+            DMA_TX(DMA_RESPONSE,
+                gm_response.async(resp_bo, XCL_BO_SYNC_BO_AIE_TO_GMIO,
+                                  COL_CHUNK_BYTES, k * COL_CHUNK_BYTES));
+            DMA_T(DMA_RESPONSE, gm_response.wait());
         }
-        gm_ifft_col_in.wait();
+        DMA_T(DMA_IFFT_COL_IN, gm_ifft_col_in.wait());
         printf("[ifft] cols done → response received (%d x %zu B)\n",
                COL_CHUNKS, COL_CHUNK_BYTES); fflush(stdout);
 
@@ -1038,39 +1429,71 @@ int main(int argc, char **argv)
         report_cint16("response", resp_bo.map<int16_t *>(),
                       PATCH_ROWS, PATCH_COLS, "rowmajor");
         dump_buffer("resp", frame, resp_bo.map<void *>(), RESP_BYTES);
-        if (g_filter.initialized)
-            report_response(resp_bo.map<int16_t *>(), PATCH_ROWS, PATCH_COLS);
-
-        // 4. Peak detection — read real parts (stride-2 for cint16)
+        // The peak is located ONCE, here, and the same PsrResult drives the
+        // reporting, the position update and the gate. It used to be scanned three
+        // times (twice inside report_psr, once in peak_detect_sw) — three
+        // independent scans that could in principle disagree about which peak the
+        // tracker was acting on.
         //
-        // Skipped entirely on frame 0: the filter is zero there by construction,
-        // so the response is identically zero and any displacement it reports is
-        // an artifact of peak_detect_sw's scan order, not a measurement.
-        if (!g_filter.initialized) {
+        // `evaluate` is keyed off the filter state, not off `frame == 0`, matching
+        // the injection block and the init branch below. Frame 0's response is
+        // identically zero by construction (H is zeroed until filter_init runs at
+        // the END of this frame), so it would gate out under ANY threshold — it
+        // must never reach the gate at all or the tracker never bootstraps.
+        const bool          evaluate = g_filter.initialized;
+        mosse::PsrResult    psr_abs{}, psr_sgn{};
+        mosse::GateDecision gate{};          // accept=false until proven otherwise
+
+        if (evaluate) {
+            const int16_t *resp = resp_bo.map<int16_t *>();
+            psr_abs = mosse::compute_psr(resp, PATCH_ROWS, PATCH_COLS, true);
+            psr_sgn = mosse::compute_psr(resp, PATCH_ROWS, PATCH_COLS, false);
+            gate    = mosse::psr_gate(psr_abs, mosse::DEFAULT_PSR_MIN);
+
+            // Suppressed on an occluded frame: report_response prints values "at
+            // the injected offset", and there is no injected target to be at.
+            if (!occluded)
+                report_response(resp, PATCH_ROWS, PATCH_COLS);
+            else
+                printf("  [diag] response profiles suppressed — no target was "
+                       "injected this frame\n");
+
+            report_psr(psr_abs, psr_sgn);
+            gate_track(frame, gate);
+        }
+
+        // 4. Peak detection and position update.
+        if (!evaluate) {
             printf("Frame %d: [INIT] response not evaluated — filter is being "
                    "trained from this frame\n", frame);
         } else {
-            int dr = 0, dc = 0;
-            int peak = peak_detect_sw(resp_bo.map<int16_t *>(),
-                                      PATCH_ROWS, PATCH_COLS, &dr, &dc);
-            pos_row += dr;
-            pos_col += dc;
+            const int  dr   = psr_abs.dr, dc = psr_abs.dc;
+            const long peak = psr_abs.peak;
 
-            // peak==0 means the response map is identically zero, so the (0,0)
-            // displacement carries no information — say so rather than printing a
-            // plausible-looking position. Now that the filter is real this should
-            // no longer happen; if it does, the filter or the shift budget is
-            // wrong, not the test.
-            const bool ok = (peak > 0 && dr == IMPULSE_DR && dc == IMPULSE_DC);
-            printf("Frame %d: displacement (%d,%d) → pos (%d,%d)  peak|re|=%d  [%s]\n",
-                   frame, dr, dc, pos_row, pos_col, peak,
+            // THE POSITION IS ONLY UPDATED ON AN ACCEPTED FRAME. A gated frame's
+            // peak is noise; following it walks the ROI off the target and the
+            // target can then never re-enter the search window. Holding is what
+            // makes Bolme's "reacquire when the appearance returns" work with no
+            // reacquisition code — and it is also why the recovery frame's
+            // expected displacement is still exactly (IMPULSE_DR, IMPULSE_DC),
+            // so the check below stays meaningful across an occlusion.
+            if (gate.accept) { pos_row += dr; pos_col += dc; }
+
+            const bool ok = (peak != 0 && dr == IMPULSE_DR && dc == IMPULSE_DC);
+            printf("Frame %d: displacement (%d,%d) %s pos (%d,%d)  peak=%ld  [%s]\n",
+                   frame, dr, dc, gate.accept ? "→" : "HELD, pos stays",
+                   pos_row, pos_col, peak,
                    peak == 0   ? "VOID: zero response — result carries no information"
+                   : occluded  ? "occluded frame — no target to match, gate decides"
                    : ok        ? "OK: matches injected offset"
                                : "MISMATCH vs injected offset");
             if (peak == 0)
                 printf("       (filter is non-zero now, so this points at the shift "
                        "budget or the filter scale — check the Q1.15 report above)\n");
-            else if (!ok)
+            // The hint is suppressed when the frame was gated: there is no
+            // expected displacement for a frame the tracker deliberately did not
+            // act on, so printing one would read as a failure when it is a pass.
+            else if (!ok && !occluded && gate.accept)
                 printf("       expected displacement (%d,%d)\n", IMPULSE_DR, IMPULSE_DC);
         }
 
@@ -1080,26 +1503,85 @@ int main(int argc, char **argv)
         // is the one learned from previous frames — updating first would leak the
         // current frame into its own detection and make tracking look better than
         // it is.
+        //
+        // THREE-WAY, AND THE ORDER OF THE TESTS IS LOAD-BEARING: the init branch
+        // is selected before `gate` is ever consulted, so the gate can never block
+        // the bootstrap.
+        bool published = false;
         if (!g_filter.initialized) {
             mosse::filter_init(g_filter, g_F_all.data(), g_target.data(),
                                N_CHANNELS, PATCH_ROWS, PATCH_COLS);
             printf("  filter: INITIALISED from frame %d (single patch, no affine "
                    "perturbations)\n", frame);
-        } else {
+            publish_filter(filter_bo, filter_scratch);
+            published = true;
+        } else if (gate.accept) {
             mosse::filter_update(g_filter, g_F_all.data(), g_target.data(),
                                  mosse::DEFAULT_ETA);
+            publish_filter(filter_bo, filter_scratch);
+            published = true;
+        } else {
+            // publish_filter is skipped as well as filter_update, and that is a
+            // CORRECTNESS requirement, not an optimization: filter_quantize_q15
+            // reads g_energy, which the per-channel loop above has already
+            // overwritten with THIS frame's per-channel energies. Publishing would
+            // therefore re-scale the old A/B by the occluder's norms. Skipping
+            // leaves filter_bo holding the H from the last accepted frame, which
+            // is what "frozen" has to mean.
+            printf("  filter: FROZEN — update and publish both skipped (%s). A/B "
+                   "unchanged; the device still holds the H published on the last "
+                   "accepted frame.\n", mosse::gate_reason_tag(gate.reason));
         }
-        publish_filter(filter_bo, filter_scratch);
 
         // The quantized filter, row-major, as filter_quantize_q15() produced it —
         // i.e. BEFORE pack_filter() converts it to the col-FFT layout. Dumping
         // this side of the conversion is deliberate: comparing it against a
         // NumPy H built from the dumped F_ch isolates the filter maths from the
         // layout conversion, which are the two remaining untested steps.
-        report_cint16("H(q15)", filter_scratch.data(),
-                      PATCH_ROWS, PATCH_COLS, "rowmajor");
-        dump_buffer("H_q15", frame, filter_scratch.data(),
-                    (size_t)N_CHANNELS * PATCH_ELEMS * 2 * sizeof(int16_t));
+        //
+        // Guarded on `published`: on a frozen frame filter_scratch still holds the
+        // PREVIOUS frame's bytes, and printing those as if they were current is
+        // exactly the kind of plausible-looking output that costs a day.
+        if (published) {
+            report_cint16("H(q15)", filter_scratch.data(),
+                          PATCH_ROWS, PATCH_COLS, "rowmajor");
+            dump_buffer("H_q15", frame, filter_scratch.data(),
+                        (size_t)N_CHANNELS * PATCH_ELEMS * 2 * sizeof(int16_t));
+        } else {
+            printf("  H(q15): unchanged (filter frozen this frame) — no dump "
+                   "written, so the previous frame's H_q15 dump is still the "
+                   "current device contents\n");
+        }
+
+        dma_report_frame(frame);
+    }
+
+    // Gate outcome across the run. Printed here for the same reason the DMA
+    // summary below is: gr.end(0) never returns, so anything after it is lost.
+    gate_report_run(ITER_CNT);
+
+    // Cumulative GMIO cost across all frames. Printed before teardown because
+    // gr.end(0) never returns (see the "host does not exit" note in CLAUDE.md) —
+    // anything printed after it is lost.
+    {
+        double        tot_us = 0.0;
+        unsigned long tot_n  = 0;
+        printf("\n[dma] CUMULATIVE over %d frame(s):\n", ITER_CNT);
+        for (int i = 0; i < DMA_N; ++i) {
+            if (!g_dma_total[i].calls) continue;
+            printf("  %-18s %6lu tx  %9.3f ms  %7.2f us/tx\n",
+                   g_dma_total[i].name, g_dma_total[i].calls,
+                   g_dma_total[i].us / 1000.0,
+                   g_dma_total[i].us / g_dma_total[i].calls);
+            tot_us += g_dma_total[i].us;
+            tot_n  += g_dma_total[i].calls;
+        }
+        printf("  %-18s %6lu tx  %9.3f ms  %7.2f us/tx\n", "TOTAL", tot_n,
+               tot_us / 1000.0, tot_n ? tot_us / tot_n : 0.0);
+        printf("  per frame: %.0f tx, %.3f ms  (N_CHANNELS=%d, %dx%d)\n",
+               (double)tot_n / ITER_CNT, tot_us / 1000.0 / ITER_CNT,
+               N_CHANNELS, PATCH_ROWS, PATCH_COLS);
+        fflush(stdout);
     }
 
     // ------------------------------------------------------------------

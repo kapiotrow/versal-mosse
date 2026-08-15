@@ -172,12 +172,27 @@ HANNING = np.array(
 # Conv2d kernel simulation (matches conv2d_kernel.cpp exactly)
 # ---------------------------------------------------------------------------
 
-def conv2d_relu_map(patch_int8: np.ndarray, weights_64b: bytes) -> np.ndarray:
-    """The post-ReLU, pre-window feature map — conv2d_kernel.cpp up to line 226.
+# Whether conv2d applies the half-wave rectifier. MUST match the CONV_RELU the
+# kernel was built with — the Makefile passes it as GEN_CONV_RELU from the same
+# variable that feeds AIE_FLAGS. A scenario generated with the wrong setting
+# produces expected values for a datapath the kernel does not run, which fails
+# the scenario for a reason that has nothing to do with the pipeline.
+CONV_RELU = int(os.environ.get('GEN_CONV_RELU', 1))
+
+
+def conv2d_relu_map(patch_int8: np.ndarray, weights_64b: bytes,
+                    relu: bool = None) -> np.ndarray:
+    """The post-nonlinearity, pre-window feature map — conv2d_kernel.cpp up to
+    the Stage B1 subtraction.
 
     Split out from simulate_conv2d because Stage B1 needs this map's mean: the
     host feeds the previous frame's value back as mean_prev.
+
+    `relu` defaults to the module-level CONV_RELU; pass it explicitly to model a
+    setting other than the one this build uses.
     """
+    if relu is None:
+        relu = bool(CONV_RELU)
     w     = np.frombuffer(weights_64b[0:9], dtype=np.int8).reshape(3, 3).astype(np.int64)
     shift = int(weights_64b[9])
     bias  = struct.unpack_from('<i', weights_64b, 10)[0]
@@ -191,15 +206,20 @@ def conv2d_relu_map(patch_int8: np.ndarray, weights_64b: bytes) -> np.ndarray:
             acc += w[kr, kc] * xp[kr:kr + PATCH_ROWS, kc:kc + PATCH_COLS]
 
     shifted = acc >> shift
-    # ReLU + saturate, matching conv2d_kernel.cpp:224-227 exactly. NOTE this
-    # used to be a bare clip(-32768, 32767): the model was missing the ReLU
-    # entirely and so did not describe the kernel it claimed to replicate.
-    out = np.where(shifted > 32767, 32767, np.where(shifted <= 0, 0, shifted))
+    # ReLU + saturate, matching conv2d_kernel.cpp's `#if CONV_RELU` branch
+    # exactly. NOTE this used to be a bare clip(-32768, 32767): the model was
+    # missing the ReLU entirely and so did not describe the kernel it claimed to
+    # replicate. With relu=False it becomes that clip again — but deliberately,
+    # and only when the kernel was built the same way.
+    if relu:
+        out = np.where(shifted > 32767, 32767, np.where(shifted <= 0, 0, shifted))
+    else:
+        out = np.clip(shifted, -32768, 32767)
     return out.astype(np.int64)
 
 
 def simulate_conv2d(patch_int8: np.ndarray, weights_64b: bytes,
-                    mean_prev: int = 0) -> np.ndarray:
+                    mean_prev: int = 0, relu: bool = None) -> np.ndarray:
     """Apply one channel of conv2d_kernel: 3×3 INT8 MAC + ReLU + B1 + Hanning.
 
     Replicates the integer arithmetic in conv2d_kernel.cpp exactly:
@@ -211,7 +231,7 @@ def simulate_conv2d(patch_int8: np.ndarray, weights_64b: bytes,
     Returns float64 array shape (PATCH_ROWS, PATCH_COLS) representing the
     real part of the cint16 output (imag = 0 as per the kernel).
     """
-    out = conv2d_relu_map(patch_int8, weights_64b)
+    out = conv2d_relu_map(patch_int8, weights_64b, relu)
 
     # Stage B1: remove the previous frame's mean BEFORE the window.
     centred = np.clip(out - int(mean_prev), -32768, 32767)
@@ -225,6 +245,50 @@ def simulate_conv2d(patch_int8: np.ndarray, weights_64b: bytes,
     wnd = np.clip(wnd, -32768, 32767)
 
     return wnd.astype(np.float64)
+
+
+# ---------------------------------------------------------------------------
+# cmul_accum kernel simulation (matches cmul_accum_kernel.cpp exactly)
+# ---------------------------------------------------------------------------
+
+def simulate_cmul(in_re, in_im, flt_re, flt_im, acc_re, acc_im):
+    """One cmul_accum invocation: F (*) conj(H) >> H_SHIFT, accumulated.
+
+    Replicates cmul_accum_kernel.cpp:116-127 exactly:
+        re = in.re*flt.re + in.im*flt.im
+        im = in.im*flt.re - in.re*flt.im
+        out.re = sat16(acc.re + ((re + CMUL_RND) >> CMUL_H_SHIFT))
+        out.im = sat16(acc.im + ((im + CMUL_RND) >> CMUL_H_SHIFT))
+
+    Three details that are easy to get wrong and silent when wrong:
+      * The filter is stored UN-conjugated; the sign flip on the imaginary
+        product is where the conjugation happens. See the conjugation note in
+        mosse_filter.h — getting this backwards is invisible on a centred target.
+      * The shift is round-to-nearest (CMUL_RND), not truncating. A bare >>
+        biases every negative bin one way and shows up as a DC offset in the
+        response, not as noise.
+      * The accumulate SATURATES. It used to wrap, which flipped the spectrum's
+        sign on overflow and sent the argmax to a garbage index.
+
+    numpy's >> on int64 is arithmetic, matching signed C++ >>.
+
+    Inputs and outputs are int64 arrays of any matching shape.
+    """
+    rnd = (1 << (H_SHIFT - 1)) if H_SHIFT > 0 else 0
+
+    in_re  = np.asarray(in_re,  dtype=np.int64)
+    in_im  = np.asarray(in_im,  dtype=np.int64)
+    flt_re = np.asarray(flt_re, dtype=np.int64)
+    flt_im = np.asarray(flt_im, dtype=np.int64)
+
+    re = in_re * flt_re + in_im * flt_im
+    im = in_im * flt_re - in_re * flt_im
+
+    out_re = np.asarray(acc_re, dtype=np.int64) + ((re + rnd) >> H_SHIFT)
+    out_im = np.asarray(acc_im, dtype=np.int64) + ((im + rnd) >> H_SHIFT)
+
+    return (np.clip(out_re, -32768, 32767),
+            np.clip(out_im, -32768, 32767))
 
 
 # ---------------------------------------------------------------------------
@@ -277,6 +341,89 @@ def write_cint16_bin(path: str, re_flat: np.ndarray, im_flat: np.ndarray) -> Non
     buf[0::2] = np.clip(np.round(re_flat), -32768, 32767).astype(np.int16)
     buf[1::2] = np.clip(np.round(im_flat), -32768, 32767).astype(np.int16)
     buf.tofile(path)
+
+
+# ---------------------------------------------------------------------------
+# cmul saturation stress scenario (kernel-only bit-exactness harness)
+# ---------------------------------------------------------------------------
+
+def write_cmul_stress_scenario(out_dir: str) -> None:
+    """Write a scenario that actually drives cmul_accum's saturating add.
+
+    NO OTHER SCENARIO DOES. Measured across s0-s7, only s0 has a non-zero
+    accum_prev at all (max 1024) and none comes near the +/-32767 rail, so the
+    sat16() clamp in cmul_accum_kernel.cpp is dead code under every existing
+    test. That clamp is not incidental: it replaced a cast that WRAPPED, and the
+    wrap flipped the accumulated spectrum's sign on overflow and sent the argmax
+    to a garbage index (see the cmul_accum entry in CLAUDE.md). A rewrite that
+    reintroduced wrapping would pass every scenario in the repo.
+
+    This directory holds only the three .bin files the kernel-only harness reads
+    — no expected.txt, because it is not an end-to-end scenario and mosse_graph's
+    aiesim harness should not be pointed at it.
+
+    Cases, cycled per element so all of them appear in every 1024-sample chunk:
+      0  high rail   : positive product onto a near-max accumulator
+      1  low rail    : negative product onto a near-min accumulator
+      2  no clamp    : near-rail accumulator that must NOT clamp
+      3  max operands: |F| and |H| both at full scale (largest int32 intermediate)
+      4  min accum   : accum_prev at -32768 exactly, zero product
+      5  mid-range   : ordinary values, so the common path is still covered
+
+    F is allowed to be -32768 (it comes from the FFT and can be), but H is not:
+    filter_quantize_q15() clamps the filter to -32767 precisely so that
+    in.re*flt.re + in.im*flt.im cannot reach 2^31. Generating H = -32768 here
+    would test a value production never emits.
+    """
+    os.makedirs(out_dir, exist_ok=True)
+
+    f_re = np.zeros(N, dtype=np.int64); f_im = np.zeros(N, dtype=np.int64)
+    h_re = np.zeros(N, dtype=np.int64); h_im = np.zeros(N, dtype=np.int64)
+    a_re = np.zeros(N, dtype=np.int64); a_im = np.zeros(N, dtype=np.int64)
+
+    # A product big enough to clear the rail after >>H_SHIFT regardless of shift.
+    BIG = 32767
+
+    for i in range(N):
+        case = i % 6
+        if case == 0:
+            f_re[i], f_im[i] = BIG, 0
+            h_re[i], h_im[i] = BIG, 0
+            a_re[i], a_im[i] = 32000, 32000
+        elif case == 1:
+            f_re[i], f_im[i] = BIG, 0
+            h_re[i], h_im[i] = -32767, 0
+            a_re[i], a_im[i] = -32000, -32000
+        elif case == 2:
+            f_re[i], f_im[i] = 100, -100
+            h_re[i], h_im[i] = 1, 1
+            a_re[i], a_im[i] = 32700, -32700
+        elif case == 3:
+            f_re[i], f_im[i] = -32768, -32768
+            h_re[i], h_im[i] = -32767, 32767
+            a_re[i], a_im[i] = 0, 0
+        elif case == 4:
+            f_re[i], f_im[i] = 0, 0
+            h_re[i], h_im[i] = 12345, -6789
+            a_re[i], a_im[i] = -32768, 32767
+        else:
+            f_re[i], f_im[i] = (i % 4001) - 2000, (i % 2999) - 1500
+            h_re[i], h_im[i] = (i % 5003) - 2500, (i % 3001) - 1500
+            a_re[i], a_im[i] = (i % 601) - 300, (i % 809) - 400
+
+    write_cint16_bin(os.path.join(out_dir, "fft_col_in.bin"), f_re, f_im)
+    write_cint16_bin(os.path.join(out_dir, "cmul_filter.bin"), h_re, h_im)
+    write_cint16_bin(os.path.join(out_dir, "cmul_accum.bin"), a_re, a_im)
+
+    # Report how much of the output actually rails, so a future change that
+    # silently stops exercising saturation is visible here rather than never.
+    o_re, o_im = simulate_cmul(f_re, f_im, h_re, h_im, a_re, a_im)
+    rails = int(np.sum((np.abs(o_re) == 32767) | (o_re == -32768)) +
+                np.sum((np.abs(o_im) == 32767) | (o_im == -32768)))
+    print(f"  cmul_stress: {rails} of {2*N} int16 outputs at a rail "
+          f"({100.0*rails/(2*N):.1f}%) — saturation IS exercised"
+          if rails else
+          "  cmul_stress: WARNING - nothing rails, the stress case is not stressing")
 
 
 # ---------------------------------------------------------------------------
@@ -419,6 +566,29 @@ def generate_scenario(out_dir: str, name: str, patch_int8: np.ndarray,
         struct.pack_into('<i', wb, 18, int(mean_prev))
         with open(os.path.join(sdir, 'weights_ch0.bin'), 'wb') as f:
             f.write(bytes(wb))
+
+        # ALSO write every other channel, for the kernel-only bit-exactness
+        # harness (make x86sim_check KUT=conv2d KUT_CH=<n>).
+        #
+        # Channel 0 alone is NOT sufficient coverage, and that is measured, not
+        # theoretical: on the s6 patch, ReLU never fires for ch0 — nor for 12 of
+        # the 16 channels, because bias_acc is oversized (see the ReLU entry in
+        # CLAUDE.md). A harness pinned to ch0 therefore cannot tell CONV_RELU=1
+        # from CONV_RELU=0 at all; it passes either way. ch11 is the channel to
+        # reach for: it is the only one where ReLU CLAMPS SOME BUT NOT ALL pixels
+        # (12434 of 16384), so it exercises both sides of the branch. ch3, ch7
+        # and ch15 clamp every pixel, which tests the dead-channel path.
+        allw = _load_all_weights(os.path.dirname(os.path.dirname(
+            os.path.abspath(__file__))))
+        if allw:
+            w2d = np.outer(HANNING, HANNING).astype(np.float64)
+            for oc, w64 in enumerate(allw):
+                relu = conv2d_relu_map(patch_int8, w64)
+                mp = int(round(float((w2d * relu).sum()) / float(w2d.sum())))
+                wbn = bytearray(w64)
+                struct.pack_into('<i', wbn, 18, mp)
+                with open(os.path.join(sdir, f'weights_ch{oc}.bin'), 'wb') as f:
+                    f.write(bytes(wbn))
     desc = kwargs.get('description', '')
     print(f"  Written: {sdir}/  [{desc}]")
 
@@ -442,6 +612,20 @@ def simulate_roundtrip(patch_int8: np.ndarray) -> np.ndarray:
 # ---------------------------------------------------------------------------
 # Main
 # ---------------------------------------------------------------------------
+
+def _load_all_weights(repo_root: str):
+    """Every 64-byte channel buffer from layer0_weights.bin, or [] if absent.
+
+    Used to give the kernel-only harness a choice of channel — see the note in
+    generate_scenario about ch0 being unable to exercise ReLU.
+    """
+    path = os.path.join(repo_root, "design", "aie_src", "weights", "layer0_weights.bin")
+    if not os.path.exists(path):
+        return []
+    with open(path, 'rb') as f:
+        data = f.read()
+    return [data[i * 64:(i + 1) * 64] for i in range(len(data) // 64)]
+
 
 def _load_ch0_weights(repo_root: str) -> bytes:
     """Load 64-byte channel-0 weight buffer from layer0_weights.bin.
@@ -509,6 +693,11 @@ def main():
     write_plio_txt(os.path.join(out_dir, "patch_in_const.txt"), const_img)
 
     print(f"\nGenerating aiesim scenarios in: {out_dir}/")
+
+    # Harness-only scenario for the kernel bit-exactness check. Not an aiesim
+    # scenario — it has no expected.txt and no patch_in.txt. See the function
+    # docstring for why it exists.
+    write_cmul_stress_scenario(os.path.join(out_dir, "cmul_stress"))
 
     # uniform arrays used in multiple scenarios.
     # ones_re is UNITY GAIN in the kernel's Q1.15 filter format, not the integer 1

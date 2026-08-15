@@ -37,6 +37,18 @@
  */
 
 #include "cmul_accum_kernel.h"
+#include <aie_api/aie.hpp>
+
+// Arithmetic implementation.
+//   1 (default) = vectorized aie::mac / srs
+//   0           = the original scalar loop, kept reachable for bisection
+// The two are BIT-IDENTICAL by construction (see the derivation above the
+// vector loop) and that is checked, not asserted:
+//   make x86sim_check KUT=cmul SCENARIO=s7
+//   make x86sim_check KUT=cmul SCENARIO=cmul_stress
+#ifndef CMUL_VECTORIZE
+#  define CMUL_VECTORIZE 1
+#endif
 
 static constexpr int CMUL_N = PATCH_COLS * FFT_COL_WS;  // 256
 
@@ -81,8 +93,14 @@ static inline int16_t sat16(int32_t v)
 
 // Tile-local scratch for filter and accumulator halves.
 // Placed in tile LDM (not stack) to avoid overflow; 2×1024 B is negligible.
-static cint16_t flt_local[CMUL_N];
-static cint16_t acc_local[CMUL_N];
+//
+// alignas(32) is REQUIRED, not decorative: both the v8cint16 copy below and the
+// aie::load_v in the vectorized arithmetic are ALIGNED vector accesses, and a
+// cint16_t array carries only 4-byte natural alignment. x86sim does not enforce
+// this, so a missing alignment here passes every bit-exactness check and then
+// misbehaves on hardware — the worst possible failure mode.
+alignas(32) static cint16_t flt_local[CMUL_N];
+alignas(32) static cint16_t acc_local[CMUL_N];
 
 void cmul_accum_kernel(
     input_buffer<cint16_t>  &fft_col_in,
@@ -107,12 +125,79 @@ void cmul_accum_kernel(
         d_acc[i] = s_acc[i];
     }
 
-    // Scalar arithmetic on tile-local arrays — fast (~1 cycle per read).
-    // No chess_prepare_for_pipelining: that pragma + int32 arithmetic causes
-    // the noodle assembler to OOM-kill during compilation on this kernel.
     cint16_t* __restrict in_ptr  = fft_col_in.data();
     cint16_t* __restrict out_ptr = accum_out.data();
 
+#if CMUL_VECTORIZE
+
+    // ------------------------------------------------------------------
+    // Vectorized arithmetic — BIT-IDENTICAL to the scalar loop below.
+    //
+    // The scalar loop cost 30 cycles per complex element and was NOT pipelined
+    // (see the note below about the assembler OOM), which at 64 invocations x 16
+    // channels made this kernel ~7.9 ms/frame — the second-largest compute cost
+    // in the design after conv2d, for four multiplies and two adds.
+    //
+    // Why this is exactly equal to the scalar code, not merely close:
+    //
+    //   from_vector(acc, S) puts acc*2^S in the accumulator, EXACTLY — acc is
+    //   int16 and cacc64 has room to spare. Then
+    //
+    //     srs_S( acc*2^S + prod )
+    //       = sat16( floor( (acc*2^S + prod + 2^(S-1)) / 2^S ) )
+    //       = sat16( acc + floor( (prod + 2^(S-1)) / 2^S ) )
+    //       = sat16( acc + ((prod + CMUL_RND) >> CMUL_H_SHIFT) )
+    //
+    //   because acc*2^S is an exact multiple of 2^S and so passes through the
+    //   floor untouched. That identity is the whole trick, and it is why the
+    //   accumulator must be folded in BEFORE the shift.
+    //
+    //   Saturating once at the end also matters. Converting the product to
+    //   cint16 first and then adding would clamp twice, and double clamping is
+    //   WRONG whenever the product overflows int16 but the sum comes back in
+    //   range (prod=+40000, acc=-20000: true 20000, double-clamped 12767).
+    //
+    // The two mode settings are load-bearing:
+    //   positive_inf = "round to nearest, ties toward +inf" = (x + 2^(S-1)) >> S
+    //     with an arithmetic shift. conv_even (a common default) would differ on
+    //     exact ties and break bit-exactness.
+    //   saturate reproduces sat16(). The alternative wraps, and a wrap here
+    //     flips the accumulated spectrum's sign and sends the argmax to a
+    //     garbage index — this kernel has shipped that bug once already.
+    aie::set_rounding(aie::rounding_mode::positive_inf);
+    aie::set_saturation(aie::saturation_mode::saturate);
+
+    constexpr int VEC = 8;
+    static_assert(CMUL_N % VEC == 0, "CMUL_N must be a whole number of vectors");
+
+    for (int i = 0; i < CMUL_N / VEC; ++i)
+    chess_prepare_for_pipelining
+    chess_loop_range(CMUL_N / VEC, CMUL_N / VEC)
+    {
+        const aie::vector<cint16, VEC> vF = aie::load_v<VEC>((cint16*)in_ptr + i * VEC);
+        const aie::vector<cint16, VEC> vH = aie::load_v<VEC>((cint16*)flt_local + i * VEC);
+        const aie::vector<cint16, VEC> vA = aie::load_v<VEC>((cint16*)acc_local + i * VEC);
+
+        // Seed the accumulator with acc << S, then MAC the product onto it.
+        aie::accum<cacc64, VEC> a;
+        a.from_vector(vA, CMUL_H_SHIFT);
+
+        // F * conj(H): the filter is stored un-conjugated and the conjugation
+        // happens here, exactly as the scalar code's sign flip on the imaginary
+        // product did. See the conjugation note in mosse_filter.h — getting this
+        // backwards is invisible whenever the target is centred.
+        a = aie::mac(a, vF, aie::op_conj(vH));
+
+        aie::store_v((cint16*)out_ptr + i * VEC, a.to_vector<cint16>(CMUL_H_SHIFT));
+    }
+
+#else
+
+    // Scalar arithmetic on tile-local arrays — fast (~1 cycle per read).
+    // No chess_prepare_for_pipelining: that pragma + int32 arithmetic causes
+    // the noodle assembler to OOM-kill during compilation on this kernel.
+    // (That OOM is why this loop ran unpipelined at 30 cycles/element. The
+    // vectorized path above does not hit it — different code path entirely.)
     for (int i = 0; i < CMUL_N; ++i) {
         int32_t re = (int32_t)in_ptr[i].real * (int32_t)flt_local[i].real
                    + (int32_t)in_ptr[i].imag * (int32_t)flt_local[i].imag;
@@ -123,4 +208,6 @@ void cmul_accum_kernel(
         out_ptr[i].imag = sat16((int32_t)acc_local[i].imag
                                 + ((im + CMUL_RND) >> CMUL_H_SHIFT));
     }
+
+#endif  // CMUL_VECTORIZE
 }

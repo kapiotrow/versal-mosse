@@ -33,26 +33,62 @@ LAUNCH_HW_EMU_EXEC := 0
 # FFT cascade lengths (increase for cfloat or large point sizes)
 FFT_ROW_CASCADE_LEN := 1
 FFT_COL_CASCADE_LEN := 1
-FFT_ROW_WS          := 2
-FFT_COL_WS          := 2
+# Rows/cols per FFT kernel invocation. These set the DMA CHUNK SIZE for the four
+# ports that carry 96% of the host's GMIO traffic, so they are the transaction-
+# count knob, not a DSP parameter: every chunk count derives from them
+# (ROW_CHUNKS, COL_CHUNKS, CONV_INVOCATIONS, CMUL_N_CHUNKS).
+#
+# RAISED 2 -> 8 on 2026-08-14. Transactions per frame 4258 -> 1090 (3.9x) at
+# 128x128/ch16, which matters because the per-transaction driver cost is the
+# dominant unmeasured risk in the design (2-10 us/tx => 8.5-42.6 ms/frame).
+# NUMERICALLY NEUTRAL — same arithmetic, same shifts, same results, verified
+# bit-exact for both kernels at WS=8 via x86sim_check. Cost is tile memory:
+# total_memory_size 50616 -> 130532 B across 6 cores, and the kernel schedules
+# are unchanged (conv2d 140 cyc/16px, cmul 2 cyc).
+#
+# Constraints if you change these: PATCH_ROWS % FFT_ROW_WS == 0; the DSPLib
+# window PATCH_ROWS*FFT_ROW_WS must stay a whole multiple of the FFT point size;
+# and ROW_CHUNKS must equal CONV_INVOCATIONS (static_assert in mosse_tracker.cpp)
+# or the interleaved weights/drain loop deadlocks.
+FFT_ROW_WS          := 8
+FFT_COL_WS          := 8
 
 # FFT/IFFT output shifts. The invariant is
 #     2*FFT_SHIFT + IFFT_ROW_SHIFT + IFFT_COL_SHIFT = 12
 # which fixes the response scale, so weight can be moved between the forward and
 # inverse passes without recalibrating any expected value.
 #
-# DEFAULT 4/2/2 is the REAL design point: validated with s6 at CONV2D_MODE=0 and
-# N_CHANNELS=16 (accum 7728, row IFFT 8805, response 6692, err=0 px, no stage above
-# 27% of cint16). Do not set IFFT_ROW_SHIFT=0 at high channel counts — the row IFFT
-# takes the accumulated spectrum and overflows (~101000) with no attenuation.
+# HISTORICAL: 4/2/2 was the default until 2026-08-14, validated with s6 at
+# CONV2D_MODE=0 and N_CHANNELS=16 (accum 7728, row IFFT 8805, response 6692,
+# err=0 px). That was with ReLU ON and a UNITY filter; see the current default
+# below. Do not set IFFT_ROW_SHIFT=0 at high channel counts — the row IFFT takes
+# the accumulated spectrum and overflows (~101000) with no attenuation.
 #
 # ECHO-MODE SCENARIOS (s0-s4, CONV2D_MODE=1) need 0/0/12 instead: their magnitudes
 # are ~100, and a forward shift of 4 divides the spectrum by 256 and crushes them to
 # zero. Run them as:
 #   make aiesim_plio CONV2D_MODE=1 SCENARIO=s1 FFT_SHIFT=0 IFFT_ROW_SHIFT=0 IFFT_COL_SHIFT=12
+#
+# FFT_SHIFT=3 SATURATES THE FORWARD FFT ON A REALISTIC TARGET AT ONE CHANNEL.
+# Measured 2026-08-11 in hw_emu, 64x64 ch1, 3/0/6, H_SHIFT=10, against the
+# asymmetric structured target (inject_target_frame, not the old impulse):
+# gmio_fft_col_out came back with 11 bins railed on BOTH frames, and they are
+# exactly the nine bins {0,+-1}x{0,+-1} that apply_dc_correction() operates on,
+# plus (+-2,0). So Stage B2 was computing its correction from clipped values —
+# it cannot work as designed while the forward pass rails. The accumulator's DC
+# bin was railed too. It still localised exactly (err=0 px), so LOCATION ALONE
+# DOES NOT DETECT THIS: the tell was PSR 8.4 against Bolme's ~7 failure
+# indicator (s7 measures 19.6), and a (10,0) ridge only 1.43x below the true
+# peak. Zeroing row 0 and column 0 of the measured accumulator offline dropped
+# that ridge from 1.08 to 0.35 of the peak, confirming residual DC as the
+# dominant contaminant. 3/0/6 is an aiesim-era setting; do not use it.
+# 4-3-3 as of 2026-08-14, up from 4-2-2, BECAUSE CONV_RELU=0 raises the signal.
+# Predicted held-out at 128x128/ch16 (scripts/phase1_sweep.py): 4-2-2 -> response
+# at 80.4% of rail, 4-3-3 -> 20.1%, accumulator 3.0%, nothing railed. The model
+# tracks hardware to ~6%, so 80% is not a margin worth taking.
 FFT_SHIFT           ?= 4
-IFFT_ROW_SHIFT      ?= 2
-IFFT_COL_SHIFT      ?= 2
+IFFT_ROW_SHIFT      ?= 3
+IFFT_COL_SHIFT      ?= 3
 
 # cmul_accum filter-product shift. INDEPENDENT of the invariant above.
 #
@@ -175,8 +211,54 @@ AIE_FLAGS  += --Xpreproc="-DFFT_2D_TP_IFFT_COL_SHIFT=$(IFFT_COL_SHIFT)"
 AIE_FLAGS  += --Xpreproc="-DCMUL_H_SHIFT=$(H_SHIFT)"
 # conv2d build mode: 0=real conv, 1=echo stream, 2=synthesize without reading the
 # stream (bisect for "is conv2d blocked on readincr?"). See conv2d_kernel.cpp.
-CONV2D_MODE ?= 1
+# DEFAULT CHANGED 1 -> 0 on 2026-08-14. Echo mode is a bisection tool, and having
+# it as the default cost a ~28 h ch16 baseline whose numbers all had to be
+# requalified (see the echo-mode entry in CLAUDE.md): nothing in a `make sd_card`
+# run announces that conv2d is a passthrough. The scenarios that need echo mode
+# (s0-s4, raw patches) already pass CONV2D_MODE=1 explicitly in their documented
+# commands, so this costs them nothing.
+CONV2D_MODE ?= 0
 AIE_FLAGS  += --Xpreproc="-DCONV2D_ECHO_TEST=$(CONV2D_MODE)"
+# cmul_accum arithmetic: 1 = vectorized aie::mac (default), 0 = the original
+# scalar loop. BIT-IDENTICAL by construction and checked by
+#   make x86sim_check KUT=cmul SCENARIO=s7
+#   make x86sim_check KUT=cmul SCENARIO=cmul_stress
+# so 0 is for bisection and cycle comparison, not for correctness fallback.
+CMUL_VECTORIZE ?= 1
+AIE_FLAGS  += --Xpreproc="-DCMUL_VECTORIZE=$(CMUL_VECTORIZE)"
+# conv2d MAC loop: 1 = vectorized aie::mac (default), 0 = the original scalar
+# loop. BIT-IDENTICAL, checked by
+#   make x86sim_check KUT=conv2d SCENARIO=s6 CONV2D_MODE=0
+CONV_VECTORIZE ?= 1
+AIE_FLAGS  += --Xpreproc="-DCONV_VECTORIZE=$(CONV_VECTORIZE)"
+# Half-wave rectifier after the output shift. 1 = as shipped, 0 = saturate only.
+#
+# THIS IS THE PHASE 1 DECISION KNOB, and 0 is the better setting — measured
+# offline (scripts/phase1_sweep.py), held out, at 128x128/ch16:
+#   ReLU on , bias as shipped  : peak/max-sidelobe 12.8
+#   ReLU on , bias "fixed" (a) : peak/max-sidelobe  3.9   <-- the planned fix, 3x WORSE
+#   ReLU OFF, bias "fixed"     : peak/max-sidelobe 16.3   <-- best
+# Unlike CONV_VECTORIZE this CHANGES NUMERICS, so it needs its own before/after
+# run and its own shift-budget check. See the ReLU entry in CLAUDE.md.
+# DEFAULT CHANGED 1 -> 0 on 2026-08-14 (user decision, on the sweep evidence).
+# Held out at 128x128/ch16, peak/max-sidelobe: ReLU on 12.8, ReLU off 15.9.
+# NOTE the bias_acc contract fix is NOT applied — with ReLU off it is worth
+# almost nothing (15.9 vs 16.3), so export_weights.py is left alone and the
+# whole Phase 1 change is this one flag.
+# COUPLED: this changes numerics, so the shift budget moves with it (4-2-2 put
+# the ch16 response at 80% of rail; 4-3-3 puts it at 20%) and the aiesim goldens
+# must be regenerated — gen_aiesim_vectors.py takes GEN_CONV_RELU below.
+CONV_RELU ?= 0
+AIE_FLAGS  += --Xpreproc="-DCONV_RELU=$(CONV_RELU)"
+
+# Snapshot of the PORTABLE part of the flags — platform, includes and every -D —
+# taken here, before the hw-specific tail (--constraints/--Xchess/--Xelfgen/
+# --workdir) is appended. The x86sim harness builds on this so it cannot drift
+# out of sync with the real build's defines: a bit-exactness test compiled with
+# different PATCH_ROWS or H_SHIFT than production would be worse than no test.
+# Assignment only, never appended to, so AIE_FLAGS itself is unaffected.
+AIE_FLAGS_COMMON := $(AIE_FLAGS)
+
 AIE_FLAGS  += --verbose
 AIE_FLAGS  += --log-level=5
 AIE_FLAGS  += --pl-freq=$(PL_FREQ)
@@ -257,6 +339,17 @@ GCC_FLAGS  += -DPATCH_ROWS=$(PATCH_ROWS)
 GCC_FLAGS  += -DPATCH_COLS=$(PATCH_COLS)
 GCC_FLAGS  += -DN_CHANNELS=$(N_CHANNELS)
 GCC_FLAGS  += -DITER_CNT=$(ITER_CNT)
+# THE HOST MUST AGREE WITH THE GRAPH ABOUT WINDOW SIZE. These were missing until
+# 2026-08-14, and the failure mode was silent and expensive: mosse_tracker.cpp
+# defaults FFT_ROW_WS/FFT_COL_WS to 2 in its own `#ifndef`, so a build with
+# FFT_ROW_WS=8 produced an AIE graph expecting 1024-sample windows and a host
+# chunking the same DMAs in 256-sample pieces. Every chunk count
+# (ROW_CHUNKS, COL_CHUNKS, CONV_INVOCATIONS, CMUL_N_CHUNKS) derives from these,
+# and a mismatch deadlocks the drain loops — which looks identical to the
+# historical aie2gm_nb hang, i.e. a multi-day misdiagnosis waiting to happen.
+# Same single-source-of-truth rule as the FFT/IFFT shifts above.
+GCC_FLAGS  += -DFFT_ROW_WS=$(FFT_ROW_WS)
+GCC_FLAGS  += -DFFT_COL_WS=$(FFT_COL_WS)
 # Offset of the synthetic test impulse from the tracked position. A correct
 # pipeline must report exactly this displacement; (0,0) would be untestable
 # because it is also what a zero response yields. Sweep to check other offsets:
@@ -270,6 +363,48 @@ GCC_FLAGS  += -DFRAME_COLS=1920
 # The host builds H in Q1.15 to match the shift cmul_accum applies to the product.
 # Same value as the AIE_FLAGS line above — see the H_SHIFT comment block.
 GCC_FLAGS  += -DCMUL_H_SHIFT=$(H_SHIFT)
+# Stage B2 mode. 1 (default) = NULL the 9 low-frequency bins; 0 = subtract µ*W,
+# the original design. Nulling was made the default 2026-08-11 because those bins
+# RAIL, so the subtraction operates on already-clipped values and the residual DC
+# swamps the response (measured: peak/pedestal 1.43x at 3/0/6, and at 4/2/2 the
+# pedestal wins outright). Nulling restores exact localisation at PSR 22.7.
+# Set to 0 to reproduce the old behaviour for comparison — the two modes are the
+# before/after pair for this finding. See apply_dc_correction() in mosse_tracker.cpp.
+B2_NULL_BINS ?= 1
+GCC_FLAGS  += -DB2_NULL_BINS=$(B2_NULL_BINS)
+
+# ---------------------------------------------------------------------------
+# PSR update gating — Bolme §3.5. HOST-ONLY: nothing in the AIE graph changes,
+# so these deliberately do NOT appear in AIE_FLAGS. (Contrast FFT_ROW_WS above,
+# which the graph and the host BOTH derive from and which therefore must go to
+# both toolchains.)
+# ---------------------------------------------------------------------------
+# "when PSR drops to around 7.0 it is an indication that the object is occluded
+# or tracking has failed" — below this the host HOLDS the tracked position and
+# skips BOTH filter_update and publish_filter, so an occluded frame cannot train
+# the filter on background at eta=0.125.
+#
+# SET TO 0 TO DISABLE the threshold test (report-only, the pre-2026-08-15
+# behaviour). Structural failures — zero response, flat sidelobe, negative peak —
+# still veto regardless; only the "weak peak" test is switched off. That makes the
+# A/B lever one make variable rather than an #if.
+#
+# Applies to Bolme's PSR (g_max-mu)/sigma ONLY, never to the |peak|/max|sidelobe|
+# ratio that gen_aiesim_vectors.py calls PSR — different statistics, and they
+# differ by several times. No `f` suffix here: mosse_filter.h casts it, so 7, 7.0
+# and 7.5 all work.
+PSR_GATE_MIN ?= 7.0
+GCC_FLAGS  += -DPSR_GATE_MIN=$(PSR_GATE_MIN)
+
+# Occlusion injection, to prove the gate actually FIRES — it cannot on the normal
+# synthetic target, which measures PSR ~172 against a threshold of 7. Bitmask over
+# frame index: bit f set => frame f gets a checkerboard instead of the target.
+# Bit 0 is ignored (frame 0 trains the filter). The occlude-then-reacquire test:
+#   make sd_card ITER_CNT=3 OCCLUDE_MASK=0x2
+OCCLUDE_MASK   ?= 0
+OCCLUDE_SQUARE ?= 8
+GCC_FLAGS  += -DOCCLUDE_MASK=$(OCCLUDE_MASK)
+GCC_FLAGS  += -DOCCLUDE_SQUARE=$(OCCLUDE_SQUARE)
 
 GCC_INC    := -I$(SDKTARGETSYSROOT)/usr/include/xrt
 GCC_INC    += -I$(XILINX_VITIS)/aietools/include/
@@ -402,6 +537,7 @@ gen_vectors:
 	    GEN_IFFT_ROW_SHIFT=$(IFFT_ROW_SHIFT) \
 	    GEN_FFT_SHIFT=$(FFT_SHIFT) \
 	    GEN_H_SHIFT=$(H_SHIFT) \
+	    GEN_CONV_RELU=$(CONV_RELU) \
 	    uv run python3 scripts/gen_aiesim_vectors.py $(AIE_SRC_REPO)/aiesim_data
 
 aiesim: graph gen_vectors
@@ -457,6 +593,94 @@ aiesim_fft: graph_fft
 	@echo "--- aiesim_fft done; check $(FFT_ONLY_BUILD_DIR)/aiesim_fft.log ---"
 
 # -------------------------------------------------------
+# x86sim kernel bit-exactness harness
+# -------------------------------------------------------
+# Isolates ONE kernel, dumps its raw output, and diffs that against the Python
+# model in gen_aiesim_vectors.py. Seconds per run, versus hours for aiesim and
+# ~24 h for an hw_emu frame at ch16.
+#
+# This is the gate for any change to conv2d or cmul_accum. It is also the only
+# check that gen_aiesim_vectors.py's simulate_conv2d() actually matches the
+# kernel it claims to replicate — a docstring assertion the offline shift-budget
+# work depends on entirely.
+#
+#   make x86sim_check KUT=conv2d SCENARIO=s6 CONV2D_MODE=0
+#   make x86sim_check KUT=cmul   SCENARIO=s7
+#
+# NOTE conv2d MUST be built CONV2D_MODE=0 to test the convolution; the default is
+# echo, and echo mode compares a passthrough. The harness prints a warning.
+KUT              ?= conv2d
+ifeq ($(KUT),conv2d)
+  KUT_ID := 0
+else ifeq ($(KUT),cmul)
+  KUT_ID := 1
+else
+  $(error KUT must be conv2d or cmul, got '$(KUT)')
+endif
+
+X86_BUILD_DIR := build/x86sim/$(PATCH_ROWS)x$(PATCH_COLS)/$(KUT)
+# ABSOLUTE. The recipes `cd $(X86_BUILD_DIR)` first, so a relative --workdir
+# resolves against it and buries Work at
+#   build/x86sim/.../conv2d/build/x86sim/.../conv2d/Work
+# which is what the other targets in this file do and it is needlessly confusing.
+X86_WORK_DIR  := $(PROJECT_REPO)/$(X86_BUILD_DIR)/Work
+X86_SRC       := $(AIE_SRC_REPO)/kernel_only_graph.cpp
+
+# Built from AIE_FLAGS_COMMON (see its definition above) so every -D matches the
+# real build. --target=hw is filtered out rather than overridden; the empty
+# constraints file is reused from the fft_only harness since x86sim does not
+# place shims.
+X86_AIE_FLAGS := $(filter-out --target=hw,$(AIE_FLAGS_COMMON))
+X86_AIE_FLAGS += --target=x86sim
+X86_AIE_FLAGS += --Xpreproc="-DKERNEL_UNDER_TEST=$(KUT_ID)"
+X86_AIE_FLAGS += --constraints $(AIE_SRC_REPO)/fft_only_constraints.aiecst
+X86_AIE_FLAGS += --workdir=$(X86_WORK_DIR)
+
+# Flag guard, same purpose as AIE_FLAGS_STAMP: a KUT= or CONV2D_MODE= change with
+# no source edit must not silently reuse the previous kernel's build. Defined
+# HERE, next to the flags it stamps — `:=` expands immediately, and defining a
+# stamp above its variables is exactly the bug that broke SMOKE_FLAGS_STAMP.
+X86_FLAGS_STAMP := $(X86_BUILD_DIR)/aie.flagstamp
+$(X86_FLAGS_STAMP): FLAGS_FOR_STAMP := $(X86_AIE_FLAGS)
+
+X86_SIM_FLAGS := --pkg-dir=$(X86_WORK_DIR)
+X86_SIM_FLAGS += -i=$(SCENARIO_DATA_DIR)
+X86_SIM_FLAGS += --output-dir=$(PROJECT_REPO)/$(X86_BUILD_DIR)
+
+.PHONY: x86sim_graph x86sim_check
+x86sim_graph: $(X86_FLAGS_STAMP) $(X86_SRC) \
+              $(AIE_SRC_REPO)/kernel_only_graph.h \
+              $(AIE_SRC_REPO)/aiesim_scenario_io.h \
+              $(AIE_SRC_REPO)/conv2d_kernel.cpp \
+              $(AIE_SRC_REPO)/cmul_accum_kernel.cpp
+	mkdir -p $(X86_BUILD_DIR)
+	cd $(X86_BUILD_DIR) && aiecompiler $(X86_AIE_FLAGS) $(X86_SRC) 2>&1 \
+	    | tee aiecompiler_x86.log
+	@grep -o 'KERNEL_UNDER_TEST=[0-9]' $(X86_BUILD_DIR)/aiecompiler_x86.log | tail -1
+	@grep -o 'CONV2D_ECHO_TEST=[0-9]'  $(X86_BUILD_DIR)/aiecompiler_x86.log | tail -1
+
+# conv2d weight channel under test. NOT a free choice: on the s6 patch ReLU never
+# fires for ch0 — nor for 12 of the 16 channels — so KUT_CH=0 cannot tell
+# CONV_RELU=1 from CONV_RELU=0. Use KUT_CH=11 for that: it is the only channel
+# where ReLU clamps SOME but not all pixels (12434 of 16384).
+KUT_CH ?= 0
+
+x86sim_check: x86sim_graph gen_vectors
+	cd $(X86_BUILD_DIR) && AIESIM_SCENARIO_DIR=$(SCENARIO_DATA_DIR) \
+	    KERNEL_OUT_DIR=$(PROJECT_REPO)/$(X86_BUILD_DIR) \
+	    KUT_CH=$(KUT_CH) \
+	    timeout 600 x86simulator $(X86_SIM_FLAGS) 2>&1 | tee x86sim.log
+	cd $(PROJECT_REPO) && env PYTHONHOME= PYTHONPATH= \
+	    GEN_PATCH_ROWS=$(PATCH_ROWS) \
+	    GEN_PATCH_COLS=$(PATCH_COLS) \
+	    GEN_H_SHIFT=$(H_SHIFT) \
+	    uv run python3 scripts/check_kernel_bitexact.py \
+	        --kernel $(KUT) \
+	        --scenario $(SCENARIO_DATA_DIR) \
+	        --ch $(KUT_CH) --relu $(CONV_RELU) \
+	        --actual $(X86_BUILD_DIR)/kernel_out.bin
+
+# -------------------------------------------------------
 # System link
 # -------------------------------------------------------
 xsa: $(BUILD_DIR)/$(XSA)
@@ -508,7 +732,7 @@ test_host:
 	    GEN_H_SHIFT=$(H_SHIFT) \
 	    uv run python3 scripts/gen_filter_golden.py $(TEST_HOST_DIR)/golden
 	g++ -O2 -std=c++17 -Wall -Wextra -I$(HOST_APP_SRC) \
-	    -DCMUL_H_SHIFT=$(H_SHIFT) \
+	    -DCMUL_H_SHIFT=$(H_SHIFT) -DPSR_GATE_MIN=$(PSR_GATE_MIN) \
 	    $(HOST_APP_SRC)/mosse_filter.cpp $(TEST_HOST_DIR)/test_mosse_filter.cpp \
 	    -o $(BUILD_DIR)/test_host
 	$(BUILD_DIR)/test_host $(TEST_HOST_DIR)/golden

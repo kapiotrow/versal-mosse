@@ -31,7 +31,41 @@
  */
 
 #include "conv2d_kernel.h"
+#include <aie_api/aie.hpp>
 #include <cstring>
+
+// MAC-loop implementation.
+//   1 (default) = vectorized aie::mac, BIT-IDENTICAL to the scalar path
+//   0           = the original scalar loop, kept for bisection and cycle
+//                 comparison
+// Verified with: make x86sim_check KUT=conv2d SCENARIO=s6 CONV2D_MODE=0
+#ifndef CONV_VECTORIZE
+#  define CONV_VECTORIZE 1
+#endif
+
+// Output pixels per vector iteration. PATCH_COLS must be a whole multiple.
+#ifndef CONV_VEC
+#  define CONV_VEC 16
+#endif
+
+// Half-wave rectifier after the output shift.
+//   1 (default) = as shipped
+//   0           = no ReLU, saturate only
+//
+// 0 IS THE BETTER SETTING and it is not the default yet on purpose. Measured
+// offline 2026-08-14 (scripts/phase1_sweep.py), held-out evaluation at
+// 128x128/ch16: removing ReLU takes peak/max-sidelobe from 12.8 to 16.3 and, more
+// importantly, the planned bias_acc fix goes from 3.9 (a 3x REGRESSION) to 16.3
+// once ReLU is off. A DCF is linear in its features; a half-wave rectifier throws
+// away half the signal and the linear filter cannot undo it. export_weights.py
+// already makes this argument when it drops Hardswish.
+//
+// Left off by default because it changes numerics, so it needs its own before/
+// after run rather than riding along with a rewrite that is bit-identical by
+// design. See the ReLU entry in CLAUDE.md Known Issues.
+#ifndef CONV_RELU
+#  define CONV_RELU 1
+#endif
 
 // Include the Hanning table sized for this build's patch (square: PATCH_ROWS==PATCH_COLS).
 // HTAB aliases the size-specific symbol. Generate a table with: make weights PATCH_COLS=<n>
@@ -212,6 +246,110 @@ void conv2d_kernel(
 
         const int16_t h_r = HTAB[out_r];
 
+#if CONV_VECTORIZE
+
+        // ------------------------------------------------------------------
+        // Vectorized column loop — BIT-IDENTICAL to the scalar loop below.
+        //
+        // The scalar version schedules at 37 cycles per OUTPUT PIXEL (measured,
+        // aiecompiler.log), which is ~11.5 ms/frame at 128x128 x 16 channels and
+        // makes conv2d the largest single compute cost in the design — nine
+        // scalar int32xint8 MACs on a core whose int8 vector datapath does 256
+        // MAC/cycle.
+        //
+        // BIT-EXACTNESS: every shift here is aie::downshift, which is an
+        // ARITHMETIC (floor) shift, matching C++ `>>` on a signed value. It is
+        // deliberately NOT srs: srs rounds to nearest, and while that is
+        // arguably better numerics it would change every pixel by up to 1 LSB
+        // and invalidate Stage B2 (whose ~1e-3 residual is documented as
+        // depending on these truncations), the shift budget, and every s6/s7
+        // expected value. `aie::logical_downshift` would be wrong for a
+        // different reason — it zero-fills instead of sign-extending.
+        //
+        // The clamps are min/max chains rather than selects for the same reason
+        // the scalar sat16 is branchless: control flow inside this loop costs
+        // more than the arithmetic.
+        for (int c = 0; c < PATCH_COLS; c += CONV_VEC)
+        chess_prepare_for_pipelining
+        chess_loop_range(PATCH_COLS / CONV_VEC, PATCH_COLS / CONV_VEC)
+        {
+            // Seed the accumulator with the bias, exactly as `int32_t acc = bias`.
+            aie::accum<acc32, CONV_VEC> a;
+            a.from_vector(aie::broadcast<int32_t, CONV_VEC>(bias), 0);
+
+            // 3x3 MAC. The taps sit at column offsets c, c+1, c+2 in the padded
+            // row buffer, so they are unaligned by construction — the sliding
+            // window is what makes this a convolution. load_unaligned_v handles
+            // that directly; aligned loads plus shuffles would be faster but the
+            // first version should be obviously correct.
+            //
+            // CONV_IN_CH is fixed at 1 (grayscale). The static_assert below is a
+            // guard, not a limitation being asserted away: RGB needs more than a
+            // loop bound here (interleaved 3x row stride, a joint Stage-A
+            // normalization, and the weight-buffer relayout) — see the RGB
+            // section in CLAUDE.md.
+            static_assert(CONV_IN_CH == 1, "vectorized path is grayscale-only; "
+                                           "see the RGB section in CLAUDE.md");
+
+            a = aie::mac(a, aie::load_unaligned_v<CONV_VEC>(row_top + c),     w00);
+            a = aie::mac(a, aie::load_unaligned_v<CONV_VEC>(row_top + c + 1), w01);
+            a = aie::mac(a, aie::load_unaligned_v<CONV_VEC>(row_top + c + 2), w02);
+            a = aie::mac(a, aie::load_unaligned_v<CONV_VEC>(row_mid + c),     w10);
+            a = aie::mac(a, aie::load_unaligned_v<CONV_VEC>(row_mid + c + 1), w11);
+            a = aie::mac(a, aie::load_unaligned_v<CONV_VEC>(row_mid + c + 2), w12);
+            a = aie::mac(a, aie::load_unaligned_v<CONV_VEC>(row_bot + c),     w20);
+            a = aie::mac(a, aie::load_unaligned_v<CONV_VEC>(row_bot + c + 1), w21);
+            a = aie::mac(a, aie::load_unaligned_v<CONV_VEC>(row_bot + c + 2), w22);
+
+            aie::vector<int32_t, CONV_VEC> sh =
+                aie::downshift(a.to_vector<int32_t>(0), out_shift);
+
+            // Nonlinearity. CONV_RELU=1 reproduces the shipped kernel exactly:
+            //   >32767 -> 32767 ; <=0 -> 0 ; else pass
+            // which is min(max(x,0),32767) for integers.
+            // CONV_RELU=0 removes the half-wave rectifier and only saturates.
+            // See the ReLU entry in CLAUDE.md Known Issues for why that is the
+            // better setting; it is OFF by default because it changes numerics.
+#if CONV_RELU
+            aie::vector<int32_t, CONV_VEC> r = aie::min(aie::max(sh, 0), 32767);
+#else
+            aie::vector<int32_t, CONV_VEC> r = aie::min(aie::max(sh, -32768), 32767);
+#endif
+
+            // Stage B1, then the separable Hann with both >>15 floor shifts.
+            aie::vector<int32_t, CONV_VEC> cen =
+                aie::sub(r, aie::broadcast<int32_t, CONV_VEC>(mean_prev));
+            cen = aie::min(aie::max(cen, -32768), 32767);
+
+            aie::vector<int32_t, CONV_VEC> w1 =
+                aie::downshift(aie::mul(cen, (int32_t)h_r).template to_vector<int32_t>(0), 15);
+            // unpack, NOT cast_to: this must SIGN-EXTEND int16 -> int32 lane for
+            // lane. cast_to reinterprets the bits and would silently halve the
+            // lane count.
+            aie::vector<int32_t, CONV_VEC> hc =
+                aie::unpack(aie::load_unaligned_v<CONV_VEC>((const int16_t *)HTAB + c));
+            aie::vector<int32_t, CONV_VEC> w2 =
+                aie::downshift(aie::mul(w1, hc).template to_vector<int32_t>(0), 15);
+            w2 = aie::min(aie::max(w2, -32768), 32767);
+
+            // Emit cint16 {wnd, 0}. interleave_zip with a zero vector builds the
+            // {re,im} pairs in one shot; storing 2*CONV_VEC int16 scalars instead
+            // would put the store on the critical path.
+            aie::accum<acc32, CONV_VEC> t;
+            t.from_vector(w2, 0);
+            const aie::vector<int16_t, CONV_VEC> re16 = t.template to_vector<int16_t>(0);
+            const aie::vector<int16_t, CONV_VEC> zero =
+                aie::zeros<int16_t, CONV_VEC>();
+            const auto zp = aie::interleave_zip(re16, zero, 1);
+
+            int16_t *dst = (int16_t *)(out + o);
+            aie::store_unaligned_v(dst,             zp.first);
+            aie::store_unaligned_v(dst + CONV_VEC,  zp.second);
+            o += CONV_VEC;
+        }
+
+#else   // scalar reference implementation
+
         for (int c = 0; c < PATCH_COLS; c++)
         chess_prepare_for_pipelining
         chess_loop_range(PATCH_COLS, PATCH_COLS)
@@ -258,6 +396,8 @@ void conv2d_kernel(
             out[o].imag = 0;
             ++o;
         }
+
+#endif  // CONV_VECTORIZE
 
         ++rows_out;
         if (rows_out >= PATCH_ROWS) rows_out = 0;   // patch complete — rearm

@@ -21,13 +21,60 @@ Processing steps
 The Hardswish activation is omitted.  The MOSSE correlation filter is linear in
 feature space — no activation is needed at this stage; H_ch* adapts to any scale.
 
-Grayscale collapse rationale
------------------------------
-The PLIO stream carries exactly PATCH_ROWS×PATCH_COLS int8 samples per channel
-invocation (128-bit beats, 16 samples/beat).  An RGB layout (3 bytes/pixel)
-does not divide evenly into 16-byte beats at 128×128 resolution.  Collapsing
-to luminance grayscale on the host/PL side before the PLIO keeps the stream
-layout simple and halves the kernel MAC count.
+Grayscale collapse rationale — the original one was WRONG (corrected 2026-08-12)
+--------------------------------------------------------------------------------
+This docstring used to claim: "The PLIO stream carries exactly
+PATCH_ROWS×PATCH_COLS int8 samples per channel invocation (128-bit beats, 16
+samples/beat). An RGB layout (3 bytes/pixel) does not divide evenly into 16-byte
+beats at 128×128 resolution."  Both halves are false:
+
+  * The PLIO is 32-BIT, not 128-bit.  mosse_graph.h:121 creates it with
+    `plio_32_bits`, and lines 118-120 record why it was changed away from 128
+    bits ("a 128-bit PLIO delivered one 128-bit beat per readincr, starving the
+    kernel").  roi_crop's port is `ap_axiu<32,0,0,0>`.  "16 samples/beat" is
+    stale.
+  * RGB divides EXACTLY anyway.  128*128*3 = 49152 B = 3072 x 16 B = 12288 x 4 B,
+    and one row is 384 B = 24 beats = 96 words.  Also exact at 64x64 and 256x256.
+
+So there is no alignment obstacle to RGB.  The real reasons to stay grayscale are
+conv2d's scalar 3x3 MAC loop (9 -> 27 MACs/pixel, ~2.2x its cycles) and the fact
+that Stage A's mean/L2 reductions would have to become JOINT across the three
+planes.  Both are tractable; see the RGB feasibility section in CLAUDE.md.
+Do not re-add the divisibility argument.
+
+The cost of staying grayscale is measured and non-trivial: the collapse
+degenerates the 16-channel bank to 14 independent filters.  See the LUM-vs-SUM
+note below and the Known Issues entry in CLAUDE.md.
+
+Why LUMINANCE weights and not the unweighted sum
+-------------------------------------------------
+Danelljan §3.3 says "for grayscale images, we simply set the R, G and B-channels
+equal to the grayscale intensities".  With x_R = x_G = x_B = g the network
+computes  y = Σ_k g[k] * Σ_ic w[ic,k], so the paper-exact collapse is the
+UNWEIGHTED sum Σ_ic w[ic].  This code deliberately does NOT do that.
+
+Measured on the real pretrained weights (2026-08-12): the unweighted sum
+ANNIHILATES the colour-opponent channels, because those have w_R ≈ -w_G and
+cancel on summation.  Collapsed norm as a fraction of the mean per-plane norm:
+
+    ch     SUM     LUM     cos(sum,lum)   cos(R,G)
+     0    0.049   0.318      -0.967       -0.9997
+     2    0.029   0.599      -0.018       -0.996
+     9    0.049   0.634      -0.634       (cos(R,B) -0.98)
+    10    0.025   0.037      +0.594       -0.994
+
+Per-channel int8 quantization then divides by max|w_gray[oc]|, so SUM would
+amplify a 2.5-5% cancellation residue back to full ±127 scale.  The other 11
+channels are achromatic and agree between the two conventions to cos > 0.99
+(int8 L1 difference <= 48 of a possible ~1140), so the convention only matters
+for the opponent channels — and on those luminance is strictly better.
+
+Magnitude is NOT a consideration either way: the LUM form is ~2.2x smaller, but
+quantize_weights() normalizes per output channel, so the scale is absorbed
+entirely into scales[oc].
+
+DO NOT "fix" this to the paper-literal sum.  Reproduce the measurement first:
+scripts/check_collapse.py.
 
 Input contract for the AIE kernel
 ----------------------------------

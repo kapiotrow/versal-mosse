@@ -40,27 +40,14 @@ MOSSE_graph mosse_graph;
 #include <cmath>
 #include <algorithm>
 
+// load_cint16_bin / load_raw_bin / dump_raw_bin. Shared with the kernel-only
+// bit-exactness harness (kernel_only_graph.cpp) so the two harnesses cannot
+// drift apart in how they read scenario data.
+#include "aiesim_scenario_io.h"
+
 // ---------------------------------------------------------------------------
 // Data-driven scenario support
 // ---------------------------------------------------------------------------
-
-// Load PATCH_ELEMS cint16 from a flat int16 LE binary file into buf (int16_t*).
-static bool load_cint16_bin(const char *path, int16_t *buf, int n_elems)
-{
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        fprintf(stderr, "[aiesim] ERROR: cannot open %s\n", path);
-        return false;
-    }
-    size_t got = fread(buf, sizeof(int16_t), (size_t)n_elems * 2, f);
-    fclose(f);
-    if ((int)got != n_elems * 2) {
-        fprintf(stderr, "[aiesim] ERROR: %s: read %zu int16, expected %d\n",
-                path, got, n_elems * 2);
-        return false;
-    }
-    return true;
-}
 
 struct ScenarioExpected {
     int peak_idx;
