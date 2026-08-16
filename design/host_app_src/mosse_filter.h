@@ -86,10 +86,73 @@ namespace mosse {
 using cfloat = std::complex<float>;
 
 // Exponential learning rate. Bolme §3.3 uses 0.125 and reports it works well
-// across the whole test set.
-constexpr float DEFAULT_ETA = 0.125f;
-// Target Gaussian width, in pixels. Bolme §3.1 uses sigma = 2.0.
-constexpr float DEFAULT_SIGMA = 2.0f;
+// across the whole test set. DSST §6.1 uses 0.025 for both its filters.
+//
+// Given an #ifndef escape for the same reason PSR_GATE_MIN has one: it is a
+// calibration constant, and this project's record is that calibration constants
+// which can only be changed by editing a header do not get swept.
+#ifndef MOSSE_ETA
+#  define MOSSE_ETA 0.125
+#endif
+constexpr float DEFAULT_ETA = (float)(MOSSE_ETA);
+
+// Target Gaussian width, in PATCH pixels. Bolme §3.1 uses sigma = 2.0 on a 64x64
+// window sized to the target.
+//
+// WHY THIS IS STILL 2.0 AND NOT THE DSST RULE — measured 2026-08-16.
+// DSST §6.1 anchors it: "The standard deviation of the desired correlation output
+// g is set to 1/16 of the target size in the translation dimensions." At padding
+// 2 the target occupies 64 of the 128 patch pixels, so the rule gives sigma = 4.
+// The offline sweep does NOT support making that switch, and the reason is that
+// the available metric cannot arbitrate:
+//
+//   sigma    0.75   1.00   1.50   2.00   2.50   3.20   4.00   5.33
+//   PSR(B)   80.3   71.8   55.2   45.7   41.2   37.5   30.5   19.3
+//
+// Bolme PSR is MONOTONE DECREASING in sigma all the way to sub-pixel, so it does
+// not select sigma — it rewards a sharp peak, and a delta target would maximise
+// it. What sigma actually buys is robustness to appearance change, which a
+// single-frame translation-only holdout does not exercise. (The obvious
+// mechanistic explanation — Stage B2 nulling the 9 low bins where a wide Gaussian
+// keeps its energy — was tested with B2 off and REFUTED: the drop survives.)
+//
+// So: default unchanged, and the rule is reachable in one make variable via
+// SIGMA_FROM_TARGET. Decide it when real video, or a holdout with scale and
+// appearance change, can measure what sigma is actually for.
+#ifndef MOSSE_SIGMA
+#  define MOSSE_SIGMA 2.0
+#endif
+constexpr float DEFAULT_SIGMA = (float)(MOSSE_SIGMA);
+
+// DSST §6.1's divisor: sigma = target_size_in_patch_px / SIGMA_FACTOR.
+#ifndef SIGMA_FACTOR
+#  define SIGMA_FACTOR 16.0
+#endif
+constexpr float DEFAULT_SIGMA_FACTOR = (float)(SIGMA_FACTOR);
+
+// 0 (default) = use DEFAULT_SIGMA literally. 1 = derive it from the target box
+// per DSST §6.1. This is the A/B lever; see the note above for why it is off.
+#ifndef SIGMA_FROM_TARGET
+#  define SIGMA_FROM_TARGET 0
+#endif
+
+// ROI padding factor: roi = target * TARGET_PADDING. Both papers use a window
+// LARGER than the object so the filter learns target-vs-background (Bolme §3.1,
+// Danelljan §3.1); DSST §6.1 sets it to 2, fDSST §6.1 to 3.
+//
+// The offline sweep (padding 1.5 / 2.0 / 2.5 / 3.0, target 64, held out by
+// re-cropping a moved target) settles this at >= 2: 1.5 is worst on both metrics
+// and shows a real 0.75 px localisation error, while 2.5 and 3.0 edge ahead but
+// trigger aliasing (roi_crop's bilinear has no prefilter, so beyond ~2x
+// decimation source rows are skipped outright) and 3.0 clips 3.6% of samples.
+//
+// 2.0 is the default because at target 64 it gives roi = 128, i.e. EXACTLY the
+// geometry shipped today — so adopting the box costs no resample change and any
+// later padding move is a clean single-variable step.
+#ifndef TARGET_PADDING
+#  define TARGET_PADDING 2.0
+#endif
+constexpr float DEFAULT_PADDING = (float)(TARGET_PADDING);
 // Regularization, as a FRACTION of mean(B) rather than an absolute value: B's
 // magnitude depends on the shift budget and the feature scale, so an absolute
 // epsilon would silently become either a no-op or a dominant term after any
@@ -188,6 +251,71 @@ GateDecision psr_gate(const PsrResult &p, float psr_min);
 const char *gate_reason_tag(GateReason r);   // "ACCEPT" / "LOW_PSR" / ...
 const char *gate_reason_why(GateReason r);   // one sentence, for the log
 
+// -----------------------------------------------------------------------
+// Target box and ROI geometry
+// -----------------------------------------------------------------------
+// Until 2026-08-16 the tracker's entire state was pos_row/pos_col, two ints. That
+// had three consequences: sigma had no defined relation to the object, the ROI
+// was pinned 1:1 to the patch so the filter saw no background context, and there
+// was no box to score an IoU against — i.e. no way to report the metric both
+// papers report.
+//
+// These live in mosse_filter.h, not in mosse_tracker.cpp, so they are under
+// `make test_host`. That matters specifically for the two conversions below.
+struct TargetBox {
+    double row = 0.0, col = 0.0;   // CENTRE, frame pixels
+    double h   = 0.0, w   = 0.0;   // size, frame pixels
+};
+
+// The ROI actually handed to roi_crop, plus the patch it is resampled into.
+struct RoiGeometry {
+    int roi_row = 0, roi_col = 0;      // top-left, frame px (may be NEGATIVE)
+    int roi_h   = 0, roi_w   = 0;      // extent, frame px
+    int patch_rows = 0, patch_cols = 0;
+};
+
+// roi = box * padding, centred on the box. roi_row/roi_col go negative for a
+// target near an edge, which roi_crop handles by border replication — and which
+// is why the kernel must not left-shift them (UB before C++20).
+RoiGeometry roi_for(const TargetBox &box, float padding,
+                    int patch_rows, int patch_cols);
+
+// -----------------------------------------------------------------------
+// THE CONVERSION THAT IS CURRENTLY INVISIBLE
+// -----------------------------------------------------------------------
+// The correlation peak is located in PATCH bins. The tracked position lives in
+// FRAME pixels. While roi_h == patch_rows those are the same number, so the
+// tracker gets away with `pos_row += dr` and with asserting `dr == IMPULSE_DR`.
+// The moment padding makes roi_h != patch_rows, both are wrong by the resample
+// ratio, and the failure mode is a tracker that localises confidently and drifts
+// — the class of bug `err=0 px` has passed through four times in this project.
+//
+// One bin is roi_h/patch_rows frame pixels. That ratio is also the localisation
+// QUANTUM: at 2.0 the tracker cannot resolve better than 2 frame px however good
+// its PSR looks, which is a cost of padding no PSR number reveals.
+double patch_dr_to_frame(int dr, const RoiGeometry &g);
+double patch_dc_to_frame(int dc, const RoiGeometry &g);
+// The inverse, for turning an expected frame-pixel displacement into the patch
+// bin a correct pipeline must report.
+int    frame_dr_to_patch(double dr, const RoiGeometry &g);
+int    frame_dc_to_patch(double dc, const RoiGeometry &g);
+
+// Target size measured in PATCH pixels — the units sigma is expressed in.
+double target_h_in_patch(const TargetBox &box, const RoiGeometry &g);
+double target_w_in_patch(const TargetBox &box, const RoiGeometry &g);
+
+// sigma per DSST §6.1, or DEFAULT_SIGMA, depending on SIGMA_FROM_TARGET.
+// Returned per axis because the paper says "in the translation dimensions" and a
+// non-square target has a different width in each.
+void sigma_for(const TargetBox &box, const RoiGeometry &g,
+               float *sigma_r, float *sigma_c);
+
+// Intersection-over-union of two boxes. This is what makes the tracker scoreable
+// — both papers report overlap precision (OTB) and neither can be reproduced
+// without it.
+double box_iou(const TargetBox &a, const TargetBox &b);
+
+
 struct FilterState {
     int    rows      = 0;
     int    cols      = 0;
@@ -213,6 +341,17 @@ struct FilterState {
 // maps to displacement (0,0)). Non-zero offsets exist for testing.
 void gaussian_target_spectrum(cfloat *G, int rows, int cols,
                               float sigma, int dr, int dc);
+
+// Anisotropic form. DSST §6.1 anchors sigma to "the target size in the
+// translation dimensionS" — plural — and a non-square target has a different
+// extent per axis. The closed form already separates them (the row and column
+// exponents are computed independently), so carrying two sigmas is nearly free
+// and collapsing to sqrt(area) would throw away real information.
+//
+// The scalar overload above forwards here with sigma_r == sigma_c, so every
+// existing caller and the NumPy golden are unaffected.
+void gaussian_target_spectrum(cfloat *G, int rows, int cols,
+                              float sigma_r, float sigma_c, int dr, int dc);
 
 // First frame: A = conj(G) (*) F_ch, B = SUM |F_ch|^2. Equivalent to
 // filter_update() with eta = 1 against a zeroed state.
@@ -245,5 +384,136 @@ void filter_update(FilterState &st, const cfloat *F_all,
 void filter_quantize_q15(const FilterState &st, const double *energy,
                          float eps_rel, int16_t *out,
                          float *out_scale, float *out_max_abs);
+
+// -----------------------------------------------------------------------
+// 1-D scale filter — DSST (docs/1609.06141v1.pdf) §5.1
+// -----------------------------------------------------------------------
+// "We propose the Discriminative Scale Space Tracking (DSST), which is based on
+//  learning a separate 1-dimensional scale correlation filter."
+//
+// WHY A SEPARATE 1-D FILTER RATHER THAN AN EXHAUSTIVE MULTI-RESOLUTION SEARCH.
+// Danelljan's ICCV'15 paper applies the translation filter at several
+// resolutions; DSST Table 1 shows the separate filter beats that on BOTH axes
+// (OP 67.7 vs 65.2, 25.4 vs 16.9 FPS). On THIS hardware the gap is wider than
+// the paper's, for a reason specific to the fixed-point pipeline: an exhaustive
+// search pushes patches resampled by +/-30% through roi_crop -> conv2d -> FFT
+// every frame, which moves |F| and therefore the accumulator scale and therefore
+// the shift budget — the coupling that has already forced two budget hunts here.
+// DSST's translation filter always runs at the CURRENT scale, so the budget that
+// was validated stays valid. Costing it against the post-vectorization figures,
+// a 3-scale exhaustive search spends exactly the 30 fps headroom that
+// vectorizing conv2d and cmul bought back.
+//
+// THE FILTER IS THE EXISTING FILTER AT rows == 1. DSST §3 says so outright:
+// "the same approach can be used to learn 1-dimensional scale estimation
+//  filters, 2-dimensional translation estimation filters and 3-dimensional joint
+//  scale and translation estimation filters. This is accomplished by only
+//  adapting the feature extraction step for each case."
+// Confirmed against this code: filter_init/filter_update/FilterState::resize read
+// their geometry from the state and touch only rows*cols and channels, and
+// gaussian_target_spectrum(G, 1, S, sigma, 0, 0) degenerates cleanly because
+// signed_freq(0,1) == 0 makes the row factor identically 1. So the reused surface
+// is large and the genuinely new code is the feature extraction and a DFT.
+//
+// WHAT THIS DELIBERATELY DOES NOT DO YET: fDSST's PCA compression (§5.2.3) and
+// sub-grid interpolation (§5.2.1). The compression is PROVABLY LOSSLESS for the
+// scale filter — rank(C_scale) <= S, so the d~1000 template compresses to exactly
+// S dimensions "without any loss of information" — which means it can be added
+// later as a pure optimisation with a bit-exactness test against this path, the
+// same pattern CONV_VECTORIZE used. Doing it now would add a QR decomposition and
+// an interpolation grid to calibrate before anything has been measured.
+
+// Number of scales. DSST §6.1 uses S = 33. MUST BE ODD so that index (S-1)/2 is
+// "no scale change". SCALE_N = 1 disables the filter entirely and reproduces the
+// pre-scale-filter behaviour exactly.
+#ifndef SCALE_N
+#  define SCALE_N 33
+#endif
+// Scale factor between adjacent levels; DSST §6.1 uses a = 1.02, giving a total
+// range of 1.02^+/-16 = +/-38%.
+#ifndef SCALE_STEP
+#  define SCALE_STEP 1.02
+#endif
+// Learning rate. DSST §6.1 uses 0.025 for BOTH filters — note the translation
+// filter here still uses Bolme's 0.125 (MOSSE_ETA), so these are deliberately
+// separate knobs rather than one shared constant.
+#ifndef SCALE_ETA
+#  define SCALE_ETA 0.025
+#endif
+// sigma of the desired 1-D output, as a fraction of S. DSST §6.1: "the standard
+// deviation in the scale dimension of the desired correlation output g is set to
+// 1/16 times the number of scales S."
+#ifndef SCALE_SIGMA_FACTOR
+#  define SCALE_SIGMA_FACTOR 16.0
+#endif
+// Cap on the scale template's area, DSST §6.1's 512 px. The feature dimension d
+// is the template's pixel count, and the DFT cost is d * S^2, so this is what
+// keeps the filter at ~0.5M complex MACs/frame against the translation update's
+// ~2M.
+#ifndef SCALE_TMPL_AREA
+#  define SCALE_TMPL_AREA 512
+#endif
+
+constexpr int   DEFAULT_SCALE_N     = (int)(SCALE_N);
+constexpr float DEFAULT_SCALE_STEP  = (float)(SCALE_STEP);
+constexpr float DEFAULT_SCALE_ETA   = (float)(SCALE_ETA);
+
+// Direct O(n^2) DFT. n = 33 is not a power of two, so an FFT would need a
+// Bluestein or mixed-radix path; at 33 points a direct transform is ~1089
+// complex MACs and about twenty lines. This design deliberately eliminated
+// KissFFT (see the header note above) and should not reacquire a dependency for
+// a transform this small.
+void dft_1d(const cfloat *in, cfloat *out, int n, bool inverse);
+
+struct ScaleFilter {
+    int   n_scales = 0;
+    int   tmpl_h = 0, tmpl_w = 0;     // scale template, <= SCALE_TMPL_AREA px
+    float step  = 1.0f;               // a
+    float sigma = 0.0f;               // in scale bins
+    bool  initialized = false;
+
+    FilterState         st;           // rows=1, cols=n_scales, channels=tmpl_h*tmpl_w
+    std::vector<cfloat> G;            // desired 1-D output, length n_scales
+
+    int dims()  const { return tmpl_h * tmpl_w; }        // d
+    int sample_elems() const { return dims() * n_scales; }
+    bool enabled() const { return n_scales > 1; }
+};
+
+// Size the template from the initial target box and precompute G.
+void scale_filter_config(ScaleFilter &sf, int n_scales, float step,
+                         double target_h, double target_w, float sigma_factor);
+
+// Build the d x S training/test sample: for each scale level n, crop a
+// (step^n * box) region centred at (row,col), resample to the template, apply a
+// Hann window, then zero-mean and unit-L2 normalise THAT LEVEL.
+//
+// Per level, not jointly: it is the direct analogue of Stage A (which zero-means
+// and unit-norms each patch) and it makes the filter robust to illumination. It
+// discards the absolute-energy cue between levels and keeps the PATTERN cue,
+// which is the one that actually identifies the scale — at the correct level the
+// target fills the template as it did in training, at a wrong level it does not.
+//
+// `frame` is the raw uint8 frame. Deliberately a plain pointer and not an
+// xrt::bo: this function has to stay compilable by the native test.
+void scale_extract(const ScaleFilter &sf, const uint8_t *frame,
+                   int frame_rows, int frame_cols,
+                   double row, double col, double box_h, double box_w,
+                   cfloat *F_out);
+
+struct ScaleResult {
+    int    idx    = 0;      // winning level, signed: 0 = no change
+    double factor = 1.0;    // step^idx, already clamped
+    double peak   = 0.0;    // correlation score at the winner
+    double psr    = 0.0;    // (peak - mu)/sigma over the other levels
+    bool   valid  = false;  // false when the filter is disabled or untrained
+};
+
+// Apply the filter to a sample and pick the winning scale.
+ScaleResult scale_detect(const ScaleFilter &sf, const cfloat *Z, float eps_rel);
+
+// Train. First call initialises (eta = 1 against a zeroed state), as for the
+// translation filter.
+void scale_update(ScaleFilter &sf, const cfloat *F, float eta);
 
 }  // namespace mosse

@@ -198,7 +198,13 @@ AIE_FLAGS  += --Xpreproc="-DFFT_ROW_CASCADE_LEN=$(FFT_ROW_CASCADE_LEN)"
 AIE_FLAGS  += --Xpreproc="-DFFT_COL_CASCADE_LEN=$(FFT_COL_CASCADE_LEN)"
 AIE_FLAGS  += --Xpreproc="-DFFT_ROW_WS=$(FFT_ROW_WS)"
 AIE_FLAGS  += --Xpreproc="-DFFT_COL_WS=$(FFT_COL_WS)"
-AIE_FLAGS  += --Xpreproc="-DITER_CNT=$(ITER_CNT)"
+# ITER_CNT is deliberately NOT here. It appears in NO file under design/aie_src —
+# the frame count is purely a host loop bound — but while it was in AIE_FLAGS it
+# landed in aie.flagstamp, so changing the number of frames forced a libadf.a
+# rebuild and an XSA relink. On TARGET=hw that also means a full re-place-and-route:
+# hours of implementation for a define nothing reads. Removed 2026-08-16, which
+# makes ITER_CNT a host-only variable — changing it now rebuilds only the ELF.
+# (GCC_FLAGS still carries it; see the app.flagstamp note.)
 # FFT/IFFT normalization shifts. IFFT_COL_SHIFT is the consequential one: it was
 # calibrated for BROADBAND spectra and destroys DC-concentrated ones (see the
 # warning in ifft_graph.h). SINGLE SOURCE OF TRUTH — the same values are passed to
@@ -396,6 +402,100 @@ GCC_FLAGS  += -DB2_NULL_BINS=$(B2_NULL_BINS)
 PSR_GATE_MIN ?= 7.0
 GCC_FLAGS  += -DPSR_GATE_MIN=$(PSR_GATE_MIN)
 
+# ---------------------------------------------------------------------------
+# Target box, ROI padding and sigma — Bolme §3.1/§3.2, Danelljan §3.1,
+# DSST (docs/1609.06141v1.pdf) §6.1. HOST-ONLY, same rule as PSR_GATE_MIN above:
+# the AIE never sees the ROI, only the fixed patch, and roi_crop takes all of its
+# geometry as runtime AXI-Lite scalars — so none of this reaches AIE_FLAGS and
+# none of it needs a PL re-synthesis or a libadf.a relink.
+# ---------------------------------------------------------------------------
+# Until 2026-08-16 the tracker's whole state was pos_row/pos_col. That left sigma
+# with no defined relation to the object, gave the filter no background context
+# (roi_h was pinned to PATCH_ROWS, so the ROI *was* the patch), and made an IoU —
+# the metric both papers report — impossible to compute.
+#
+# TARGET_H/W = 64 with TARGET_PADDING = 2 gives roi = 128, i.e. EXACTLY the
+# geometry that shipped before the box existed, so the resample stays 1:1 and
+# roi_crop's bilinear interpolator stays dormant. Adopting the box is therefore a
+# single-variable change; moving padding afterwards is a second, separate one.
+# TARGET_H/W also drive the shape inject_target_frame draws, so the declared box
+# and the drawn object agree by construction (they did not before: an ~11x11
+# object sat in a 128x128 ROI, an effective padding of ~11.6).
+TARGET_H       ?= 64
+TARGET_W       ?= 64
+GCC_FLAGS  += -DTARGET_H=$(TARGET_H) -DTARGET_W=$(TARGET_W)
+
+# roi = target * TARGET_PADDING. DSST §6.1 uses 2, fDSST 3. The offline sweep
+# (scripts/phase1_sweep.py --roi-model synth) settles this at >= 2: padding 1.5 is
+# worst on both metrics and shows a real 0.75 px localisation error, while 2.5/3.0
+# edge ahead but trigger aliasing — roi_crop's bilinear has no prefilter, so
+# beyond ~2x decimation source rows are skipped outright — and 3.0 clips 3.6% of
+# samples. >2x decimation is sampling an aliased signal and no shift budget fixes
+# that, so treat 2.5-3.0 as needing evidence rather than as a free upgrade.
+TARGET_PADDING ?= 2.0
+GCC_FLAGS  += -DTARGET_PADDING=$(TARGET_PADDING)
+
+# Target Gaussian width, in PATCH pixels.
+#
+# MOSSE_SIGMA is used literally when SIGMA_FROM_TARGET=0 (the default). Setting
+# SIGMA_FROM_TARGET=1 switches to DSST §6.1's rule, sigma = target_in_patch_px /
+# SIGMA_FACTOR, which at padding 2 gives 4.0.
+#
+# THE DEFAULT IS DELIBERATELY STILL 2.0. The sweep does not support switching,
+# and the reason is that the metric cannot arbitrate: Bolme PSR is MONOTONE
+# DECREASING in sigma all the way to sub-pixel (80.3 at 0.75, 45.7 at 2.0, 30.5 at
+# 4.0), so it rewards a sharp peak rather than selecting a width — a delta target
+# would maximise it. What sigma buys is robustness to appearance change, which a
+# single-frame translation-only holdout does not exercise. The obvious
+# alternative explanation, Stage B2 nulling the 9 low bins where a wide Gaussian
+# keeps its energy, was tested with B2 off and REFUTED (the drop survives).
+# Decide it when real video can measure what sigma is actually for.
+MOSSE_SIGMA       ?= 2.0
+SIGMA_FACTOR      ?= 16.0
+SIGMA_FROM_TARGET ?= 0
+GCC_FLAGS  += -DMOSSE_SIGMA=$(MOSSE_SIGMA) -DSIGMA_FACTOR=$(SIGMA_FACTOR)
+GCC_FLAGS  += -DSIGMA_FROM_TARGET=$(SIGMA_FROM_TARGET)
+
+# Learning rate. Bolme §3.3 uses 0.125; DSST §6.1 uses 0.025 for both filters.
+MOSSE_ETA      ?= 0.125
+GCC_FLAGS  += -DMOSSE_ETA=$(MOSSE_ETA)
+
+# Background for the synthetic test frame: 1 = band-limited texture, 0 = the
+# pre-2026-08-16 flat fill. NOT cosmetic — padding exists so the filter can learn
+# target-vs-background, so against a flat fill more padding is strictly less
+# target and any padding comparison is decided before it runs.
+FRAME_TEXTURE  ?= 1
+GCC_FLAGS  += -DFRAME_TEXTURE=$(FRAME_TEXTURE)
+
+# ---------------------------------------------------------------------------
+# DSST 1-D scale filter — docs/1609.06141v1.pdf §5.1. HOST-ONLY.
+# ---------------------------------------------------------------------------
+# A SEPARATE 1-D filter over scale, not an exhaustive multi-resolution search.
+# DSST Table 1 beats exhaustive on both axes (OP 67.7 vs 65.2, 25.4 vs 16.9 FPS),
+# and on this hardware the gap is wider still: an exhaustive search would push
+# patches resampled by +/-30% through roi_crop -> conv2d -> FFT every frame, which
+# moves |F| and hence the shift budget, and it would spend exactly the 30 fps
+# headroom that vectorizing conv2d and cmul bought back. The 1-D filter runs
+# entirely on the APU at ~0.5M complex MACs/frame against the translation
+# update's ~2M, and touches no AIE, no PL and no shift budget.
+#
+# SCALE_N=1 DISABLES the filter completely and reproduces the pre-scale
+# behaviour — the same bisection lever CONV_VECTORIZE=0 provides, and it is
+# asserted in test_host.
+#
+# NOT implemented yet, deliberately: fDSST's PCA compression (§5.2.3) and
+# sub-grid interpolation (§5.2.1). The compression is PROVABLY LOSSLESS for the
+# scale filter (rank <= S), so it can be added later as a pure optimisation with
+# a bit-exactness test against this path.
+SCALE_N            ?= 33
+SCALE_STEP         ?= 1.02
+SCALE_ETA          ?= 0.025
+SCALE_SIGMA_FACTOR ?= 16.0
+SCALE_TMPL_AREA    ?= 512
+GCC_FLAGS  += -DSCALE_N=$(SCALE_N) -DSCALE_STEP=$(SCALE_STEP)
+GCC_FLAGS  += -DSCALE_ETA=$(SCALE_ETA) -DSCALE_SIGMA_FACTOR=$(SCALE_SIGMA_FACTOR)
+GCC_FLAGS  += -DSCALE_TMPL_AREA=$(SCALE_TMPL_AREA)
+
 # Occlusion injection, to prove the gate actually FIRES — it cannot on the normal
 # synthetic target, which measures PSR ~172 against a threshold of 7. Bitmask over
 # frame index: bit f set => frame f gets a checkerboard instead of the target.
@@ -405,6 +505,60 @@ OCCLUDE_MASK   ?= 0
 OCCLUDE_SQUARE ?= 8
 GCC_FLAGS  += -DOCCLUDE_MASK=$(OCCLUDE_MASK)
 GCC_FLAGS  += -DOCCLUDE_SQUARE=$(OCCLUDE_SQUARE)
+
+# ---------------------------------------------------------------------------
+# Test-sequence generation — HOST-ONLY. Added 2026-08-16 for the board runs.
+# ---------------------------------------------------------------------------
+# Every default below reproduces the pre-2026-08-16 behaviour exactly, so the
+# existing hw_emu comparisons stay valid. They exist because a board run can
+# afford hundreds of frames where hw_emu could afford two, and the shipped test
+# data does not survive that:
+#
+#   * the background was regenerated every frame (12.4 M sin() calls, ~0.6-1.2 s
+#     on the A72) — 30-90x the whole pipeline, which would have made the FPS
+#     measurement a measurement of the test harness. Now generated ONCE with a
+#     dirty-rect restore; no flag, it is simply correct.
+#   * the target walked off a 1080-row frame at about frame 48.
+#   * the target never changed size, so the scale filter had nothing to track.
+#
+# TRAJECTORY=1 also changes something subtler and more important: the target moves
+# on an ABSOLUTE scripted path instead of being planted at the tracker's own
+# estimate plus a constant. Under the legacy scheme the ground truth follows the
+# estimate, so the tracker cannot drift and `err=0 px` is close to self-fulfilling.
+# On an absolute path drift is real, measurable, and reported as IoU / centre
+# error against the box actually drawn.
+TRAJECTORY        ?= 0
+TRAJ_AMP_R        ?= 180.0
+TRAJ_AMP_C        ?= 180.0
+TRAJ_PERIOD       ?= 120.0
+GCC_FLAGS  += -DTRAJECTORY=$(TRAJECTORY) -DTRAJ_AMP_R=$(TRAJ_AMP_R)
+GCC_FLAGS  += -DTRAJ_AMP_C=$(TRAJ_AMP_C) -DTRAJ_PERIOD=$(TRAJ_PERIOD)
+
+# Size envelope for the scale filter. The rate limit is what matters: SCALE_STEP
+# bounds one frame's correction and SCALE_ETA makes the model adapt slowly, so the
+# envelope must change far more slowly than the filter's single-frame range.
+# 0.30 over 200 frames peaks at 0.94%/frame against a 2%/frame step size.
+SCALE_TRAJ        ?= 0
+SCALE_TRAJ_AMP    ?= 0.30
+SCALE_TRAJ_PERIOD ?= 200.0
+GCC_FLAGS  += -DSCALE_TRAJ=$(SCALE_TRAJ) -DSCALE_TRAJ_AMP=$(SCALE_TRAJ_AMP)
+GCC_FLAGS  += -DSCALE_TRAJ_PERIOD=$(SCALE_TRAJ_PERIOD)
+
+# Periodic occlusion: occlude when (frame % OCCLUDE_PERIOD) < OCCLUDE_LEN.
+# 0 keeps the legacy OCCLUDE_MASK, which is a 32-bit mask indexed by frame number
+# and therefore cannot express anything past frame 31 (and shifted by >= 32, which
+# is undefined — now guarded).
+# OCCLUDE_START is a warm-up: no occlusion before this frame, and the period runs
+# from there. Without it the first occlusion is frame 1 — the filter occluded
+# immediately after being initialised from a single patch, which tests the gate
+# against a filter that has not converged. 30 frames is ~4 time constants at
+# MOSSE_ETA=0.125. The SCALE filter is much slower (SCALE_ETA=0.025, ~40 frames
+# per constant), so a run meant to occlude a settled SIZE estimate wants ~120.
+OCCLUDE_PERIOD    ?= 0
+OCCLUDE_LEN       ?= 1
+OCCLUDE_START     ?= 30
+GCC_FLAGS  += -DOCCLUDE_PERIOD=$(OCCLUDE_PERIOD) -DOCCLUDE_LEN=$(OCCLUDE_LEN)
+GCC_FLAGS  += -DOCCLUDE_START=$(OCCLUDE_START)
 
 GCC_INC    := -I$(SDKTARGETSYSROOT)/usr/include/xrt
 GCC_INC    += -I$(XILINX_VITIS)/aietools/include/
@@ -439,7 +593,7 @@ KERNEL_XOS := $(CAM_XO) $(CROP_XO)
 # =========================================================
 # Rules
 # =========================================================
-.PHONY: help kernels graph gen_vectors aiesim graph_fft aiesim_fft xsa application package sd_card run_emu weights test_host cleanall
+.PHONY: help kernels graph gen_vectors aiesim graph_fft aiesim_fft xsa application package sd_card run_emu weights test_host test_roi_crop cleanall
 
 help:
 	@echo ""
@@ -454,6 +608,7 @@ help:
 	@echo "  make xsa          — link → .xsa"
 	@echo "  make application  — cross-compile host ELF"
 	@echo "  make test_host    — native unit test for the filter init/update math"
+	@echo "  make test_roi_crop — native bit-exact test for roi_crop resample + Stage A"
 	@echo "  make package      — package SD card image"
 	@echo "  make sd_card      — kernels + graph + xsa + application + package"
 	@echo "  make run_emu      — launch hw emulator"
@@ -733,9 +888,47 @@ test_host:
 	    uv run python3 scripts/gen_filter_golden.py $(TEST_HOST_DIR)/golden
 	g++ -O2 -std=c++17 -Wall -Wextra -I$(HOST_APP_SRC) \
 	    -DCMUL_H_SHIFT=$(H_SHIFT) -DPSR_GATE_MIN=$(PSR_GATE_MIN) \
+	    -DMOSSE_SIGMA=$(MOSSE_SIGMA) -DSIGMA_FACTOR=$(SIGMA_FACTOR) \
+	    -DSIGMA_FROM_TARGET=$(SIGMA_FROM_TARGET) -DMOSSE_ETA=$(MOSSE_ETA) \
+	    -DTARGET_PADDING=$(TARGET_PADDING) \
+	    -DSCALE_N=$(SCALE_N) -DSCALE_STEP=$(SCALE_STEP) -DSCALE_ETA=$(SCALE_ETA) \
+	    -DSCALE_SIGMA_FACTOR=$(SCALE_SIGMA_FACTOR) -DSCALE_TMPL_AREA=$(SCALE_TMPL_AREA) \
 	    $(HOST_APP_SRC)/mosse_filter.cpp $(TEST_HOST_DIR)/test_mosse_filter.cpp \
 	    -o $(BUILD_DIR)/test_host
 	$(BUILD_DIR)/test_host $(TEST_HOST_DIR)/golden
+
+# -------------------------------------------------------
+# Native roi_crop test — the RESAMPLE path
+# -------------------------------------------------------
+# roi_crop.cpp includes only ap_int.h / hls_stream.h / ap_axi_sdata.h and uses
+# std::sqrt rather than hls::rsqrtf specifically so it stays C-simulatable, and
+# the 2025.2 HLS headers are header-only and live under $(XILINX_VITIS)/include.
+# So the kernel builds with the system g++ and runs in seconds.
+#
+# WHY THIS TARGET EXISTS. Until 2026-08-16 CLAUDE.md claimed roi_crop had been
+# "verified bit-exact against a NumPy reference in native C simulation (6 cases)".
+# No such harness was ever in the repo — no testbench, no csim target, no
+# reference, nothing in git history. And every build to date runs
+# roi_h == patch_rows, which makes step_y exactly 256, hence fy == fx == 0, hence
+# the whole bilinear datapath collapses to `pix = p00`. The interpolator had never
+# executed. 11 of the 17 cases here are its first execution.
+#
+# The golden comes from scripts/roi_crop_ref.py, which scripts/phase1_sweep.py
+# also uses to model the ROI — one reference, two consumers, so the sweep's
+# padding numbers inherit whatever this target proves. Regenerated every run, same
+# anti-drift reason as test_host above.
+TEST_PL_DIR := $(PL_SRC_REPO)/test
+
+.PHONY: test_roi_crop
+test_roi_crop:
+	mkdir -p $(BUILD_DIR)
+	cd $(PROJECT_REPO) && env PYTHONHOME= PYTHONPATH= \
+	    uv run python3 scripts/gen_roi_crop_golden.py $(TEST_PL_DIR)/golden
+	g++ -O2 -std=c++17 -Wall -Wextra -Wno-comment -Wno-unknown-pragmas \
+	    -I$(XILINX_VITIS)/include -I$(PL_SRC_REPO)/roi_crop \
+	    $(PL_SRC_REPO)/roi_crop/roi_crop.cpp $(TEST_PL_DIR)/test_roi_crop.cpp \
+	    -o $(BUILD_DIR)/test_roi_crop
+	$(BUILD_DIR)/test_roi_crop $(TEST_PL_DIR)/golden
 
 # -------------------------------------------------------
 # Package
@@ -753,7 +946,17 @@ $(ROOTFS): $(COMMON_IMAGE_VERSAL)/rootfs.ext4
 	e2fsck -fy $@ || test $$? -lt 4
 	@echo "rootfs: $@ ready for packaging"
 
-package: $(BUILD_DIR)/$(APP_ELF) $(BUILD_DIR)/$(XSA) $(LIBADF_A) $(ROOTFS)
+# The on-target run script is GENERATED, not copied, because XCL_EMULATION_MODE
+# must be set for hw_emu and must NOT be set on real hardware. Packaging the
+# template verbatim (as this did until 2026-08-16) bakes "hw_emu" into a board
+# image, where it makes XRT open the emulation driver instead of the device.
+$(BUILD_DIR)/run_script.sh: $(EXEC_SCRIPTS)/run_script.sh
+	mkdir -p $(BUILD_DIR)
+	sed 's|@EMU_MODE@|$(if $(filter hw_emu,$(TARGET)),hw_emu,)|' $< > $@
+	chmod +x $@
+
+package: $(BUILD_DIR)/$(APP_ELF) $(BUILD_DIR)/$(XSA) $(LIBADF_A) $(ROOTFS) \
+         $(BUILD_DIR)/run_script.sh
 	v++ --package $(VPP_FLAGS) \
 	    --package.rootfs $(ROOTFS) \
 	    --package.kernel_image $(COMMON_IMAGE_VERSAL)/Image \
@@ -764,7 +967,7 @@ package: $(BUILD_DIR)/$(APP_ELF) $(BUILD_DIR)/$(XSA) $(LIBADF_A) $(ROOTFS)
 	    --package.sd_file $(BUILD_DIR)/$(XSA) \
 	    --package.sd_file $(LIBADF_A) \
 	    --package.sd_file $(AIE_SRC_REPO)/weights/layer0_weights.bin \
-	    --package.sd_file $(EXEC_SCRIPTS)/run_script.sh \
+	    --package.sd_file $(BUILD_DIR)/run_script.sh \
 	    --package.defer_aie_run \
 	    $(BUILD_DIR)/$(XSA) $(LIBADF_A)
 

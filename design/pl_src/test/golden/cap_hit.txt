@@ -1,0 +1,19 @@
+name cap_hit
+frame_rows 128
+frame_cols 128
+roi_row 0
+roi_col 0
+roi_h 128
+roi_w 128
+patch_rows 128
+patch_cols 128
+twice 0
+exp_mean 65302
+exp_var 1
+exp_inv_q 1048576
+exp_beats 4096
+step_y 256
+step_x 256
+fy_nonzero 0
+fx_nonzero 0
+why var=1 -> inv_q clamped at ROI_INV_Q_MAX

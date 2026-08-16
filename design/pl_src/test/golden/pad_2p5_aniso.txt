@@ -1,0 +1,19 @@
+name pad_2p5_aniso
+frame_rows 1080
+frame_cols 1920
+roi_row 300
+roi_col 300
+roi_h 127
+roi_w 129
+patch_rows 128
+patch_cols 128
+twice 0
+exp_mean 55882
+exp_var 4200597
+exp_inv_q 1023
+exp_beats 4096
+step_y 254
+step_x 258
+fy_nonzero 127
+fx_nonzero 127
+why step_y != step_x — catches an x/y transposition

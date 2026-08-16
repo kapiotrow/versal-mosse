@@ -1,0 +1,19 @@
+name outside
+frame_rows 1080
+frame_cols 1920
+roi_row -500
+roi_col -500
+roi_h 100
+roi_w 100
+patch_rows 128
+patch_cols 128
+twice 0
+exp_mean 54660
+exp_var 0
+exp_inv_q 0
+exp_beats 4096
+step_y 200
+step_x 200
+fy_nonzero 124
+fx_nonzero 124
+why every sample clamps -> var 0 via the clamp path

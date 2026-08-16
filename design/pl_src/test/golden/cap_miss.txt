@@ -1,0 +1,19 @@
+name cap_miss
+frame_rows 128
+frame_cols 128
+roi_row 0
+roi_col 0
+roi_h 128
+roi_w 128
+patch_rows 128
+patch_cols 128
+twice 0
+exp_mean 65302
+exp_var 5
+exp_inv_q 937874
+exp_beats 4096
+step_y 256
+step_x 256
+fy_nonzero 0
+fx_nonzero 0
+why var=5 -> just below the cap; must NOT clamp

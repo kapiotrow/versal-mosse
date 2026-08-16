@@ -1,0 +1,19 @@
+name up_2x
+frame_rows 200
+frame_cols 200
+roi_row 30
+roi_col 30
+roi_h 64
+roi_w 64
+patch_rows 128
+patch_cols 128
+twice 0
+exp_mean 55400
+exp_var 2202344
+exp_inv_q 1413
+exp_beats 4096
+step_y 128
+step_x 128
+fy_nonzero 64
+fx_nonzero 64
+why FIRST nonzero fy ever; fy=128 is max-weight interpolation

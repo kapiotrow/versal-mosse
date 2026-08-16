@@ -25,6 +25,22 @@
 #include "roi_crop.h"
 #include <cmath>
 
+// Precondition checks. Compiled out for synthesis, so they cost nothing in
+// hardware and fire in the native harness (make test_roi_crop), which is the only
+// place a bad geometry can be caught before it reaches a ~50 min hw_emu frame.
+//
+// Each guards a real hole. None of these was checked before 2026-08-16, and the
+// first is the worst: PASS2_COL steps by 4 and reads patch_buf[... + i] for
+// i in 0..3 unconditionally, while total_beats = n_elems >> 2 undercounts, so a
+// patch_cols that is not a multiple of 4 BOTH reads past the row and never
+// asserts word.last — and a PLIO that never sees last stalls the whole graph.
+#ifndef __SYNTHESIS__
+#  include <cassert>
+#  define ROI_ASSERT(cond, msg) assert((cond) && (msg))
+#else
+#  define ROI_ASSERT(cond, msg) ((void)0)
+#endif
+
 // log(1+v) mapped to [0, 65535], v = 0..255.
 //
 // Bolme §3.1: "the pixel values are transformed using a log function which
@@ -101,13 +117,38 @@ void roi_crop(
     static ap_uint<8> patch_buf[ROI_MAX_PATCH_ELEMS];
 #pragma HLS BIND_STORAGE variable=patch_buf type=ram_2p impl=bram
 
+    ROI_ASSERT(patch_rows > 0 && patch_cols > 0,
+               "patch dimensions must be positive (the step divisions below trap)");
+    ROI_ASSERT((patch_cols & 3) == 0,
+               "patch_cols must be a multiple of 4: PASS2 packs 4 px/beat and "
+               "total_beats = n_elems>>2, so otherwise word.last never asserts");
+    ROI_ASSERT((long)patch_rows * (long)patch_cols <= (long)ROI_MAX_PATCH_ELEMS,
+               "patch exceeds ROI_MAX_PATCH_ELEMS — patch_buf would overrun");
+    ROI_ASSERT(roi_h > 0 && roi_w > 0,
+               "roi extent must be positive: 0 collapses every row onto one "
+               "source row, negative runs the sampler backwards");
+    ROI_ASSERT(frame_rows > 0 && frame_cols > 0, "frame dimensions must be positive");
+
     const int n_elems    = patch_rows * patch_cols;
     const int total_beats = n_elems >> 2;
 
     // Q8 source-coordinate step. Computed once, outside every pipeline, so no
     // divider lands in the datapath.
+    //
+    // Exact at every supported geometry: patch dims are powers of two <= 128, so
+    // 256/patch_rows is an integer and step = roi_h * (256/patch_rows) divides
+    // evenly. Truncation only becomes reachable if ROI_MAX_PATCH_ROWS is raised
+    // past 256, which roi_crop_ref.py's step_is_exact() asserts against.
     const int step_y = (roi_h << ROI_FRAC_BITS) / patch_rows;
     const int step_x = (roi_w << ROI_FRAC_BITS) / patch_cols;
+
+    // roi_row * ROI_FRAC_ONE, NOT roi_row << ROI_FRAC_BITS: the host computes
+    // roi_row = pos_row - roi_h/2 and passes it as (uint32_t), so it is routinely
+    // negative, and left-shifting a negative signed value is undefined behaviour
+    // before C++20 — which the native harness compiles as (-std=c++17). The
+    // multiply is well defined and generates the same hardware.
+    const int base_y = roi_row * ROI_FRAC_ONE;
+    const int base_x = roi_col * ROI_FRAC_ONE;
 
     const int max_y = frame_rows - 1;
     const int max_x = frame_cols - 1;
@@ -130,7 +171,7 @@ void roi_crop(
     // ---------------------------------------------------------------------
 PASS1_ROW:
     for (int r = 0; r < patch_rows; ++r) {
-        const int    sy  = (roi_row << ROI_FRAC_BITS) + r * step_y;
+        const int    sy  = base_y + r * step_y;
         const int    fy  = sy & (ROI_FRAC_ONE - 1);
         int          y0  = sy >> ROI_FRAC_BITS;
         int          y1  = y0 + 1;
@@ -145,7 +186,7 @@ PASS1_ROW:
     PASS1_COL:
         for (int c = 0; c < patch_cols; ++c) {
 #pragma HLS PIPELINE II=1
-            const int sx = (roi_col << ROI_FRAC_BITS) + c * step_x;
+            const int sx = base_x + c * step_x;
             const int fx = sx & (ROI_FRAC_ONE - 1);
             int       x0 = sx >> ROI_FRAC_BITS;
             int       x1 = x0 + 1;

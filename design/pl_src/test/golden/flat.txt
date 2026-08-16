@@ -1,0 +1,19 @@
+name flat
+frame_rows 256
+frame_cols 256
+roi_row 0
+roi_col 0
+roi_h 128
+roi_w 128
+patch_rows 128
+patch_cols 128
+twice 0
+exp_mean 51489
+exp_var 0
+exp_inv_q 0
+exp_beats 4096
+step_y 256
+step_x 256
+fy_nonzero 0
+fx_nonzero 0
+why legitimately uniform image -> var 0, distinct from the clamp path

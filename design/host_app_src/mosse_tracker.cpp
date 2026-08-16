@@ -106,6 +106,36 @@ static_assert(IMPULSE_DC >  -PATCH_COLS/2 && IMPULSE_DC < PATCH_COLS/2,
 #ifndef OCCLUDE_SQUARE
 #  define OCCLUDE_SQUARE  8
 #endif
+// Target box size in FRAME pixels. The tracker's state was pos_row/pos_col only
+// until 2026-08-16; see the TargetBox note in mosse_filter.h for what that cost.
+//
+// 64 is chosen so that at TARGET_PADDING=2 the ROI is 128x128 — EXACTLY the
+// geometry that shipped before the box existed. The resample therefore stays 1:1
+// and roi_crop's bilinear interpolator stays dormant, which makes adopting the
+// box a single-variable change rather than two at once.
+//
+// TARGET_SIZE also drives the SHAPE inject_target_frame draws, so the declared
+// box and the drawn object agree by construction. Before this they did not: the
+// shipped target was ~11x11 inside a 128x128 ROI, i.e. an effective padding of
+// ~11.6, so any sigma anchored to a declared 64 px box would have been anchored
+// to a fiction.
+#ifndef TARGET_H
+#  define TARGET_H  64
+#endif
+#ifndef TARGET_W
+#  define TARGET_W  64
+#endif
+// Background for the synthetic test frame.
+//   1 (default) = band-limited texture   0 = the flat BACKGROUND=40 fill
+//
+// This is not cosmetic. Padding exists so the filter can learn
+// target-vs-background (Bolme §3.1, Danelljan §3.1); against a flat fill there is
+// no background to learn, so more padding is strictly less target and any padding
+// comparison is decided before it runs. The flat fill remains reachable for
+// reproducing pre-2026-08-16 runs.
+#ifndef FRAME_TEXTURE
+#  define FRAME_TEXTURE  1
+#endif
 #ifndef FRAME_ROWS
 #  define FRAME_ROWS  1080
 #endif
@@ -893,23 +923,244 @@ static void inject_impulse_frame(uint8_t *frame_buf, int rows, int cols,
 // keeps the patch spectrum analysable. Every pixel is a function of (r-tr, c-tc)
 // alone, so a later frame is EXACTLY the earlier frame translated — which makes
 // the expected displacement unambiguous.
-static void inject_target_frame(uint8_t *frame_buf, int rows, int cols,
-                                int tr, int tc)
+// Band-limited background, written into the whole frame.
+//
+// Band-limited rather than white noise on purpose: the padding experiments
+// compare different resample ratios, and roi_crop's bilinear sampler has NO
+// prefilter, so a broadband background would alias differently at every ratio and
+// the comparison would be measuring aliasing of the test signal rather than
+// padding. A smooth field resamples predictably.
+//
+// Structurally the same construction as scripts/synth_frame.py (six low-order
+// sinusoids plus a small noise floor), but NOT bit-identical to it — the two use
+// different RNGs. The sweep and this harness therefore agree on ordering and
+// mechanism, not on absolute values, which is the same relationship every other
+// model in this project has with the hardware.
+static void fill_background(uint8_t *frame_buf, int rows, int cols)
 {
-    constexpr uint8_t BACKGROUND = 40;
-    constexpr uint8_t BAR_VALUE  = 220;
-    constexpr uint8_t SPUR_VALUE = 150;
-
-    memset(frame_buf, BACKGROUND, (size_t)rows * cols);
+#if FRAME_TEXTURE
+    // Fixed LCG so the frame is reproducible across runs and machines. rand() is
+    // libc-dependent, which the PSR fixtures already record as a reason to avoid it.
+    uint32_t s = 20260816u;
+    auto next = [&s]() {
+        s = s * 1664525u + 1013904223u;
+        return (double)(s >> 8) / (double)(1u << 24);   // [0,1)
+    };
+    struct { double fy, fx, ph, amp; } comp[6];
+    for (auto &k : comp) {
+        k.fy  = (1.0 + 5.0 * next()) / (double)rows;
+        k.fx  = (1.0 + 5.0 * next()) / (double)cols;
+        k.ph  = 2.0 * M_PI * next();
+        k.amp = 0.4 + 0.6 * next();
+    }
+    double amp_sum = 0.0;
+    for (const auto &k : comp) amp_sum += k.amp;
 
     for (int r = 0; r < rows; ++r) {
-        const int dr = r - tr;
-        if (dr < -5 || dr > 5) continue;          // bar and spur both fit in |dr| <= 5
         for (int c = 0; c < cols; ++c) {
-            const int dc = c - tc;
+            double f = 0.0;
+            for (const auto &k : comp)
+                f += k.amp * std::sin(2.0 * M_PI * (k.fy * r + k.fx * c) + k.ph);
+            f /= amp_sum;                                  // roughly [-1, 1]
+            const double v = 110.0 + 90.0 * 0.35 * f + 3.0 * (next() - 0.5);
+            frame_buf[(size_t)r * cols + c] =
+                (uint8_t)(v < 0.0 ? 0.0 : (v > 255.0 ? 255.0 : v));
+        }
+    }
+#else
+    memset(frame_buf, 40, (size_t)rows * cols);   // the pre-2026-08-16 flat fill
+#endif
+}
+
+// -----------------------------------------------------------------------
+// Scene generation: static background + dirty-rect restore
+// -----------------------------------------------------------------------
+// fill_background() runs six sinusoids per pixel over 1080x1920 — 12.4 M sin()
+// calls. Measured at 193 ms/frame on an x86 host, so ~0.6-1.2 s on the A72.
+//
+// That was free in hw_emu, where a frame costs ~11.5 h at ch16. On real hardware
+// the pipeline is ~13-22 ms, so regenerating the background every frame would be
+// 30-90x the entire design's frame time and the FPS measurement — one of the two
+// things a board run is FOR — would be measuring this function.
+//
+// The background is static by construction (fixed LCG seed, no frame dependence),
+// so it is generated ONCE and only the region that actually changed is restored.
+// g_dirty tracks that region; the occluder dirties the whole frame, which is why
+// the rect has to be able to grow to full size rather than being assumed
+// target-sized.
+static std::vector<uint8_t> g_background;
+
+struct DirtyRect { int r0 = 0, c0 = 0, r1 = -1, c1 = -1; };   // inclusive; empty if r1 < r0
+static DirtyRect g_dirty;
+
+static void scene_init(int rows, int cols)
+{
+    g_background.resize((size_t)rows * cols);
+    fill_background(g_background.data(), rows, cols);
+    g_dirty = DirtyRect{};                       // frame starts equal to background
+}
+
+static void scene_restore(uint8_t *frame_buf, int rows, int cols)
+{
+    if (g_dirty.r1 < g_dirty.r0) return;
+    const int r0 = std::max(0, g_dirty.r0), r1 = std::min(rows - 1, g_dirty.r1);
+    const int c0 = std::max(0, g_dirty.c0), c1 = std::min(cols - 1, g_dirty.c1);
+    const size_t w = (size_t)(c1 - c0 + 1);
+    for (int r = r0; r <= r1; ++r)
+        memcpy(frame_buf + (size_t)r * cols + c0,
+               g_background.data() + (size_t)r * cols + c0, w);
+    g_dirty = DirtyRect{};
+}
+
+static void scene_mark_dirty(int r0, int c0, int r1, int c1)
+{
+    if (g_dirty.r1 < g_dirty.r0) { g_dirty = DirtyRect{r0, c0, r1, c1}; return; }
+    g_dirty.r0 = std::min(g_dirty.r0, r0);  g_dirty.c0 = std::min(g_dirty.c0, c0);
+    g_dirty.r1 = std::max(g_dirty.r1, r1);  g_dirty.c1 = std::max(g_dirty.c1, c1);
+}
+
+// -----------------------------------------------------------------------
+// Scripted target trajectory and size envelope
+// -----------------------------------------------------------------------
+// TRAJECTORY=0 reproduces the legacy behaviour exactly: the target is injected at
+// pos + (IMPULSE_DR, IMPULSE_DC), i.e. RELATIVE TO THE TRACKER'S OWN ESTIMATE.
+// That makes the expected displacement a constant and `err=0 px` meaningful, but
+// it also means the tracker is marking its own homework — it cannot drift,
+// because the ground truth follows wherever it goes.
+//
+// TRAJECTORY=1 puts the target on an ABSOLUTE closed ellipse around the initial
+// centre. Ground truth no longer depends on the estimate, so drift becomes
+// visible and measurable — and because the path is closed the run length is
+// unbounded. The legacy scheme walks off a 1080-row frame at about frame 48
+// (constant velocity (10,-7) from row 540), which is what capped hw_emu runs.
+//
+// Amplitudes and period are chosen so the peak per-frame step is ~9 px/axis,
+// comparable to the (10,-7) the pipeline is already proven against.
+#ifndef TRAJECTORY
+#  define TRAJECTORY 0
+#endif
+#ifndef TRAJ_AMP_R
+#  define TRAJ_AMP_R 180.0
+#endif
+#ifndef TRAJ_AMP_C
+#  define TRAJ_AMP_C 180.0
+#endif
+#ifndef TRAJ_PERIOD
+#  define TRAJ_PERIOD 120.0
+#endif
+
+// Size envelope. SCALE_TRAJ=0 holds the drawn target at TARGET_H/W, which is what
+// shipped — and which means the scale filter has NOTHING TO TRACK: it can be
+// shown not to crash and nothing more.
+//
+// The rate limit that matters: SCALE_STEP=1.02 bounds one frame's correction to
+// 1.02^((S-1)/2) = 1.37x, but SCALE_ETA=0.025 means the model adapts slowly, so
+// the envelope must change far more slowly than the filter's single-frame range.
+// amp 0.3 over a 200-frame period peaks at 0.94%/frame, comfortably inside it.
+#ifndef SCALE_TRAJ
+#  define SCALE_TRAJ 0
+#endif
+#ifndef SCALE_TRAJ_AMP
+#  define SCALE_TRAJ_AMP 0.30
+#endif
+#ifndef SCALE_TRAJ_PERIOD
+#  define SCALE_TRAJ_PERIOD 200.0
+#endif
+
+// Periodic occlusion. OCCLUDE_PERIOD=0 keeps the legacy OCCLUDE_MASK, which is a
+// 32-bit mask indexed by frame number — so it can only express frames 0..31, and
+// `mask >> frame` is undefined once frame >= 32. For a run of hundreds of frames
+// a period is both expressible and more useful.
+//
+// OCCLUDE_START is a WARM-UP: no occlusion before this frame, and the period runs
+// from there. Without it the first occlusion lands on frame 1, i.e. the filter is
+// occluded immediately after being initialised from a single patch — which tests
+// the gate against a filter that has not converged and conflates two different
+// failures if it goes wrong.
+//
+// Choosing it: the translation filter smooths at MOSSE_ETA (0.125 by default), so
+// its time constant is 1/eta = 8 frames and it is essentially converged after
+// ~3-4 of those. 30 frames is comfortably past that. THE SCALE FILTER IS MUCH
+// SLOWER — SCALE_ETA is 0.025, so 40 frames per time constant and ~120 to
+// converge. If a run is meant to test occlusion against a settled SCALE estimate
+// rather than a settled position, this wants to be ~120, not 30.
+#ifndef OCCLUDE_PERIOD
+#  define OCCLUDE_PERIOD 0
+#endif
+#ifndef OCCLUDE_LEN
+#  define OCCLUDE_LEN 1
+#endif
+#ifndef OCCLUDE_START
+#  define OCCLUDE_START 30
+#endif
+
+static void target_pose(int frame, double row0, double col0,
+                        double *row, double *col, double *scale)
+{
+#if TRAJECTORY
+    const double th = 2.0 * M_PI * (double)frame / (double)(TRAJ_PERIOD);
+    *row = row0 + (double)(TRAJ_AMP_R) * std::sin(th);
+    *col = col0 + (double)(TRAJ_AMP_C) * (std::cos(th) - 1.0);   // starts at (row0,col0)
+#else
+    *row = row0; *col = col0;                                    // caller applies the offset
+#endif
+#if SCALE_TRAJ
+    *scale = 1.0 + (double)(SCALE_TRAJ_AMP)
+                 * std::sin(2.0 * M_PI * (double)frame / (double)(SCALE_TRAJ_PERIOD));
+#else
+    (void)frame; *scale = 1.0;
+#endif
+}
+
+static bool frame_is_occluded(int frame, bool init_frame)
+{
+    if (init_frame) return false;               // never occlude the training frame
+#if OCCLUDE_PERIOD
+    if (frame < (OCCLUDE_START)) return false;  // warm-up: let the filter converge
+    return ((frame - (OCCLUDE_START)) % (OCCLUDE_PERIOD)) < (OCCLUDE_LEN);
+#else
+    // Guard the shift: `mask >> frame` is UB for frame >= 32.
+    return frame < 32 && (((OCCLUDE_MASK) >> frame) & 1) != 0;
+#endif
+}
+
+// Draw the target at (tr, tc) with the given box size.
+//
+// The shape is the shipped bar-plus-spur, now SCALED by the target box instead of
+// being fixed at 11x11. Its three asymmetries are load-bearing and every extent
+// below is therefore a fraction of the box rather than an absolute pixel count:
+// different extents in r and c catch a transpose, the one-sided spur catches a
+// reflection, and neither is symmetric about the centre so a sign flip shows up.
+// At target_h = target_w = 11 this reproduces the original exactly.
+static void inject_target_frame(uint8_t *frame_buf, int rows, int cols,
+                                int tr, int tc, int target_h, int target_w)
+{
+    constexpr uint8_t BAR_VALUE  = 220;
+    constexpr uint8_t SPUR_VALUE = 150;
+    constexpr double  NOMINAL    = 11.0;   // the box the shape was drawn in
+
+    // Restore only what the previous frame dirtied, instead of regenerating the
+    // whole background — see the note on scene_init().
+    scene_restore(frame_buf, rows, cols);
+
+    const double sh = (double)target_h / NOMINAL;
+    const double sw = (double)target_w / NOMINAL;
+    const int    r0 = (int)std::floor(tr - 5.0 * sh);
+    const int    r1 = (int)std::ceil (tr + 5.0 * sh);
+    // The shape spans dc in [-2*sw, 8*sw], so the column extent is asymmetric.
+    scene_mark_dirty(r0, (int)std::floor(tc - 2.0 * sw) - 1,
+                     r1, (int)std::ceil (tc + 8.0 * sw) + 1);
+
+    for (int r = std::max(0, r0); r <= std::min(rows - 1, r1); ++r) {
+        const double dr = (double)r - tr;
+        if (dr < -5.0 * sh || dr > 5.0 * sh) continue;
+        for (int c = 0; c < cols; ++c) {
+            const double dc = (double)c - tc;
             uint8_t v = 0;
-            if (dc >= -2 && dc <= 2)                       v = BAR_VALUE;   // 11 x 5
-            else if (dr >= 2 && dc >= 3 && dc <= 8)        v = SPUR_VALUE;  // one side only
+            if (dc >= -2.0 * sw && dc <= 2.0 * sw)
+                v = BAR_VALUE;
+            else if (dr >= 2.0 * sh && dc >= 3.0 * sw && dc <= 8.0 * sw)
+                v = SPUR_VALUE;
             if (v) frame_buf[(size_t)r * cols + c] = v;
         }
     }
@@ -937,6 +1188,10 @@ static void inject_checkerboard_frame(uint8_t *frame_buf, int rows, int cols, in
             frame_buf[r * cols + c] = ((sq_r + sq_c) & 1) ? 255 : 0;
         }
     }
+    // The occluder overwrites everything, so the NEXT frame has to restore the
+    // whole buffer, not just a target-sized rect. Getting this wrong would leave
+    // checkerboard fragments in the background for the rest of the run.
+    scene_mark_dirty(0, 0, rows - 1, cols - 1);
 }
 
 // -----------------------------------------------------------------------
@@ -1063,11 +1318,73 @@ int main(int argc, char **argv)
     memset(filter_bo.map<void *>(), 0, FILTER_BYTES * N_CHANNELS);
     filter_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
+    // ------------------------------------------------------------------
+    // Target box and the ROI derived from it
+    // ------------------------------------------------------------------
+    // The box is the tracker's state now, not just a position. roi = box *
+    // padding, so the filter sees background context — which is the whole reason
+    // both papers use a window larger than the object.
+    mosse::TargetBox box;
+    box.row = FRAME_ROWS / 2.0;
+    box.col = FRAME_COLS / 2.0;
+    box.h   = (double)TARGET_H;
+    box.w   = (double)TARGET_W;
+
+    // Recomputed per frame inside the loop, because the scale filter moves
+    // box.h/box.w. This copy is for the startup report only.
+    const mosse::RoiGeometry roi0 =
+        mosse::roi_for(box, mosse::DEFAULT_PADDING, PATCH_ROWS, PATCH_COLS);
+
+    float sigma_r = 0.0f, sigma_c = 0.0f;
+    mosse::sigma_for(box, roi0, &sigma_r, &sigma_c);
+    // sigma does NOT need recomputing per frame even under SIGMA_FROM_TARGET:
+    // the target always occupies patch/padding patch pixels regardless of its
+    // size in frame pixels, so the rule is scale-invariant and G is constant.
+
+    // ------------------------------------------------------------------
+    // DSST 1-D scale filter (docs/1609.06141v1.pdf §5.1)
+    // ------------------------------------------------------------------
+    mosse::ScaleFilter scale;
+    mosse::scale_filter_config(scale, mosse::DEFAULT_SCALE_N,
+                               mosse::DEFAULT_SCALE_STEP,
+                               box.h, box.w, (float)SCALE_SIGMA_FACTOR);
+    std::vector<mosse::cfloat> scale_sample(
+        (size_t)(scale.enabled() ? scale.sample_elems() : 1));
+    // Absolute bounds on the box, so a run of bad scale estimates cannot collapse
+    // the target to nothing or grow it past the frame. The PER-FRAME change is
+    // already bounded by the filter's own range (step^±(S-1)/2 = ±38% at the
+    // defaults), so this only has to catch accumulated drift.
+    const double box_h0 = box.h, box_w0 = box.w;
+    constexpr double SCALE_MIN_REL = 0.25, SCALE_MAX_REL = 4.0;
+
+    printf("box: %.0fx%.0f px at (%.0f,%.0f)  padding %.2f  ->  roi %dx%d @(%d,%d)\n",
+           box.h, box.w, box.row, box.col, (double)mosse::DEFAULT_PADDING,
+           roi0.roi_h, roi0.roi_w, roi0.roi_row, roi0.roi_col);
+    printf("     %.4f frame px per patch bin (the localisation quantum)  "
+           "sigma %.2f/%.2f  target %.1f patch px\n",
+           mosse::patch_dr_to_frame(1, roi0), (double)sigma_r, (double)sigma_c,
+           mosse::target_h_in_patch(box, roi0));
+    if (mosse::DEFAULT_SCALE_N > 1)
+        printf("scale: DSST 1-D filter, S=%d step=%.3f eta=%.3f sigma=%.2f  "
+               "template %dx%d (d=%d)  range %.0f%%..%.0f%%\n",
+               scale.n_scales, (double)scale.step, (double)mosse::DEFAULT_SCALE_ETA,
+               (double)scale.sigma, scale.tmpl_h, scale.tmpl_w, scale.dims(),
+               100.0 * std::pow((double)scale.step, -(scale.n_scales - 1) / 2.0),
+               100.0 * std::pow((double)scale.step, (scale.n_scales - 1) / 2.0));
+    else
+        printf("scale: DISABLED (SCALE_N=1) — box size is held fixed\n");
+    if (roi0.roi_h != PATCH_ROWS || roi0.roi_w != PATCH_COLS)
+        printf("     NOTE resample is NOT 1:1 — roi_crop's bilinear interpolator "
+               "is live. It is covered by `make test_roi_crop` (17 cases) and by "
+               "nothing before 2026-08-16.\n");
+
     // Target spectrum: closed form, no FFT (see mosse_filter.h). CENTRED — a
     // target displaced by (dr,dc) must produce a peak at (dr,dc), so G itself
-    // carries no offset. Constant for the whole run.
+    // carries no offset. Per-axis sigma, because DSST §6.1 anchors it to "the
+    // target size in the translation dimensionS" and a non-square box has a
+    // different extent in each.
     mosse::gaussian_target_spectrum(g_target.data(), PATCH_ROWS, PATCH_COLS,
-                                    mosse::DEFAULT_SIGMA, 0, 0);
+                                    sigma_r, sigma_c, 0, 0);
 
     // Scratch for the row-major quantized filter, before pack_filter() converts
     // it to the col-FFT layout.
@@ -1082,9 +1399,69 @@ int main(int argc, char **argv)
            (double)mosse::DEFAULT_SIGMA, (double)mosse::DEFAULT_ETA, CMUL_H_SHIFT);
     fflush(stdout);
 
-    // Tracked position (centre of search patch in frame coordinates)
-    int pos_row = FRAME_ROWS / 2;
-    int pos_col = FRAME_COLS / 2;
+    // Tracked position, kept as ints because roi_crop takes integer coordinates.
+    // They mirror box.row/box.col, which stay the authoritative state.
+    int pos_row = (int)llround(box.row);
+    int pos_col = (int)llround(box.col);
+
+    // Where the target was actually injected, for the IoU report.
+    mosse::TargetBox truth = box;
+
+    // Anchor for the scripted trajectory. Fixed for the run, so the path is a
+    // closed curve about the INITIAL centre and not about wherever the tracker
+    // has wandered to.
+    const double traj_row0 = box.row, traj_col0 = box.col;
+
+    // Background is generated ONCE — see scene_init(). Regenerating it per frame
+    // costs ~0.6-1.2 s on the A72, which would be 30-90x the whole pipeline.
+    scene_init(FRAME_ROWS, FRAME_COLS);
+
+    // Per-run tracking statistics. The point of a long hardware run is the CURVE,
+    // not a single frame, and these are what make it a result rather than a smoke
+    // test: mean IoU is the OTB-style overlap metric both papers report, and the
+    // failure count is what a tracker is actually judged on.
+    int    trk_eval = 0, trk_ok = 0, trk_lost = 0;
+    double trk_iou_sum = 0.0, trk_iou_min = 1.0;
+    double trk_cerr_sum = 0.0, trk_cerr_max = 0.0;
+#if TRAJECTORY
+    printf("trajectory: ELLIPSE amp (%.0f,%.0f) px, period %.0f frames, "
+           "peak step ~%.1f px/frame — closed path, run length unbounded\n",
+           (double)TRAJ_AMP_R, (double)TRAJ_AMP_C, (double)TRAJ_PERIOD,
+           2.0 * M_PI * (double)TRAJ_AMP_R / (double)TRAJ_PERIOD);
+#else
+    printf("trajectory: LEGACY relative offset (%d,%d) per frame — the target "
+           "follows the ESTIMATE, so drift is not measurable, and the ROI leaves "
+           "a %dx%d frame at about frame %d\n",
+           IMPULSE_DR, IMPULSE_DC, FRAME_ROWS, FRAME_COLS,
+           IMPULSE_DR ? (int)((FRAME_ROWS / 2 - PATCH_ROWS) / (IMPULSE_DR ? IMPULSE_DR : 1))
+                      : 0);
+#endif
+#if SCALE_TRAJ
+    printf("size envelope: %.2fx..%.2fx over %.0f frames (peak %.2f%%/frame, "
+           "filter range %.2f%%/frame)\n",
+           1.0 - (double)SCALE_TRAJ_AMP, 1.0 + (double)SCALE_TRAJ_AMP,
+           (double)SCALE_TRAJ_PERIOD,
+           100.0 * 2.0 * M_PI * (double)SCALE_TRAJ_AMP / (double)SCALE_TRAJ_PERIOD,
+           100.0 * ((double)mosse::DEFAULT_SCALE_STEP - 1.0));
+#else
+    printf("size envelope: FIXED at %dx%d — the scale filter has nothing to "
+           "track; set SCALE_TRAJ=1 to exercise it\n", TARGET_H, TARGET_W);
+#endif
+#if OCCLUDE_PERIOD
+    printf("occlusion: %d frame(s) every %d, starting at frame %d "
+           "(warm-up = %.1f translation time constants at eta=%.3f; "
+           "%.1f scale time constants at eta=%.3f)\n",
+           (int)(OCCLUDE_LEN), (int)(OCCLUDE_PERIOD), (int)(OCCLUDE_START),
+           (double)(OCCLUDE_START) * (double)mosse::DEFAULT_ETA,
+           (double)mosse::DEFAULT_ETA,
+           (double)(OCCLUDE_START) * (double)mosse::DEFAULT_SCALE_ETA,
+           (double)mosse::DEFAULT_SCALE_ETA);
+#elif OCCLUDE_MASK
+    printf("occlusion: legacy OCCLUDE_MASK=0x%x (frames 0-31 only)\n",
+           (unsigned)(OCCLUDE_MASK));
+#else
+    printf("occlusion: none\n");
+#endif
 
     // ------------------------------------------------------------------
     // Per-frame tracking loop
@@ -1092,6 +1469,11 @@ int main(int argc, char **argv)
     for (int frame = 0; frame < ITER_CNT; ++frame) {
 
         dma_reset_frame();
+
+        // Recomputed every frame: the scale filter moves box.h/box.w, so the
+        // ROI is no longer a constant of the run.
+        const mosse::RoiGeometry roi =
+            mosse::roi_for(box, mosse::DEFAULT_PADDING, PATCH_ROWS, PATCH_COLS);
 
         // 1. Camera capture → DDR frame buffer (zeros the buffer)
         // SKIPPED for hw_emu: camera_capture zeros the full 1080×1920 frame at
@@ -1134,12 +1516,30 @@ int main(int argc, char **argv)
             // that actually decides where the target must be, and the init branch
             // at the bottom of the loop uses the same one.
             const bool init_frame = !g_filter.initialized;
+
+            // Where the target actually is this frame, and how big.
+            //
+            // TRAJECTORY=0 (default) keeps the legacy RELATIVE scheme: the target
+            // is placed at the tracker's own estimate plus a fixed offset, so the
+            // expected displacement is the constant (IMPULSE_DR, IMPULSE_DC).
+            // TRAJECTORY=1 uses an ABSOLUTE scripted path, which is what makes
+            // drift measurable and the run length unbounded.
+            double traj_r = 0.0, traj_c = 0.0, traj_s = 1.0;
+            target_pose(frame, traj_row0, traj_col0, &traj_r, &traj_c, &traj_s);
+#if TRAJECTORY
+            int test_row = (int)llround(traj_r);
+            int test_col = (int)llround(traj_c);
+            (void)init_frame;
+#else
             int test_row = pos_row + (init_frame ? 0 : IMPULSE_DR);
             int test_col = pos_col + (init_frame ? 0 : IMPULSE_DC);
+#endif
+            const int test_h = std::max(4, (int)llround((double)TARGET_H * traj_s));
+            const int test_w = std::max(4, (int)llround((double)TARGET_W * traj_s));
 
-            // Occlusion test for the PSR gate. Guarded on !init_frame so bit 0 is
-            // a no-op — see the OCCLUDE_MASK comment at the top of this file.
-            occluded = !init_frame && (((OCCLUDE_MASK) >> frame) & 1);
+            // Occlusion test for the PSR gate. Never on the training frame — see
+            // frame_is_occluded() for why the legacy mask is bounded at frame 32.
+            occluded = frame_is_occluded(frame, init_frame);
 
             if (occluded) {
                 // A checkerboard, not a flat fill: full-scale structure with real
@@ -1158,7 +1558,14 @@ int main(int argc, char **argv)
                 // transposed pack_filter() and a wrong conjugation both invisible.
                 // See inject_target_frame().
                 inject_target_frame(frame_ptr, FRAME_ROWS, FRAME_COLS,
-                                    test_row, test_col);
+                                    test_row, test_col, test_h, test_w);
+                // Ground truth for the IoU report. Taken from what was actually
+                // DRAWN, not from the tracker's box — that is the whole point of
+                // TRAJECTORY=1, where the two are allowed to diverge.
+                truth.row = test_row;
+                truth.col = test_col;
+                truth.h   = (double)test_h;
+                truth.w   = (double)test_w;
             }
             frame_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);  // Flush host → device
             if (occluded)
@@ -1175,8 +1582,14 @@ int main(int argc, char **argv)
         }
 
         // 2. Per-channel: conv2d + FFT2D + cmul_accum
-        int roi_row = pos_row - PATCH_ROWS / 2;
-        int roi_col = pos_col - PATCH_COLS / 2;
+        //
+        // The ROI is now derived from the BOX, not from the patch size. It is
+        // roi.roi_h x roi.roi_w frame pixels centred on the tracked position, and
+        // roi_crop resamples that to the fixed PATCH_ROWS x PATCH_COLS. Both
+        // offsets may be negative for a target near an edge; roi_crop clamps by
+        // border replication.
+        int roi_row = pos_row - roi.roi_h / 2;
+        int roi_col = pos_col - roi.roi_w / 2;
 
         // Stage B2: per-channel mean that conv2d did NOT remove this frame,
         // filled in as each channel's row-FFT comes back and applied once to the
@@ -1210,9 +1623,10 @@ int main(int argc, char **argv)
             // channels re-stream the cached patch. See roi_crop.h.
             //
             // roi_h/roi_w are the ROI's size in FRAME pixels; roi_crop resamples
-            // that to PATCH_ROWS × PATCH_COLS. They are fixed to the patch size
-            // here because scale estimation is not implemented yet — once it is,
-            // this is where the estimated target size goes.
+            // that to PATCH_ROWS × PATCH_COLS. They now come from the target box
+            // (roi = box × TARGET_PADDING). Scale estimation, when it lands, only
+            // has to update box.h/box.w and recompute `roi` per frame — the
+            // plumbing is already here.
             // Arguments MUST be set by explicit index, NOT positionally via
             // `crop(...)`. roi_crop's AXIS port sits in the MIDDLE of the
             // argument list, and xrt::kernel::operator() assigns positionally
@@ -1237,8 +1651,8 @@ int main(int argc, char **argv)
             crop_run.set_arg(3,  (uint32_t)FRAME_COLS);
             crop_run.set_arg(4,  (uint32_t)roi_row);
             crop_run.set_arg(5,  (uint32_t)roi_col);
-            crop_run.set_arg(6,  (uint32_t)PATCH_ROWS);   // roi_h
-            crop_run.set_arg(7,  (uint32_t)PATCH_COLS);   // roi_w
+            crop_run.set_arg(6,  (uint32_t)roi.roi_h);    // roi_h, FRAME px
+            crop_run.set_arg(7,  (uint32_t)roi.roi_w);    // roi_w, FRAME px
             crop_run.set_arg(8,  (uint32_t)PATCH_ROWS);
             crop_run.set_arg(9,  (uint32_t)PATCH_COLS);
             crop_run.set_arg(10, (uint32_t)((ch == 0) ? 1 : 0));
@@ -1470,6 +1884,31 @@ int main(int argc, char **argv)
             const int  dr   = psr_abs.dr, dc = psr_abs.dc;
             const long peak = psr_abs.peak;
 
+            // PATCH BINS -> FRAME PIXELS. One bin is roi_h/patch_rows frame
+            // pixels, so these are the same number ONLY while the ROI is 1:1 with
+            // the patch — which it was for every build before the box existed.
+            // Omitting the conversion gives a tracker that localises confidently
+            // and drifts by the resample ratio every frame, which `err=0 px`
+            // cannot see. Checked by run_box_tests() in test_mosse_filter.cpp.
+            const double dr_frame = mosse::patch_dr_to_frame(dr, roi);
+            const double dc_frame = mosse::patch_dc_to_frame(dc, roi);
+            // And the inverse for the expectation: the impulse is injected in
+            // FRAME pixels, so the bin a correct pipeline must report is
+            // IMPULSE_DR scaled into patch coordinates.
+            // Expected displacement, derived from WHERE THE TARGET WAS DRAWN
+            // rather than from a constant. pos_row/pos_col are still the values
+            // the ROI was formed around — the position update below has not run
+            // yet — so this is the true offset the pipeline had to find.
+            //
+            // At TRAJECTORY=0 truth.row is pos + IMPULSE_DR by construction, so
+            // this reduces exactly to the old constant. At TRAJECTORY=1 it
+            // tracks the scripted path, which is the whole point: the expectation
+            // no longer follows the estimate around.
+            const double inj_dr = truth.row - (double)pos_row;   // FRAME px, pre-update
+            const double inj_dc = truth.col - (double)pos_col;
+            const int exp_dr = mosse::frame_dr_to_patch(inj_dr, roi);
+            const int exp_dc = mosse::frame_dc_to_patch(inj_dc, roi);
+
             // THE POSITION IS ONLY UPDATED ON AN ACCEPTED FRAME. A gated frame's
             // peak is noise; following it walks the ROI off the target and the
             // target can then never re-enter the search window. Holding is what
@@ -1477,11 +1916,18 @@ int main(int argc, char **argv)
             // reacquisition code — and it is also why the recovery frame's
             // expected displacement is still exactly (IMPULSE_DR, IMPULSE_DC),
             // so the check below stays meaningful across an occlusion.
-            if (gate.accept) { pos_row += dr; pos_col += dc; }
+            if (gate.accept) {
+                box.row += dr_frame;
+                box.col += dc_frame;
+                pos_row = (int)llround(box.row);
+                pos_col = (int)llround(box.col);
+            }
 
-            const bool ok = (peak != 0 && dr == IMPULSE_DR && dc == IMPULSE_DC);
-            printf("Frame %d: displacement (%d,%d) %s pos (%d,%d)  peak=%ld  [%s]\n",
-                   frame, dr, dc, gate.accept ? "→" : "HELD, pos stays",
+            const bool ok = (peak != 0 && dr == exp_dr && dc == exp_dc);
+            printf("Frame %d: displacement (%d,%d) bins = (%.2f,%.2f) frame px %s "
+                   "pos (%d,%d)  peak=%ld  [%s]\n",
+                   frame, dr, dc, dr_frame, dc_frame,
+                   gate.accept ? "→" : "HELD, pos stays",
                    pos_row, pos_col, peak,
                    peak == 0   ? "VOID: zero response — result carries no information"
                    : occluded  ? "occluded frame — no target to match, gate decides"
@@ -1494,7 +1940,74 @@ int main(int argc, char **argv)
             // expected displacement for a frame the tracker deliberately did not
             // act on, so printing one would read as a failure when it is a pass.
             else if (!ok && !occluded && gate.accept)
-                printf("       expected displacement (%d,%d)\n", IMPULSE_DR, IMPULSE_DC);
+                printf("       expected displacement (%d,%d) bins "
+                       "(= injected (%d,%d) frame px / %.4f px per bin)\n",
+                       exp_dr, exp_dc, (int)llround(inj_dr), (int)llround(inj_dc),
+                       mosse::patch_dr_to_frame(1, roi));
+
+            // SCALE ESTIMATION — DSST §5.1, Algorithm 1.
+            //
+            // Order is load-bearing and the paper states why: "Typically, the
+            // target scale difference between two frames is small compared to the
+            // difference in the location. We therefore first apply the translation
+            // filter... The scale filter is then applied at the new target
+            // location estimate." So this runs AFTER the position update above.
+            //
+            // Gated on gate.accept for the same reason filter_update is: an
+            // occluded frame's scale peak is noise, and resizing the box from it
+            // would walk the ROI off the target just as surely as moving it would.
+            if (scale.enabled() && gate.accept && scale.initialized) {
+                const uint8_t *fp = frame_bo.map<uint8_t *>();
+                mosse::scale_extract(scale, fp, FRAME_ROWS, FRAME_COLS,
+                                     box.row, box.col, box.h, box.w,
+                                     scale_sample.data());
+                const mosse::ScaleResult sr =
+                    mosse::scale_detect(scale, scale_sample.data(),
+                                        mosse::DEFAULT_EPS_REL);
+                if (sr.valid) {
+                    const double nh = box.h * sr.factor;
+                    const double nw = box.w * sr.factor;
+                    const bool in_range =
+                        nh >= box_h0 * SCALE_MIN_REL && nh <= box_h0 * SCALE_MAX_REL &&
+                        nw >= box_w0 * SCALE_MIN_REL && nw <= box_w0 * SCALE_MAX_REL;
+                    if (in_range) { box.h = nh; box.w = nw; }
+                    printf("  [scale] level %+d  factor %.4f  peak %.3g  conf %.2f"
+                           "  box %.1fx%.1f%s\n",
+                           sr.idx, sr.factor, sr.peak, sr.psr, box.h, box.w,
+                           in_range ? "" : "  [CLAMPED: outside the absolute "
+                                           "bounds, size held]");
+                }
+            } else if (scale.enabled() && !gate.accept) {
+                printf("  [scale] FROZEN — gated frame, size held at %.1fx%.1f\n",
+                       box.h, box.w);
+            }
+
+            // IoU against the injected box. This is what makes the tracker
+            // SCOREABLE: both papers report overlap precision, and until the box
+            // existed there was no way to compute it at all. Suppressed on an
+            // occluded frame, where there is no ground-truth box to score.
+            if (!occluded) {
+                const mosse::TargetBox est = box;
+                const double iou  = mosse::box_iou(est, truth);
+                const double cerr = std::hypot(est.row - truth.row,
+                                               est.col - truth.col);
+                printf("       IoU %.4f  centre err %.2f px  vs injected box "
+                       "(%.0fx%.0f at (%.1f,%.1f); estimate %.0fx%.0f at "
+                       "(%.1f,%.1f))%s\n",
+                       iou, cerr, truth.h, truth.w, truth.row, truth.col,
+                       est.h, est.w, est.row, est.col,
+                       iou >= 0.5 ? "  [OK: above the PASCAL 0.5 criterion]"
+                                  : "  [BELOW 0.5 — PASCAL would score this a miss]");
+                // Accumulate the curve. PASCAL's 0.5 overlap is the criterion both
+                // papers report against, so "lost" means IoU < 0.5 — not err != 0,
+                // which is meaningless once the target moves sub-pixel.
+                ++trk_eval;
+                trk_iou_sum  += iou;
+                trk_cerr_sum += cerr;
+                if (iou < trk_iou_min)  trk_iou_min  = iou;
+                if (cerr > trk_cerr_max) trk_cerr_max = cerr;
+                if (iou >= 0.5) ++trk_ok; else ++trk_lost;
+            }
         }
 
         // 5. Filter init / update (PS-side). Bolme eq. 10-12; see mosse_filter.h.
@@ -1507,6 +2020,19 @@ int main(int argc, char **argv)
         // THREE-WAY, AND THE ORDER OF THE TESTS IS LOAD-BEARING: the init branch
         // is selected before `gate` is ever consulted, so the gate can never block
         // the bootstrap.
+        // Scale model update, DSST Algorithm 1 step 9. Trained on frame 0 (so the
+        // filter exists before it is ever applied) and on every ACCEPTED frame
+        // thereafter — the same freeze rule as the translation filter, so one
+        // gated frame cannot teach the scale filter what an occluder looks like.
+        if (scale.enabled() && (!g_filter.initialized || gate.accept)) {
+            const uint8_t *fp = frame_bo.map<uint8_t *>();
+            mosse::scale_extract(scale, fp, FRAME_ROWS, FRAME_COLS,
+                                 box.row, box.col, box.h, box.w,
+                                 scale_sample.data());
+            mosse::scale_update(scale, scale_sample.data(),
+                                mosse::DEFAULT_SCALE_ETA);
+        }
+
         bool published = false;
         if (!g_filter.initialized) {
             mosse::filter_init(g_filter, g_F_all.data(), g_target.data(),
@@ -1554,6 +2080,25 @@ int main(int argc, char **argv)
         }
 
         dma_report_frame(frame);
+    }
+
+    // Tracking result across the run — the thing a long hardware run exists to
+    // produce, and which no hw_emu run could ever afford to compute (2-3 frames
+    // is not a curve). Mean overlap precision at the PASCAL 0.5 threshold is the
+    // metric both papers report; until the target box existed it could not be
+    // computed at all.
+    if (trk_eval > 0) {
+        printf("\n[track] SUMMARY over %d evaluated frame(s):\n", trk_eval);
+        printf("  overlap precision @0.5 : %5.1f%%  (%d of %d; %d lost)\n",
+               100.0 * trk_ok / trk_eval, trk_ok, trk_eval, trk_lost);
+        printf("  mean IoU               : %.4f   (worst %.4f)\n",
+               trk_iou_sum / trk_eval, trk_iou_min);
+        printf("  mean centre error      : %.2f px (worst %.2f px)\n",
+               trk_cerr_sum / trk_eval, trk_cerr_max);
+        printf("  final box              : %.0fx%.0f at (%.1f,%.1f)  "
+               "truth %.0fx%.0f at (%.1f,%.1f)\n",
+               box.h, box.w, box.row, box.col,
+               truth.h, truth.w, truth.row, truth.col);
     }
 
     // Gate outcome across the run. Printed here for the same reason the DMA

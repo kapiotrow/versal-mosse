@@ -1,0 +1,19 @@
+name whole_frame
+frame_rows 1080
+frame_cols 1920
+roi_row 0
+roi_col 0
+roi_h 1080
+roi_w 1920
+patch_rows 128
+patch_cols 128
+twice 0
+exp_mean 55627
+exp_var 1900940
+exp_inv_q 1521
+exp_beats 4096
+step_y 2160
+step_x 3840
+fy_nonzero 120
+fx_nonzero 0
+why max step; 8.4x/15x decimation with no prefilter

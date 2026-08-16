@@ -425,6 +425,358 @@ void run_psr_tests()
     }
 }
 
+// ---------------------------------------------------------------------------
+// Bounding box, ROI geometry and the patch<->frame conversions.
+//
+// Analytic, no golden — same rule as the PSR suite above: every property here has
+// a closed form, so a NumPy reference would be a second implementation of trivial
+// arithmetic to keep in sync forever.
+//
+// These exist because the conversions are INVISIBLE today. While roi_h ==
+// patch_rows a patch bin IS a frame pixel, so `pos_row += dr` and
+// `dr == IMPULSE_DR` are both accidentally correct. Padding breaks both, and the
+// symptom is a tracker that localises confidently and drifts — which `err=0 px`
+// cannot see, and which this project has shipped four times.
+// ---------------------------------------------------------------------------
+void run_box_tests()
+{
+    using namespace mosse;
+    printf("\nbounding box / ROI geometry (analytic)\n");
+
+    // 1. The shipped geometry must survive adopting the box. Target 64 at padding
+    //    2 gives roi 128 on a 128 patch — a 1:1 resample, i.e. exactly what runs
+    //    today. That is what makes the first hardware step single-variable.
+    {
+        const TargetBox b{540.0, 960.0, 64.0, 64.0};
+        const RoiGeometry g = roi_for(b, 2.0f, 128, 128);
+        check_int("roi_h at padding 2", g.roi_h, 128);
+        check_int("roi_w at padding 2", g.roi_w, 128);
+        check_int("roi_row centred", g.roi_row, 540 - 64);
+        check_int("roi_col centred", g.roi_col, 960 - 64);
+        check_true("padding 2 keeps 1:1", g.roi_h == g.patch_rows,
+                   "so the interpolator stays dormant for this step");
+    }
+
+    // 2. IDENTITY at 1:1 — the property that hides the bug. If this were the only
+    //    test, both conversions could be `return dr;` and pass.
+    {
+        const TargetBox b{540.0, 960.0, 64.0, 64.0};
+        const RoiGeometry g = roi_for(b, 2.0f, 128, 128);
+        check_double("1:1 dr identity", patch_dr_to_frame(10, g), 10.0, 1e-12);
+        check_double("1:1 dc identity", patch_dc_to_frame(-7, g), -7.0, 1e-12);
+    }
+
+    // 3. NON-identity: the case that actually discriminates. Target 64 at padding
+    //    3 gives roi 192, so one patch bin is 1.5 frame px.
+    {
+        const TargetBox b{540.0, 960.0, 64.0, 64.0};
+        const RoiGeometry g = roi_for(b, 3.0f, 128, 128);
+        check_int("roi_h at padding 3", g.roi_h, 192);
+        check_double("px per bin", patch_dr_to_frame(1, g), 1.5, 1e-12);
+        check_double("dr 10 bins -> frame", patch_dr_to_frame(10, g), 15.0, 1e-12);
+        check_double("dc -7 bins -> frame", patch_dc_to_frame(-7, g), -10.5, 1e-12);
+        // And the inverse, which is what the pass/fail assertion needs.
+        check_int("frame 15 -> 10 bins", frame_dr_to_patch(15.0, g), 10);
+        check_int("frame 10 -> 7 bins", frame_dr_to_patch(10.0, g), 7);
+    }
+
+    // 4. Round-trip over a range of paddings, including a non-integer ratio and
+    //    an anisotropic box. Frame -> patch -> frame must return the original to
+    //    within one bin, which is the quantisation the tracker genuinely has.
+    {
+        const double pads[] = {1.5, 2.0, 2.5, 3.0};
+        bool ok = true;
+        double worst = 0.0;
+        for (double p : pads) {
+            const TargetBox b{540.0, 960.0, 64.0, 48.0};
+            const RoiGeometry g = roi_for(b, (float)p, 128, 128);
+            for (int d = -20; d <= 20; ++d) {
+                const double back = patch_dr_to_frame(frame_dr_to_patch((double)d, g), g);
+                const double err  = std::fabs(back - (double)d);
+                if (err > worst) worst = err;
+                if (err > patch_dr_to_frame(1, g) * 0.5 + 1e-9) ok = false;
+            }
+        }
+        char det[80];
+        snprintf(det, sizeof(det), "worst %.4f frame px, <= half a bin", worst);
+        check_true("frame->patch->frame round-trip", ok, det);
+    }
+
+    // 5. Anisotropic box: rows and columns must convert INDEPENDENTLY. A single
+    //    shared ratio would pass every square-target test and fail here.
+    {
+        const TargetBox b{540.0, 960.0, 64.0, 32.0};
+        const RoiGeometry g = roi_for(b, 2.0f, 128, 128);
+        check_int("aniso roi_h", g.roi_h, 128);
+        check_int("aniso roi_w", g.roi_w, 64);
+        check_double("aniso dr ratio", patch_dr_to_frame(4, g), 4.0, 1e-12);
+        check_double("aniso dc ratio", patch_dc_to_frame(4, g), 2.0, 1e-12);
+        check_true("aniso ratios differ",
+                   patch_dr_to_frame(4, g) != patch_dc_to_frame(4, g),
+                   "a shared ratio would pass every square test");
+    }
+
+    // 6. Target size in patch pixels, the units sigma is expressed in. The target
+    //    always occupies patch/padding regardless of its size in frame pixels —
+    //    which is why the DSST rule gives sigma = patch/(16*padding).
+    {
+        for (double p : {1.5, 2.0, 3.0}) {
+            const TargetBox b{540.0, 960.0, 64.0, 64.0};
+            const RoiGeometry g = roi_for(b, (float)p, 128, 128);
+            check_double("target in patch px", target_h_in_patch(b, g),
+                         128.0 / p, 1e-9);
+        }
+    }
+
+    // 7. sigma_for honours SIGMA_FROM_TARGET. Default is 0, i.e. DEFAULT_SIGMA
+    //    literally — see the long note in mosse_filter.h for why the sweep does
+    //    not support switching to the rule.
+    {
+        const TargetBox b{540.0, 960.0, 64.0, 64.0};
+        const RoiGeometry g = roi_for(b, 2.0f, 128, 128);
+        float sr = 0.0f, sc = 0.0f;
+        sigma_for(b, g, &sr, &sc);
+#if SIGMA_FROM_TARGET
+        check_double("sigma from target (rule on)", sr, 4.0, 1e-6);
+#else
+        check_double("sigma = DEFAULT_SIGMA", sr, (double)DEFAULT_SIGMA, 1e-6);
+#endif
+        check_double("sigma isotropic for square box", sr, sc, 1e-9);
+    }
+
+    // 8. Anisotropic sigma reaches gaussian_target_spectrum. DSST §6.1 says "the
+    //    target size in the translation dimensionS" — the plural is the point.
+    {
+        constexpr int N = 32;
+        std::vector<cfloat> g1(N * N), g2(N * N);
+        gaussian_target_spectrum(g1.data(), N, N, 2.0f, 4.0f, 0, 0);
+        gaussian_target_spectrum(g2.data(), N, N, 4.0f, 2.0f, 0, 0);
+        // Swapping the two sigmas must transpose the spectrum, not leave it alone.
+        bool transposed = true, differs = false;
+        for (int u = 0; u < N && transposed; ++u)
+            for (int v = 0; v < N; ++v) {
+                if (std::abs(g1[u * N + v] - g2[v * N + u]) > 1e-6f) transposed = false;
+                if (std::abs(g1[u * N + v] - g2[u * N + v]) > 1e-6f) differs = true;
+            }
+        check_true("aniso sigma transposes", transposed, "");
+        check_true("aniso sigma is not a no-op", differs, "");
+        // And the scalar overload must equal the equal-sigma anisotropic call,
+        // which is what keeps the NumPy golden valid.
+        std::vector<cfloat> s1(N * N), s2(N * N);
+        gaussian_target_spectrum(s1.data(), N, N, 2.5f, 3, -5);
+        gaussian_target_spectrum(s2.data(), N, N, 2.5f, 2.5f, 3, -5);
+        bool same = true;
+        for (int i = 0; i < N * N; ++i)
+            if (std::abs(s1[i] - s2[i]) > 0.0f) same = false;
+        check_true("scalar overload forwards exactly", same,
+                   "the golden depends on this");
+    }
+
+    // 9. IoU. Closed-form cases, including the one that catches an
+    //    intersection/union swap (which agrees at overlap 1.0 and nowhere else).
+    {
+        const TargetBox a{100.0, 100.0, 40.0, 40.0};
+        check_double("IoU self", box_iou(a, a), 1.0, 1e-12);
+        const TargetBox disjoint{300.0, 300.0, 40.0, 40.0};
+        check_double("IoU disjoint", box_iou(a, disjoint), 0.0, 1e-12);
+        // Half-overlap along one axis: intersection 20x40, union 2*1600-800.
+        const TargetBox half{120.0, 100.0, 40.0, 40.0};
+        check_double("IoU half overlap", box_iou(a, half), 800.0 / 2400.0, 1e-12);
+        // Concentric, one twice the side: inter 1600, union 6400.
+        const TargetBox big{100.0, 100.0, 80.0, 80.0};
+        check_double("IoU nested", box_iou(a, big), 1600.0 / 6400.0, 1e-12);
+        check_true("IoU symmetric",
+                   std::fabs(box_iou(a, half) - box_iou(half, a)) < 1e-15, "");
+    }
+}
+
+// ---------------------------------------------------------------------------
+// DSST 1-D scale filter.
+//
+// Analytic, no golden. The 1-D filter update is the SAME CODE already checked
+// against NumPy at 2-D (filter_init/filter_update are dimension-agnostic), so a
+// new golden would re-test tested code. What is genuinely new is the DFT, the
+// feature extraction and the detect loop — and every property of those worth
+// asserting has a closed form.
+// ---------------------------------------------------------------------------
+void run_scale_tests()
+{
+    using namespace mosse;
+    printf("\nDSST 1-D scale filter (analytic)\n");
+
+    constexpr int S = 33;
+
+    // 1. DFT closed forms. A delta transforms to a constant, a constant to a
+    //    delta, and forward-then-inverse is the identity. Between them these pin
+    //    the sign convention, the normalisation and the indexing.
+    {
+        std::vector<cfloat> in(S), out(S), back(S);
+        in[0] = cfloat(1.0f, 0.0f);
+        dft_1d(in.data(), out.data(), S, false);
+        double worst = 0.0;
+        for (int k = 0; k < S; ++k)
+            worst = std::max(worst, (double)std::abs(out[k] - cfloat(1.0f, 0.0f)));
+        check_double("DFT: delta -> constant", worst, 0.0, 1e-5);
+
+        std::fill(in.begin(), in.end(), cfloat(1.0f, 0.0f));
+        dft_1d(in.data(), out.data(), S, false);
+        worst = (double)std::abs(out[0] - cfloat((float)S, 0.0f));
+        for (int k = 1; k < S; ++k) worst = std::max(worst, (double)std::abs(out[k]));
+        check_double("DFT: constant -> delta", worst, 0.0, 1e-4);
+
+        Lcg rng(12345);
+        for (int k = 0; k < S; ++k)
+            in[k] = cfloat((float)rng.next(1000) / 1000.0f,
+                           (float)rng.next(1000) / 1000.0f);
+        dft_1d(in.data(), out.data(), S, false);
+        dft_1d(out.data(), back.data(), S, true);
+        worst = 0.0;
+        for (int k = 0; k < S; ++k)
+            worst = std::max(worst, (double)std::abs(back[k] - in[k]));
+        check_double("DFT: round-trip identity", worst, 0.0, 1e-5);
+    }
+
+    // 2. The 1-D target degenerates cleanly at rows = 1. This is the property
+    //    the whole "reuse the 2-D filter" argument rests on, and DSST §3 asserts
+    //    it in prose; here it is asserted in code. Cross-checked against a direct
+    //    DFT of the spatial wrapped Gaussian rather than against a second copy of
+    //    the closed form.
+    {
+        const float sig = (float)S / 16.0f;
+        std::vector<cfloat> G(S);
+        gaussian_target_spectrum(G.data(), 1, S, sig, 0, 0);
+
+        std::vector<cfloat> g(S), Gd(S);
+        for (int n = 0; n < S; ++n) {
+            const double dn = (n <= S / 2) ? n : n - S;
+            g[n] = cfloat((float)std::exp(-0.5 * dn * dn / ((double)sig * sig)), 0.0f);
+        }
+        dft_1d(g.data(), Gd.data(), S, false);
+        // The closed form drops the constant gain, so compare shapes.
+        double sc = (double)Gd[0].real() / (double)G[0].real();
+        double worst = 0.0;
+        for (int k = 0; k < S; ++k)
+            worst = std::max(worst, (double)std::abs(Gd[k] - G[k] * (float)sc));
+        check_double("1-D target vs direct DFT", worst / std::abs(sc), 0.0, 1e-3);
+        check_true("1-D target is real at dr=0",
+                   std::abs(G[3].imag()) < 1e-6f, "centred => conj(G) == G");
+    }
+
+    // 3. End to end on a synthetic pyramid. Build a frame with a box of known
+    //    size, train at that size, then present the SAME frame while claiming a
+    //    wrong box size — the filter must report the level that corrects it.
+    //    This is the test that would fail on a sign error in the detect loop,
+    //    an off-by-one in the wrap, or a transposed sample layout.
+    {
+        constexpr int FR = 256, FC = 256;
+        std::vector<uint8_t> frame((size_t)FR * FC, 60);
+        // A bright square of side 64, centred.
+        for (int r = 96; r < 160; ++r)
+            for (int c = 96; c < 160; ++c)
+                frame[(size_t)r * FC + c] = 200;
+
+        ScaleFilter sf;
+        scale_filter_config(sf, S, 1.02f, 64.0, 64.0, 16.0f);
+        check_int("template area <= cap", sf.dims() <= SCALE_TMPL_AREA ? 1 : 0, 1);
+        check_true("S forced odd", (sf.n_scales % 2) == 1, "");
+
+        std::vector<cfloat> F((size_t)sf.sample_elems());
+        scale_extract(sf, frame.data(), FR, FC, 128.0, 128.0, 64.0, 64.0, F.data());
+        scale_update(sf, F.data(), 1.0f);
+        check_true("scale filter initialises", sf.initialized, "");
+
+        // Correct size in, no change out.
+        std::vector<cfloat> Z((size_t)sf.sample_elems());
+        scale_extract(sf, frame.data(), FR, FC, 128.0, 128.0, 64.0, 64.0, Z.data());
+        ScaleResult r0 = scale_detect(sf, Z.data(), DEFAULT_EPS_REL);
+        check_int("correct scale -> level 0", r0.idx, 0);
+        check_double("correct scale -> factor 1", r0.factor, 1.0, 1e-9);
+
+        // Claim the box is 10% too SMALL. The true object then looks larger than
+        // the template expects, so the filter must select a POSITIVE level.
+        scale_extract(sf, frame.data(), FR, FC, 128.0, 128.0, 58.0, 58.0, Z.data());
+        ScaleResult rs = scale_detect(sf, Z.data(), DEFAULT_EPS_REL);
+        check_true("under-sized box -> positive level", rs.idx > 0,
+                   ("idx " + std::to_string(rs.idx) + ", factor "
+                    + std::to_string(rs.factor)).c_str());
+        // Claim it is 10% too LARGE -> negative level.
+        scale_extract(sf, frame.data(), FR, FC, 128.0, 128.0, 71.0, 71.0, Z.data());
+        ScaleResult rl = scale_detect(sf, Z.data(), DEFAULT_EPS_REL);
+        check_true("over-sized box -> negative level", rl.idx < 0,
+                   ("idx " + std::to_string(rl.idx) + ", factor "
+                    + std::to_string(rl.factor)).c_str());
+        check_true("levels are opposite in sign", rs.idx * rl.idx < 0,
+                   "a filter that always answers the same way would pass one of these");
+    }
+
+    // 3b. CONVERGENCE, which is the property that actually decides whether the
+    //     filter is useful. A single application UNDER-corrects — the test above
+    //     answers +3 (factor 1.061) to a box that is 10% too small — because the
+    //     scale response is a correlation peak on a discrete grid smoothed by a
+    //     sigma = S/16 target. DSST relies on iterating across frames, so what
+    //     must be asserted is that repeated application walks the box TOWARDS the
+    //     truth and settles, not that one shot lands on it.
+    //
+    //     Trained once at the true size (as frame 0 does, where the box IS the
+    //     ground truth) and then applied repeatedly without retraining, which is
+    //     what a static scene reduces to.
+    {
+        constexpr int FR = 256, FC = 256;
+        std::vector<uint8_t> frame((size_t)FR * FC, 60);
+        for (int r = 96; r < 160; ++r)
+            for (int c = 96; c < 160; ++c)
+                frame[(size_t)r * FC + c] = 200;
+
+        ScaleFilter sf;
+        scale_filter_config(sf, S, 1.02f, 64.0, 64.0, 16.0f);
+        std::vector<cfloat> F((size_t)sf.sample_elems());
+        scale_extract(sf, frame.data(), FR, FC, 128.0, 128.0, 64.0, 64.0, F.data());
+        scale_update(sf, F.data(), 1.0f);
+
+        double h = 51.2;                       // start 20% too small
+        const double err0 = std::fabs(h - 64.0);
+        double prev = err0;
+        bool monotone = true;
+        for (int it = 0; it < 12; ++it) {
+            scale_extract(sf, frame.data(), FR, FC, 128.0, 128.0, h, h, F.data());
+            const ScaleResult r = scale_detect(sf, F.data(), DEFAULT_EPS_REL);
+            h *= r.factor;
+            const double e = std::fabs(h - 64.0);
+            if (e > prev + 1e-9) monotone = false;   // must never move away
+            prev = e;
+        }
+        char det[96];
+        snprintf(det, sizeof(det), "51.2 -> %.2f (truth 64), error %.2f -> %.2f px",
+                 h, err0, prev);
+        check_true("scale converges toward truth", prev < err0 * 0.35, det);
+        check_true("scale never diverges", monotone,
+                   "error must not increase on any iteration");
+    }
+
+    // 4. SCALE_N = 1 must be a complete no-op, so the whole feature can be
+    //    switched off with one make variable — the CONV_VECTORIZE=0 pattern.
+    {
+        ScaleFilter off;
+        scale_filter_config(off, 1, 1.02f, 64.0, 64.0, 16.0f);
+        check_true("S=1 disables the filter", !off.enabled(), "");
+        std::vector<cfloat> Z(1);
+        ScaleResult r = scale_detect(off, Z.data(), DEFAULT_EPS_REL);
+        check_true("disabled -> invalid, factor 1", !r.valid && r.factor == 1.0, "");
+        scale_update(off, Z.data(), 1.0f);
+        check_true("disabled -> no training", !off.initialized, "");
+    }
+
+    // 5. An untrained filter must never claim a scale. Without this the very
+    //    first frame would apply a filter of zeros and resize the box from noise.
+    {
+        ScaleFilter fresh;
+        scale_filter_config(fresh, S, 1.02f, 64.0, 64.0, 16.0f);
+        std::vector<cfloat> Z((size_t)fresh.sample_elems());
+        ScaleResult r = scale_detect(fresh, Z.data(), DEFAULT_EPS_REL);
+        check_true("untrained -> invalid", !r.valid, "");
+    }
+}
+
 }  // namespace
 
 int main(int argc, char **argv)
@@ -536,6 +888,8 @@ int main(int argc, char **argv)
     // Placed LAST so a missing or short golden still fails fast at exit(2) above
     // — these tests need no golden at all and would otherwise mask that.
     run_psr_tests();
+    run_box_tests();
+    run_scale_tests();
 
     printf("\n  OVERALL: %s (%d failure%s)\n\n",
            g_failures ? "FAIL" : "PASS", g_failures, g_failures == 1 ? "" : "s");

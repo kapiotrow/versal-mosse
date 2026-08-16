@@ -1,0 +1,19 @@
+name pad_3p0
+frame_rows 1080
+frame_cols 1920
+roi_row 100
+roi_col 100
+roi_h 129
+roi_w 129
+patch_rows 128
+patch_cols 128
+twice 0
+exp_mean 55905
+exp_var 4019527
+exp_inv_q 1046
+exp_beats 4096
+step_y 258
+step_x 258
+fy_nonzero 127
+fx_nonzero 127
+why slow phase drift; adjacent to 1:1 in ratio

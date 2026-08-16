@@ -1,0 +1,19 @@
+name clamp_botright
+frame_rows 1080
+frame_cols 1920
+roi_row 1000
+roi_col 1850
+roi_h 200
+roi_w 200
+patch_rows 128
+patch_cols 128
+twice 0
+exp_mean 58501
+exp_var 5328182
+exp_inv_q 908
+exp_beats 4096
+step_y 400
+step_x 400
+fy_nonzero 120
+fx_nonzero 120
+why y1 clamps one row before y0

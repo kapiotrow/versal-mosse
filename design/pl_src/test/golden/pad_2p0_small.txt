@@ -1,0 +1,19 @@
+name pad_2p0_small
+frame_rows 1080
+frame_cols 1920
+roi_row 534
+roi_col 954
+roi_h 22
+roi_w 22
+patch_rows 128
+patch_cols 128
+twice 0
+exp_mean 56895
+exp_var 6436933
+exp_inv_q 826
+exp_beats 4096
+step_y 44
+step_x 44
+fy_nonzero 126
+fx_nonzero 126
+why 5.8x upsample; smallest ROI

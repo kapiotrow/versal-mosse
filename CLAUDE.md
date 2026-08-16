@@ -544,8 +544,40 @@ Bolme PSR 172, nothing railed at any stage, and the response profile matches
 The PSR-gating regression run (same 128×128/ch1/5-2-2 build as run D, XSA reused unchanged)
 measured **~50 min per frame**, ~2× the number recorded above. The ~26 min came from run B's
 wall clock; nothing about the design changed between them, so treat this as machine/load
-variance rather than a regression. **Budget ~50 min/frame when planning a hw_emu run**, i.e.
-~1.7 h for `ITER_CNT=2` and ~2.5 h for `ITER_CNT=3`.
+variance rather than a regression. **Budget ~50 min/frame at ch1**, i.e. ~1.7 h for
+`ITER_CNT=2` and ~2.5 h for `ITER_CNT=3`.
+
+**SECOND FRAME-TIME CORRECTION 2026-08-16 — AND THIS ONE IS AN ORDER OF MAGNITUDE.
+EVERY FIGURE ABOVE IS ch1. DO NOT APPLY THEM TO ch16.**
+
+Measured on a ch16 run (128×128, `CONV2D_MODE=0`, `ITER_CNT=3`, 5-2-2), started 11:35:41 UTC
+and killed by hand 172 minutes later having completed ch0-ch3 and started ch4 —
+`runs/occlusion_0816_1321.log`:
+
+```
+                        ch1 (measured)   ch16 (measured)
+per channel                    ~50 min          ~43 min
+per FRAME                      ~50 min        ~11.5 h     (16 channels)
+ITER_CNT=2                      ~1.7 h          ~23 h
+ITER_CNT=3                      ~2.5 h          ~34 h
+```
+
+The per-channel cost is almost the same at both; the frame cost is not, because the
+per-channel loop runs 16×. **The "~1.7 h for ITER_CNT=2" this file carried for the ch16 run
+was a ch1 number applied to a ch16 plan — wrong by ~13×.**
+
+**The reasoning that produced it is also wrong, and that matters more than the number.**
+This file attributed the speedup to "3.5× faster kernels and 4× fewer DMA transactions". But
+**hw_emu wall-clock does not track AIE compute**: the 2026-08-13 echo-mode ch16 run, in which
+`conv2d` returned at the top of the function and did *no MAC work whatsoever*, still took
+~14 h/frame. The emulator is simulating the PL and the DMA/NoC traffic, and that cost is
+almost independent of what the AIE cores do. Measured 11.5 h now against 14 h then is a
+**1.2×** improvement — consistent with the DMA count falling 4×, and flatly inconsistent with
+kernel vectorization mattering at all to emulation.
+
+So: **vectorizing a kernel speeds up the DESIGN, not the emulation of it.** Size hw_emu runs
+from measured wall clock at the same `N_CHANNELS`, never by scaling a ch1 measurement and
+never by reasoning from AIE cycle counts.
 
 **Four findings drove that, and all four were invisible to `err=0 px`** — which passed in
 every single run, before and after:
@@ -560,13 +592,276 @@ every single run, before and after:
 4. **Both custom kernels were scalar**, worth ~19 ms/frame; cmul's arithmetic loop was not
    even pipelined, behind a stale assembler-OOM workaround.
 
-**Remaining expensive item:** the ch16 run at budget 5-3-4. **Largest functional gap:** PSR
-gating (Bolme §3.5) — **implemented 2026-08-15, covered by 34 native assertions, and
-regression-validated on hardware (bit-exact vs run D, `[gate] ACCEPT psr=172.41`). It has
-still never FIRED on hardware.** The occlusion run (`ITER_CNT=3 OCCLUDE_MASK=0x2`, ~2.5 h)
-is what turns it from inert-and-correct into validated.
+**Remaining expensive item:** the ch16 run — **~23 h for `ITER_CNT=2`, measured, not the
+~1.7 h this file used to claim** — at budget **4-2-1**, not 5-3-4. Run ch1 (~1.7 h) first;
+it exercises all the new host code and 5-3-4 no longer suits the geometry. See the ch16
+entry under In Progress. **Largest functional gap:** PSR
+gating (Bolme §3.5) — **DONE 2026-08-15**: 34 native assertions, a bit-exact hardware
+regression vs run D, and an occlusion run in which the gate fired (`LOW_PSR`, PSR 3.90),
+held the position, froze the filter provably bit-exactly, and reacquired the target on the
+next frame with `err=0 px`.
 
 ### Completed
+- [x] **TEST-SEQUENCE GENERATION, FOR RUNS OF HUNDREDS OF FRAMES (2026-08-16) — host-only.**
+      Three things about the shipped test data do not survive contact with real hardware,
+      where a frame costs ~20 ms instead of ~11.5 h and a run can afford hundreds of frames
+      rather than two. All defaults reproduce the previous behaviour exactly, so existing
+      hw_emu comparisons stay valid.
+
+      **1. The background was regenerated every frame — ~0.6-1.2 s on the A72.**
+      `fill_background` runs six sinusoids per pixel over 1080×1920: **12.4 M `sin()` calls per
+      frame**, measured at 193 ms on an x86 host. Free when a frame took 11.5 h; on hardware it
+      is **30-90× the entire pipeline**, so the FPS number — one of the two things a board run
+      exists to produce — would have been a measurement of the test harness. The background is
+      static by construction (fixed LCG seed, no frame dependence), so it is now generated once
+      and only the dirty rectangle is restored. No flag: the old behaviour was simply wrong.
+      The occluder dirties the whole frame, which is why the rect has to be able to grow to
+      full size rather than being assumed target-sized.
+
+      **2. The target walked off the frame at about frame 48.** The legacy scheme injects at
+      `pos + (IMPULSE_DR, IMPULSE_DC)` and `pos` then moves by the detected displacement, i.e.
+      constant velocity (10,−7)/frame from row 540 on a 1080-row frame. `TRAJECTORY=1` puts it
+      on a closed ellipse instead — validated over 2000 frames: row 360..720, col 600..960, ROI
+      inside the frame on every frame, peak step **9.42 px/frame** against the 12.2 the
+      pipeline is already proven at, and it starts exactly at the initial centre so frame 0
+      still trains on a centred target.
+
+      **AND IT CHANGES SOMETHING MORE IMPORTANT THAN RUN LENGTH.** Under the legacy scheme the
+      target is planted at the tracker's OWN ESTIMATE plus a constant — the ground truth
+      follows the tracker wherever it goes, so it cannot drift and `err=0 px` is close to
+      self-fulfilling. On an absolute scripted path the truth is independent of the estimate,
+      so drift is real and measurable. The pass/fail expectation is now derived from where the
+      target was actually DRAWN rather than from a constant; at `TRAJECTORY=0` that reduces to
+      the old constant exactly.
+
+      **3. The target never changed size, so the scale filter had nothing to track.**
+      `inject_target_frame` drew at the fixed `TARGET_H/W` macros, so a hardware run could show
+      the DSST filter does not crash and nothing more. `SCALE_TRAJ=1` adds a sinusoidal
+      envelope, 0.70×..1.30× over 200 frames — **0.99%/frame peak against the filter's
+      2%/frame step size**, which is the rate limit that actually matters (`SCALE_ETA=0.025`
+      makes the model adapt slowly, so the envelope must move far slower than the single-frame
+      range).
+
+      **Also fixed:** `OCCLUDE_MASK` is a 32-bit mask indexed by frame number, so it cannot
+      express anything past frame 31 and `mask >> frame` is undefined at frame ≥ 32 — now
+      guarded, with `OCCLUDE_PERIOD`/`OCCLUDE_LEN`/`OCCLUDE_START` as the periodic alternative.
+
+      **`OCCLUDE_START` is a warm-up and it matters more than it looks.** Without it the first
+      occlusion lands on frame 1 — the filter occluded immediately after being initialised
+      from a single patch, which tests the gate against a filter that has not converged and
+      conflates two failures if it goes wrong. Default 30, i.e. ~4 time constants at
+      `MOSSE_ETA=0.125`. **The scale filter is 5× slower** (`SCALE_ETA=0.025` ⇒ ~40 frames per
+      constant, ~120 to settle), so a run intended to occlude a converged SIZE estimate rather
+      than a converged position wants `OCCLUDE_START=120`. The startup line prints the warm-up
+      in time constants for both filters so the choice is visible in the log.
+
+      **And the run now produces a CURVE, not a verdict:** per-frame IoU and centre error
+      against the drawn box, with a run summary reporting overlap precision at PASCAL's 0.5
+      threshold, mean/worst IoU and mean/worst centre error. That is the OTB-style metric both
+      papers report and which was uncomputable before the target box existed — and it is
+      uncomputable in hw_emu for a different reason: two frames is not a curve.
+
+      New host-only make variables: `TRAJECTORY`, `TRAJ_AMP_R/C`, `TRAJ_PERIOD`, `SCALE_TRAJ`,
+      `SCALE_TRAJ_AMP/PERIOD`, `OCCLUDE_PERIOD`, `OCCLUDE_LEN`.
+
+- [x] **DSST 1-D SCALE FILTER (2026-08-16) — host only, natively tested, and it CONVERGES.**
+      `docs/1609.06141v1.pdf` §5.1. A separate 1-D correlation filter over scale rather than
+      the ICCV'15 paper's exhaustive multi-resolution search, for a reason that is stronger
+      here than in the paper: DSST Table 1 already beats exhaustive on **both** axes (OP 67.7
+      vs 65.2, 25.4 vs 16.9 FPS), and on this hardware an exhaustive search would push patches
+      resampled by ±30% through `roi_crop → conv2d → FFT` every frame — moving `|F|` and
+      therefore the shift budget, the coupling that has forced two budget hunts — while
+      spending exactly the 30 fps headroom that vectorizing conv2d and cmul bought back.
+
+      **The filter is the existing filter at `rows = 1`.** DSST §3 states it in prose ("the
+      same approach can be used to learn 1-dimensional scale estimation filters… accomplished
+      by only adapting the feature extraction step"); it holds in this code because
+      `filter_init`/`filter_update`/`FilterState::resize` read geometry from the state, and
+      `gaussian_target_spectrum(G, 1, S, σ, 0, 0)` degenerates cleanly since
+      `signed_freq(0,1) == 0`. So the reused surface is large and the new code is the feature
+      extraction, a DFT and the detect loop. Same conjugation convention as the translation
+      path — one convention in the design, because the header already records how silent a
+      mix-up is.
+
+      **Defaults from §6.1: S=33, a=1.02, η=0.025 (NOT the translation filter's 0.125),
+      σ_s = S/16, template capped at 512 px.** `SCALE_N=1` disables it completely and
+      reproduces the pre-scale behaviour — the `CONV_VECTORIZE=0` bisection lever, asserted.
+
+      **19 analytic assertions, no new goldens** (the 1-D update is the same code already
+      golden-tested at 2-D, so a golden would re-test tested code). The two that earn their
+      keep:
+      ```
+      under-sized box -> level +3 (factor 1.061)   over-sized -> level -4 (0.924)
+      convergence: 51.2 -> 63.66 against a truth of 64, error 12.80 -> 0.34 px, MONOTONE
+      ```
+      A single application UNDER-corrects — +3 where +5 would be exact — because the scale
+      response is a correlation peak on a discrete grid smoothed by a σ=S/16 target. That is
+      not a bug and the convergence test is what shows it: DSST iterates across frames, so the
+      property to assert is that repeated application walks toward the truth and never away,
+      which it does, to 0.5%.
+
+      **MEASURED COST: 1.54 ms/frame on x86 (d=484, S=33, detect + update).** Not free, and
+      that matches the paper — DSST Table 1 has the scale filter costing *more* than the
+      translation filter (17.5 → 39.4 ms/frame). Expect ~3-5 ms on the A72. Still far below a
+      3-scale exhaustive search's ~16 ms of extra AIE + DMA, so the choice stands, but do not
+      describe it as free.
+
+      **fDSST's PCA COMPRESSION IS NOT THE RIGHT NEXT OPTIMISATION HERE — MEASURED
+      2026-08-16, and this entry said the opposite an hour earlier.** The retracted claim was
+      "~28× fewer DFTs, i.e. ~0.06 ms". The DFT saving is real and even larger than that
+      (**45.9× measured**), but it counted only what compression saves and not what it costs.
+      Measured per frame, d=484, S=33, on the same machine:
+      ```
+      today: complex DFT, d transforms per sample                1.136 ms   1.00x
+      (b) real-input DFT + Hermitian symmetry, NO PCA            0.365 ms   3.11x
+      (c) full fDSST PCA: 2 QR + 1 projection + 3 compressed DFT 0.713 ms   1.59x
+            of which  MGS/QR of one 484x33 matrix   0.231 ms  (x2)
+                      Q^T z projection              0.214 ms
+                      the compressed DFTs themselves 0.012 ms
+      ```
+      **PCA is beaten roughly 2:1 by simply not doing complex arithmetic on real data**, and
+      the reason is structural rather than a tuning accident: **the QR is O(d·S²) — the same
+      order as the DFT it eliminates.** Compression converts a complex O(dS²) transform into a
+      real O(dS²) factorisation, which is a constant-factor win (real MACs are ~3× cheaper),
+      not an asymptotic one. The compressed DFTs it enables cost 0.012 ms; the machinery to
+      enable them costs 0.68 ms.
+
+      The paper wins where we do not because its parameters differ: d≈1000 with S=17 gives a
+      59× compression against our 14.7×, its QR is ~1.8× cheaper (dS² = 289k vs our 527k), it
+      *also* halves S (33→17, interpolating the output back), and most of fDSST's headline 2×
+      comes from the TRANSLATION filter's 32→18 reduction on a 2-D grid, not from the scale
+      filter at all.
+
+      **Do the real-input DFT instead**: the features are real by construction
+      (`scale_extract` writes `cfloat(v, 0)`), so half the multiplies are against a zero
+      imaginary part, and Hermitian symmetry makes only S/2+1 of the S outputs independent.
+      3.11× for no algorithmic change and no new failure mode, and it is checkable against the
+      current path to float precision.
+
+      After that the real levers are **d and S, not PCA**: the template is 22×22=484 and the
+      rank argument says at most S=33 dimensions carry information anyway, so a 16×16 template
+      halves the cost outright; and S=33→17 with interpolation (what fDSST actually does for
+      the scale filter) halves both the extraction and the transform.
+
+      **Perspective: this is optimising a non-bottleneck.** 1.39 ms sits against a 13-22 ms
+      frame; conv2d (4.1 ms) and the DMA (2.2-10.9 ms) are both larger. Do not spend
+      correctness risk here before the ch16 run.
+
+      **One cost trap found and fixed while writing the tests:** the obvious direct DFT
+      evaluates `sin`/`cos` in the inner loop, i.e. n² transcendental calls per transform.
+      With d≈484 transforms per sample and two samples per frame that is **~2M sin/cos per
+      frame** — tens of milliseconds, which would have made the scale filter the most
+      expensive thing in a design whose entire AIE budget is 6.4 ms. The twiddle table is
+      built once per frame instead.
+
+- [x] **BOUNDING-BOX STATE, ROI PADDING AND σ ANCHORING (2026-08-16) — host only, no AIE
+      recompile, no XSA relink, no PL re-synthesis.** The tracker's state was `pos_row`/
+      `pos_col`, two ints. It is now a `TargetBox` (centre + size, frame px) with
+      `roi = box × TARGET_PADDING`, so the filter finally sees background context — the thing
+      both papers use a larger-than-object window *for* (Bolme §3.1, Danelljan §3.1).
+      `roi_crop` takes all geometry as runtime AXI-Lite scalars, which is why this costs no
+      rebuild of anything but the host ELF.
+
+      **THE TWO CONVERSIONS THAT WERE INVISIBLE — the real content of this change.** The peak
+      is located in PATCH bins; the position lives in FRAME pixels. While `roi_h ==
+      patch_rows` those are the same number, so `pos_row += dr` (`:1480`) and
+      `dr == IMPULSE_DR` (`:1482`) were both accidentally correct. Padding breaks both by the
+      resample ratio, and the symptom is a tracker that localises confidently and **drifts** —
+      invisible to `err=0 px`, which is the failure mode this file already records four times.
+      Now `patch_dr_to_frame` / `frame_dr_to_patch` in `mosse_filter.{h,cpp}`, i.e. under
+      `make test_host`, with 33 analytic assertions including a `frame→patch→frame` round-trip
+      over four paddings (worst error 0.5 frame px = exactly half a bin, the real quantisation)
+      and an anisotropic box where a single shared ratio would pass every square-target test
+      and fail.
+
+      **`TARGET_H/W=64` with `TARGET_PADDING=2` gives `roi = 128` — EXACTLY today's geometry.**
+      So the resample stays 1:1, the interpolator stays dormant, both conversions are
+      identities, and the expected displacement is still literally `(IMPULSE_DR, IMPULSE_DC)`.
+      Adopting the box is therefore a single-variable change and any later padding move is a
+      separate one.
+
+      **The test harness had to be rebuilt, and that is not incidental.** `inject_target_frame`
+      drew an ~11×11 object inside a 128×128 ROI — an effective padding of **~11.6**, not 1 —
+      so a σ anchored to a declared 64 px box would have been anchored to a fiction. The shape
+      is now scaled by `TARGET_H/W` (reproducing the original exactly at 11×11, asymmetries
+      intact) and the background is a **band-limited texture** rather than a flat fill.
+      That second part is load-bearing: padding exists so the filter can learn
+      target-vs-background, so against `memset(BACKGROUND=40)` more padding is strictly less
+      target and *any* padding comparison is decided before it runs.
+
+      **IoU reporting lands with it** (`box_iou`, PASCAL 0.5 flagged) — the metric both papers
+      report and which was previously impossible to compute, since there was no box.
+
+      **σ stays at 2.0 and the DSST rule is a build flag, not the default** — see the padding
+      sweep entry below for why the evidence does not support switching. `SIGMA_FROM_TARGET=1`
+      gives σ=4 at padding 2 and is asserted in `test_host` under both settings.
+
+      New host-only make variables, all in `GCC_FLAGS` and deliberately **not** `AIE_FLAGS`
+      (the AIE never sees the ROI): `TARGET_H`, `TARGET_W`, `TARGET_PADDING`, `MOSSE_SIGMA`,
+      `SIGMA_FACTOR`, `SIGMA_FROM_TARGET`, `MOSSE_ETA`, `FRAME_TEXTURE`. `MOSSE_SIGMA` and
+      `MOSSE_ETA` also give `DEFAULT_SIGMA`/`DEFAULT_ETA` the `#ifndef` escape they lacked —
+      they were hard `constexpr`s, and a calibration constant that can only be changed by
+      editing a header does not get swept.
+
+- [~] **ROI PADDING SWEEP (2026-08-16) — padding SETTLED at ≥2; σ NOT settled, and the
+      reason is that PSR cannot settle it.** `phase1_sweep.py --roi-model synth` now
+      synthesizes a frame, crops an ROI of `target × padding`, and runs the bit-exact Stage A
+      (`roi_crop_ref.py`), so padding finally has somewhere to act — the old `--roi-model file`
+      path starts from a patch already Stage-A'd at 1:1 and has no notion of an ROI at all.
+      Held out properly: `--frame-shift` moves the target in FRAME pixels and re-crops, so the
+      evaluation patch differs by resample phase, border content and its own mean/σ.
+      (`--holdout`'s `np.roll` is a circular shift of the Stage-A *output*, which cannot
+      physically occur; the combination is now rejected rather than silently weaker.)
+
+      **Padding, at target 64, budget 4-2-2, ch16, held out (10,−7) frame px:**
+      ```
+      padding  best PSR(B)   best ratio   locerr   notes
+        1.5       18.4          2.59       0.75px  upsamples 1.33x; WORST on both metrics
+        2.0       45.7          4.97       0.00px  roi 128 -> resample is 1:1
+        2.5       51.5          5.68       0.00px  aliasing: 128 of 160 src rows read
+        3.0       49.8          5.90       0.00px  aliasing + 3.57% of samples clipped
+      ```
+      **Padding 1.5 is clearly bad and ≥2 is clearly right** — consistent with DSST's 2 and
+      fDSST's 3. 2.5-3.0 edge out 2.0 on both metrics but trigger the aliasing detector
+      (bilinear has no prefilter, so beyond ~2× decimation source rows are skipped outright)
+      and 3.0 clips 3.57% of samples. **Recommend padding 2.0**: it is the only value where
+      the resample stays 1:1 at target 64, which makes it the clean single-variable step.
+
+      **σ IS A DIFFERENT STORY, AND THE PLANNED CHANGE IS NOT SUPPORTED.** The plan was to
+      move σ 2 → 4 per DSST §6.1's "σ = target size / 16" (at padding 2 the target is 64 patch
+      px, so σ=4). Measured, at padding 2:
+      ```
+      sigma    0.75    1.00    1.50    2.00    2.50    3.20    4.00    5.33
+      PSR(B)   80.3    71.8    55.2    45.7    41.2    37.5    30.5    19.3
+      ratio     2.58    3.78    4.97    4.47    4.23    4.09    3.50    1.85
+      ```
+      **Bolme PSR is MONOTONE DECREASING in σ, all the way down to sub-pixel.** So PSR does
+      not select σ — it just rewards a sharper peak, and a delta target would maximise it
+      trivially. σ=4 scores worse than σ=2 on both metrics, but that is not evidence σ=4 is
+      wrong; it is evidence the metric cannot arbitrate. What σ actually buys is robustness to
+      appearance change, and a single-frame translation-only holdout does not exercise that.
+
+      **A tempting mechanistic explanation was tested and REFUTED.** `b2_removed` rises 433 →
+      3018 from σ=2 to σ=4, so Stage B2 — which nulls the 9 lowest bins, exactly where a wide
+      Gaussian keeps its energy — looked like the cause. Re-run with `--no-b2` (new flag,
+      models `B2_NULL_BINS=0`): PSR goes 45.7 → 46.5 at σ=2 and 30.5 → 32.9 at σ=4. B2 costs
+      ~2 PSR points at large σ; the 45.7 → 30.5 drop survives with B2 off. **The σ dependence
+      is intrinsic to the metric, not a Stage-B2 artifact.**
+
+      **Consequence for the plan: keep σ=2.0 as the default and make it a build parameter.**
+      Switching to the paper rule on the strength of a metric that is monotone in σ would be
+      exactly the "plan built on unvalidated measurement" failure this file already records
+      three times. σ needs real video, or at minimum a holdout with scale/appearance change,
+      to arbitrate. The DSST rule stays available as `SIGMA_FACTOR`.
+
+      **Two further things the sweep now reports that no PSR number reveals:**
+      - **`px/bin` = `roi_h/patch_rows`, the localisation quantum in FRAME pixels.** At
+        padding 3 on an 85 px target one response bin is 2 frame px, so the tracker cannot
+        resolve better than 2 px however good its PSR looks.
+      - **The centring bias is constant at 0.5 PATCH px but grows in FRAME px** with the
+        resample ratio (0.375 → 0.75 source px over padding 1.5 → 3.0). It does not cancel in
+        a closed loop, because `pos_row` is updated from the peak every frame.
+
 - [x] **RUN D — the `mean_prev` seed CONFIRMED ON HARDWARE (2026-08-14).** ch1, 128×128,
       `ITER_CNT=2`, budget 5-2-2 — identical to run C, so the seed is the only variable.
       ```
@@ -701,8 +996,11 @@ is what turns it from inert-and-correct into validated.
 - [x] **RUN B — hw_emu 128×128 ch1 ITER_CNT=2, the new configuration end to end
       (2026-08-14). Tracks correctly; found a REAL budget problem.**
       `CONV2D_MODE=0`, `CONV_RELU=0`, both kernels vectorized, WS=8, budget 4-3-3.
-      ~26 min per frame — down from the ~90 min reference, consistent with 3.5× faster
-      kernels and 4× fewer DMA transactions.
+      ~26 min per frame at **ch1** — down from the ~90 min reference. *(The "consistent with
+      3.5× faster kernels" gloss that used to follow is WRONG and was retracted 2026-08-16:
+      hw_emu wall clock is dominated by simulating the PL and the DMA/NoC, not by AIE cycles —
+      the echo-mode run did no MAC work at all and still took ~14 h/frame. See the second
+      frame-time correction under Current status.)*
       ```
       Frame 1: displacement (10,-7) -> pos (550,953)  peak|re|=14076  [OK: matches injected offset]
       F_ch     max|.| = 32768   rails=11      <-- RAILED
@@ -976,8 +1274,36 @@ is what turns it from inert-and-correct into validated.
       see the Key design decisions entry). `hanning_*.h` switched to the periodic Hann.
       Cost: 44 DSP / 10 BRAM18 / 7694 LUT in PL, ~472 µs/frame (1.4% of a 33 ms budget),
       no new AIE tiles.
-- [x] roi_crop verified bit-exact against a NumPy reference in native C simulation
-      (6 cases: 1:1, 2× up, 2× down, both edge-clamp paths, whole frame)
+- [x] **roi_crop verified bit-exact — FOR REAL THIS TIME (2026-08-16). `make test_roi_crop`,
+      17 cases, 0 failures.** This entry previously claimed a 6-case native C simulation
+      against a NumPy reference. **That harness never existed** — no testbench, no `csim`
+      target, no reference, and `git log --all --diff-filter=A -- '*roi*'` returns only the
+      original kernel commit `5b9a40f`. The claim was load-bearing in two places: the scale
+      estimation entry below said the resample "hardware is already built and tested", and
+      `gen_aiesim_vectors.py:926` justified its float Stage A by citing it.
+
+      **And the interpolator had never executed.** Every build to date runs
+      `roi_h == patch_rows`, which makes `step_y` exactly 256, hence `fy == fx == 0`, hence
+      `top = p00<<8`, `val = p00<<16`, `pix = p00` — the entire bilinear datapath
+      (`ap_uint<18> top`, `ap_uint<27> val`, the `>>16`) collapses to a copy.
+
+      **11 of the 17 cases execute it for the first time, and all 17 pass bit-exact.**
+      Coverage: 1:1, 2× up (first nonzero `fy` in the project's history), 2× down, paddings
+      1.5/2.5/3.0, an anisotropic case with `step_y ≠ step_x` (the only one that would catch
+      an x/y transposition), negative `roi_row`/`roi_col`, both edge-clamp paths, whole frame,
+      two `var == 0` paths, the `ROI_INV_Q_MAX` cap plus a negative control just below it, a
+      case where the kernel's two independent floors annihilate a real variance to 0, a
+      non-square patch, the `recompute=0` cached path, and the AXIS framing contract.
+
+      The golden comes from **`scripts/roi_crop_ref.py`**, which `phase1_sweep.py` also uses
+      to model the ROI — one reference, two consumers, so the sweep's padding numbers inherit
+      what this target proves. Tolerance is **zero**, unlike `test_host`'s 1-LSB slack: this
+      is an integer datapath and any difference is a bug.
+
+      **Measured while validating it: the float Stage A in `gen_aiesim_vectors.py:928` differs
+      from the kernel on 40.9% of samples, by at most 2 LSB** (rms 0.65 on a signal of
+      std 32). Small, so nothing already recorded is invalidated — but it is ~2% relative,
+      comparable to the model's own hardware agreement, and it had never been checked.
 - [x] **aiesim s6 PASS** — the first scenario driven by a realistic Stage-A-preprocessed
       patch through the real conv2d path (`make aiesim_plio SCENARIO=s6 CONV2D_MODE=0
       FFT_SHIFT=3 IFFT_COL_SHIFT=6`). `err=0 px`, `rails=0`, all seven checks OK.
@@ -1119,13 +1445,15 @@ inherits their errors, and `err=0 px` passed through every one of these failures
 - **DONE:** x86sim bit-exactness harness; conv2d and cmul vectorized (21.6 → 6.4 ms AIE
   compute); DMA transactions 4258 → 1090; `CONV_RELU=0`; `mean_prev` seeding; offline model
   validated against hardware to 3-11% on the real test patch.
-- **NEXT:** the ch16 confirmation run at budget **5-3-4** — the one thing no cheap run covers
-  is multi-channel accumulation with real conv2d. Predicted: accum 6.2%, response 32.6%,
-  ratio 36.8, peak exact, nothing railed.
-- **PSR gating LANDED 2026-08-15** — native tests pass, and the ch1 hw_emu regression
-  reproduces run D bit-exactly with `[gate] ACCEPT psr=172.41`, so the restructuring is
-  behaviour-preserving and the negative-peak risk is retired. **The occlusion run at
-  `ITER_CNT=3 OCCLUDE_MASK=0x2` (~2.5 h) is the outstanding proof** — see the gaps section.
+- **NEXT: a ch1 run at the new geometry (~1.7 h), THEN one ch16 run (~23 h) at budget
+  4-2-1.** ch16 is the only thing that covers multi-channel accumulation with real conv2d, but
+  at ~11.5 h/frame it is 13× more expensive than this file used to say, and the Phase D/E host
+  code (box state, the patch↔frame conversions, IoU, the scale filter) is compiled but has
+  never executed — ch1 exercises all of it for 1/13th the machine time. Budget 5-3-4 is
+  retired: on the post-2026-08-16 geometry it puts the response at 0.4% of range.
+- **PSR gating COMPLETE 2026-08-15** — native tests, a bit-exact ch1 regression vs run D,
+  and an occlusion run proving the gate fires (PSR 3.90 → `LOW_PSR`), holds position, freezes
+  the filter bit-exactly, and reacquires with `err=0 px`. Largest functional gap: closed.
 - **THEN, in this order:** target size / σ
   anchoring; `TARGET=hw` for the µs/tx number; scale search and RGB.
 - **DROPPED:** `bias_acc` variants (a)/(b) — harmful; raising `eps_rel` — refuted; channel
@@ -1210,8 +1538,9 @@ Original plan follows for reference.
 The signal-processing core of both papers is implemented and validated. What is missing is
 the *tracker* around it. `docs/` holds both PDFs; section numbers below refer to them.
 
-- [~] **PSR failure detection and update gating (Bolme §3.5) — IMPLEMENTED 2026-08-15 and
-      REGRESSION-VALIDATED ON HARDWARE; the gate has still never FIRED on hardware.**
+- [x] **PSR failure detection and update gating (Bolme §3.5) — DONE 2026-08-15. Implemented,
+      regression-validated, and PROVEN FIRING under occlusion on hardware.** This was the
+      largest functional gap in the tracker; it is closed.
 
       **Regression run (hw_emu, 128×128, ch1, `ITER_CNT=2`, budget 5-2-2) reproduces run D
       BIT-EXACTLY.** The XSA and `libadf.a` were not relinked — `aie.flagstamp` was byte-
@@ -1273,7 +1602,7 @@ the *tracker* around it. `docs/` holds both PDFs; section numbers below refer to
       plausible-looking output that costs a day.
 
       **Four failure conditions, not one** — the reason is reported, because "HOLD" alone is
-      unactionable at ~26 min/frame:
+      unactionable at ~50 min/frame at ch1 and ~11.5 h/frame at ch16:
       ```
       ZERO_RESPONSE   peak == 0     the pipeline produced nothing — shift budget/filter scale
       FLAT_SIDELOBE   sdev == 0     constant map; PSR undefined, not infinite
@@ -1309,13 +1638,48 @@ the *tracker* around it. `docs/` holds both PDFs; section numbers below refer to
       independent scans that could disagree about which peak the tracker acted on — one
       driving the position, the other driving the gate.
 
-      **STILL OPEN — the gate has never FIRED on hardware.** The regression above proves it
-      is inert on a good frame (PSR 172.41 against a threshold of 7.00 is a 24× margin), which
-      is the safe half. Run `ITER_CNT=3 OCCLUDE_MASK=0x2` and confirm frame 2 reports
-      `LOW_PSR`, holds the position, and that the frame-1 and frame-2 `H_q15` dumps are
-      **byte-identical**. That byte-comparison is the real assertion; the console line only
-      says the branch was taken. **A gate that has never fired is not a validated gate.**
-      Budget ~2.5 h, not the 80 min first estimated — see the frame-time correction below.
+      **THE GATE HAS NOW FIRED ON HARDWARE — occlusion run 2026-08-15, `ITER_CNT=3
+      OCCLUDE_MASK=0x2` (init → occluded → reacquire). FULL PASS.**
+      ```
+      Frame 1 [OCCLUDED, checkerboard]
+        [psr]  peak 1566  sidelobe mu -2.7 sd 402.1 max 1552   PSR 3.90   ratio 1.01x
+        [gate] frame 1: HOLD  reason=LOW_PSR  psr=3.90  threshold=7.00
+        Frame 1: displacement (9,-3) HELD, pos stays pos (540,960)
+        filter: FROZEN — update and publish both skipped (LOW_PSR)
+      Frame 2 [target returns]
+        [psr]  peak 2534  PSR 172.41  ratio 23.04x
+        [gate] frame 2: ACCEPT   REACQUIRED after 1 gated frame(s)
+        Frame 2: displacement (10,-7) → pos (550,953)   err=0 px
+      [gate] SUMMARY: 2 evaluated, 1 accepted, 1 gated;  PSR min 3.90 / max 172.41
+      ```
+      **`ratio 1.01x` is the number that says "occluded"**: the largest sidelobe (1552) is
+      within 1% of the "peak" (1566), i.e. there is no peak at all, and the sidelobe σ is 402
+      against 14.7 on a good frame. Bolme's PSR reads 3.90 — squarely inside his "around 7.0
+      indicates occlusion" band, on the first attempt, with no threshold tuning.
+
+      **THE FREEZE IS PROVEN BIT-EXACTLY, by an argument stronger than the one planned.**
+      The intended assertion — `cmp` the frame N and N+1 `H_q15` dumps — turned out to be
+      *impossible by construction*: a frozen frame skips `publish_filter`, and the H dump is
+      guarded on that, so no `H_q15_f1.bin` is ever written. Its **absence** from the SD image
+      is itself positive evidence (`F_ch_f1`/`accum_f1`/`resp_f1` are all present; only
+      `H_q15_f1` is missing). But the decisive check is a cross-run comparison:
+      ```
+      occlusion run frame 2  H_q15  ==  regression run frame 1  H_q15   BYTE-IDENTICAL
+      (and H_q15_f0 is byte-identical across both runs — determinism confirmed)
+      ```
+      In the regression, frame 1 detected using the filter straight from `filter_init`. In the
+      occlusion run, frame 2 detected using that same filter **after passing through a gated
+      frame**. Identical bytes therefore prove the occluded frame perturbed *nothing* — and
+      because the comparison is of the H produced by the post-detection update, it covers the
+      host-side `g_filter.A`/`B` as well, not just the device buffer `filter_bo`. The planned
+      `cmp` would only have covered the latter. Every downstream number agrees too: F_ch 49,
+      accum 70, response 2534, PSR 172.41, ratio 23.04 — identical across the two runs.
+
+      **`OCCLUDE_MASK` semantics: bit *f* occludes frame *f*, so `0x2` occludes frame 1.**
+      Earlier drafts of this file described `0x2` as occluding frame 2; the prose was wrong,
+      the code (`mosse_tracker.cpp`) was always right. Frame-1 occlusion is the better test
+      anyway — it ends on a *recovery* frame, so it exercises reacquisition, which a
+      frame-2 occlusion (`0x4`) cannot because the run ends there.
 
       **Risk worth tracking: `err=0 px` is no longer a sufficient pass criterion.** The
       occluded frame will legitimately report a mismatch — there is no target to find — and
@@ -1326,22 +1690,23 @@ the *tracker* around it. `docs/` holds both PDFs; section numbers below refer to
       here, and `PSR_GATE_MIN=0` disables the threshold test in one make variable if it
       does. A `PSR_GRACE_FRAMES` that skips the first N evaluated frames is the cheap
       stand-in for §3.4 — design it if real video lands first, and **default it to 0**.
-- [ ] **Target size / bounding box (both papers).** Tracker state is `pos_row`/`pos_col` only
-      (`mosse_tracker.cpp:822-823`). Two consequences: (a) **σ is unanchored** — Bolme §3.2
-      uses σ=2.0 for a 64×64 window *sized to the target*, while `DEFAULT_SIGMA=2.0` here sits
-      on a 128×128 patch with no defined relationship to the object; (b) **no background
-      context ratio** — `roi_h = roi_w = PATCH_ROWS/COLS` (`mosse_tracker.cpp:947-948`), so
-      the ROI *is* the patch with no padding, whereas both papers deliberately use a window
-      larger than the object so the filter learns target-vs-background (Bolme §3.1;
-      Danelljan §3.1). Also blocks any OTB/VOT overlap metric, which is how both papers report
-      results — there is currently no way to score this tracker.
-- [ ] **Scale estimation.** Danelljan §3.1: "we apply the learned filter at multiple
-      resolutions. The target location and scale in the image are then updated by finding the
-      maximum correlation score over all evaluated locations and scales." Bolme's conclusion
-      proposes the log-polar variant. **The hardware is already built and tested** —
-      `roi_crop`'s bilinear resample from arbitrary `roi_h × roi_w` is verified bit-exact over
-      6 cases including 2× up and 2× down; only the policy is missing. Caveat: a 3-scale
-      search triples the pipeline and the DMA count, so this is gated on the DMA measurement.
+- [x] **Target size / bounding box (both papers) — DONE 2026-08-16.** See the bounding-box
+      entry in Completed. Tracker state is now a `TargetBox`, `roi = box × TARGET_PADDING`
+      gives real background context, IoU is reported so the tracker is finally scoreable, and
+      the patch↔frame conversions the box makes necessary are unit-tested. σ is anchored to
+      the box behind `SIGMA_FROM_TARGET`, defaulting OFF — the sweep showed Bolme PSR is
+      monotone in σ and therefore cannot arbitrate the DSST rule; that needs real video.
+      *(Was: "Tracker state is pos_row/pos_col only… there is currently no way to score this
+      tracker.")*
+- [x] **Scale estimation — DONE 2026-08-16 via the DSST 1-D filter, not multi-resolution.**
+      See the DSST entry in Completed. Danelljan §3.1's exhaustive form ("apply the learned
+      filter at multiple resolutions… finding the maximum correlation score over all evaluated
+      locations and scales") was NOT taken: DSST beats it on both accuracy and speed
+      (Table 1), and here it would additionally perturb the shift budget every frame and spend
+      the 30 fps headroom vectorization recovered. The 1-D filter runs entirely on the APU,
+      touches no AIE, no PL and no calibrated constant, and converges to 0.5% in the native
+      test. Bolme's log-polar suggestion (§5 conclusion) remains unexplored and would need a
+      nonlinear warp roi_crop cannot do.
 - [ ] **Affine perturbations for init (Bolme §3.4)** — already listed below, but note the
       papers *quantify* it: Fig. 3 puts second-frame PSR at ~4 for N=1 vs ~19 for N=8. That
       compounds with the missing PSR gating — a weak initial filter with no failure detection.
@@ -1372,12 +1737,26 @@ the *tracker* around it. `docs/` holds both PDFs; section numbers below refer to
       Everything cheap that could be done first has been (runs A/B/C/D, the offline model,
       the x86sim harness). **The only thing it uniquely tests is multi-channel accumulation
       with real conv2d**; every other subsystem is now validated at ch1 or in x86sim.
-      Predicted: accum 6.2%, response 32.6%, ratio 36.8, peak (10,−7) exact, nothing railed.
-      Frames now take ~26 min (was ~14 h in the echo-mode run — 3.5× faster kernels and 4×
-      fewer DMA transactions), so **ITER_CNT=2 should be ~1 h, not 28**. *(Measured ~50
-      min/frame on 2026-08-15 — see the frame-time correction under Current status. Budget
-      ~1.7 h for ITER_CNT=2.)*
       Confirm `CONV2D_ECHO_TEST=0` and `CONV_RELU=0` reach `aiecompiler.log` before starting.
+
+      **COST: ~11.5 h PER FRAME, i.e. ~23 h for `ITER_CNT=2`. MEASURED 2026-08-16**
+      (`runs/occlusion_0816_1321.log`: 172 min got through 4 of 16 channels at ch16,
+      ~43 min/channel). This entry previously said "~1 h" and then "~1.7 h"; both were **ch1**
+      numbers applied to a ch16 plan, wrong by ~13×. See the second frame-time correction
+      under Current status.
+
+      **Consequence: the Phase F ladder does not fit.** Four ch16 runs would be ~4 days of
+      machine time. Run **ch1 first** — the box/conversion/IoU/scale-filter host code is
+      compiled but has never executed, and ch1 exercises all of it at ~1.7 h instead of ~23 h.
+      Then spend the single ch16 run on the one question ch1 cannot answer.
+
+      Predicted (OLD, from the s6 patch): accum 6.2%, response 32.6%, ratio 36.8, peak (10,−7)
+      exact, nothing railed — at budget 5-3-4. **That budget does not transfer to the
+      post-2026-08-16 geometry**: re-swept on the synthetic textured source at target 64 /
+      padding 2, 5-3-4 puts the response at **0.4%** of range while the accumulator sits at
+      0.8%, so the attenuation is in the wrong place. Use **4-2-1** (response 23.9%, accum
+      0.8%, PSR 45.7, peak exact, nothing railed). `IFFT_ROW_SHIFT=0` remains unsafe at 16
+      channels, which rules out the 4-2-0 / 4-0-2 pair that also reach ~48%.
 - [x] **Shift budget SETTLED 2026-08-14 — see the budget note under Build parameters.**
       The 99.69% figure that reopened it was echo mode; the railing that reopened it again was
       `mean_prev=0`. Validated at ch1: 5-2-2, F_ch 53, accum 70, response 2534 (7.7%), ratio

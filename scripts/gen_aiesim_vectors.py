@@ -923,8 +923,15 @@ def main():
     s6_img = (180.0 * np.exp(-(((rr6 - s6_r) ** 2 + (cc6 - s6_c) ** 2) / (2.0 * s6_sigma ** 2)))
               + 0.12 * cc6 + 0.06 * rr6 + 30.0
               + 5.0 * s6_rng.standard_normal((PATCH_ROWS, PATCH_COLS)))
-    # Stage A, in float — the fixed-point version is verified separately by the
-    # roi_crop C simulation.
+    # Stage A, in float.
+    #
+    # This used to say "the fixed-point version is verified separately by the
+    # roi_crop C simulation" — a simulation that did not exist anywhere in the
+    # repo. It does now (`make test_roi_crop`), and the float shortcut has been
+    # measured against it: the two differ on 40.9% of samples, by at most 2 LSB
+    # (rms 0.65 on a signal of std 32). Small enough that s6 stays valid, but it
+    # is a real ~2% bias, so anything needing the exact patch should call
+    # scripts/roi_crop_ref.py:stage_a() rather than reproducing this.
     s6_log = np.log1p(np.clip(s6_img, 0.0, 255.0))
     s6_z   = (s6_log - s6_log.mean()) / s6_log.std()
     s6_patch = np.clip(np.round(s6_z * ROI_NORM_Q), -127, 127).astype(np.int8).flatten()

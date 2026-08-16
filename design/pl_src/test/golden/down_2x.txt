@@ -1,0 +1,19 @@
+name down_2x
+frame_rows 320
+frame_cols 320
+roi_row 20
+roi_col 20
+roi_h 256
+roi_w 256
+patch_rows 128
+patch_cols 128
+twice 0
+exp_mean 55901
+exp_var 4432706
+exp_inv_q 996
+exp_beats 4096
+step_y 512
+step_x 512
+fy_nonzero 0
+fx_nonzero 0
+why integer decimation; exactly half the source rows read
