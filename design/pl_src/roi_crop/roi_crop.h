@@ -91,9 +91,26 @@ void roi_crop(
  *
  * recompute=1 runs the resample + statistics + normalize passes and leaves the
  * quantized int8 patch in the on-chip buffer. recompute=0 skips straight to
- * streaming that buffer out. Measured on the 128×128 build: the Stage A passes
- * cost ~81k cycles, the stream-out pass ~4k, so per frame this turns
- * 16 × 85k ≈ 1.36M cycles into 81k + 16 × 4k ≈ 146k — roughly a 9× saving.
+ * streaming that buffer out.
+ *
+ * COST, corrected 2026-08-17 from a hw_emu VCD probe (the previous figures here
+ * were estimates and both were low). Scaling the 64×64 measurement to 128×128:
+ *
+ *   Stage A (PASS1 + NORM)  ~195k cycles   once per frame     (was estimated 81k)
+ *   stream-out (PASS2)      ~112k cycles   EVERY channel      (was estimated  4k)
+ *
+ * The stream-out estimate was low by ~28× because PASS2 does not achieve II=1:
+ * it is backpressured by the AIE at ~27 cycles/beat. So the saving is
+ *
+ *   without cache  16 × (195k + 112k) ≈ 4.90M cycles
+ *   with cache      195k + 16 × 112k  ≈ 1.98M cycles     -> ~2.5×, not ~9×.
+ *
+ * The cache is still clearly worth having, but it is no longer the dominant
+ * term: 90% of the remaining cost is the 16 stream-out passes, and their cost is
+ * set by how fast conv2d consumes, not by anything in this file.
+ *
+ * None of this is currently the bottleneck — see the MEASURED COST block in
+ * roi_crop.cpp: XRT's crop_run.wait() dwarfs the whole kernel by ~300×.
  *
  * The buffer persists across calls (it is static), so recompute=0 before any
  * recompute=1 call streams stale or zero data. The host must order them.

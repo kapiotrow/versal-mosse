@@ -1,0 +1,1146 @@
+[ch 2] fft_row_out received
+[ch 2] transpose done
+[ch 2] accum_out + F_ch received (16 x 4096 B)
+[ch 2] fft_col_in sent
+[ch 2] cmul_in sent
+[ch 3] START
+[ch 3] weights sent + row-FFT drained (16 x 4096 B)
+[ch 3] roi_crop done
+[ch 3] fft_row_out received
+[ch 3] transpose done
+[ch 3] accum_out + F_ch received (16 x 4096 B)
+[ch 3] fft_col_in sent
+[ch 3] cmul_in sent
+[ch 4] START
+[ch 4] weights sent + row-FFT drained (16 x 4096 B)
+[ch 4] roi_crop done
+[ch 4] fft_row_out received
+[ch 4] transpose done
+[ch 4] accum_out + F_ch received (16 x 4096 B)
+[ch 4] fft_col_in sent
+[ch 4] cmul_in sent
+[ch 5] START
+[ch 5] weights sent + row-FFT drained (16 x 4096 B)
+[ch 5] roi_crop done
+[ch 5] fft_row_out received
+[ch 5] transpose done
+[ch 5] accum_out + F_ch received (16 x 4096 B)
+[ch 5] fft_col_in sent
+[ch 5] cmul_in sent
+[ch 6] START
+[ch 6] weights sent + row-FFT drained (16 x 4096 B)
+[ch 6] roi_crop done
+[ch 6] fft_row_out received
+[ch 6] transpose done
+[ch 6] accum_out + F_ch received (16 x 4096 B)
+[ch 6] fft_col_in sent
+[ch 6] cmul_in sent
+[ch 7] START
+[ch 7] weights sent + row-FFT drained (16 x 4096 B)
+[ch 7] roi_crop done
+[ch 7] fft_row_out received
+[ch 7] transpose done
+[ch 7] accum_out + F_ch received (16 x 4096 B)
+[ch 7] fft_col_in sent
+[ch 7] cmul_in sent
+[ch 8] START
+[ch 8] weights sent + row-FFT drained (16 x 4096 B)
+[ch 8] roi_crop done
+[ch 8] fft_row_out received
+[ch 8] transpose done
+[ch 8] accum_out + F_ch received (16 x 4096 B)
+[ch 8] fft_col_in sent
+[ch 8] cmul_in sent
+[ch 9] START
+[ch 9] weights sent + row-FFT drained (16 x 4096 B)
+[ch 9] roi_crop done
+[ch 9] fft_row_out received
+[ch 9] transpose done
+[ch 9] accum_out + F_ch received (16 x 4096 B)
+[ch 9] fft_col_in sent
+[ch 9] cmul_in sent
+[ch 10] START
+[ch 10] weights sent + row-FFT drained (16 x 4096 B)
+[ch 10] roi_crop done
+[ch 10] fft_row_out received
+[ch 10] transpose done
+[ch 10] accum_out + F_ch received (16 x 4096 B)
+[ch 10] fft_col_in sent
+[ch 10] cmul_in sent
+[ch 11] START
+[ch 11] weights sent + row-FFT drained (16 x 4096 B)
+[ch 11] roi_crop done
+[ch 11] fft_row_out received
+[ch 11] transpose done
+[ch 11] accum_out + F_ch received (16 x 4096 B)
+[ch 11] fft_col_in sent
+[ch 11] cmul_in sent
+[ch 12] START
+[ch 12] weights sent + row-FFT drained (16 x 4096 B)
+[ch 12] roi_crop done
+[ch 12] fft_row_out received
+[ch 12] transpose done
+[ch 12] accum_out + F_ch received (16 x 4096 B)
+[ch 12] fft_col_in sent
+[ch 12] cmul_in sent
+[ch 13] START
+[ch 13] weights sent + row-FFT drained (16 x 4096 B)
+[ch 13] roi_crop done
+[ch 13] fft_row_out received
+[ch 13] transpose done
+[ch 13] accum_out + F_ch received (16 x 4096 B)
+[ch 13] fft_col_in sent
+[ch 13] cmul_in sent
+[ch 14] START
+[ch 14] weights sent + row-FFT drained (16 x 4096 B)
+[ch 14] roi_crop done
+[ch 14] fft_row_out received
+[ch 14] transpose done
+[ch 14] accum_out + F_ch received (16 x 4096 B)
+[ch 14] fft_col_in sent
+[ch 14] cmul_in sent
+[ch 15] START
+[ch 15] weights sent + row-FFT drained (16 x 4096 B)
+[ch 15] roi_crop done
+[ch 15] fft_row_out received
+[ch 15] transpose done
+[ch 15] accum_out + F_ch received (16 x 4096 B)
+[ch 15] fft_col_in sent
+[ch 15] cmul_in sent
+  [B2] nulled 9 low-frequency bins, max|removed|=3180  (not railed — reconsider B2_NULL_BINS=0)
+  [diag] accum     max|.|=   3228 at colFFT idx 2 (0,2)  rails=0
+  [dump] accum -> accum_f307.bin (65536 of 65536 B)
+[ifft] START
+[ifft] rows done (16 x 4096 B)
+[ifft] transpose done
+[ifft] cols done → response received (16 x 4096 B)
+  [diag] response  max|.|=   7989 at rowmajor idx 14844 (115,124)  rails=0
+  [dump] resp -> resp_f307.bin (65536 of 65536 B)
+  [diag] resp rank 0: (-13, -4) |re|=7989
+  [diag] resp rank 1: (-13, -3) |re|=7638
+  [diag] resp rank 2: (  0, -3) |re|=7379
+  [diag] resp rank 3: (  0,  2) |re|=7240
+  [diag] resp rank 4: (  0, -2) |re|=7089
+  [diag] resp at injected (10,-7) = 185   |   (0,0) = 1242, (10,0) = 332, (0,-7) = 2715
+  [diag] row 10 profile (every 4th col): 332 1701 317 2332 43 561 421 4993 1692 68 1695 698 649 669 616 269 931 464 1024 886 717 724 712 2636 748 1239 812 1120 35 169 1160 2370
+  [diag] col -7 profile (every 4th row): 2715 571 3163 4547 1189 1439 151 235 1738 2133 164 889 1642 1181 420 690 1600 337 478 585 2777 440 524 1496 1415 2138 564 86 1601 1185 1008 647
+  [psr] at argmax|re| (-13,-4): peak 7989  sidelobe mu 1.8 sd 1430.7 max 7379.0  PSR 5.58 (Bolme)  ratio 1.08x (aiesim metric)  n=16263
+  [psr] at argmax re  (-13,-4): peak 7989  sidelobe mu 1.8 sd 1430.7 max 7379.0  PSR 5.58 (Bolme)  ratio 1.08x
+  [psr] peak definitions agree.
+  [psr] verdict: FAIL — at or below Bolme's ~7.0 occlusion/failure indicator
+  [psr]          (Bolme PSR only — his thresholds do NOT apply to the ratio column)
+  [gate] frame 307: HOLD  reason=LOW_PSR  psr=5.58  threshold=7.00
+  [gate]         Bolme §3.5: PSR at or below ~7 indicates the object is occluded or tracking has failed. Holding position and freezing the filter.
+  [gate]         position HELD; filter A/B frozen; H not republished. Consecutive gated frames: 7
+Frame 307: displacement (-13,-4) bins = (-5.59,-1.72) frame px HELD, pos stays pos (703,812)  peak=7989  [MISMATCH vs injected offset]
+  [scale] FROZEN — gated frame, size held at 27.3x27.3
+       IoU 0.0000  centre err 302.93 px  vs injected box (60x60 at (475.0,612.0); estimate 27x27 at (703.0,811.5))  [BELOW 0.5 — PASCAL would score this a miss]
+  filter: FROZEN — update and publish both skipped (LOW_PSR). A/B unchanged; the device still holds the H published on the last accepted frame.
+  H(q15): unchanged (filter frozen this frame) — no dump written, so the previous frame's H_q15 dump is still the current device contents
+[dma] frame 307 per-port cost:
+  gmio_weights          256 tx      3.706 ms    14.48 us/tx
+  gmio_fft_row_out      256 tx     73.534 ms   287.24 us/tx
+  gmio_fft_col_in        16 tx      0.658 ms    41.12 us/tx
+  gmio_fft_col_out      256 tx      4.749 ms    18.55 us/tx
+  gmio_cmul_in           16 tx      0.374 ms    23.35 us/tx
+  gmio_accum_out        256 tx      4.529 ms    17.69 us/tx
+  gmio_ifft_row_in        1 tx      0.065 ms    65.34 us/tx
+  gmio_ifft_row_out      16 tx      0.313 ms    19.59 us/tx
+  gmio_ifft_col_in        1 tx      0.024 ms    24.27 us/tx
+  gmio_response          16 tx      0.294 ms    18.39 us/tx
+  TOTAL                1090 tx     88.247 ms    80.96 us/tx  = 267.4% of a 33 ms frame
+  NOTE: hw_emu wall time is not real hardware time. Treat the tx COUNT and the
+        per-port split as the real findings; the us/tx figure needs a `TARGET=hw` run.
+Frame 308: target at pos+(10,-7) = (467,616)
+[ch 0] START
+[ch 0] weights sent + row-FFT drained (16 x 4096 B)
+[ch 0] roi_crop done
+[ch 0] fft_row_out received
+[ch 0] transpose done
+[ch 0] accum_out + F_ch received (16 x 4096 B)
+  [diag] F_ch      max|.|=    883 at colFFT idx 127 (0,127)  rails=0
+  [dump] F_ch -> F_ch_f308.bin (65536 of 65536 B)
+[ch 0] fft_col_in sent
+[ch 0] cmul_in sent
+[ch 1] START
+[ch 1] weights sent + row-FFT drained (16 x 4096 B)
+[ch 1] roi_crop done
+[ch 1] fft_row_out received
+[ch 1] transpose done
+[ch 1] accum_out + F_ch received (16 x 4096 B)
+[ch 1] fft_col_in sent
+[ch 1] cmul_in sent
+[ch 2] START
+[ch 2] weights sent + row-FFT drained (16 x 4096 B)
+[ch 2] roi_crop done
+[ch 2] fft_row_out received
+[ch 2] transpose done
+[ch 2] accum_out + F_ch received (16 x 4096 B)
+[ch 2] fft_col_in sent
+[ch 2] cmul_in sent
+[ch 3] START
+[ch 3] weights sent + row-FFT drained (16 x 4096 B)
+[ch 3] roi_crop done
+[ch 3] fft_row_out received
+[ch 3] transpose done
+[ch 3] accum_out + F_ch received (16 x 4096 B)
+[ch 3] fft_col_in sent
+[ch 3] cmul_in sent
+[ch 4] START
+[ch 4] weights sent + row-FFT drained (16 x 4096 B)
+[ch 4] roi_crop done
+[ch 4] fft_row_out received
+[ch 4] transpose done
+[ch 4] accum_out + F_ch received (16 x 4096 B)
+[ch 4] fft_col_in sent
+[ch 4] cmul_in sent
+[ch 5] START
+[ch 5] weights sent + row-FFT drained (16 x 4096 B)
+[ch 5] roi_crop done
+[ch 5] fft_row_out received
+[ch 5] transpose done
+[ch 5] accum_out + F_ch received (16 x 4096 B)
+[ch 5] fft_col_in sent
+[ch 5] cmul_in sent
+[ch 6] START
+[ch 6] weights sent + row-FFT drained (16 x 4096 B)
+[ch 6] roi_crop done
+[ch 6] fft_row_out received
+[ch 6] transpose done
+[ch 6] accum_out + F_ch received (16 x 4096 B)
+[ch 6] fft_col_in sent
+[ch 6] cmul_in sent
+[ch 7] START
+[ch 7] weights sent + row-FFT drained (16 x 4096 B)
+[ch 7] roi_crop done
+[ch 7] fft_row_out received
+[ch 7] transpose done
+[ch 7] accum_out + F_ch received (16 x 4096 B)
+[ch 7] fft_col_in sent
+[ch 7] cmul_in sent
+[ch 8] START
+[ch 8] weights sent + row-FFT drained (16 x 4096 B)
+[ch 8] roi_crop done
+[ch 8] fft_row_out received
+[ch 8] transpose done
+[ch 8] accum_out + F_ch received (16 x 4096 B)
+[ch 8] fft_col_in sent
+[ch 8] cmul_in sent
+[ch 9] START
+[ch 9] weights sent + row-FFT drained (16 x 4096 B)
+[ch 9] roi_crop done
+[ch 9] fft_row_out received
+[ch 9] transpose done
+[ch 9] accum_out + F_ch received (16 x 4096 B)
+[ch 9] fft_col_in sent
+[ch 9] cmul_in sent
+[ch 10] START
+[ch 10] weights sent + row-FFT drained (16 x 4096 B)
+[ch 10] roi_crop done
+[ch 10] fft_row_out received
+[ch 10] transpose done
+[ch 10] accum_out + F_ch received (16 x 4096 B)
+[ch 10] fft_col_in sent
+[ch 10] cmul_in sent
+[ch 11] START
+[ch 11] weights sent + row-FFT drained (16 x 4096 B)
+[ch 11] roi_crop done
+[ch 11] fft_row_out received
+[ch 11] transpose done
+[ch 11] accum_out + F_ch received (16 x 4096 B)
+[ch 11] fft_col_in sent
+[ch 11] cmul_in sent
+[ch 12] START
+[ch 12] weights sent + row-FFT drained (16 x 4096 B)
+[ch 12] roi_crop done
+[ch 12] fft_row_out received
+[ch 12] transpose done
+[ch 12] accum_out + F_ch received (16 x 4096 B)
+[ch 12] fft_col_in sent
+[ch 12] cmul_in sent
+[ch 13] START
+[ch 13] weights sent + row-FFT drained (16 x 4096 B)
+[ch 13] roi_crop done
+[ch 13] fft_row_out received
+[ch 13] transpose done
+[ch 13] accum_out + F_ch received (16 x 4096 B)
+[ch 13] fft_col_in sent
+[ch 13] cmul_in sent
+[ch 14] START
+[ch 14] weights sent + row-FFT drained (16 x 4096 B)
+[ch 14] roi_crop done
+[ch 14] fft_row_out received
+[ch 14] transpose done
+[ch 14] accum_out + F_ch received (16 x 4096 B)
+[ch 14] fft_col_in sent
+[ch 14] cmul_in sent
+[ch 15] START
+[ch 15] weights sent + row-FFT drained (16 x 4096 B)
+[ch 15] roi_crop done
+[ch 15] fft_row_out received
+[ch 15] transpose done
+[ch 15] accum_out + F_ch received (16 x 4096 B)
+[ch 15] fft_col_in sent
+[ch 15] cmul_in sent
+  [B2] nulled 9 low-frequency bins, max|removed|=3180  (not railed — reconsider B2_NULL_BINS=0)
+  [diag] accum     max|.|=   3229 at colFFT idx 2 (0,2)  rails=0
+  [dump] accum -> accum_f308.bin (65536 of 65536 B)
+[ifft] START
+[ifft] rows done (16 x 4096 B)
+[ifft] transpose done
+[ifft] cols done → response received (16 x 4096 B)
+  [diag] response  max|.|=   7986 at rowmajor idx 14844 (115,124)  rails=0
+  [dump] resp -> resp_f308.bin (65536 of 65536 B)
+  [diag] resp rank 0: (-13, -4) |re|=7986
+  [diag] resp rank 1: (-13, -3) |re|=7632
+  [diag] resp rank 2: (  0, -3) |re|=7379
+  [diag] resp rank 3: (  0,  2) |re|=7244
+  [diag] resp rank 4: (  0, -2) |re|=7092
+  [diag] resp at injected (10,-7) = 189   |   (0,0) = 1239, (10,0) = 321, (0,-7) = 2726
+  [diag] row 10 profile (every 4th col): 321 1701 315 2330 47 558 418 4997 1695 73 1700 687 646 681 617 274 934 473 1022 886 715 712 717 2637 746 1232 808 1121 31 158 1166 2371
+  [diag] col -7 profile (every 4th row): 2726 569 3156 4543 1189 1434 153 235 1739 2137 169 889 1642 1180 422 692 1590 347 474 596 2772 441 525 1491 1417 2128 567 87 1604 1187 1006 647
+  [psr] at argmax|re| (-13,-4): peak 7986  sidelobe mu 1.8 sd 1430.9 max 7379.0  PSR 5.58 (Bolme)  ratio 1.08x (aiesim metric)  n=16263
+  [psr] at argmax re  (-13,-4): peak 7986  sidelobe mu 1.8 sd 1430.9 max 7379.0  PSR 5.58 (Bolme)  ratio 1.08x
+  [psr] peak definitions agree.
+  [psr] verdict: FAIL — at or below Bolme's ~7.0 occlusion/failure indicator
+  [psr]          (Bolme PSR only — his thresholds do NOT apply to the ratio column)
+  [gate] frame 308: HOLD  reason=LOW_PSR  psr=5.58  threshold=7.00
+  [gate]         Bolme §3.5: PSR at or below ~7 indicates the object is occluded or tracking has failed. Holding position and freezing the filter.
+  [gate]         position HELD; filter A/B frozen; H not republished. Consecutive gated frames: 8
+Frame 308: displacement (-13,-4) bins = (-5.59,-1.72) frame px HELD, pos stays pos (703,812)  peak=7986  [MISMATCH vs injected offset]
+  [scale] FROZEN — gated frame, size held at 27.3x27.3
+       IoU 0.0000  centre err 306.43 px  vs injected box (59x59 at (467.0,616.0); estimate 27x27 at (703.0,811.5))  [BELOW 0.5 — PASCAL would score this a miss]
+  filter: FROZEN — update and publish both skipped (LOW_PSR). A/B unchanged; the device still holds the H published on the last accepted frame.
+  H(q15): unchanged (filter frozen this frame) — no dump written, so the previous frame's H_q15 dump is still the current device contents
+[dma] frame 308 per-port cost:
+  gmio_weights          256 tx      3.691 ms    14.42 us/tx
+  gmio_fft_row_out      256 tx     73.427 ms   286.82 us/tx
+  gmio_fft_col_in        16 tx      0.588 ms    36.72 us/tx
+  gmio_fft_col_out      256 tx      4.729 ms    18.47 us/tx
+  gmio_cmul_in           16 tx      0.364 ms    22.75 us/tx
+  gmio_accum_out        256 tx      4.511 ms    17.62 us/tx
+  gmio_ifft_row_in        1 tx      0.066 ms    66.36 us/tx
+  gmio_ifft_row_out      16 tx      0.313 ms    19.56 us/tx
+  gmio_ifft_col_in        1 tx      0.025 ms    25.41 us/tx
+  gmio_response          16 tx      0.294 ms    18.35 us/tx
+  TOTAL                1090 tx     88.008 ms    80.74 us/tx  = 266.7% of a 33 ms frame
+  NOTE: hw_emu wall time is not real hardware time. Treat the tx COUNT and the
+        per-port split as the real findings; the us/tx figure needs a `TARGET=hw` run.
+Frame 309: target at pos+(10,-7) = (458,620)
+[ch 0] START
+[ch 0] weights sent + row-FFT drained (16 x 4096 B)
+[ch 0] roi_crop done
+[ch 0] fft_row_out received
+[ch 0] transpose done
+[ch 0] accum_out + F_ch received (16 x 4096 B)
+  [diag] F_ch      max|.|=    883 at colFFT idx 127 (0,127)  rails=0
+  [dump] F_ch -> F_ch_f309.bin (65536 of 65536 B)
+[ch 0] fft_col_in sent
+[ch 0] cmul_in sent
+[ch 1] START
+[ch 1] weights sent + row-FFT drained (16 x 4096 B)
+[ch 1] roi_crop done
+[ch 1] fft_row_out received
+[ch 1] transpose done
+[ch 1] accum_out + F_ch received (16 x 4096 B)
+[ch 1] fft_col_in sent
+[ch 1] cmul_in sent
+[ch 2] START
+[ch 2] weights sent + row-FFT drained (16 x 4096 B)
+[ch 2] roi_crop done
+[ch 2] fft_row_out received
+[ch 2] transpose done
+[ch 2] accum_out + F_ch received (16 x 4096 B)
+[ch 2] fft_col_in sent
+[ch 2] cmul_in sent
+[ch 3] START
+[ch 3] weights sent + row-FFT drained (16 x 4096 B)
+[ch 3] roi_crop done
+[ch 3] fft_row_out received
+[ch 3] transpose done
+[ch 3] accum_out + F_ch received (16 x 4096 B)
+[ch 3] fft_col_in sent
+[ch 3] cmul_in sent
+[ch 4] START
+[ch 4] weights sent + row-FFT drained (16 x 4096 B)
+[ch 4] roi_crop done
+[ch 4] fft_row_out received
+[ch 4] transpose done
+[ch 4] accum_out + F_ch received (16 x 4096 B)
+[ch 4] fft_col_in sent
+[ch 4] cmul_in sent
+[ch 5] START
+[ch 5] weights sent + row-FFT drained (16 x 4096 B)
+[ch 5] roi_crop done
+[ch 5] fft_row_out received
+[ch 5] transpose done
+[ch 5] accum_out + F_ch received (16 x 4096 B)
+[ch 5] fft_col_in sent
+[ch 5] cmul_in sent
+[ch 6] START
+[ch 6] weights sent + row-FFT drained (16 x 4096 B)
+[ch 6] roi_crop done
+[ch 6] fft_row_out received
+[ch 6] transpose done
+[ch 6] accum_out + F_ch received (16 x 4096 B)
+[ch 6] fft_col_in sent
+[ch 6] cmul_in sent
+[ch 7] START
+[ch 7] weights sent + row-FFT drained (16 x 4096 B)
+[ch 7] roi_crop done
+[ch 7] fft_row_out received
+[ch 7] transpose done
+[ch 7] accum_out + F_ch received (16 x 4096 B)
+[ch 7] fft_col_in sent
+[ch 7] cmul_in sent
+[ch 8] START
+[ch 8] weights sent + row-FFT drained (16 x 4096 B)
+[ch 8] roi_crop done
+[ch 8] fft_row_out received
+[ch 8] transpose done
+[ch 8] accum_out + F_ch received (16 x 4096 B)
+[ch 8] fft_col_in sent
+[ch 8] cmul_in sent
+[ch 9] START
+[ch 9] weights sent + row-FFT drained (16 x 4096 B)
+[ch 9] roi_crop done
+[ch 9] fft_row_out received
+[ch 9] transpose done
+[ch 9] accum_out + F_ch received (16 x 4096 B)
+[ch 9] fft_col_in sent
+[ch 9] cmul_in sent
+[ch 10] START
+[ch 10] weights sent + row-FFT drained (16 x 4096 B)
+[ch 10] roi_crop done
+[ch 10] fft_row_out received
+[ch 10] transpose done
+[ch 10] accum_out + F_ch received (16 x 4096 B)
+[ch 10] fft_col_in sent
+[ch 10] cmul_in sent
+[ch 11] START
+[ch 11] weights sent + row-FFT drained (16 x 4096 B)
+[ch 11] roi_crop done
+[ch 11] fft_row_out received
+[ch 11] transpose done
+[ch 11] accum_out + F_ch received (16 x 4096 B)
+[ch 11] fft_col_in sent
+[ch 11] cmul_in sent
+[ch 12] START
+[ch 12] weights sent + row-FFT drained (16 x 4096 B)
+[ch 12] roi_crop done
+[ch 12] fft_row_out received
+[ch 12] transpose done
+[ch 12] accum_out + F_ch received (16 x 4096 B)
+[ch 12] fft_col_in sent
+[ch 12] cmul_in sent
+[ch 13] START
+[ch 13] weights sent + row-FFT drained (16 x 4096 B)
+[ch 13] roi_crop done
+[ch 13] fft_row_out received
+[ch 13] transpose done
+[ch 13] accum_out + F_ch received (16 x 4096 B)
+[ch 13] fft_col_in sent
+[ch 13] cmul_in sent
+[ch 14] START
+[ch 14] weights sent + row-FFT drained (16 x 4096 B)
+[ch 14] roi_crop done
+[ch 14] fft_row_out received
+[ch 14] transpose done
+[ch 14] accum_out + F_ch received (16 x 4096 B)
+[ch 14] fft_col_in sent
+[ch 14] cmul_in sent
+[ch 15] START
+[ch 15] weights sent + row-FFT drained (16 x 4096 B)
+[ch 15] roi_crop done
+[ch 15] fft_row_out received
+[ch 15] transpose done
+[ch 15] accum_out + F_ch received (16 x 4096 B)
+[ch 15] fft_col_in sent
+[ch 15] cmul_in sent
+  [B2] nulled 9 low-frequency bins, max|removed|=3180  (not railed — reconsider B2_NULL_BINS=0)
+  [diag] accum     max|.|=   3228 at colFFT idx 2 (0,2)  rails=0
+  [dump] accum -> accum_f309.bin (65536 of 65536 B)
+[ifft] START
+[ifft] rows done (16 x 4096 B)
+[ifft] transpose done
+[ifft] cols done → response received (16 x 4096 B)
+  [diag] response  max|.|=   7989 at rowmajor idx 14844 (115,124)  rails=0
+  [dump] resp -> resp_f309.bin (65536 of 65536 B)
+  [diag] resp rank 0: (-13, -4) |re|=7989
+  [diag] resp rank 1: (-13, -3) |re|=7635
+  [diag] resp rank 2: (  0, -3) |re|=7385
+  [diag] resp rank 3: (  0,  2) |re|=7244
+  [diag] resp rank 4: (  0, -2) |re|=7096
+  [diag] resp at injected (10,-7) = 187   |   (0,0) = 1238, (10,0) = 326, (0,-7) = 2728
+  [diag] row 10 profile (every 4th col): 326 1701 315 2332 47 563 418 4997 1696 73 1707 693 644 680 625 272 936 476 1019 890 719 713 720 2639 745 1233 812 1128 34 160 1169 2373
+  [diag] col -7 profile (every 4th row): 2728 570 3157 4544 1186 1435 150 232 1739 2134 165 888 1639 1182 422 695 1591 345 471 591 2768 441 526 1496 1420 2131 570 84 1603 1183 1004 652
+  [psr] at argmax|re| (-13,-4): peak 7989  sidelobe mu 1.8 sd 1430.6 max 7385.0  PSR 5.58 (Bolme)  ratio 1.08x (aiesim metric)  n=16263
+  [psr] at argmax re  (-13,-4): peak 7989  sidelobe mu 1.8 sd 1430.6 max 7385.0  PSR 5.58 (Bolme)  ratio 1.08x
+  [psr] peak definitions agree.
+  [psr] verdict: FAIL — at or below Bolme's ~7.0 occlusion/failure indicator
+  [psr]          (Bolme PSR only — his thresholds do NOT apply to the ratio column)
+  [gate] frame 309: HOLD  reason=LOW_PSR  psr=5.58  threshold=7.00
+  [gate]         Bolme §3.5: PSR at or below ~7 indicates the object is occluded or tracking has failed. Holding position and freezing the filter.
+  [gate]         position HELD; filter A/B frozen; H not republished. Consecutive gated frames: 9
+Frame 309: displacement (-13,-4) bins = (-5.59,-1.72) frame px HELD, pos stays pos (703,812)  peak=7989  [MISMATCH vs injected offset]
+  [scale] FROZEN — gated frame, size held at 27.3x27.3
+       IoU 0.0000  centre err 310.93 px  vs injected box (59x59 at (458.0,620.0); estimate 27x27 at (703.0,811.5))  [BELOW 0.5 — PASCAL would score this a miss]
+  filter: FROZEN — update and publish both skipped (LOW_PSR). A/B unchanged; the device still holds the H published on the last accepted frame.
+  H(q15): unchanged (filter frozen this frame) — no dump written, so the previous frame's H_q15 dump is still the current device contents
+[dma] frame 309 per-port cost:
+  gmio_weights          256 tx      3.690 ms    14.41 us/tx
+  gmio_fft_row_out      256 tx     74.512 ms   291.06 us/tx
+  gmio_fft_col_in        16 tx      0.591 ms    36.91 us/tx
+  gmio_fft_col_out      256 tx      4.735 ms    18.49 us/tx
+  gmio_cmul_in           16 tx      0.370 ms    23.12 us/tx
+  gmio_accum_out        256 tx      4.509 ms    17.61 us/tx
+  gmio_ifft_row_in        1 tx      0.068 ms    67.99 us/tx
+  gmio_ifft_row_out      16 tx      0.310 ms    19.39 us/tx
+  gmio_ifft_col_in        1 tx      0.024 ms    24.46 us/tx
+  gmio_response          16 tx      0.293 ms    18.34 us/tx
+  TOTAL                1090 tx     89.102 ms    81.74 us/tx  = 270.0% of a 33 ms frame
+  NOTE: hw_emu wall time is not real hardware time. Treat the tx COUNT and the
+        per-port split as the real findings; the us/tx figure needs a `TARGET=hw` run.
+Frame 310: target at pos+(10,-7) = (450,624)
+[ch 0] START
+[ch 0] weights sent + row-FFT drained (16 x 4096 B)
+[ch 0] roi_crop done
+[ch 0] fft_row_out received
+[ch 0] transpose done
+[ch 0] accum_out + F_ch received (16 x 4096 B)
+  [diag] F_ch      max|.|=    883 at colFFT idx 127 (0,127)  rails=0
+  [dump] F_ch -> F_ch_f310.bin (65536 of 65536 B)
+[ch 0] fft_col_in sent
+[ch 0] cmul_in sent
+[ch 1] START
+[ch 1] weights sent + row-FFT drained (16 x 4096 B)
+[ch 1] roi_crop done
+[ch 1] fft_row_out received
+[ch 1] transpose done
+[ch 1] accum_out + F_ch received (16 x 4096 B)
+[ch 1] fft_col_in sent
+[ch 1] cmul_in sent
+[ch 2] START
+[ch 2] weights sent + row-FFT drained (16 x 4096 B)
+[ch 2] roi_crop done
+[ch 2] fft_row_out received
+[ch 2] transpose done
+[ch 2] accum_out + F_ch received (16 x 4096 B)
+[ch 2] fft_col_in sent
+[ch 2] cmul_in sent
+[ch 3] START
+[ch 3] weights sent + row-FFT drained (16 x 4096 B)
+[ch 3] roi_crop done
+[ch 3] fft_row_out received
+[ch 3] transpose done
+[ch 3] accum_out + F_ch received (16 x 4096 B)
+[ch 3] fft_col_in sent
+[ch 3] cmul_in sent
+[ch 4] START
+[ch 4] weights sent + row-FFT drained (16 x 4096 B)
+[ch 4] roi_crop done
+[ch 4] fft_row_out received
+[ch 4] transpose done
+[ch 4] accum_out + F_ch received (16 x 4096 B)
+[ch 4] fft_col_in sent
+[ch 4] cmul_in sent
+[ch 5] START
+[ch 5] weights sent + row-FFT drained (16 x 4096 B)
+[ch 5] roi_crop done
+[ch 5] fft_row_out received
+[ch 5] transpose done
+[ch 5] accum_out + F_ch received (16 x 4096 B)
+[ch 5] fft_col_in sent
+[ch 5] cmul_in sent
+[ch 6] START
+[ch 6] weights sent + row-FFT drained (16 x 4096 B)
+[ch 6] roi_crop done
+[ch 6] fft_row_out received
+[ch 6] transpose done
+[ch 6] accum_out + F_ch received (16 x 4096 B)
+[ch 6] fft_col_in sent
+[ch 6] cmul_in sent
+[ch 7] START
+[ch 7] weights sent + row-FFT drained (16 x 4096 B)
+[ch 7] roi_crop done
+[ch 7] fft_row_out received
+[ch 7] transpose done
+[ch 7] accum_out + F_ch received (16 x 4096 B)
+[ch 7] fft_col_in sent
+[ch 7] cmul_in sent
+[ch 8] START
+[ch 8] weights sent + row-FFT drained (16 x 4096 B)
+[ch 8] roi_crop done
+[ch 8] fft_row_out received
+[ch 8] transpose done
+[ch 8] accum_out + F_ch received (16 x 4096 B)
+[ch 8] fft_col_in sent
+[ch 8] cmul_in sent
+[ch 9] START
+[ch 9] weights sent + row-FFT drained (16 x 4096 B)
+[ch 9] roi_crop done
+[ch 9] fft_row_out received
+[ch 9] transpose done
+[ch 9] accum_out + F_ch received (16 x 4096 B)
+[ch 9] fft_col_in sent
+[ch 9] cmul_in sent
+[ch 10] START
+[ch 10] weights sent + row-FFT drained (16 x 4096 B)
+[ch 10] roi_crop done
+[ch 10] fft_row_out received
+[ch 10] transpose done
+[ch 10] accum_out + F_ch received (16 x 4096 B)
+[ch 10] fft_col_in sent
+[ch 10] cmul_in sent
+[ch 11] START
+[ch 11] weights sent + row-FFT drained (16 x 4096 B)
+[ch 11] roi_crop done
+[ch 11] fft_row_out received
+[ch 11] transpose done
+[ch 11] accum_out + F_ch received (16 x 4096 B)
+[ch 11] fft_col_in sent
+[ch 11] cmul_in sent
+[ch 12] START
+[ch 12] weights sent + row-FFT drained (16 x 4096 B)
+[ch 12] roi_crop done
+[ch 12] fft_row_out received
+[ch 12] transpose done
+[ch 12] accum_out + F_ch received (16 x 4096 B)
+[ch 12] fft_col_in sent
+[ch 12] cmul_in sent
+[ch 13] START
+[ch 13] weights sent + row-FFT drained (16 x 4096 B)
+[ch 13] roi_crop done
+[ch 13] fft_row_out received
+[ch 13] transpose done
+[ch 13] accum_out + F_ch received (16 x 4096 B)
+[ch 13] fft_col_in sent
+[ch 13] cmul_in sent
+[ch 14] START
+[ch 14] weights sent + row-FFT drained (16 x 4096 B)
+[ch 14] roi_crop done
+[ch 14] fft_row_out received
+[ch 14] transpose done
+[ch 14] accum_out + F_ch received (16 x 4096 B)
+[ch 14] fft_col_in sent
+[ch 14] cmul_in sent
+[ch 15] START
+[ch 15] weights sent + row-FFT drained (16 x 4096 B)
+[ch 15] roi_crop done
+[ch 15] fft_row_out received
+[ch 15] transpose done
+[ch 15] accum_out + F_ch received (16 x 4096 B)
+[ch 15] fft_col_in sent
+[ch 15] cmul_in sent
+  [B2] nulled 9 low-frequency bins, max|removed|=3179  (not railed — reconsider B2_NULL_BINS=0)
+  [diag] accum     max|.|=   3228 at colFFT idx 2 (0,2)  rails=0
+  [dump] accum -> accum_f310.bin (65536 of 65536 B)
+[ifft] START
+[ifft] rows done (16 x 4096 B)
+[ifft] transpose done
+[ifft] cols done → response received (16 x 4096 B)
+  [diag] response  max|.|=   7989 at rowmajor idx 14844 (115,124)  rails=0
+  [dump] resp -> resp_f310.bin (65536 of 65536 B)
+  [diag] resp rank 0: (-13, -4) |re|=7989
+  [diag] resp rank 1: (-13, -3) |re|=7637
+  [diag] resp rank 2: (  0, -3) |re|=7381
+  [diag] resp rank 3: (  0,  2) |re|=7240
+  [diag] resp rank 4: (  0, -2) |re|=7092
+  [diag] resp at injected (10,-7) = 188   |   (0,0) = 1238, (10,0) = 324, (0,-7) = 2726
+  [diag] row 10 profile (every 4th col): 324 1698 313 2329 45 561 422 4996 1694 72 1707 692 642 679 622 272 936 476 1019 885 718 711 719 2637 742 1236 813 1124 35 163 1167 2369
+  [diag] col -7 profile (every 4th row): 2726 569 3159 4543 1189 1434 149 230 1737 2137 166 884 1639 1185 420 694 1590 344 473 590 2770 440 525 1493 1421 2135 567 83 1601 1189 1006 650
+  [psr] at argmax|re| (-13,-4): peak 7989  sidelobe mu 1.8 sd 1430.7 max 7381.0  PSR 5.58 (Bolme)  ratio 1.08x (aiesim metric)  n=16263
+  [psr] at argmax re  (-13,-4): peak 7989  sidelobe mu 1.8 sd 1430.7 max 7381.0  PSR 5.58 (Bolme)  ratio 1.08x
+  [psr] peak definitions agree.
+  [psr] verdict: FAIL — at or below Bolme's ~7.0 occlusion/failure indicator
+  [psr]          (Bolme PSR only — his thresholds do NOT apply to the ratio column)
+  [gate] frame 310: HOLD  reason=LOW_PSR  psr=5.58  threshold=7.00
+  [gate]         Bolme §3.5: PSR at or below ~7 indicates the object is occluded or tracking has failed. Holding position and freezing the filter.
+  [gate]         position HELD; filter A/B frozen; H not republished. Consecutive gated frames: 10
+Frame 310: displacement (-13,-4) bins = (-5.59,-1.72) frame px HELD, pos stays pos (703,812)  peak=7989  [MISMATCH vs injected offset]
+  [scale] FROZEN — gated frame, size held at 27.3x27.3
+       IoU 0.0000  centre err 314.87 px  vs injected box (58x58 at (450.0,624.0); estimate 27x27 at (703.0,811.5))  [BELOW 0.5 — PASCAL would score this a miss]
+  filter: FROZEN — update and publish both skipped (LOW_PSR). A/B unchanged; the device still holds the H published on the last accepted frame.
+  H(q15): unchanged (filter frozen this frame) — no dump written, so the previous frame's H_q15 dump is still the current device contents
+[dma] frame 310 per-port cost:
+  gmio_weights          256 tx      3.686 ms    14.40 us/tx
+  gmio_fft_row_out      256 tx     73.431 ms   286.84 us/tx
+  gmio_fft_col_in        16 tx      0.576 ms    36.01 us/tx
+  gmio_fft_col_out      256 tx      4.734 ms    18.49 us/tx
+  gmio_cmul_in           16 tx      0.362 ms    22.65 us/tx
+  gmio_accum_out        256 tx      4.514 ms    17.63 us/tx
+  gmio_ifft_row_in        1 tx      0.066 ms    66.42 us/tx
+  gmio_ifft_row_out      16 tx      0.311 ms    19.46 us/tx
+  gmio_ifft_col_in        1 tx      0.025 ms    24.74 us/tx
+  gmio_response          16 tx      0.294 ms    18.37 us/tx
+  TOTAL                1090 tx     88.001 ms    80.73 us/tx  = 266.7% of a 33 ms frame
+  NOTE: hw_emu wall time is not real hardware time. Treat the tx COUNT and the
+        per-port split as the real findings; the us/tx figure needs a `TARGET=hw` run.
+Frame 311: target at pos+(10,-7) = (442,629)
+[ch 0] START
+[ch 0] weights sent + row-FFT drained (16 x 4096 B)
+[ch 0] roi_crop done
+[ch 0] fft_row_out received
+[ch 0] transpose done
+[ch 0] accum_out + F_ch received (16 x 4096 B)
+  [diag] F_ch      max|.|=    883 at colFFT idx 127 (0,127)  rails=0
+  [dump] F_ch -> F_ch_f311.bin (65536 of 65536 B)
+[ch 0] fft_col_in sent
+[ch 0] cmul_in sent
+[ch 1] START
+[ch 1] weights sent + row-FFT drained (16 x 4096 B)
+[ch 1] roi_crop done
+[ch 1] fft_row_out received
+[ch 1] transpose done
+[ch 1] accum_out + F_ch received (16 x 4096 B)
+[ch 1] fft_col_in sent
+[ch 1] cmul_in sent
+[ch 2] START
+[ch 2] weights sent + row-FFT drained (16 x 4096 B)
+[ch 2] roi_crop done
+[ch 2] fft_row_out received
+[ch 2] transpose done
+[ch 2] accum_out + F_ch received (16 x 4096 B)
+[ch 2] fft_col_in sent
+[ch 2] cmul_in sent
+[ch 3] START
+[ch 3] weights sent + row-FFT drained (16 x 4096 B)
+[ch 3] roi_crop done
+[ch 3] fft_row_out received
+[ch 3] transpose done
+[ch 3] accum_out + F_ch received (16 x 4096 B)
+[ch 3] fft_col_in sent
+[ch 3] cmul_in sent
+[ch 4] START
+[ch 4] weights sent + row-FFT drained (16 x 4096 B)
+[ch 4] roi_crop done
+[ch 4] fft_row_out received
+[ch 4] transpose done
+[ch 4] accum_out + F_ch received (16 x 4096 B)
+[ch 4] fft_col_in sent
+[ch 4] cmul_in sent
+[ch 5] START
+[ch 5] weights sent + row-FFT drained (16 x 4096 B)
+[ch 5] roi_crop done
+[ch 5] fft_row_out received
+[ch 5] transpose done
+[ch 5] accum_out + F_ch received (16 x 4096 B)
+[ch 5] fft_col_in sent
+[ch 5] cmul_in sent
+[ch 6] START
+[ch 6] weights sent + row-FFT drained (16 x 4096 B)
+[ch 6] roi_crop done
+[ch 6] fft_row_out received
+[ch 6] transpose done
+[ch 6] accum_out + F_ch received (16 x 4096 B)
+[ch 6] fft_col_in sent
+[ch 6] cmul_in sent
+[ch 7] START
+[ch 7] weights sent + row-FFT drained (16 x 4096 B)
+[ch 7] roi_crop done
+[ch 7] fft_row_out received
+[ch 7] transpose done
+[ch 7] accum_out + F_ch received (16 x 4096 B)
+[ch 7] fft_col_in sent
+[ch 7] cmul_in sent
+[ch 8] START
+[ch 8] weights sent + row-FFT drained (16 x 4096 B)
+[ch 8] roi_crop done
+[ch 8] fft_row_out received
+[ch 8] transpose done
+[ch 8] accum_out + F_ch received (16 x 4096 B)
+[ch 8] fft_col_in sent
+[ch 8] cmul_in sent
+[ch 9] START
+[ch 9] weights sent + row-FFT drained (16 x 4096 B)
+[ch 9] roi_crop done
+[ch 9] fft_row_out received
+[ch 9] transpose done
+[ch 9] accum_out + F_ch received (16 x 4096 B)
+[ch 9] fft_col_in sent
+[ch 9] cmul_in sent
+[ch 10] START
+[ch 10] weights sent + row-FFT drained (16 x 4096 B)
+[ch 10] roi_crop done
+[ch 10] fft_row_out received
+[ch 10] transpose done
+[ch 10] accum_out + F_ch received (16 x 4096 B)
+[ch 10] fft_col_in sent
+[ch 10] cmul_in sent
+[ch 11] START
+[ch 11] weights sent + row-FFT drained (16 x 4096 B)
+[ch 11] roi_crop done
+[ch 11] fft_row_out received
+[ch 11] transpose done
+[ch 11] accum_out + F_ch received (16 x 4096 B)
+[ch 11] fft_col_in sent
+[ch 11] cmul_in sent
+[ch 12] START
+[ch 12] weights sent + row-FFT drained (16 x 4096 B)
+[ch 12] roi_crop done
+[ch 12] fft_row_out received
+[ch 12] transpose done
+[ch 12] accum_out + F_ch received (16 x 4096 B)
+[ch 12] fft_col_in sent
+[ch 12] cmul_in sent
+[ch 13] START
+[ch 13] weights sent + row-FFT drained (16 x 4096 B)
+[ch 13] roi_crop done
+[ch 13] fft_row_out received
+[ch 13] transpose done
+[ch 13] accum_out + F_ch received (16 x 4096 B)
+[ch 13] fft_col_in sent
+[ch 13] cmul_in sent
+[ch 14] START
+[ch 14] weights sent + row-FFT drained (16 x 4096 B)
+[ch 14] roi_crop done
+[ch 14] fft_row_out received
+[ch 14] transpose done
+[ch 14] accum_out + F_ch received (16 x 4096 B)
+[ch 14] fft_col_in sent
+[ch 14] cmul_in sent
+[ch 15] START
+[ch 15] weights sent + row-FFT drained (16 x 4096 B)
+[ch 15] roi_crop done
+[ch 15] fft_row_out received
+[ch 15] transpose done
+[ch 15] accum_out + F_ch received (16 x 4096 B)
+[ch 15] fft_col_in sent
+[ch 15] cmul_in sent
+  [B2] nulled 9 low-frequency bins, max|removed|=3180  (not railed — reconsider B2_NULL_BINS=0)
+  [diag] accum     max|.|=   3228 at colFFT idx 2 (0,2)  rails=0
+  [dump] accum -> accum_f311.bin (65536 of 65536 B)
+[ifft] START
+[ifft] rows done (16 x 4096 B)
+[ifft] transpose done
+[ifft] cols done → response received (16 x 4096 B)
+  [diag] response  max|.|=   7987 at rowmajor idx 14844 (115,124)  rails=0
+  [dump] resp -> resp_f311.bin (65536 of 65536 B)
+  [diag] resp rank 0: (-13, -4) |re|=7987
+  [diag] resp rank 1: (-13, -3) |re|=7634
+  [diag] resp rank 2: (  0, -3) |re|=7382
+  [diag] resp rank 3: (  0,  2) |re|=7240
+  [diag] resp rank 4: (  0, -2) |re|=7093
+  [diag] resp at injected (10,-7) = 187   |   (0,0) = 1237, (10,0) = 324, (0,-7) = 2725
+  [diag] row 10 profile (every 4th col): 324 1700 314 2330 45 558 423 4996 1691 70 1705 691 641 678 620 270 932 478 1017 890 718 712 721 2636 740 1236 814 1122 35 159 1167 2373
+  [diag] col -7 profile (every 4th row): 2725 569 3159 4540 1186 1435 152 232 1739 2137 166 883 1637 1186 421 698 1592 346 473 592 2770 445 526 1492 1422 2133 568 85 1599 1182 1005 652
+  [psr] at argmax|re| (-13,-4): peak 7987  sidelobe mu 1.8 sd 1430.7 max 7382.0  PSR 5.58 (Bolme)  ratio 1.08x (aiesim metric)  n=16263
+  [psr] at argmax re  (-13,-4): peak 7987  sidelobe mu 1.8 sd 1430.7 max 7382.0  PSR 5.58 (Bolme)  ratio 1.08x
+  [psr] peak definitions agree.
+  [psr] verdict: FAIL — at or below Bolme's ~7.0 occlusion/failure indicator
+  [psr]          (Bolme PSR only — his thresholds do NOT apply to the ratio column)
+  [gate] frame 311: HOLD  reason=LOW_PSR  psr=5.58  threshold=7.00
+  [gate]         Bolme §3.5: PSR at or below ~7 indicates the object is occluded or tracking has failed. Holding position and freezing the filter.
+  [gate]         position HELD; filter A/B frozen; H not republished. Consecutive gated frames: 11
+Frame 311: displacement (-13,-4) bins = (-5.59,-1.72) frame px HELD, pos stays pos (703,812)  peak=7987  [MISMATCH vs injected offset]
+  [scale] FROZEN — gated frame, size held at 27.3x27.3
+       IoU 0.0000  centre err 318.44 px  vs injected box (57x57 at (442.0,629.0); estimate 27x27 at (703.0,811.5))  [BELOW 0.5 — PASCAL would score this a miss]
+  filter: FROZEN — update and publish both skipped (LOW_PSR). A/B unchanged; the device still holds the H published on the last accepted frame.
+  H(q15): unchanged (filter frozen this frame) — no dump written, so the previous frame's H_q15 dump is still the current device contents
+[dma] frame 311 per-port cost:
+  gmio_weights          256 tx      3.913 ms    15.29 us/tx
+  gmio_fft_row_out      256 tx     74.170 ms   289.73 us/tx
+  gmio_fft_col_in        16 tx      0.658 ms    41.09 us/tx
+  gmio_fft_col_out      256 tx      4.929 ms    19.25 us/tx
+  gmio_cmul_in           16 tx      0.374 ms    23.37 us/tx
+  gmio_accum_out        256 tx      4.541 ms    17.74 us/tx
+  gmio_ifft_row_in        1 tx      0.066 ms    65.88 us/tx
+  gmio_ifft_row_out      16 tx      0.312 ms    19.49 us/tx
+  gmio_ifft_col_in        1 tx      0.025 ms    24.93 us/tx
+  gmio_response          16 tx      0.295 ms    18.45 us/tx
+  TOTAL                1090 tx     89.283 ms    81.91 us/tx  = 270.6% of a 33 ms frame
+  NOTE: hw_emu wall time is not real hardware time. Treat the tx COUNT and the
+        per-port split as the real findings; the us/tx figure needs a `TARGET=hw` run.
+Frame 312: target at pos+(10,-7) = (434,634)
+[ch 0] START
+[ch 0] weights sent + row-FFT drained (16 x 4096 B)
+[ch 0] roi_crop done
+[ch 0] fft_row_out received
+[ch 0] transpose done
+[ch 0] accum_out + F_ch received (16 x 4096 B)
+  [diag] F_ch      max|.|=    883 at colFFT idx 127 (0,127)  rails=0
+  [dump] F_ch -> F_ch_f312.bin (65536 of 65536 B)
+[ch 0] fft_col_in sent
+[ch 0] cmul_in sent
+[ch 1] START
+[ch 1] weights sent + row-FFT drained (16 x 4096 B)
+[ch 1] roi_crop done
+[ch 1] fft_row_out received
+[ch 1] transpose done
+[ch 1] accum_out + F_ch received (16 x 4096 B)
+[ch 1] fft_col_in sent
+[ch 1] cmul_in sent
+[ch 2] START
+[ch 2] weights sent + row-FFT drained (16 x 4096 B)
+[ch 2] roi_crop done
+[ch 2] fft_row_out received
+[ch 2] transpose done
+[ch 2] accum_out + F_ch received (16 x 4096 B)
+[ch 2] fft_col_in sent
+[ch 2] cmul_in sent
+[ch 3] START
+[ch 3] weights sent + row-FFT drained (16 x 4096 B)
+[ch 3] roi_crop done
+[ch 3] fft_row_out received
+[ch 3] transpose done
+[ch 3] accum_out + F_ch received (16 x 4096 B)
+[ch 3] fft_col_in sent
+[ch 3] cmul_in sent
+[ch 4] START
+[ch 4] weights sent + row-FFT drained (16 x 4096 B)
+[ch 4] roi_crop done
+[ch 4] fft_row_out received
+[ch 4] transpose done
+[ch 4] accum_out + F_ch received (16 x 4096 B)
+[ch 4] fft_col_in sent
+[ch 4] cmul_in sent
+[ch 5] START
+[ch 5] weights sent + row-FFT drained (16 x 4096 B)
+[ch 5] roi_crop done
+[ch 5] fft_row_out received
+[ch 5] transpose done
+[ch 5] accum_out + F_ch received (16 x 4096 B)
+[ch 5] fft_col_in sent
+[ch 5] cmul_in sent
+[ch 6] START
+[ch 6] weights sent + row-FFT drained (16 x 4096 B)
+[ch 6] roi_crop done
+[ch 6] fft_row_out received
+[ch 6] transpose done
+[ch 6] accum_out + F_ch received (16 x 4096 B)
+[ch 6] fft_col_in sent
+[ch 6] cmul_in sent
+[ch 7] START
+[ch 7] weights sent + row-FFT drained (16 x 4096 B)
+[ch 7] roi_crop done
+[ch 7] fft_row_out received
+[ch 7] transpose done
+[ch 7] accum_out + F_ch received (16 x 4096 B)
+[ch 7] fft_col_in sent
+[ch 7] cmul_in sent
+[ch 8] START
+[ch 8] weights sent + row-FFT drained (16 x 4096 B)
+[ch 8] roi_crop done
+[ch 8] fft_row_out received
+[ch 8] transpose done
+[ch 8] accum_out + F_ch received (16 x 4096 B)
+[ch 8] fft_col_in sent
+[ch 8] cmul_in sent
+[ch 9] START
+[ch 9] weights sent + row-FFT drained (16 x 4096 B)
+[ch 9] roi_crop done
+[ch 9] fft_row_out received
+[ch 9] transpose done
+[ch 9] accum_out + F_ch received (16 x 4096 B)
+[ch 9] fft_col_in sent
+[ch 9] cmul_in sent
+[ch 10] START
+[ch 10] weights sent + row-FFT drained (16 x 4096 B)
+[ch 10] roi_crop done
+[ch 10] fft_row_out received
+[ch 10] transpose done
+[ch 10] accum_out + F_ch received (16 x 4096 B)
+[ch 10] fft_col_in sent
+[ch 10] cmul_in sent
+[ch 11] START
+[ch 11] weights sent + row-FFT drained (16 x 4096 B)
+[ch 11] roi_crop done
+[ch 11] fft_row_out received
+[ch 11] transpose done
+[ch 11] accum_out + F_ch received (16 x 4096 B)
+[ch 11] fft_col_in sent
+[ch 11] cmul_in sent
+[ch 12] START
+[ch 12] weights sent + row-FFT drained (16 x 4096 B)
+[ch 12] roi_crop done
+[ch 12] fft_row_out received
+[ch 12] transpose done
+[ch 12] accum_out + F_ch received (16 x 4096 B)
+[ch 12] fft_col_in sent
+[ch 12] cmul_in sent
+[ch 13] START
+[ch 13] weights sent + row-FFT drained (16 x 4096 B)
+[ch 13] roi_crop done
+[ch 13] fft_row_out received
+[ch 13] transpose done
+[ch 13] accum_out + F_ch received (16 x 4096 B)
+[ch 13] fft_col_in sent
+[ch 13] cmul_in sent
+[ch 14] START
+[ch 14] weights sent + row-FFT drained (16 x 4096 B)
+[ch 14] roi_crop done
+[ch 14] fft_row_out received
+[ch 14] transpose done
+[ch 14] accum_out + F_ch received (16 x 4096 B)
+[ch 14] fft_col_in sent
+[ch 14] cmul_in sent
+[ch 15] START
+[ch 15] weights sent + row-FFT drained (16 x 4096 B)
+[ch 15] roi_crop done
+[ch 15] fft_row_out received
+[ch 15] transpose done
+[ch 15] accum_out + F_ch received (16 x 4096 B)
+[ch 15] fft_col_in sent
+[ch 15] cmul_in sent
+  [B2] nulled 9 low-frequency bins, max|removed|=3180  (not railed — reconsider B2_NULL_BINS=0)
+  [diag] accum     max|.|=   3228 at colFFT idx 2 (0,2)  rails=0
+  [dump] accum -> accum_f312.bin (65536 of 65536 B)
+[ifft] START
+[ifft] rows done (16 x 4096 B)
+[ifft] transpose done
+[ifft] cols done → response received (16 x 4096 B)
+  [diag] response  max|.|=   7987 at rowmajor idx 14844 (115,124)  rails=0
+  [dump] resp -> resp_f312.bin (65536 of 65536 B)
+  [diag] resp rank 0: (-13, -4) |re|=7987
+  [diag] resp rank 1: (-13, -3) |re|=7634
+  [diag] resp rank 2: (  0, -3) |re|=7382
+  [diag] resp rank 3: (  0,  2) |re|=7240
+  [diag] resp rank 4: (  0, -2) |re|=7093
+  [diag] resp at injected (10,-7) = 187   |   (0,0) = 1237, (10,0) = 324, (0,-7) = 2725
+  [diag] row 10 profile (every 4th col): 324 1700 314 2330 45 558 423 4996 1691 70 1705 691 641 678 620 270 932 478 1017 890 718 712 721 2636 740 1236 814 1122 35 159 1167 2373
+  [diag] col -7 profile (every 4th row): 2725 569 3159 4540 1186 1435 152 232 1739 2137 166 883 1637 1186 421 698 1592 346 473 592 2770 445 526 1492 1422 2133 568 85 1599 1182 1005 652
+  [psr] at argmax|re| (-13,-4): peak 7987  sidelobe mu 1.8 sd 1430.7 max 7382.0  PSR 5.58 (Bolme)  ratio 1.08x (aiesim metric)  n=16263
+  [psr] at argmax re  (-13,-4): peak 7987  sidelobe mu 1.8 sd 1430.7 max 7382.0  PSR 5.58 (Bolme)  ratio 1.08x
+  [psr] peak definitions agree.
+  [psr] verdict: FAIL — at or below Bolme's ~7.0 occlusion/failure indicator
+  [psr]          (Bolme PSR only — his thresholds do NOT apply to the ratio column)
+  [gate] frame 312: HOLD  reason=LOW_PSR  psr=5.58  threshold=7.00
+  [gate]         Bolme §3.5: PSR at or below ~7 indicates the object is occluded or tracking has failed. Holding position and freezing the filter.
+  [gate]         position HELD; filter A/B frozen; H not republished. Consecutive gated frames: 12
+Frame 312: displacement (-13,-4) bins = (-5.59,-1.72) frame px HELD, pos stays pos (703,812)  peak=7987  [MISMATCH vs injected offset]
+  [scale] FROZEN — gated frame, size held at 27.3x27.3
+       IoU 0.0000  centre err 322.25 px  vs injected box (57x57 at (434.0,634.0); estimate 27x27 at (703.0,811.5))  [BELOW 0.5 — PASCAL would score this a miss]
+  filter: FROZEN — update and publish both skipped (LOW_PSR). A/B unchanged; the device still holds the H published on the last accepted frame.
+  H(q15): unchanged (filter frozen this frame) — no dump written, so the previous frame's H_q15 dump is still the current device contents
+[dma] frame 312 per-port cost:
+  gmio_weights          256 tx      3.696 ms    14.44 us/tx
+  gmio_fft_row_out      256 tx     73.670 ms   287.77 us/tx
+  gmio_fft_col_in        16 tx      0.639 ms    39.93 us/tx
+  gmio_fft_col_out      256 tx      4.741 ms    18.52 us/tx
+  gmio_cmul_in           16 tx      0.374 ms    23.38 us/tx
+  gmio_accum_out        256 tx      4.510 ms    17.62 us/tx
+  gmio_ifft_row_in        1 tx      0.067 ms    67.08 us/tx
+  gmio_ifft_row_out      16 tx      0.311 ms    19.41 us/tx
+  gmio_ifft_col_in        1 tx      0.026 ms    25.57 us/tx
+  gmio_response          16 tx      0.294 ms    18.35 us/tx
+  TOTAL                1090 tx     88.326 ms    81.03 us/tx  = 267.7% of a 33 ms frame
+  NOTE: hw_emu wall time is not real hardware time. Treat the tx COUNT and the
+        per-port split as the real findings; the us/tx figure needs a `TARGET=hw` run.
+Frame 313: target at pos+(10,-7) = (427,640)
+[ch 0] START
+[ch 0] weights sent + row-FFT drained (16 x 4096 B)
+[ch 0] roi_crop done
+[ch 0] fft_row_out received
+[ch 0] transpose done
+[ch 0] accum_out + F_ch received (16 x 4096 B)
+  [diag] F_ch      max|.|=    883 at colFFT idx 127 (0,127)  rails=0
+  [dump] F_ch -> F_ch_f313.bin (65536 of 65536 B)
+[ch 0] fft_col_in sent
+[ch 0] cmul_in sent
+[ch 1] START
+[ch 1] weights sent + row-FFT drained (16 x 4096 B)
+[ch 1] roi_crop done
+[ch 1] fft_row_out received
+[ch 1] transpose done
+[ch 1] accum_out + F_ch received (16 x 4096 B)
+[ch 1] fft_col_in sent
+[ch 1] cmul_in sent
+[ch 2] START
+[ch 2] weights sent + row-FFT drained (16 x 4096 B)
+[ch 2] roi_crop done
+[ch 2] fft_row_out received
+[ch 2] transpose done
+[ch 2] accum_out + F_ch received (16 x 4096 B)
+[ch 2] fft_col_in sent
+[ch 2] cmul_in sent
+[ch 3] START
+[ch 3] weights sent + row-FFT drained (16 x 4096 B)
+[ch 3] roi_crop done
+[ch 3] fft_row_out received
+[ch 3] transpose done
+[ch 3] accum_out + F_ch received (16 x 4096 B)
+[ch 3] fft_col_in sent
+[ch 3] cmul_in sent
+[ch 4] START
+[ch 4] weights sent + row-FFT drained (16 x 4096 B)
+[ch 4] roi_crop done
+[ch 4] fft_row_out received
+[ch 4] transpose done
+[ch 4] accum_out + F_ch received (16 x 4096 B)
+[ch 4] fft_col_in sent
+[ch 4] cmul_in sent
+[ch 5] START
+[ch 5] weights sent + row-FFT drained (16 x 4096 B)
+[ch 5] roi_crop done
+[ch 5] fft_row_out received
+[ch 5] transpose done
+[ch 5] accum_out + F_ch received (16 x 4096 B)
+[ch 5] fft_col_in sent
+[ch 5] cmul_in sent
+[ch 6] START
+[ch 6] weights sent + row-FFT drained (16 x 4096 B)
+[ch 6] roi_crop done
+[ch 6] fft_row_out received
+[ch 6] transpose done
+[ch 6] accum_out + F_ch received (16 x 4096 B)
+[ch 6] fft_col_in sent
+[ch 6] cmul_in sent
+[ch 7] START
+[ch 7] weights sent + row-FFT drained (16 x 4096 B)
+[ch 7] roi_crop done
+[ch 7] fft_row_out received
+[ch 7] transpose done
+[ch 7] accum_out + F_ch received (16 x 4096 B)
+[ch 7] fft_col_in sent
+[ch 7] cmul_in sent
+[ch 8] START
+[ch 8] weights sent + row-FFT drained (16 x 4096 B)
+[ch 8] roi_crop done
+[ch 8] fft_row_out received
+[ch 8] transpose done
+[ch 8] accum_out + F_ch received (16 x 4096 B)
+[ch 8] fft_col_in sent
+[ch 8] cmul_in sent
+[ch 9] START
+[ch 9] weights sent + row-FFT drained (16 x 4096 B)
+[ch 9] roi_crop done
+[ch 9] fft_row_out received
+[ch 9] transpose done
+[ch 9] accum_out + F_ch received (16 x 4096 B)
+[ch 9] fft_col_in sent
+[ch 9] cmul_in sent
+[ch 10] START
+[ch 10] weights sent + row-FFT drained (16 x 4096 B)
+[ch 10] roi_crop done
+[ch 10] fft_row_out received
+[ch 10] transpose done
+[ch 10] accum_out + F_ch received (16 x 4096 B)
+[ch 10] fft_col_in sent
+[ch 10] cmul_in sent
+[ch 11] START
+[ch 11] weights sent + row-FFT drained (16 x 4096 B)
+[ch 11] roi_crop done
+[ch 11] fft_row_out received
+[ch 11] transpose done
+[ch 11] accum_out + F_ch received (16 x 4096 B)
+[ch 11] fft_col_in sent
+[ch 11] cmul_in sent
+[ch 12] START
+[ch 12] weights sent + row-FFT drained (16 x 4096 B)
+[ch 12] roi_crop done
+[ch 12] fft_row_out received
+[ch 12] transpose done
+[ch 12] accum_out + F_ch received (16 x 4096 B)
+[ch 12] fft_col_in sent
+[ch 12] cmul_in sent
+[ch 13] START
+[ch 13] weights sent + row-FFT drained (16 x 4096 B)
+[ch 13] roi_crop done
+[ch 13] fft_row_out received
+[ch 13] transpose done
+[ch 13] accum_out + F_ch received (16 x 4096 B)
+[ch 13] fft_col_in sent
+[ch 13] cmul_in sent
+[ch 14] START
+[ch 14] weights sent + row-FFT drained (16 x 4096 B)
+

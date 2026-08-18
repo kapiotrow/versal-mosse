@@ -43,6 +43,7 @@
 #include <stdexcept>
 #include <fstream>
 #include <chrono>
+#include <thread>          // std::this_thread::yield() in rc_poll_until_done()
 
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_kernel.h"
@@ -135,6 +136,37 @@ static_assert(IMPULSE_DC >  -PATCH_COLS/2 && IMPULSE_DC < PATCH_COLS/2,
 // reproducing pre-2026-08-16 runs.
 #ifndef FRAME_TEXTURE
 #  define FRAME_TEXTURE  1
+#endif
+// Per-frame sensor noise, PEAK amplitude in LSB. 0 disables it.
+//
+// WHY THIS EXISTS. fill_background() already had a sensor-noise term
+// (`3.0 * (next() - 0.5)`), but it was drawn ONCE and cached with the rest of the
+// field, so the "noise" was byte-identical on every frame. Combined with
+// dirty-rect restore, that made the background outside the target a perfectly
+// repeating signal — and a correlation filter fed a perfectly repeating
+// background correlates with it at exactly zero shift.
+//
+// Measured on the 2026-08-17 board run (128x128, ch16, 4-3-3, TRAJECTORY=1):
+// the response carried TWO peaks every frame — the true motion peak at ~(9,-3),
+// and a static-background peak at (0,0)/(-1,0)/(-1,-1) sitting at 69-86% of it.
+// The static one won 21 of 48 frames, and because MOSSE measures only RELATIVE
+// displacement, each win cost a permanent ~9.4 px offset. Centre error went
+// 1.35 -> 9.56 -> 87 -> 292 px in steps, with PSR reading 24-35 the whole time:
+// the response really was sharply peaked, just in the wrong place. Neither the
+// PSR gate nor `err=0 px` can see this failure mode; only IoU and the
+// resp00_over_peak column in the CSV can.
+//
+// Real video never does this — sensor noise and camera motion guarantee the
+// background does not repeat to the LSB. So this is the harness being
+// unrepresentative, not the tracker being wrong, and the minimal honest fix is
+// to re-draw the noise term that was already there once per frame.
+//
+// 2 LSB peak sits in the 1-3 LSB range typical of real 8-bit sensor noise.
+// NOTE this is the one test-sequence default that does NOT reproduce the
+// previous behaviour: FRAME_NOISE=0 restores it, for reproducing runs before
+// 2026-08-17 or for deliberately re-testing the pathological case.
+#ifndef FRAME_NOISE
+#  define FRAME_NOISE  2
 #endif
 #ifndef FRAME_ROWS
 #  define FRAME_ROWS  1080
@@ -253,6 +285,409 @@ static DmaStat g_dma_total[DMA_N];
 static void dma_reset_frame(void)
 {
     for (int i = 0; i < DMA_N; ++i) { g_dma[i].calls = 0; g_dma[i].us = 0.0; }
+}
+
+// -----------------------------------------------------------------------
+// roi_crop launch-phase instrumentation
+// -----------------------------------------------------------------------
+// WHY THIS EXISTS. Timestamped console capture on 2026-08-17 put 478.7 ms x 16
+// channels = 7.66 s in the interval between the "weights sent + row-FFT drained"
+// and "roi_crop done" prints — 94% of an 8.18 s frame, against a design budget
+// of 0.7 ms/frame for this kernel. That interval contained exactly one
+// statement, crop_run.wait(), and nothing timed it.
+//
+// It is NOT the kernel's datapath, proven three ways:
+//   - ch0 (recompute=1, 36864 loop iterations) took 277 ms; ch1-15 (recompute=0,
+//     4096 iterations) took 492 ms. 9x the work, 1.8x FASTER.
+//   - the drain loop below completes in 2-6 ms for every channel, and it cannot
+//     complete until conv2d has consumed all 16384 patch pixels — so roi_crop
+//     has written all 4096 AXIS beats within ~5 ms and has nothing left to do.
+//   - Pass 2 alone is 4096 beats at II=1, 312.5 MHz = 13 us. The measured floor
+//     is 277 ms, 21000x off. No HLS pathology spans four orders of magnitude.
+//
+// So the cost is in the launch/completion path. These four slots split it into
+// construction, argument setting, submission and completion, which is the one
+// thing the log could not distinguish. Same shape as DmaStat above, and the same
+// reason for macros over a wrapper: the call sites stay textually where they are.
+// RC_POLL vs RC_WAIT is THE discriminating measurement, and it is deliberately
+// both in one run because hardware access is the scarce resource:
+//
+//   poll ~5 ms, wait ~500 ms  -> the CU finished long ago and XRT's BLOCKING
+//                                path is the cost. The spin is then also the fix.
+//   poll ~500 ms              -> the CU genuinely is not asserting ap_done, and
+//                                the problem is in the PL, not the host.
+//
+// The spin is bounded so a misread state enum cannot hang an unattended run: on
+// timeout it gives up, flags it, and falls through to wait() which is correct
+// regardless. `yield` keeps a tight spin from starving the QEMU/simulator pair
+// under hw_emu; on hardware it returns in ~100 ns when nothing else is runnable,
+// which is three orders below anything being measured here.
+// RC_WAIT2 is a SECOND wait() on the same, already-completed run. It exists to
+// separate "wait() blocks until the command completes" from "wait() does work
+// beyond waiting". Once poll() has returned a terminal state the command IS
+// complete, so a correct wait() must return in microseconds. If RC_WAIT2 is also
+// hundreds of ms, then the cost is per-CALL bookkeeping in the completion path
+// and not a wait on anything at all — a different bug, with a different fix, and
+// one that no amount of poll-vs-wait comparison can distinguish.
+enum { RC_CTOR, RC_ARGS, RC_START, RC_POLL, RC_WAIT, RC_WAIT2, RC_N };
+
+static const char *g_rc_name[RC_N] = {
+    "crop_run ctor", "crop_run set_arg", "crop_run start",
+    "crop_run poll(state)", "crop_run wait", "crop_run wait #2"
+};
+
+// Spin bound, seconds. Generous: hw_emu host time is ~1000x hardware, and a
+// spurious trip there would only mislabel a measurement that is meaningless in
+// emulation anyway.
+static constexpr double RC_POLL_MAX_S = 60.0;
+static unsigned long    g_rc_poll_iters = 0;   // per frame
+static unsigned long    g_rc_poll_timeouts = 0;
+
+// True while the command has not reached a terminal state. Enumerated rather
+// than using `!= COMPLETED`: SUBMITTED is 7, i.e. NUMERICALLY ABOVE COMPLETED(4),
+// so any ordering comparison would exit the spin early and report a completion
+// that has not happened.
+static inline bool rc_pending(ert_cmd_state s)
+{
+    return s == ERT_CMD_STATE_NEW       || s == ERT_CMD_STATE_QUEUED
+        || s == ERT_CMD_STATE_RUNNING   || s == ERT_CMD_STATE_SUBMITTED;
+}
+static double        g_rc_us[RC_N];
+static unsigned long g_rc_n[RC_N];
+static double        g_rc_us_total[RC_N];
+static unsigned long g_rc_n_total[RC_N];
+
+// -------- per-call detail, not just the frame mean --------
+//
+// WHY. A per-frame mean destroys the single most diagnostic feature of this
+// measurement: whether the cost is QUANTIZED or DISPERSED. 16 calls all landing
+// at 500.0 +- 0.1 ms is a periodic sleep/poll interval in the completion path —
+// a host software constant, which nothing in the PL can produce. A spread of
+// 200-800 ms is a cost that tracks data or contention. The two demand opposite
+// next steps, and the mean is identical for both.
+//
+// It is also the only way to read the anomaly already on record: ch0 does 9x the
+// loop iterations of ch1-15 and took 277 ms against their 492 ms. Faster with
+// more work has no datapath explanation, but it is exactly what beating against
+// a fixed tick looks like. Per-call values make the tick visible directly, as
+// clustering at multiples of a base interval.
+#define RC_MAX_CALLS 64
+#ifndef RC_TRACE_FRAMES
+#define RC_TRACE_FRAMES 3      // frames for which every call is printed
+#endif
+static double g_rc_call_us[RC_N][RC_MAX_CALLS];   // this frame, per call
+static double g_rc_min_us[RC_N];                  // over the whole run
+static double g_rc_max_us[RC_N];
+
+// -------- completion timeline, anchored to the drain (item 5) --------
+//
+// The strongest existing evidence that the CU is innocent — the row-FFT drain
+// completes in 2-6 ms, and it CANNOT complete until conv2d has consumed all
+// 16384 patch pixels, so roi_crop has emitted its last AXIS beat by then, and
+// the hw_emu VCD shows ap_done asserting in the same cycle as TLAST — is
+// currently assembled by hand from two unrelated aggregates (a DMA total and an
+// RC total) that share no clock. These five marks put all of it on ONE clock,
+// zeroed at the crop_run.start() call, so the interval that matters can be read
+// off directly rather than inferred:
+//
+//   drain -> poll   is time spent AFTER the CU had finished. If this is the
+//                   500 ms, the cost is in the host/scheduler completion path,
+//                   and that holds whether the 500 ms shows up in poll() or in
+//                   wait() — both observe the same ERT command state.
+//   start -> drain   is time the CU (or its AIE backpressure) was genuinely
+//                   busy. If THIS is the 500 ms, the investigation moves into
+//                   the PL and the poll/wait split is beside the point.
+enum { TL_START, TL_DRAIN, TL_POLL, TL_WAIT, TL_WAIT2, TL_N };
+static const char *g_tl_name[TL_N] = { "start()", "drain", "poll", "wait", "wait#2" };
+static double g_tl_ms[RC_MAX_CALLS][TL_N];
+static int    g_tl_rows;
+static std::chrono::steady_clock::time_point g_tl_t0;
+
+static inline void rc_tl_begin(void)
+{
+    if (g_tl_rows < RC_MAX_CALLS)
+        for (int i = 0; i < TL_N; ++i) g_tl_ms[g_tl_rows][i] = -1.0;
+    g_tl_t0 = std::chrono::steady_clock::now();
+}
+static inline void rc_tl_mark(int which)
+{
+    if (g_tl_rows >= RC_MAX_CALLS) return;
+    g_tl_ms[g_tl_rows][which] = std::chrono::duration<double, std::milli>(
+        std::chrono::steady_clock::now() - g_tl_t0).count();
+}
+static inline void rc_tl_end(void) { if (g_tl_rows < RC_MAX_CALLS) ++g_tl_rows; }
+
+// min/max are seeded on the first call of the run via the n_total==0 test rather
+// than from a sentinel, so there is no "0.0 means unset" ambiguity to misread.
+#define RC_T(slot, stmt) do {                                                   \
+        const auto _t0 = std::chrono::steady_clock::now();                       \
+        stmt;                                                                    \
+        const double _dt = std::chrono::duration<double, std::micro>(             \
+            std::chrono::steady_clock::now() - _t0).count();                      \
+        if (g_rc_n[slot] < RC_MAX_CALLS)                                          \
+            g_rc_call_us[slot][g_rc_n[slot]] = _dt;                               \
+        if (!g_rc_n_total[slot] || _dt < g_rc_min_us[slot])                       \
+            g_rc_min_us[slot] = _dt;                                              \
+        if (!g_rc_n_total[slot] || _dt > g_rc_max_us[slot])                       \
+            g_rc_max_us[slot] = _dt;                                              \
+        g_rc_us[slot] += _dt;  ++g_rc_n[slot];                                    \
+        g_rc_us_total[slot] += _dt;  ++g_rc_n_total[slot];                        \
+    } while (0)
+
+static void rc_reset_frame(void)
+{
+    for (int i = 0; i < RC_N; ++i) { g_rc_us[i] = 0.0; g_rc_n[i] = 0; }
+    g_rc_poll_iters = 0;
+    g_tl_rows = 0;
+    // g_rc_call_us needs no clearing: it is written before it is read, indexed by
+    // g_rc_n[slot], which was just zeroed. g_rc_min_us/g_rc_max_us deliberately
+    // survive the reset — they are run-scoped, not frame-scoped.
+}
+
+// Spin until the command reaches a terminal state, then report how long that
+// took and how many polls it needed. Returns the final state so the caller can
+// see an ERROR/ABORT rather than silently treating it as success.
+static ert_cmd_state rc_poll_until_done(xrt::run &r)
+{
+    const auto     t0 = std::chrono::steady_clock::now();
+    ert_cmd_state  st = r.state();
+    while (rc_pending(st)) {
+        ++g_rc_poll_iters;
+        if (std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - t0).count() > RC_POLL_MAX_S) {
+            ++g_rc_poll_timeouts;
+            break;
+        }
+        std::this_thread::yield();
+        st = r.state();
+    }
+    return st;
+}
+
+static void rc_report_frame(int frame)
+{
+    double tot = 0.0;
+    printf("[roi_crop] frame %d launch-phase cost:\n", frame);
+    for (int i = 0; i < RC_N; ++i) {
+        if (!g_rc_n[i]) continue;
+        printf("  %-20s %4lu x  %9.3f ms  %8.2f ms each"
+               "   [run min %8.2f  max %8.2f]\n",
+               g_rc_name[i], g_rc_n[i], g_rc_us[i] / 1000.0,
+               g_rc_us[i] / g_rc_n[i] / 1000.0,
+               g_rc_min_us[i] / 1000.0, g_rc_max_us[i] / 1000.0);
+        tot += g_rc_us[i];
+    }
+    printf("  %-20s        %9.3f ms  = %.1f%% of a 33 ms frame\n",
+           "TOTAL", tot / 1000.0, 100.0 * tot / 33000.0);
+    // The verdict, stated inline so it does not have to be re-derived from the
+    // table every time.
+    //
+    // CORRECTED. This used to print "CU itself is slow to signal done (PL side)"
+    // whenever poll dominated wait. That conclusion does not follow, and printing
+    // it would have sent the next investigation into the PL on no evidence:
+    // xrt::run::state() reads the ERT command-packet state, which is updated by
+    // the same scheduler path that unblocks wait(). poll and wait are therefore
+    // NOT independent observers of the CU — a slow poll is equally consistent with
+    // "the CU finished at 5 ms and the observation of that fact is slow". Only the
+    // drain-anchored timeline below can separate those two, so the PL-side verdict
+    // is issued there and this one is confined to what the split can actually
+    // establish: WHICH host call carries the cost.
+    if (g_rc_n[RC_POLL] && g_rc_n[RC_WAIT]) {
+        const double p  = g_rc_us[RC_POLL]  / g_rc_n[RC_POLL]  / 1000.0;
+        const double w  = g_rc_us[RC_WAIT]  / g_rc_n[RC_WAIT]  / 1000.0;
+        const double w2 = g_rc_n[RC_WAIT2]
+                        ? g_rc_us[RC_WAIT2] / g_rc_n[RC_WAIT2] / 1000.0 : 0.0;
+        printf("  poll %.2f ms | wait %.2f ms | wait#2 %.2f ms per call, "
+               "%lu poll iters%s\n",
+               p, w, w2, g_rc_poll_iters,
+               g_rc_poll_timeouts ? "  [SPIN TIMED OUT — poll figure truncated]" : "");
+        printf("  -> %s\n",
+               (p > 10.0 * w)
+                   ? "the blocking cost is absorbed by the POLL SPIN; see the "
+                     "timeline for whether the CU or its observation was slow"
+                   : "the blocking cost is in XRT's wait(); the spin is the fix "
+                     "IF the timeline shows the CU already done");
+        // Item 8. A wait() on a command that poll() has already seen reach a
+        // terminal state cannot legitimately block on anything.
+        if (g_rc_n[RC_WAIT2] && w2 > 1.0)
+            printf("  -> wait#2 costs %.2f ms on an ALREADY-COMPLETED command: "
+                   "wait() is doing per-call work, not waiting. Neither a spin "
+                   "nor a PL fix addresses this.\n", w2);
+    }
+    fflush(stdout);
+}
+
+// -----------------------------------------------------------------------
+// Per-call dump (item 6). Printed for the first RC_TRACE_FRAMES frames only:
+// 5 slots x 16 channels x 3 frames is ~240 short lines, which is 2 s of console
+// at 115200 and worth it exactly once per run.
+//
+// What to read from it: are the values CLUSTERED at multiples of a base interval
+// (a tick in the completion path — a host constant), or DISPERSED (a cost that
+// tracks data)? The `gcd-ish` hint is deliberately not computed here; eyeballing
+// 16 numbers is more reliable than a heuristic that can be fooled by one outlier.
+// -----------------------------------------------------------------------
+static void rc_report_calls(int frame)
+{
+    if (frame >= RC_TRACE_FRAMES) return;
+    printf("[roi_crop] frame %d per-call detail, ms (look for tick quantization):\n",
+           frame);
+    for (int i = 0; i < RC_N; ++i) {
+        if (g_rc_n[i] < 2) continue;          // ctor is once-per-run, skip it
+        const unsigned long n = g_rc_n[i] < RC_MAX_CALLS ? g_rc_n[i] : RC_MAX_CALLS;
+        printf("  %-20s", g_rc_name[i]);
+        for (unsigned long c = 0; c < n; ++c) {
+            printf(" %8.2f", g_rc_call_us[i][c] / 1000.0);
+            if ((c % 8) == 7 && c + 1 < n) printf("\n  %-20s", "");
+        }
+        printf("\n");
+    }
+    fflush(stdout);
+}
+
+// -----------------------------------------------------------------------
+// Completion timeline (item 5). One row per channel, all five marks on one
+// clock zeroed at the crop_run.start() call.
+// -----------------------------------------------------------------------
+static void rc_report_timeline(int frame)
+{
+    if (!g_tl_rows) return;
+    printf("[roi_crop] frame %d completion timeline, ms since start() entry:\n",
+           frame);
+    printf("  ch %9s %9s %9s %9s %9s | %11s\n",
+           g_tl_name[TL_START], g_tl_name[TL_DRAIN], g_tl_name[TL_POLL],
+           g_tl_name[TL_WAIT], g_tl_name[TL_WAIT2], "drain->poll");
+    double drain_sum = 0.0, gap_sum = 0.0, drain_max = 0.0, gap_max = 0.0;
+    for (int c = 0; c < g_tl_rows; ++c) {
+        const double drain = g_tl_ms[c][TL_DRAIN];
+        const double gap   = g_tl_ms[c][TL_POLL] - drain;
+        printf("  %2d %9.3f %9.3f %9.3f %9.3f %9.3f | %11.3f\n", c,
+               g_tl_ms[c][TL_START], drain, g_tl_ms[c][TL_POLL],
+               g_tl_ms[c][TL_WAIT], g_tl_ms[c][TL_WAIT2], gap);
+        drain_sum += drain;  gap_sum += gap;
+        if (drain > drain_max) drain_max = drain;
+        if (gap   > gap_max)   gap_max   = gap;
+    }
+    const double drain_mean = drain_sum / g_tl_rows;
+    const double gap_mean   = gap_sum   / g_tl_rows;
+    printf("  mean: start->drain %.3f ms (max %.3f), drain->done %.3f ms "
+           "(max %.3f)\n", drain_mean, drain_max, gap_mean, gap_max);
+
+    // THE VERDICT THIS PATCH EXISTS FOR.
+    //
+    // The drain loop cannot complete until conv2d has consumed all PATCH_ELEMS
+    // pixels, so by the `drain` mark roi_crop has emitted every AXIS beat — and
+    // the hw_emu VCD shows ap_done asserting in the same cycle as TLAST. So the
+    // `drain` mark is an upper bound on when the CU finished that is INDEPENDENT
+    // of the ERT command state, which is precisely what poll() and wait() are not.
+    if (gap_mean > 10.0 * drain_mean && gap_mean > 20.0)
+        printf("  -> CU WAS ALREADY DONE. %.1f%% of the per-channel cost lands "
+               "AFTER the last AXIS beat was consumed. The cost is in the host "
+               "completion path (scheduler/driver), NOT in the PL. Compare the "
+               "control-CU probe: if camera_capture pays the same, it is "
+               "scheduler-wide.\n",
+               100.0 * gap_mean / (drain_mean + gap_mean));
+    else if (drain_mean > 20.0)
+        printf("  -> THE CU (or its AIE backpressure) IS THE COST: %.3f ms "
+               "elapses before conv2d has consumed the patch, against ~1 ms of "
+               "measured PL datapath. This is a PL/AIE-side investigation and "
+               "the poll-vs-wait split above is beside the point.\n", drain_mean);
+    else
+        printf("  -> both intervals are small; roi_crop is no longer the frame. "
+               "Re-read the frame total before optimising anything here.\n");
+    fflush(stdout);
+}
+
+// -----------------------------------------------------------------------
+// Control CU probe (item 7)
+// -----------------------------------------------------------------------
+// WHY. Every launch-path number in this design is measured on roi_crop, so
+// nothing yet distinguishes "roi_crop's completion is slow" from "ANY CU
+// completion costs ~500 ms on this stack". Those have nothing in common: the
+// first is a datapath or PLIO question, the second is XRT/zocl configuration and
+// roi_crop is a bystander.
+//
+// camera_capture is the ideal control. It is already in the xclbin, it has no
+// AXIS port (so no AIE backpressure and no graph dependency), and its runtime is
+// known from the source: one II=1 loop over frame_rows*frame_cols bytes, i.e.
+// ~6.6 ms full-size at 312.5 MHz and ~6 us for a single row. Two sizes are probed
+// on purpose — completion cost that is identical at 1920 and 2073600 bytes is a
+// fixed host cost by construction, and no PL explanation survives that.
+//
+// Safe to call here: it zero-fills frame_bo, which is exactly what the
+// (currently commented-out) intended call did, and every frame overwrites the
+// whole buffer from the host map before syncing it to the device.
+//
+// Must run BEFORE the frame loop and AFTER the graph is up, and it deliberately
+// does NOT touch crop_run — a probe that perturbed the thing being measured
+// would be worthless.
+#ifndef CONTROL_CU_RUNS
+#define CONTROL_CU_RUNS 0
+#endif
+static void rc_control_cu_probe(xrt::kernel &cam, xrt::bo &frame_bo,
+                                int frame_rows, int frame_cols)
+{
+#if CONTROL_CU_RUNS
+    printf("\n[control-cu] camera_capture launch-path probe, %d runs "
+           "(alternating 1 row / %d rows)\n", CONTROL_CU_RUNS, frame_rows);
+    printf("  run  rows      start(ms)   poll(ms)   wait(ms)  wait#2(ms)  state\n");
+    double poll_small = 0.0, poll_full = 0.0, wait_small = 0.0, wait_full = 0.0;
+    int    n_small = 0, n_full = 0;
+
+    xrt::run r(cam);
+    r.set_arg(0, frame_bo);
+    for (int i = 0; i < CONTROL_CU_RUNS; ++i) {
+        const bool full = (i & 1) != 0;
+        const int  rows = full ? frame_rows : 1;
+        r.set_arg(1, (uint32_t)rows);
+        r.set_arg(2, (uint32_t)frame_cols);
+
+        const auto t0 = std::chrono::steady_clock::now();
+        r.start();
+        const auto t1 = std::chrono::steady_clock::now();
+        const ert_cmd_state st = rc_poll_until_done(r);
+        const auto t2 = std::chrono::steady_clock::now();
+        r.wait();
+        const auto t3 = std::chrono::steady_clock::now();
+        r.wait();
+        const auto t4 = std::chrono::steady_clock::now();
+
+        const double ms_start = std::chrono::duration<double, std::milli>(t1 - t0).count();
+        const double ms_poll  = std::chrono::duration<double, std::milli>(t2 - t1).count();
+        const double ms_wait  = std::chrono::duration<double, std::milli>(t3 - t2).count();
+        const double ms_wait2 = std::chrono::duration<double, std::milli>(t4 - t3).count();
+        printf("  %3d %5d   %9.3f  %9.3f  %9.3f   %9.3f  %d\n",
+               i, rows, ms_start, ms_poll, ms_wait, ms_wait2, (int)st);
+        if (full) { poll_full  += ms_poll; wait_full  += ms_wait; ++n_full; }
+        else      { poll_small += ms_poll; wait_small += ms_wait; ++n_small; }
+    }
+    if (n_small && n_full) {
+        const double s = (poll_small + wait_small) / n_small;
+        const double f = (poll_full  + wait_full)  / n_full;
+        // Expected PL datapath: rows*cols cycles at II=1. The point of printing it
+        // is that the SLOPE, not the level, is what a PL explanation has to match.
+        printf("  completion cost: 1 row %.3f ms (PL expects ~%.3f ms), "
+               "%d rows %.3f ms (PL expects ~%.3f ms)\n",
+               s, 1.0 * frame_cols / (PL_FREQ_MHZ * 1000.0),
+               frame_rows, f,
+               1.0 * frame_rows * frame_cols / (PL_FREQ_MHZ * 1000.0));
+        if (s > 50.0)
+            printf("  -> A CU WITH NO AXIS PORT AND ~%.0f us OF WORK ALSO PAYS "
+                   "%.1f ms. The cost is scheduler-wide and roi_crop is a "
+                   "bystander; do not optimise roi_crop.\n",
+                   1000.0 * frame_cols / (PL_FREQ_MHZ * 1000.0), s);
+        else if (f < 50.0)
+            printf("  -> the control CU completes at its datapath cost, so the "
+                   "completion path is healthy in general and whatever roi_crop "
+                   "pays is specific to roi_crop.\n");
+    }
+    fflush(stdout);
+#else
+    (void)cam; (void)frame_bo; (void)frame_rows; (void)frame_cols;
+    printf("[control-cu] probe disabled (CONTROL_CU_RUNS=0). It is a HARDWARE "
+           "measurement: under hw_emu camera_capture zero-fills at II=1 in cosim "
+           "and would cost hours for a number that means nothing there.\n");
+#endif
 }
 
 // Per-frame breakdown. The number that decides whether the transposes have to
@@ -510,6 +945,89 @@ static void dump_buffer(const char *tag, int frame, const void *p, size_t bytes)
     printf("  [dump] %s -> %s (%zu of %zu B)\n", tag, path, wrote, bytes);
 #else
     (void)tag; (void)frame; (void)p; (void)bytes;
+#endif
+}
+
+// -----------------------------------------------------------------------
+// Per-frame CSV — the run's actual product
+// -----------------------------------------------------------------------
+// One row per frame, ~40 B, flushed every row. The three things it exists for:
+//
+//   1. The binary dumps are 1216 KB/frame and set the frame rate of a board run
+//      (see DUMP_BUFFERS in the Makefile). This carries what the tracking curves
+//      need at 1/30000th the volume, so a long run can afford it.
+//   2. stdout is a 115200-baud UART and the only surviving record of the
+//      2026-08-17 run was a hand-copied fragment. A flushed CSV survives a power
+//      cut up to the frame in progress.
+//   3. The end-of-run [track] SUMMARY reports means. Means hide the thing that
+//      actually happens here — a single missed frame costs a permanent ~9.4 px
+//      offset, and that is a step in a per-frame series, invisible in an average.
+//
+// resp00_over_peak is the background-lock diagnostic: |resp(0,0)| / |peak|. A
+// DCF fed a byte-identical static background correlates with it at zero shift,
+// which produces a second peak competing with the true motion peak. On the
+// 2026-08-17 run it sat at 0.69-0.86 and won 21 of 48 frames. Under ~0.3 is
+// healthy. The number was computable from data already on stdout and nothing
+// consumed it, which is why the failure took two runs to see.
+#ifndef CSV_LOG
+#  define CSV_LOG 1
+#endif
+
+static FILE *g_csv = nullptr;
+
+static void csv_open(void)
+{
+#if CSV_LOG
+    // Same best-effort placement as dump_buffer(): cwd (the SD card) first, then
+    // /tmp. Never fatal — losing the CSV must not abort a 500-frame run.
+    const char *path = "track.csv";
+    g_csv = fopen(path, "w");
+    if (!g_csv) { path = "/tmp/track.csv"; g_csv = fopen(path, "w"); }
+    if (!g_csv) {
+        printf("[csv] no writable location — stdout diagnostics only\n");
+        return;
+    }
+    fprintf(g_csv,
+            "frame,occluded,evaluated,accept,reason,psr_bolme,psr_ratio,peak,"
+            "dr_bin,dc_bin,resp00_over_peak,est_row,est_col,est_h,est_w,"
+            "truth_row,truth_col,truth_h,truth_w,iou,centre_err,published\n");
+    fflush(g_csv);
+    printf("[csv] per-frame log -> %s\n", path);
+#endif
+}
+
+static void csv_row(int frame, bool occluded, bool evaluated,
+                    const mosse::GateDecision &gate,
+                    const mosse::PsrResult &p, double resp00_over_peak,
+                    const mosse::TargetBox &est, const mosse::TargetBox &truth,
+                    double iou, double cerr, bool published)
+{
+#if CSV_LOG
+    if (!g_csv) return;
+    fprintf(g_csv,
+            "%d,%d,%d,%d,%s,%.4f,%.4f,%ld,%d,%d,%.4f,"
+            "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.4f,%.2f,%d\n",
+            frame, occluded ? 1 : 0, evaluated ? 1 : 0, gate.accept ? 1 : 0,
+            mosse::gate_reason_tag(gate.reason),
+            p.psr, p.ratio, p.peak, p.dr, p.dc, resp00_over_peak,
+            est.row, est.col, est.h, est.w,
+            truth.row, truth.col, truth.h, truth.w,
+            iou, cerr, published ? 1 : 0);
+    // Per ROW, not per run: the whole point is surviving a power cut. A 500-frame
+    // run writes 500 flushes of ~40 B, which is nothing against 1216 KB/frame of
+    // binaries or 8.3 KB/frame of console.
+    fflush(g_csv);
+#else
+    (void)frame; (void)occluded; (void)evaluated; (void)gate; (void)p;
+    (void)resp00_over_peak; (void)est; (void)truth; (void)iou; (void)cerr;
+    (void)published;
+#endif
+}
+
+static void csv_close(void)
+{
+#if CSV_LOG
+    if (g_csv) { fclose(g_csv); g_csv = nullptr; }
 #endif
 }
 
@@ -1019,6 +1537,55 @@ static void scene_mark_dirty(int r0, int c0, int r1, int c1)
     g_dirty.r1 = std::max(g_dirty.r1, r1);  g_dirty.c1 = std::max(g_dirty.c1, c1);
 }
 
+// Per-frame sensor noise over a rectangle — see FRAME_NOISE at the top.
+//
+// SCOPED TO THE ROI, NOT THE FRAME, and that is the whole reason this is cheap.
+// The pipeline only ever sees the ROI: roi_crop reads exactly that window, and
+// scale_extract reads box.h x box.w concentric inside it. Noising 1080x1920
+// would be 2.07 M pixels of RNG plus a full-frame restore every frame; the ROI
+// is ~130x130, about 122x less work — tens of microseconds against an 88 ms
+// pipeline. Regenerating the six-sinusoid field is what must NOT happen here:
+// fill_background() is 193 ms on x86 and ~0.6-1.2 s on the A72, which is why it
+// is cached in the first place.
+//
+// The rect is marked dirty, so the EXISTING restore machinery undoes it at the
+// start of the next frame exactly as it undoes the drawn target. No new
+// bookkeeping, and the noise cannot accumulate frame over frame.
+//
+// One continuously-advancing LCG, seeded once: deterministic run to run (so a
+// result is reproducible) but different every frame (which is the entire point).
+// Reseeding per frame with a fixed seed would rebuild the bug.
+static uint32_t g_noise_s = 0x9E3779B9u;
+
+static void scene_add_noise(uint8_t *frame_buf, int rows, int cols,
+                            int r0, int c0, int r1, int c1)
+{
+#if FRAME_NOISE > 0
+    r0 = std::max(0, r0);  c0 = std::max(0, c0);
+    r1 = std::min(rows - 1, r1);  c1 = std::min(cols - 1, c1);
+    if (r1 < r0 || c1 < c0) return;
+
+    constexpr int      A    = FRAME_NOISE;          // peak amplitude, LSB
+    constexpr uint32_t SPAN = 2u * (uint32_t)A + 1u; // uniform over [-A, +A]
+
+    for (int r = r0; r <= r1; ++r) {
+        uint8_t *p = frame_buf + (size_t)r * cols;
+        for (int c = c0; c <= c1; ++c) {
+            g_noise_s = g_noise_s * 1664525u + 1013904223u;
+            // High bits: the low bits of an LCG have short periods, and a short
+            // period in the noise is a repeating background again.
+            const int n = (int)((g_noise_s >> 16) % SPAN) - A;
+            const int v = (int)p[c] + n;
+            p[c] = (uint8_t)(v < 0 ? 0 : (v > 255 ? 255 : v));
+        }
+    }
+    scene_mark_dirty(r0, c0, r1, c1);
+#else
+    (void)frame_buf; (void)rows; (void)cols;
+    (void)r0; (void)c0; (void)r1; (void)c1;
+#endif
+}
+
 // -----------------------------------------------------------------------
 // Scripted target trajectory and size envelope
 // -----------------------------------------------------------------------
@@ -1466,9 +2033,105 @@ int main(int argc, char **argv)
     // ------------------------------------------------------------------
     // Per-frame tracking loop
     // ------------------------------------------------------------------
+    csv_open();
+
+    // HOISTED OUT OF THE PER-CHANNEL LOOP (was constructed at every channel of
+    // every frame — 16 per frame, 8000 over a 500-frame run).
+    //
+    // Each xrt::run construction allocates a command BO and registers it with the
+    // KDS scheduler, then tears it down again; none of that depends on the
+    // channel. Reuse is the documented XRT pattern: set_arg / start / wait,
+    // repeat. See the RC_* instrumentation above for why this became suspect.
+    //
+    // The four geometry arguments are frame-invariant, so they are set ONCE here.
+    // Only roi_row/roi_col/roi_h/roi_w (per frame) and recompute (per channel)
+    // are re-set in the loop. Arguments are set by explicit index for the reason
+    // documented at the call site — the AXIS port at id=1 consumes a positional
+    // slot, so positional assignment silently shifts every scalar after it.
+    // Timed even though it now happens once: if a single construction costs
+    // hundreds of ms, that alone explained the old per-channel figure. Printed at
+    // startup rather than through rc_report_frame(), which resets every frame.
+    const auto _rc_t0 = std::chrono::steady_clock::now();
+    xrt::run crop_run(crop);
+    crop_run.set_arg(0, frame_bo);
+    crop_run.set_arg(2, (uint32_t)FRAME_ROWS);
+    crop_run.set_arg(3, (uint32_t)FRAME_COLS);
+    crop_run.set_arg(8, (uint32_t)PATCH_ROWS);
+    crop_run.set_arg(9, (uint32_t)PATCH_COLS);
+    printf("[roi_crop] crop_run constructed once (hoisted): %.3f ms\n",
+           std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now() - _rc_t0).count());
+    fflush(stdout);
+
+    // Control CU. Runs before the first frame so its zero-fill of frame_bo cannot
+    // race the per-frame injection, and after the graph is up so the device state
+    // matches what roi_crop will see. See rc_control_cu_probe().
+    rc_control_cu_probe(cam, frame_bo, FRAME_ROWS, FRAME_COLS);
+
+    // ------------------------------------------------------------------
+    // Seed the frame buffer with the generated background — ONCE.
+    // ------------------------------------------------------------------
+    // WITHOUT THIS, THE BACKGROUND WAS NEVER IN THE FRAME AT ALL. scene_init()
+    // fills g_background, and g_background is read in exactly one place:
+    // scene_restore(), which copies only the PREVIOUS frame's dirty rect. g_dirty
+    // starts empty, nothing ever copied the whole thing in, and the camera_capture
+    // zero-fill that used to initialise the buffer is commented out above. So the
+    // frame the pipeline read was the BO as allocated, plus a target, plus
+    // whatever narrow rect a previous frame happened to dirty.
+    //
+    // MEASURED, by replaying these exact scene functions offline (2026-08-18),
+    // fraction of the 128x128 ROI that had never been written:
+    //
+    //   frame 0                          88.53%   <- the frame the filter trains on
+    //   frames 2+, TRAJECTORY=0           6.92%   (a 6-row + 3-col leading band)
+    //   frames 2+, TRAJECTORY=1        3.1-4.7%
+    //   frames 2+, without FRAME_NOISE   55.68%   <- the HEAD-era code path
+    //
+    // The last row is the configuration that produced run_0_17-08-2026.txt, whose
+    // frames 307-313 report ratio 1.08x, peak 7989 against max sidelobe 7379,
+    // identical to +-3 every frame, box collapsed to 27x27, 302 px error. A patch
+    // that is more than half a flat saturated field produces exactly that.
+    //
+    // WHAT IT COST, through roi_crop_ref's bit-exact Stage A: the band saturates
+    // the int8 rail (clipped count == band count, exactly), which inflates the
+    // patch sigma ~4.3x, which divides the REAL scene content by 4.3 before
+    // quantization. Signal std reaching conv2d 7.0-7.6 instead of 32.2-32.4, i.e.
+    // 77% lost on a normal frame and 88.7% on frame 0.
+    //
+    // WHAT IT DID NOT COST, because this was the tempting wrong answer: the band
+    // sits at patch rows 123-127, where conv2d's Hann window is 177 against 32767
+    // at the centre. Those rows carry 7.3e-6 of the windowed patch energy. The
+    // band cannot correlate with anything and has nothing to do with the (0,0)
+    // background lock that FRAME_NOISE fixed. The damage is entirely upstream, in
+    // Stage A's normalisation, and is already baked into the int8 patch by the
+    // time the window would have suppressed it.
+    //
+    // ONE memcpy, ~2 MB, ~1-2 ms once. No per-frame cost: the dirty-rect machinery
+    // was always written on the assumption that this had happened.
+    //
+    // ORDER IS LOAD-BEARING, TWICE. It must come AFTER rc_control_cu_probe(),
+    // which zero-fills frame_bo by design, and after scene_init() (which fills
+    // g_background). Putting it next to scene_init(), where it naturally belongs,
+    // silently hands the probe an opportunity to erase it.
+    //
+    // NOTE THE COUPLING: this raises the patch amplitude 4.3x and the response
+    // ~9.2x, which is why the shift budget moved from 4-3-3 to 4-5-5 in the same
+    // change. See the FFT_SHIFT block in the Makefile. Seeding without that is a
+    // railed response.
+    {
+        uint8_t *fp = frame_bo.map<uint8_t *>();
+        memcpy(fp, g_background.data(), FRAME_BYTES);
+        frame_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        printf("[scene] frame buffer seeded with the generated background "
+               "(%zu B). Before this the pipeline read an unwritten buffer "
+               "outside the dirty rect — see the note here.\n", FRAME_BYTES);
+        fflush(stdout);
+    }
+
     for (int frame = 0; frame < ITER_CNT; ++frame) {
 
         dma_reset_frame();
+        rc_reset_frame();
 
         // Recomputed every frame: the scale filter moves box.h/box.w, so the
         // ROI is no longer a constant of the run.
@@ -1567,6 +2230,24 @@ int main(int argc, char **argv)
                 truth.h   = (double)test_h;
                 truth.w   = (double)test_w;
             }
+            // Per-frame sensor noise over the ROI — see FRAME_NOISE at the top.
+            // AFTER the target/occluder is drawn, so the target is noisy too (a
+            // noiseless target on a noisy background would be its own giveaway),
+            // and BEFORE the sync, so the device sees it.
+            //
+            // The rect is the ROI the pipeline will actually read, centred on the
+            // TRACKER's position rather than the target's — when the two diverge
+            // it is the tracker's window that must be noisy. +4 px of margin
+            // covers roi_crop's bilinear taps at the border.
+            //
+            // Applied on occluded frames too: inject_checkerboard_frame() is just
+            // as perfectly repeating as the background is.
+            {
+                const int nr = pos_row - roi.roi_h / 2, nc = pos_col - roi.roi_w / 2;
+                scene_add_noise(frame_ptr, FRAME_ROWS, FRAME_COLS,
+                                nr - 4, nc - 4,
+                                nr + roi.roi_h + 3, nc + roi.roi_w + 3);
+            }
             frame_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);  // Flush host → device
             if (occluded)
                 printf("Frame %d: [OCCLUDED] checkerboard (square %d) — no target "
@@ -1645,18 +2326,22 @@ int main(int argc, char **argv)
             // is what produced "PL->AIE PLIO delivers nothing" and 0.00 MBps on
             // S00_AXIS. Confirmed on the plio_smoke testcase, which had the same
             // bug in miniature: TVALID never asserted while TREADY stayed high.
-            xrt::run crop_run(crop);
-            crop_run.set_arg(0,  frame_bo);
-            crop_run.set_arg(2,  (uint32_t)FRAME_ROWS);
-            crop_run.set_arg(3,  (uint32_t)FRAME_COLS);
-            crop_run.set_arg(4,  (uint32_t)roi_row);
-            crop_run.set_arg(5,  (uint32_t)roi_col);
-            crop_run.set_arg(6,  (uint32_t)roi.roi_h);    // roi_h, FRAME px
-            crop_run.set_arg(7,  (uint32_t)roi.roi_w);    // roi_w, FRAME px
-            crop_run.set_arg(8,  (uint32_t)PATCH_ROWS);
-            crop_run.set_arg(9,  (uint32_t)PATCH_COLS);
-            crop_run.set_arg(10, (uint32_t)((ch == 0) ? 1 : 0));
-            crop_run.start();
+            // crop_run is HOISTED above the frame loop and reused — see there.
+            // frame_buf / frame_rows / frame_cols / patch_rows / patch_cols are
+            // already set and never change; only the ROI geometry (per frame) and
+            // recompute (per channel) are re-set here.
+            RC_T(RC_ARGS, {
+                crop_run.set_arg(4,  (uint32_t)roi_row);
+                crop_run.set_arg(5,  (uint32_t)roi_col);
+                crop_run.set_arg(6,  (uint32_t)roi.roi_h);    // roi_h, FRAME px
+                crop_run.set_arg(7,  (uint32_t)roi.roi_w);    // roi_w, FRAME px
+                crop_run.set_arg(10, (uint32_t)((ch == 0) ? 1 : 0));
+            });
+            // Timeline zero. Everything the drain-anchored verdict rests on is
+            // measured from here — see rc_tl_begin().
+            rc_tl_begin();
+            RC_T(RC_START, crop_run.start());
+            rc_tl_mark(TL_START);
 
             // Feed one weight buffer per conv2d firing AND drain one row-FFT
             // window per firing, in the same loop.
@@ -1679,10 +2364,32 @@ int main(int argc, char **argv)
                 DMA_T(DMA_WEIGHTS,     gm_weights.wait());
                 DMA_T(DMA_FFT_ROW_OUT, gm_fft_row_out.wait());
             }
+            // Marked BEFORE the printf: this line is ~50 chars, i.e. ~4 ms of
+            // console at 115200 baud, and it sits between the drain and the poll.
+            // 4 ms against a 500 ms gap changes no conclusion, but it would be
+            // charged to the completion path rather than to the console, and this
+            // instrumentation exists because of exactly that kind of leak.
+            rc_tl_mark(TL_DRAIN);
             printf("[ch %d] weights sent + row-FFT drained (%d x %zu B)\n",
                    ch, CONV_INVOCATIONS, ROW_CHUNK_BYTES); fflush(stdout);
 
-            crop_run.wait();
+            // Poll to completion FIRST, then wait(). Both are timed; the gap
+            // between them is the whole question — see the RC_POLL note above.
+            // wait() is still called: it is what actually releases the run object
+            // for reuse, and it must be correct regardless of what poll reports.
+            ert_cmd_state _st = ERT_CMD_STATE_COMPLETED;
+            RC_T(RC_POLL, _st = rc_poll_until_done(crop_run));
+            rc_tl_mark(TL_POLL);
+            RC_T(RC_WAIT, crop_run.wait());
+            rc_tl_mark(TL_WAIT);
+            // Second wait on the same completed command — see RC_WAIT2. Free when
+            // the completion path is healthy, and the whole answer when it is not.
+            RC_T(RC_WAIT2, crop_run.wait());
+            rc_tl_mark(TL_WAIT2);
+            rc_tl_end();
+            if (_st != ERT_CMD_STATE_COMPLETED)
+                printf("[ch %d] roi_crop WARNING: terminal state %d, not COMPLETED\n",
+                       ch, (int)_st);
             printf("[ch %d] roi_crop done\n", ch); fflush(stdout);
             printf("[ch %d] fft_row_out received\n", ch); fflush(stdout);
 
@@ -2079,8 +2786,43 @@ int main(int argc, char **argv)
                    "current device contents\n");
         }
 
+        // Per-frame CSV row. Emitted here, at the very end of the frame body, so
+        // `box` carries BOTH the position update and the scale update — the same
+        // state the IoU line above printed — and `published` is known.
+        //
+        // Recomputed rather than captured from the reporting block above: those
+        // locals live inside `if (evaluate)`, and widening their scope to reach
+        // here would put the tracker's state in mutable frame-scope variables
+        // purely for logging. box/truth are unchanged between the two points, so
+        // the CSV and the printed IoU line agree by construction.
+        {
+            const double iou  = occluded ? 0.0 : mosse::box_iou(box, truth);
+            const double cerr = occluded ? 0.0
+                                         : std::hypot(box.row - truth.row,
+                                                      box.col - truth.col);
+            // |resp(0,0)| / |peak| — see the csv_row() comment. Frame 0's
+            // response is identically zero (H is zeroed until filter_init runs
+            // at the end of this frame), so it is only meaningful once the
+            // filter exists; 0 is reported otherwise rather than a 0/0.
+            double resp00_over_peak = 0.0;
+            if (evaluate && psr_abs.peak != 0) {
+                const int16_t *r = resp_bo.map<int16_t *>();
+                // cint16: bin (0,0) is the first sample, real part at index 0.
+                // The peak scan is on |real|, so compare like with like.
+                resp00_over_peak = std::fabs((double)r[0])
+                                 / std::fabs((double)psr_abs.peak);
+            }
+            csv_row(frame, occluded, evaluate, gate, psr_abs, resp00_over_peak,
+                    box, truth, iou, cerr, published);
+        }
+
+        rc_report_frame(frame);
+        rc_report_timeline(frame);
+        rc_report_calls(frame);
         dma_report_frame(frame);
     }
+
+    csv_close();
 
     // Tracking result across the run — the thing a long hardware run exists to
     // produce, and which no hw_emu run could ever afford to compute (2-3 frames

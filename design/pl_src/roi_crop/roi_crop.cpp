@@ -12,10 +12,28 @@
  * seen. Pass 1 resamples into a BRAM scratch buffer and accumulates Σx and Σx²;
  * pass 2 re-reads the buffer and emits normalized int8.
  *
+ * MEASURED COST (hw_emu VCD probe, 64×64, recompute=1, 312.5 MHz, 2026-08-17).
+ * These supersede the II=1 claim this comment used to make, which was the
+ * pragma's request rather than what the loops achieve:
+ *
+ *   PASS1   44,600 cyc   142.7 µs   10.9 cyc / output px   (asked II=1, got ~11)
+ *   NORM     4,100 cyc    13.1 µs    1.0 cyc / element     (asked II=1, got it)
+ *   PASS2   27,900 cyc    89.2 µs   27.2 cyc / AXIS beat   (asked II=1, got ~27)
+ *   total   76,725 cyc   245.5 µs   ap_start -> ap_done
+ *
+ * The pattern is worth remembering: NORM_LOOP is the only one of the three that
+ * touches nothing but BRAM, and it is the only one that hits II=1. PASS1 misses
+ * by ~11x on m_axi read latency and PASS2 by ~27x on AXIS backpressure from the
+ * AIE. A PIPELINE II=1 pragma bounds the datapath, not the interfaces.
+ *
+ * Scaled to 128×128 that is ~1 ms for recompute=1 and ~0.36 ms for recompute=0.
+ * The host measured 277 ms and 492 ms respectively for the same calls, so
+ * ~99.7% of roi_crop's apparent cost is NOT this kernel — it is XRT's blocking
+ * crop_run.wait(). ap_done asserts in the same cycle as TLAST; there is zero
+ * completion latency in the PL. Do not optimise this file for frame rate until
+ * that is fixed. See "Frame time" in CLAUDE.md.
+ *
  * HLS notes:
- * - Both passes are II=1 with the inner 4-sample loop unrolled, so the kernel
- *   sustains 4 pixels/cycle. At 312.5 MHz a 128×128 patch costs
- *   2 × 4096 cycles ≈ 26 µs.
  * - The only divisions are the two step computations and the mean, all outside
  *   any pipeline, so no divider is instantiated in the datapath.
  * - The reciprocal of sigma is computed once per patch in float and converted
@@ -163,11 +181,16 @@ void roi_crop(
     // ---------------------------------------------------------------------
     // Pass 1: bilinear resample into patch_buf, accumulate Σlog(x), Σlog(x)²
     //
-    // II=4, not 1: bilinear needs 4 scattered reads per output pixel through a
-    // single m_axi port, and HLS serializes them. Left as-is deliberately —
-    // at one execution per frame this is ~210 µs (0.6% of a 33 ms budget), and
-    // forcing II=1 would need source-row line buffers or a wider/split AXI port
-    // for no benefit the frame budget can notice.
+    // MEASURED 10.9 cycles per output pixel, not the II=4 this comment used to
+    // estimate and not the II=1 the pragma asks for. Bilinear needs 4 scattered
+    // reads per output pixel through a single m_axi port; HLS serialises them
+    // and each carries DDR read latency that no amount of pipelining hides.
+    //
+    // Left as-is deliberately. It runs once per FRAME (recompute=1 on channel 0
+    // only), so 128×128 costs ~571 µs — against a frame that is currently 8.26 s
+    // and would still be ~500 ms with the crop_run.wait() fix in. Forcing II=1
+    // would need source-row line buffers or a wider/split AXI port; revisit only
+    // if the frame ever gets close to 33 ms, and re-measure first.
     // ---------------------------------------------------------------------
 PASS1_ROW:
     for (int r = 0; r < patch_rows; ++r) {
@@ -265,6 +288,19 @@ NORM_LOOP:
     // ---------------------------------------------------------------------
     // Pass 2: stream the quantized patch out, 4 int8 per 32-bit AXIS beat.
     // Runs on every call, including recompute=0.
+    //
+    // MEASURED 27.2 cycles per beat, not the II=1 the pragma asks for. This loop
+    // reads BRAM and writes AXIS, so the only thing it can be waiting on is
+    // TREADY: the AIE accepts a beat about every 87 ns, while conv2d's compiler
+    // schedule (~8.75 cyc/px at 1 GHz, 4 px per beat) implies ~35 ns. So the AIE
+    // consumes ~2.5x slower than its schedule and roi_crop is backpressured for
+    // roughly 26 of every 27 cycles here.
+    //
+    // That is real and it is the thing that will matter once the host-side
+    // crop_run.wait() cost is removed — but it is 89 µs against 505 ms today, so
+    // it is not the bottleneck and must not be treated as one. If it does become
+    // one, the lever is conv2d's stream-read loop (CLAUDE.md records it as 44%
+    // of that kernel and never vectorised), not this loop.
     // ---------------------------------------------------------------------
     int beat = 0;
 PASS2_ROW:

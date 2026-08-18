@@ -86,9 +86,61 @@ FFT_COL_WS          := 8
 # Predicted held-out at 128x128/ch16 (scripts/phase1_sweep.py): 4-2-2 -> response
 # at 80.4% of rail, 4-3-3 -> 20.1%, accumulator 3.0%, nothing railed. The model
 # tracks hardware to ~6%, so 80% is not a margin worth taking.
+#
+# 4-5-5 (TOTAL 18) as of 2026-08-18, up from 4-3-3 (total 14), BECAUSE THE SCENE
+# CHANGED. The host never wrote the generated background into the frame buffer,
+# so every patch the pipeline has ever seen carried a saturated never-written
+# band; that band inflated Stage A's sigma and compressed the real content by
+# 4.3x. Seeding the background (mosse_tracker.cpp, after the control-CU probe)
+# removes it and raises the signal, so the budget MUST move with it — applying the
+# seed at 4-3-3 rails the response outright.
+#
+# The +4 bits is measured, not guessed. Re-sweep 2026-08-18 over the SAME integer
+# datapath, on patches replayed from the host's own scene functions and cropped by
+# roi_crop_ref's bit-exact Stage A, broken arm vs seeded arm, frames 2/8/15:
+#
+#   |feat|max  4.3x    (Stage A sigma no longer set by the band)
+#   |F|max     4.4x    (linear, as expected)
+#   accum      8.3-10.4x   <- NOT 4.3x, and this is the part that surprises
+#   response   8.6-10.5x
+#
+# The extra ~2.3x is H's Q1.15 quantization. max|Hq| is 32767 in BOTH arms (the
+# host always normalises to full scale), but the compressed spectrum drops far
+# more filter bins below 1 LSB: 73702 non-zero Hq bins broken vs 90122 seeded.
+# So the broken scene lost signal TWICE — once in Stage A, again in the filter
+# grid — and only the first loss is visible in the patch.
+#
+# Transfer to hardware uses the measured converged range rather than the model's
+# absolute level, per CLAUDE.md ("ratios and orderings are sound; absolute
+# magnitudes are patch-specific"). Hardware at 4-3-3, broken scene, filter
+# converged over ~20 frames: 14000-26000 = 43-79% of range. Scaling by the
+# measured 9.2x and dividing by 2^k:
+#
+#   total 14  ->  395-735% of range   RAILS
+#   total 16  ->   99-184%            RAILS
+#   total 17  ->   49- 92%            top end 8% from the rail
+#   total 18  ->   25- 46%            <- chosen
+#
+# Total 17 lands nearest the previously validated band, and is the fallback if
+# hardware comes back small. It is not the default because the response GROWS as
+# the filter converges — that is exactly how 4-2-2 passed at frame 1 (56%) and
+# railed by frame 15 — and 8% of margin against a model accurate to ~6% is not
+# margin. Verified offline at total 18: rails=0 at every stage (row/col FFT,
+# accumulator, both IFFTs) on frames 0/1/2/8/15, |F|max a stable 32-33% of scale.
+#
+# THE SPLIT IS FREE, MEASURED: in the seeded scene the invariant holds to 1.3%
+# across (4,4,5)/(4,5,4)/(5,3,4)/(5,4,3) and (4,5,5)/(5,3,5)/(5,4,4). FFT_SHIFT
+# stays at 4 rather than 5 because that leaves the accumulator at ~1400 instead
+# of ~330 — same response, 4x the accumulator resolution.
+#
+# READ THE FIRST HARDWARE RUN BEFORE TRUSTING ANY OF THIS. The scene and the
+# budget move together here, which breaks the project's own "never move two
+# magnitudes at once" rule; it is unavoidable because the budget change is
+# DERIVED from the scene change. DUMP_BUFFERS=1 gives per-frame F_ch/accum/resp,
+# so check rails and response %FS first and adjust k by whole bits.
 FFT_SHIFT           ?= 4
-IFFT_ROW_SHIFT      ?= 3
-IFFT_COL_SHIFT      ?= 3
+IFFT_ROW_SHIFT      ?= 5
+IFFT_COL_SHIFT      ?= 5
 
 # cmul_accum filter-product shift. INDEPENDENT of the invariant above.
 #
@@ -141,6 +193,20 @@ PL_SRC_REPO    := $(DESIGN_REPO)/pl_src
 HOST_APP_SRC   := $(DESIGN_REPO)/host_app_src
 SYS_CONFIGS    := $(DESIGN_REPO)/system_configs
 PROFILING_REPO := $(DESIGN_REPO)/profiling_configs
+
+# XRT runtime configuration, packaged onto the SD card NEXT TO THE ELF so XRT
+# picks it up from the working directory at startup.
+#
+# It was not packaged before, despite CLAUDE.md claiming it was. That mattered:
+# the whole point of this file is that XRT settings (scheduler mode, thread
+# policy, CPU affinity) can be A/B'd on the board WITHOUT a rebuild, and none of
+# them were reaching the board at all.
+#
+# Overridable so a variant can be packaged without editing the tracked file:
+#     make package XRT_INI=design/profiling_configs/xrt_ert_off.ini
+# Faster still, once a card is flashed: mount the FAT partition and edit the file
+# in place. Nothing in the image depends on its contents.
+XRT_INI ?= $(PROFILING_REPO)/xrt.ini
 DIRECTIVES     := $(DESIGN_REPO)/directives
 EXEC_SCRIPTS   := $(DESIGN_REPO)/exec_scripts
 
@@ -403,6 +469,75 @@ PSR_GATE_MIN ?= 7.0
 GCC_FLAGS  += -DPSR_GATE_MIN=$(PSR_GATE_MIN)
 
 # ---------------------------------------------------------------------------
+# Run instrumentation. HOST-ONLY, like PSR_GATE_MIN above.
+# ---------------------------------------------------------------------------
+# DUMP_BUFFERS writes F_ch / accum / resp / H_q15 as raw binaries next to the
+# ELF, one file per tag per frame. Measured on the 2026-08-17 board run:
+#
+#   F_ch      64 KB     accum   64 KB     resp    64 KB
+#   H_q15   1024 KB   <- 86% of the volume, written on every ACCEPTED frame
+#            -------
+#           1216 KB per frame
+#
+# through fopen/fwrite/fclose onto FAT32, into a directory that accumulates one
+# file per tag per frame across runs (so every fopen("wb") does a linear
+# directory scan over ~1000+ entries). That run measured 10.2 s/frame end to end
+# against an 88 ms instrumented pipeline and 0.72 s of 115200-baud console — the
+# dumps are the residual, i.e. the frame rate of a board run is set by this knob
+# and not by the design.
+#
+# So: 1 for a short diagnostic run where you intend to open the binaries in
+# NumPy, 0 for any run whose purpose is tracking behaviour or FPS. The CSV below
+# is the thing you actually want for the latter and costs ~40 B/frame.
+#
+# Not just a #define in mosse_tracker.cpp: it was hardcoded to 1 with no way to
+# turn it off from the build, which is how a 500-frame run ends up spending 99%
+# of its wall clock on diagnostics nobody reads.
+DUMP_BUFFERS ?= 1
+GCC_FLAGS  += -DDUMP_BUFFERS=$(DUMP_BUFFERS)
+
+# One CSV row per frame — frame, gate verdict, both PSR statistics, peak, the
+# displacement in bins, the zero-displacement/peak ratio, and both boxes with
+# IoU and centre error. ~40 B/frame, so ~20 KB for a 500-frame run, fflush'd
+# every row so a power cut costs at most the frame in progress.
+#
+# This is the run's actual product: the summary block at the end of the run
+# reports means, and `err=0 px` cannot see drift, mainlobe width or a gated
+# frame. Everything plotted in the thesis comes from here.
+CSV_LOG ?= 1
+GCC_FLAGS  += -DCSV_LOG=$(CSV_LOG)
+
+# ---------------------------------------------------------------------------
+# Launch-path diagnosis knobs (roi_crop's 505 ms crop_run.wait()). HOST-ONLY —
+# none of this reaches AIE_FLAGS or the PL, so changing any of it costs an ELF
+# rebuild and a repackage, not a re-synthesis.
+# ---------------------------------------------------------------------------
+
+# PL clock, MHz. Passed to the HOST as well as to the AIE compiler because the
+# host now converts PL cycles to ms when it reports the control CU's expected
+# datapath cost. Same variable, both toolchains — a second literal in the host
+# would be the exact failure mode CLAUDE.md records for FFT_ROW_WS.
+GCC_FLAGS  += -DPL_FREQ_MHZ=$(PL_FREQ)
+
+# Frames for which every individual launch-path call is printed, rather than only
+# the frame mean. A mean cannot distinguish a cost quantized to a scheduler tick
+# from one that tracks data, and that distinction is the whole diagnosis. ~240
+# short lines per frame, so keep it small.
+RC_TRACE_FRAMES ?= 3
+GCC_FLAGS  += -DRC_TRACE_FRAMES=$(RC_TRACE_FRAMES)
+
+# Control-CU probe: camera_capture launched CONTROL_CU_RUNS times at startup with
+# the same start/poll/wait timing as roi_crop, alternating a 1-row (~6 us) and a
+# full-frame (~6.6 ms) datapath. It answers the question no roi_crop measurement
+# can: does ANY CU completion cost ~500 ms on this stack?
+#
+# Defaults to 0 under hw_emu, where camera_capture's II=1 zero-fill of 2 M bytes
+# is simulated at RTL and would cost hours to produce a host-side number that is
+# meaningless there anyway (the host runs on QEMU).
+CONTROL_CU_RUNS ?= $(if $(filter hw,$(TARGET)),8,0)
+GCC_FLAGS  += -DCONTROL_CU_RUNS=$(CONTROL_CU_RUNS)
+
+# ---------------------------------------------------------------------------
 # Target box, ROI padding and sigma — Bolme §3.1/§3.2, Danelljan §3.1,
 # DSST (docs/1609.06141v1.pdf) §6.1. HOST-ONLY, same rule as PSR_GATE_MIN above:
 # the AIE never sees the ROI, only the fixed patch, and roi_crop takes all of its
@@ -466,6 +601,26 @@ GCC_FLAGS  += -DMOSSE_ETA=$(MOSSE_ETA)
 # target and any padding comparison is decided before it runs.
 FRAME_TEXTURE  ?= 1
 GCC_FLAGS  += -DFRAME_TEXTURE=$(FRAME_TEXTURE)
+
+# Per-frame sensor noise, PEAK amplitude in LSB. 0 = the pre-2026-08-17 behaviour.
+#
+# The background was generated once and cached (fill_background() is ~0.6-1.2 s on
+# the A72, so caching is not optional), which made it byte-identical every frame
+# outside the dirty rect. A DCF correlates with a perfectly repeating background
+# at exactly zero shift: the 2026-08-17 run carried a static peak at (0,0) worth
+# 69-86% of the true motion peak, it won 21 of 48 frames, and each win cost a
+# permanent ~9.4 px offset because MOSSE measures only relative displacement.
+# PSR read 24-35 throughout — the response was sharply peaked, at the wrong place.
+#
+# Only the noise term is re-drawn per frame, and only over the ROI (~130x130, the
+# window the pipeline actually reads), so the sinusoid field stays cached. Watch
+# the resp00_over_peak column in the CSV: 0.69-0.86 was the broken run, under
+# ~0.3 is healthy.
+#
+# THE ONE TEST-SEQUENCE DEFAULT THAT DOES NOT REPRODUCE PREVIOUS BEHAVIOUR.
+# Deliberate: the old default is the pathological case. FRAME_NOISE=0 restores it.
+FRAME_NOISE    ?= 2
+GCC_FLAGS  += -DFRAME_NOISE=$(FRAME_NOISE)
 
 # ---------------------------------------------------------------------------
 # DSST 1-D scale filter — docs/1609.06141v1.pdf §5.1. HOST-ONLY.
@@ -956,7 +1111,7 @@ $(BUILD_DIR)/run_script.sh: $(EXEC_SCRIPTS)/run_script.sh
 	chmod +x $@
 
 package: $(BUILD_DIR)/$(APP_ELF) $(BUILD_DIR)/$(XSA) $(LIBADF_A) $(ROOTFS) \
-         $(BUILD_DIR)/run_script.sh
+         $(BUILD_DIR)/run_script.sh $(XRT_INI)
 	v++ --package $(VPP_FLAGS) \
 	    --package.rootfs $(ROOTFS) \
 	    --package.kernel_image $(COMMON_IMAGE_VERSAL)/Image \
@@ -968,6 +1123,7 @@ package: $(BUILD_DIR)/$(APP_ELF) $(BUILD_DIR)/$(XSA) $(LIBADF_A) $(ROOTFS) \
 	    --package.sd_file $(LIBADF_A) \
 	    --package.sd_file $(AIE_SRC_REPO)/weights/layer0_weights.bin \
 	    --package.sd_file $(BUILD_DIR)/run_script.sh \
+	    --package.sd_file $(XRT_INI) \
 	    --package.defer_aie_run \
 	    $(BUILD_DIR)/$(XSA) $(LIBADF_A)
 
