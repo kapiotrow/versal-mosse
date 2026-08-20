@@ -337,8 +337,17 @@ struct FilterState {
 // At sigma = 2 and N = 128 the theta-function truncation error is far below one
 // cint16 LSB.
 //
-// At runtime dr = dc = 0 (the target sits at the patch centre, so "no motion"
-// maps to displacement (0,0)). Non-zero offsets exist for testing.
+// TWO RUNTIME USES, and conflating them was the tracker's primary defect until
+// 2026-08-20:
+//   DETECTION scale  dr = dc = 0. A target displaced by (dr,dc) must produce a
+//                    peak at (dr,dc), so the reference target carries no offset.
+//   TRAINING target  dr,dc = THIS frame's measured displacement. filter_update()
+//                    is handed the patch cropped at the PRE-update position, so
+//                    the object in it sits at (dr,dc); training that against a
+//                    centred G teaches a zero-shift response and the error
+//                    compounds at the learning rate. See the filter_update()
+//                    call site in mosse_tracker.cpp, and
+//                    run_training_target_tests() in test_mosse_filter.cpp.
 void gaussian_target_spectrum(cfloat *G, int rows, int cols,
                               float sigma, int dr, int dc);
 
@@ -458,6 +467,22 @@ constexpr int   DEFAULT_SCALE_N     = (int)(SCALE_N);
 constexpr float DEFAULT_SCALE_STEP  = (float)(SCALE_STEP);
 constexpr float DEFAULT_SCALE_ETA   = (float)(SCALE_ETA);
 
+// Scale-gate thresholds — see scale_gate() below for the hardware data these
+// come from. Casts rather than suffixed literals so `SCALE_CONF_MIN=2` and
+// `=2.5` both compile, matching DEFAULT_PSR_MIN.
+#ifndef SCALE_CONF_MIN
+#  define SCALE_CONF_MIN 2.0
+#endif
+#ifndef SCALE_MIN_REL
+#  define SCALE_MIN_REL 0.5
+#endif
+#ifndef SCALE_MAX_REL
+#  define SCALE_MAX_REL 2.0
+#endif
+constexpr float  DEFAULT_SCALE_CONF_MIN = (float)(SCALE_CONF_MIN);
+constexpr double DEFAULT_SCALE_MIN_REL  = (double)(SCALE_MIN_REL);
+constexpr double DEFAULT_SCALE_MAX_REL  = (double)(SCALE_MAX_REL);
+
 // Direct O(n^2) DFT. n = 33 is not a power of two, so an FFT would need a
 // Bluestein or mixed-radix path; at 33 points a direct transform is ~1089
 // complex MACs and about twenty lines. This design deliberately eliminated
@@ -515,5 +540,80 @@ ScaleResult scale_detect(const ScaleFilter &sf, const cfloat *Z, float eps_rel);
 // Train. First call initialises (eta = 1 against a zeroed state), as for the
 // translation filter.
 void scale_update(ScaleFilter &sf, const cfloat *F, float eta);
+
+// -----------------------------------------------------------------------
+// Scale-update gating — the direct analogue of psr_gate() for the size axis
+// -----------------------------------------------------------------------
+// WHY THIS EXISTS. Measured on hardware 2026-08-20, ch16, TRAJECTORY=0 with the
+// background panning and position tracking EXACT (IoU 1.0000, centre error
+// 0.00 px through frame 5): the scale filter jumped to level -12 on frame 6 and
+// took the box from 64.0 to 50.5 in one step. That shrank the ROI, which then
+// broke position tracking, which fed the scale filter off-target patches, and
+// the box thrashed -12/+5/+10/-14/+4/+10/-14/+16 from there.
+//
+// **THE ORDERING MATTERS AND IT REVERSES WHAT WAS PREVIOUSLY BELIEVED.** The
+// collapse was recorded as a SYMPTOM of background lock -> position drift. It is
+// not: it fires first, with position perfect and the background moving. Nothing
+// upstream of it needs to be wrong.
+//
+// `conf` (ScaleResult::psr) separates the two populations cleanly, on three
+// independent hardware runs:
+//
+//   healthy   3.30-3.31 (2026-08-20 A) | 2.24-3.30 (2026-08-20 B) | 2.37-3.24
+//   collapsed 0.91-1.87                | 1.05-1.63               | 0.72-1.85
+//
+// 2.0 sits in the gap every time. `ScaleResult::peak` separates too (0.15-0.21 vs
+// 0.033-0.051) but is not scale-free, so `conf` is the gate.
+//
+// THREE VETOES, NOT ONE, and they are reported separately for the same reason
+// GateReason is an enum: "size held" alone does not tell you whether the filter
+// was uncertain, structurally wrong, or merely clamped.
+//
+//   AtSearchRail   |idx| == (n_scales-1)/2. An argmax ON the boundary of the
+//                  search range cannot be the true optimum — the true one lies
+//                  outside it. At the defaults the filter steps 2%/frame against
+//                  a size envelope moving under 1%/frame, so the target can never
+//                  legitimately be at the rail. Checked BEFORE LowConf because it
+//                  is the stronger statement: frame 13 of the run above argmaxed
+//                  at exactly +16 of +/-16.
+//   LowConf        conf < conf_min. The occlusion/deformation indicator.
+//   OutOfRange     the PROPOSED box leaves [h0*min_rel, h0*max_rel]. The old
+//                  0.25/4.0 was so loose it never fired in any run on record;
+//                  it is a backstop against accumulated drift, not a per-frame
+//                  test, so it must still admit the test sequence's own envelope
+//                  (SCALE_TRAJ_AMP=0.30 => 0.70x..1.30x).
+//
+// A veto holds the box AND skips scale_update(), exactly as psr_gate() holds the
+// position and skips filter_update(). Training on a frame whose estimate was
+// rejected is what turns one bad frame into a runaway.
+enum class ScaleVeto {
+    Accept,        // conf >= threshold, argmax interior, proposed box in range
+    Disabled,      // conf_min <= 0: threshold test off, accepted by policy
+    Invalid,       // !sr.valid — filter disabled or not yet trained
+    AtSearchRail,  // argmax on the boundary of the search range
+    LowConf,       // conf below the threshold
+    OutOfRange,    // proposed box outside the absolute bounds
+};
+
+struct ScaleDecision {
+    // Default FALSE on purpose: an unset decision must never resize the box.
+    bool      accept    = false;
+    ScaleVeto reason    = ScaleVeto::Invalid;
+    double    conf      = 0.0;
+    double    new_h     = 0.0;   // the PROPOSAL, whether or not it was accepted
+    double    new_w     = 0.0;
+    float     threshold = 0.0f;
+};
+
+// `cur_h/cur_w` are the box now; `h0/w0` are the INITIAL box the relative bounds
+// are measured against. Thresholds are parameters rather than being read from the
+// DEFAULT_* constants internally, so the unit tests can sweep them without
+// depending on the build's -D.
+ScaleDecision scale_gate(const ScaleResult &sr, int n_scales,
+                         double cur_h, double cur_w, double h0, double w0,
+                         float conf_min, double min_rel, double max_rel);
+
+const char *scale_veto_tag(ScaleVeto v);   // "ACCEPT" / "AT_SEARCH_RAIL" / ...
+const char *scale_veto_why(ScaleVeto v);   // one sentence, for the log
 
 }  // namespace mosse

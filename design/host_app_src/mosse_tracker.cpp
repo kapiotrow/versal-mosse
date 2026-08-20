@@ -389,6 +389,232 @@ static unsigned long g_rc_n_total[RC_N];
 // more work has no datapath explanation, but it is exactly what beating against
 // a fixed tick looks like. Per-call values make the tick visible directly, as
 // clustering at multiples of a base interval.
+// -----------------------------------------------------------------------
+// APU-side per-frame cost — the ~90 ms nobody has ever measured
+// -----------------------------------------------------------------------
+// WHY. After console gating the frame is 177 ms (runs/run_0820_1513.log) of
+// which GMIO is a measured 87 ms and the roi_crop launch path a measured
+// 0.085 ms. The remaining ~90 ms — half the frame — has only ever been
+// ATTRIBUTED, never measured: "transposes + packing memcpy + filter update".
+// CLAUDE.md records the cost of exactly that habit: the dumps were inferred to
+// cost ~9.4 s and measured 2 s.
+//
+// THE RULE THIS FOLLOWS: measure the TOTAL and print the RESIDUAL. A profiler
+// that does not account for the whole frame lets you conclude confidently and
+// wrongly. AP_TOTAL is wall time across the whole frame body; the report prints
+// total - (GMIO + roi_crop + every AP_ slot) as an explicit "unattributed" line.
+// If that line is large, the breakdown below is not the answer and says so.
+enum {
+    AP_SCENE,        // inject_target_frame + scene_restore + BG_PAN
+    AP_FRAME_PUSH,   // memcpy g_frame_host -> frame_bo (2 MB)
+    AP_FRAME_SYNC,   // frame_bo.sync host->device (2 MB)
+    AP_TRANSPOSE,    // transpose_inplace, 17x 64 KB per frame
+    AP_WINMEAN,      // measure_window_mean + the Parseval energy loop
+    AP_FCOL_SYNC,    // fcol_bo.sync(FROM_DEVICE), 64 KB
+    AP_BO_STAGE,     // bulk memcpy between a BO mapping and the heap staging
+                     // buffers. Given its OWN slot rather than folded into the
+                     // callers: this is the cost the copy pattern ADDS, and a
+                     // fix whose overhead is invisible cannot be evaluated.
+    AP_UNPACK,       // unpack_spectrum: cint16 col-FFT -> cfloat row-major
+    AP_CMUL_PACK,    // [H|accum] packing memcpy, ~2 MB/frame
+    AP_B2,           // apply_dc_correction
+    AP_PSR,          // compute_psr x2
+    AP_FILTER,       // filter_init / filter_update
+    AP_PUBLISH,      // filter_quantize_q15 + pack_filter + sync
+    AP_SCALE_EXTRACT,// scale_extract, x2/frame — reads frame_bo DIRECTLY
+    AP_SCALE_MODEL,  // scale_detect + scale_update, pure heap
+    AP_DIAG_SCAN,    // report_cint16's max/rails scan. It runs at EVERY verbosity
+                     // because rails detection is the point, so it is a real
+                     // per-frame cost that was sitting in UNATTRIBUTED — and one
+                     // of its four calls still scans a BO mapping (accum_bo).
+    AP_N
+};
+static const char *g_ap_name[AP_N] = {
+    "scene gen", "frame push (2MB)", "frame_bo.sync", "transpose",
+    "window mean+energy",
+    "fcol_bo.sync", "BO<->heap stage", "unpack F_ch", "cmul packing",
+    "B2 correction", "PSR scan",
+    "filter update", "publish filter", "scale extract", "scale detect+update",
+    "diag scan (rails)"
+};
+// The enum and the name table are two lists that must stay the same length, in
+// the same order — exactly the class of coupling CLAUDE.md flags as "duplicated
+// in four files with no compile-time check". Here there IS one:
+static_assert(sizeof(g_ap_name) / sizeof(g_ap_name[0]) == AP_N,
+              "g_ap_name is out of sync with the AP_* enum");
+
+static double        g_ap_us[AP_N];        // this frame
+static unsigned long g_ap_n[AP_N];         // calls this frame
+static double        g_ap_tot_us[AP_N];    // whole run
+static unsigned long g_ap_tot_n[AP_N];
+static double        g_ap_frame_us;        // whole frame body, wall
+static double        g_ap_run_us;          // whole run, summed frames
+static std::chrono::steady_clock::time_point g_ap_frame_t0;
+
+#define AP_T(slot, stmt) do {                                                   \
+        const auto _a0 = std::chrono::steady_clock::now();                       \
+        stmt;                                                                    \
+        g_ap_us[slot] += std::chrono::duration<double, std::micro>(              \
+            std::chrono::steady_clock::now() - _a0).count();                     \
+        ++g_ap_n[slot];                                                          \
+    } while (0)
+
+static void ap_reset_frame(void)
+{
+    for (int i = 0; i < AP_N; ++i) { g_ap_us[i] = 0.0; g_ap_n[i] = 0; }
+    g_ap_frame_t0 = std::chrono::steady_clock::now();
+}
+
+// `dma_us` and `rc_us` are passed in rather than read from the DMA/RC globals so
+// this function cannot disagree with what those reports printed.
+// Split out of the printer for the reason dma_accumulate_frame() was: the report
+// runs on two frames, the accumulation must run on all of them.
+static void ap_accumulate_frame(void)
+{
+    g_ap_frame_us = std::chrono::duration<double, std::micro>(
+        std::chrono::steady_clock::now() - g_ap_frame_t0).count();
+    g_ap_run_us += g_ap_frame_us;
+    for (int i = 0; i < AP_N; ++i) {
+        g_ap_tot_us[i] += g_ap_us[i];
+        g_ap_tot_n[i]  += g_ap_n[i];
+    }
+}
+
+static void ap_report_frame(int frame, double dma_us, double rc_us)
+{
+    ap_accumulate_frame();
+    double apu = 0.0;
+    for (int i = 0; i < AP_N; ++i) apu += g_ap_us[i];
+    printf("[apu] frame %d cost breakdown, frame body = %.2f ms:\n",
+           frame, g_ap_frame_us / 1000.0);
+    printf("  %-20s %8s %10s %9s %7s\n", "stage", "calls", "ms", "us/call", "share");
+    for (int i = 0; i < AP_N; ++i) {
+        if (!g_ap_n[i]) continue;
+        printf("  %-20s %8lu %10.3f %9.1f %6.1f%%\n",
+               g_ap_name[i], g_ap_n[i], g_ap_us[i] / 1000.0,
+               g_ap_us[i] / (double)g_ap_n[i],
+               100.0 * g_ap_us[i] / g_ap_frame_us);
+    }
+    printf("  %-20s %8s %10.3f %9s %6.1f%%\n", "-- APU subtotal", "",
+           apu / 1000.0, "", 100.0 * apu / g_ap_frame_us);
+    printf("  %-20s %8s %10.3f %9s %6.1f%%\n", "-- GMIO (DMA_T)", "",
+           dma_us / 1000.0, "", 100.0 * dma_us / g_ap_frame_us);
+    printf("  %-20s %8s %10.3f %9s %6.1f%%\n", "-- roi_crop launch", "",
+           rc_us / 1000.0, "", 100.0 * rc_us / g_ap_frame_us);
+    const double resid = g_ap_frame_us - apu - dma_us - rc_us;
+    printf("  %-20s %8s %10.3f %9s %6.1f%%   <-- console, dumps, printf, "
+           "and anything not instrumented\n", "== UNATTRIBUTED", "",
+           resid / 1000.0, "", 100.0 * resid / g_ap_frame_us);
+    if (resid > 0.25 * g_ap_frame_us)
+        printf("  NOTE: the unattributed share is over 25%%. The breakdown above "
+               "is NOT the frame; find the missing cost before acting on it.\n");
+    fflush(stdout);
+}
+
+// -----------------------------------------------------------------------
+// CONSOLE VERBOSITY — and the console is not a cosmetic concern here.
+//
+// MEASURED 2026-08-20, 198 frames of runs/run_0820_1244.log at DUMP_BUFFERS=0:
+// regressing frame period against bytes printed gives slope 92.5 us/byte
+// (115200 8N1 is 86.8) and an INTERCEPT OF ZERO. The frame time was the UART,
+// exactly; the 87 ms of GMIO, the 17 transposes, the ~2 MB/frame of packing
+// memcpy and the filter update were all already hidden behind the tty drain.
+// 79% of the ~10 KB/frame was instrumentation for problems that are now closed.
+//
+//   0  one compact line per frame (~45 B, ~4 ms) plus warnings and the
+//      end-of-run summaries. USE THIS FOR ANY LONG RUN. track.csv carries the
+//      per-frame data and loses nothing. This is the first level at which
+//      something other than the UART sets the frame time.
+//   1  human-readable per-frame block; the roi_crop and DMA tables on the FIRST
+//      and LAST frame only. The default.
+//   2  everything, including the 96 per-channel progress lines. This is what
+//      every run before 2026-08-20 did.
+//
+// LEVEL 0 STILL PRINTS ONE LINE PER FRAME, DELIBERATELY. Gating the console to
+// literally nothing would delete the instrument that produced the measurement
+// above — `picocom | ts` needs a per-frame marker to time. ~4 ms against an
+// ~87 ms floor is 4%, which is the right price for keeping the frame period
+// measurable at all.
+#ifndef VERBOSITY
+#define VERBOSITY 1
+#endif
+
+// -----------------------------------------------------------------------
+// Row-FFT drain pipeline depth — THE GMIO PROBE
+// -----------------------------------------------------------------------
+// gmio_fft_row_out costs 286 us/tx against 17.7-19.6 for its sibling AIE->DDR
+// ports, which drain the same 4096 B chunks in a structurally identical loop.
+// The one difference is that this loop interleaves the weights feed and waits
+// once PER FIRING, so all 256 firings a frame pay a full host<->AIE round trip.
+// GMIO is now 67% of a 127.7 ms frame, so this is the whole remaining question.
+//
+// THIS PROBE CAN KILL THE HYPOTHESIS, NOT ONLY CONFIRM IT. If the 286 us is
+// per-barrier latency, raising the depth divides it. If it is throughput — the
+// AIE genuinely producing at that rate — the depth changes nothing at all. Those
+// are opposite predictions and one run settles it.
+//
+// RESULT 2026-08-20 (runs/run_0820_1629.log): **ONLY DEPTH 1 IS POSSIBLE.** The
+// sweep ran 40 clean frames at depth 1 and then aborted the instant it tried
+// depth 2:
+//
+//     terminate called after throwing an instance of 'xrt_core::error'
+//       what():  Asynchronous operation is already initiated.
+//                Multiple 'async' calls are not supported: Invalid argument
+//
+// XRT's GMIO permits exactly ONE outstanding async per port. The per-firing
+// barrier is imposed by the API, not by this loop, so there is no pipeline to
+// deepen and DO NOT TRY AGAIN — this block is kept only to record that.
+// It cost 11 seconds of board time to retire, which is the whole argument for
+// probes that can fail loudly.
+//
+// WHAT IT DOES NOT KILL: the sibling output ports drain the same 4096 B chunks
+// under the SAME one-async-at-a-time rule at 17.7-19.6 us/tx. So the constraint
+// is not what makes gmio_fft_row_out cost 286. The difference is that its wait()
+// is interleaved with the weights feed, so each firing pays a full
+// host->AIE->host round trip that only starts once its weights buffer lands.
+// Removing gmio_weights from the loop (the RTP change) should therefore leave a
+// plain drain like its siblings. That remains the fix; this was not it.
+//
+//   FFT_DRAIN_DEPTH = n  fixed depth n — ONLY 1 WORKS, see above
+//   FFT_DRAIN_DEPTH = 0  sweep 1,2,4,8,16 in 40-frame blocks (aborts at 2)
+//
+// The sweep ASCENDS on purpose. adf acquires conv2d's `weights` input_buffer per
+// firing and only ~2 fit in flight, so a deep queue is the one thing here that
+// could deadlock — and a deadlock on the board needs a power cycle, not a
+// timeout. Ascending means every depth that works is already measured and
+// printed before the one that might not, so a hang still leaves a usable log and
+// names the depth that caused it.
+#ifndef FFT_DRAIN_DEPTH
+#define FFT_DRAIN_DEPTH 1
+#endif
+
+static inline int drain_depth_for_frame(int frame)
+{
+#if FFT_DRAIN_DEPTH > 0
+    (void)frame;
+    return FFT_DRAIN_DEPTH;
+#else
+    static const int d[5] = { 1, 2, 4, 8, 16 };
+    int b = frame / 40;
+    if (b > 4) b = 4;
+    return d[b];
+#endif
+}
+
+// Compile-time constant, so at VERBOSITY 0 the format strings themselves are
+// dead-code-eliminated rather than merely skipped at runtime.
+#define VP1(...) do { if (VERBOSITY >= 1) { printf(__VA_ARGS__); } } while (0)
+#define VP2(...) do { if (VERBOSITY >= 2) { printf(__VA_ARGS__); fflush(stdout); } } while (0)
+
+// The instrumentation tables (~3.2 KB/frame of roi_crop timeline + DMA split)
+// are printed on the first and last frame only. Two frames of it in a 200-frame
+// run is ~6 KB total against 640 KB before — and the LAST frame matters as much
+// as the first, since it is the converged state.
+static inline bool trace_frame(int frame)
+{
+    return frame == 0 || frame == ITER_CNT - 1;
+}
+
 #define RC_MAX_CALLS 64
 #ifndef RC_TRACE_FRAMES
 #define RC_TRACE_FRAMES 3      // frames for which every call is printed
@@ -566,7 +792,10 @@ static void rc_report_frame(int frame)
 // -----------------------------------------------------------------------
 static void rc_report_calls(int frame)
 {
-    if (frame >= RC_TRACE_FRAMES) return;
+    // The caller gates this to the first and last frame; RC_TRACE_FRAMES is kept
+    // as an additional cap so `RC_TRACE_FRAMES=0` silences the per-call detail
+    // without silencing the timeline next to it.
+    if (frame >= RC_TRACE_FRAMES && frame != ITER_CNT - 1) return;
     printf("[roi_crop] frame %d per-call detail, ms (look for tick quantization):\n",
            frame);
     for (int i = 0; i < RC_N; ++i) {
@@ -864,6 +1093,22 @@ static void rc_control_cu_probe(xrt::kernel &cam, xrt::bo &frame_bo,
 
 // Per-frame breakdown. The number that decides whether the transposes have to
 // move off the APU is the total, against 33 ms.
+// Roll this frame's counters into the run totals. SPLIT OUT OF THE PRINTER on
+// purpose: the per-frame table is now printed on two frames only, and folding
+// accumulation into a function that is no longer called every frame would have
+// silently made the CUMULATIVE report at exit a two-frame report. That is the
+// exact failure mode the DUMP_BUFFERS residual taught — a number that still
+// looks plausible after it stops meaning what it says.
+static void dma_accumulate_frame(void)
+{
+    for (int i = 0; i < DMA_N; ++i) {
+        if (!g_dma[i].calls && g_dma[i].us == 0.0) continue;
+        g_dma_total[i].name   = g_dma[i].name;
+        g_dma_total[i].calls += g_dma[i].calls;
+        g_dma_total[i].us    += g_dma[i].us;
+    }
+}
+
 static void dma_report_frame(int frame)
 {
     double        tot_us = 0.0;
@@ -876,16 +1121,19 @@ static void dma_report_frame(int frame)
                g_dma[i].name, g_dma[i].calls, g_dma[i].us / 1000.0, per);
         tot_us += g_dma[i].us;
         tot_n  += g_dma[i].calls;
-        g_dma_total[i].name   = g_dma[i].name;
-        g_dma_total[i].calls += g_dma[i].calls;
-        g_dma_total[i].us    += g_dma[i].us;
     }
+    dma_accumulate_frame();
     printf("  %-18s %6lu tx  %9.3f ms  %7.2f us/tx  = %.1f%% of a 33 ms frame\n",
            "TOTAL", tot_n, tot_us / 1000.0,
            tot_n ? tot_us / tot_n : 0.0, 100.0 * tot_us / 33000.0);
+    // GUARDED. This line used to print unconditionally, including on TARGET=hw,
+    // and it caused a set of genuine hardware numbers to be discounted — see
+    // CLAUDE.md, "Measurement / methodology".
+#ifdef HW_EMU_BUILD
     printf("  NOTE: hw_emu wall time is not real hardware time. Treat the "
            "tx COUNT and the\n        per-port split as the real findings; the "
            "us/tx figure needs a `TARGET=hw` run.\n");
+#endif
     fflush(stdout);
 }
 
@@ -895,21 +1143,19 @@ static void dma_report_frame(int frame)
 
 // In-place 2-D matrix transpose via a temporary scratch buffer.
 // elem_bytes must be 4 (cint16).
-static void transpose_inplace(void *buf, int rows, int cols, size_t elem_bytes)
+// HEAP -> HEAP. Was transpose_inplace() operating directly on the BO mapping,
+// which made every one of the rows*cols element reads an uncached load: measured
+// 547 us for 64 KB, i.e. 33 ns/element. The scatter is unavoidable; doing it on
+// an uncached buffer is not. Callers now bulk-copy in and out around this.
+static void transpose_to(const void *src_v, void *dst_v,
+                         int rows, int cols, size_t elem_bytes)
 {
-    // Allocate scratch (stack for 64 KB is too large; use heap).
-    size_t total = (size_t)rows * cols * elem_bytes;
-    std::vector<uint8_t> tmp(total);
-    const uint8_t *src = static_cast<const uint8_t *>(buf);
-    uint8_t       *dst = tmp.data();
-
+    const uint8_t *src = static_cast<const uint8_t *>(src_v);
+    uint8_t       *dst = static_cast<uint8_t *>(dst_v);
     for (int r = 0; r < rows; ++r)
-        for (int c = 0; c < cols; ++c) {
-            const uint8_t *s = src + (r * cols + c) * elem_bytes;
-            uint8_t       *d = dst + (c * rows + r) * elem_bytes;
-            memcpy(d, s, elem_bytes);
-        }
-    memcpy(buf, tmp.data(), total);
+        for (int c = 0; c < cols; ++c)
+            memcpy(dst + ((size_t)c * rows + r) * elem_bytes,
+                   src + ((size_t)r * cols + c) * elem_bytes, elem_bytes);
 }
 
 // Peak detection used to live here as peak_detect_sw(). It is gone: it performed
@@ -948,12 +1194,16 @@ static void transpose_inplace(void *buf, int rows, int cols, size_t elem_bytes)
 static void report_psr(const mosse::PsrResult &a,   // argmax|re| — what we act on
                        const mosse::PsrResult &s)   // argmax re  — paper-literal
 {
-    printf("  [psr] at argmax|re| (%d,%d): peak %ld  sidelobe mu %.1f sd %.1f "
-           "max %.1f  PSR %.2f (Bolme)  ratio %.2fx (aiesim metric)  n=%ld\n",
-           a.dr, a.dc, a.peak, a.mean, a.sdev, a.side_max, a.psr, a.ratio, a.n_side);
-    printf("  [psr] at argmax re  (%d,%d): peak %ld  sidelobe mu %.1f sd %.1f "
-           "max %.1f  PSR %.2f (Bolme)  ratio %.2fx\n",
-           s.dr, s.dc, s.peak, s.mean, s.sdev, s.side_max, s.psr, s.ratio);
+    // The two table rows are TRACE ONLY: track.csv already carries both PSRs and
+    // the peak, one row per frame. The two ANOMALY branches below are printed at
+    // every verbosity — a disagreeing or negative peak must never be silenced to
+    // save console.
+    VP2("  [psr] at argmax|re| (%d,%d): peak %ld  sidelobe mu %.1f sd %.1f "
+        "max %.1f  PSR %.2f (Bolme)  ratio %.2fx (aiesim metric)  n=%ld\n",
+        a.dr, a.dc, a.peak, a.mean, a.sdev, a.side_max, a.psr, a.ratio, a.n_side);
+    VP2("  [psr] at argmax re  (%d,%d): peak %ld  sidelobe mu %.1f sd %.1f "
+        "max %.1f  PSR %.2f (Bolme)  ratio %.2fx\n",
+        s.dr, s.dc, s.peak, s.mean, s.sdev, s.side_max, s.psr, s.ratio);
 
     if (a.dr != s.dr || a.dc != s.dc)
         printf("  [psr] DISAGREE: the |real| scan and the signed max pick "
@@ -961,7 +1211,7 @@ static void report_psr(const mosse::PsrResult &a,   // argmax|re| — what we ac
                "the paper-literal peak is (%d,%d) with %ld.\n",
                a.dr, a.dc, a.peak, s.dr, s.dc, s.peak);
     else
-        printf("  [psr] peak definitions agree.\n");
+        VP2("  [psr] peak definitions agree.\n");
 
     if (a.peak < 0)
         printf("  [psr] WARNING: the acted-on peak is NEGATIVE (%ld). The target "
@@ -986,10 +1236,10 @@ static void report_psr(const mosse::PsrResult &a,   // argmax|re| — what we ac
         : (p >= 20.0)   ? "OK — inside Bolme's normal 20-60 range"
         : (p >= 7.0)    ? "WEAK — below Bolme's normal range, above his ~7 failure mark"
                         : "FAIL — at or below Bolme's ~7.0 occlusion/failure indicator";
-    printf("  [psr] verdict: %s\n", verdict);
-    printf("  [psr]          (Bolme PSR only — his thresholds do NOT apply to the "
-           "ratio column)\n");
-    fflush(stdout);
+    VP2("  [psr] verdict: %s\n", verdict);
+    VP2("  [psr]          (Bolme PSR only — his thresholds do NOT apply to the "
+        "ratio column)\n");
+    (void)verdict;
 }
 
 // -----------------------------------------------------------------------
@@ -1032,10 +1282,16 @@ static void gate_track(int frame, const mosse::GateDecision &g)
     g_psr_sum += g.psr;
     ++g_gate_reason_n[(int)g.reason];
 
-    printf("  [gate] frame %d: %s  reason=%s  psr=%.2f  threshold=%.2f\n",
-           frame, g.accept ? "ACCEPT" : "HOLD",
-           mosse::gate_reason_tag(g.reason), g.psr, (double)g.threshold);
-    printf("  [gate]         %s\n", mosse::gate_reason_why(g.reason));
+    // A HOLD is an event; an ACCEPT is the steady state. The verdict line drops
+    // to VERBOSITY 1 and the prose explanation to 2, but a HOLD prints at every
+    // level (below) because "the tracker stopped updating" is never noise.
+    VP1("  [gate] frame %d: %s  reason=%s  psr=%.2f  threshold=%.2f\n",
+        frame, g.accept ? "ACCEPT" : "HOLD",
+        mosse::gate_reason_tag(g.reason), g.psr, (double)g.threshold);
+    VP2("  [gate]         %s\n", mosse::gate_reason_why(g.reason));
+    if (!g.accept && VERBOSITY < 1)
+        printf("  [gate] frame %d: HOLD  reason=%s  psr=%.2f\n",
+               frame, mosse::gate_reason_tag(g.reason), g.psr);
 
     if (g.accept) {
         // The line that proves the hold-position policy works: the target came
@@ -1162,7 +1418,12 @@ static void csv_open(void)
     fprintf(g_csv,
             "frame,occluded,evaluated,accept,reason,psr_bolme,psr_ratio,peak,"
             "dr_bin,dc_bin,resp00_over_peak,est_row,est_col,est_h,est_w,"
-            "truth_row,truth_col,truth_h,truth_w,iou,centre_err,published\n");
+            "truth_row,truth_col,truth_h,truth_w,iou,centre_err,published,"
+            // The scale filter's own verdict. Added 2026-08-20: the previous run
+            // logged only est_h, so the level the detector actually PROPOSED had
+            // to be reverse-engineered from log(est_h/64)/log(a) — which is how
+            // "the detector only ever proposes +-1" was found, slowly. Log it.
+            "scale_idx,scale_conf,scale_reason\n");
     fflush(g_csv);
     printf("[csv] per-frame log -> %s\n", path);
 #endif
@@ -1172,19 +1433,29 @@ static void csv_row(int frame, bool occluded, bool evaluated,
                     const mosse::GateDecision &gate,
                     const mosse::PsrResult &p, double resp00_over_peak,
                     const mosse::TargetBox &est, const mosse::TargetBox &truth,
-                    double iou, double cerr, bool published)
+                    double iou, double cerr, bool published,
+                    bool scale_evaluated, int scale_idx,
+                    const mosse::ScaleDecision &sd)
 {
 #if CSV_LOG
     if (!g_csv) return;
     fprintf(g_csv,
             "%d,%d,%d,%d,%s,%.4f,%.4f,%ld,%d,%d,%.4f,"
-            "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.4f,%.2f,%d\n",
+            "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.4f,%.2f,%d,"
+            "%d,%.4f,%s\n",
             frame, occluded ? 1 : 0, evaluated ? 1 : 0, gate.accept ? 1 : 0,
             mosse::gate_reason_tag(gate.reason),
             p.psr, p.ratio, p.peak, p.dr, p.dc, resp00_over_peak,
             est.row, est.col, est.h, est.w,
             truth.row, truth.col, truth.h, truth.w,
-            iou, cerr, published ? 1 : 0);
+            iou, cerr, published ? 1 : 0,
+            // NOT_RUN is distinct from ACCEPT with idx 0: frame 0, an occluded
+            // frame and a PSR-gated frame never reach the scale filter at all,
+            // and reporting those as "level 0, accepted" would read as a healthy
+            // settled scale — the exact confusion this column exists to remove.
+            scale_evaluated ? scale_idx : 0,
+            scale_evaluated ? sd.conf : 0.0,
+            scale_evaluated ? mosse::scale_veto_tag(sd.reason) : "NOT_RUN");
     // Per ROW, not per run: the whole point is surviving a power cut. A 500-frame
     // run writes 500 flushes of ~40 B, which is nothing against 1216 KB/frame of
     // binaries or 8.3 KB/frame of console.
@@ -1192,7 +1463,7 @@ static void csv_row(int frame, bool occluded, bool evaluated,
 #else
     (void)frame; (void)occluded; (void)evaluated; (void)gate; (void)p;
     (void)resp00_over_peak; (void)est; (void)truth; (void)iou; (void)cerr;
-    (void)published;
+    (void)published; (void)scale_evaluated; (void)scale_idx; (void)sd;
 #endif
 }
 
@@ -1209,6 +1480,7 @@ static void csv_close(void)
 static void report_cint16(const char *tag, const int16_t *b, int rows, int cols,
                           const char *layout)
 {
+    const auto _ds0 = std::chrono::steady_clock::now();
     double max_m = -1.0;
     int    max_i = 0, rails = 0;
     for (int i = 0; i < rows * cols; ++i) {
@@ -1217,8 +1489,18 @@ static void report_cint16(const char *tag, const int16_t *b, int rows, int cols,
         if (m > max_m) { max_m = m; max_i = i; }
         if (re >= 32767.0 || re <= -32768.0 || im >= 32767.0 || im <= -32768.0) ++rails;
     }
-    printf("  [diag] %-9s max|.|=%7.0f at %s idx %d (%d,%d)  rails=%d\n",
-           tag, sqrt(max_m), layout, max_i, max_i / cols, max_i % cols, rails);
+    g_ap_us[AP_DIAG_SCAN] += std::chrono::duration<double, std::micro>(
+        std::chrono::steady_clock::now() - _ds0).count();
+    ++g_ap_n[AP_DIAG_SCAN];
+
+    // Printed at VERBOSITY >= 1, but ALWAYS when something railed. `rails` is
+    // the shift-budget instrument and it is the one number here that track.csv
+    // does not carry, so a quiet run must still shout when a bin saturates —
+    // silencing an anomaly to save console is how a budget hunt goes wrong.
+    if (VERBOSITY >= 1 || rails > 0)
+        printf("  [diag] %-9s max|.|=%7.0f at %s idx %d (%d,%d)  rails=%d%s\n",
+               tag, sqrt(max_m), layout, max_i, max_i / cols, max_i % cols, rails,
+               rails > 0 ? "   <-- RAILED" : "");
 }
 
 // The decisive report: where the response actually peaks, and — the number that
@@ -1230,6 +1512,10 @@ static void report_cint16(const char *tag, const int16_t *b, int rows, int cols,
 // is a different bug entirely. The old pass/fail line could not tell these apart.
 static void report_response(const int16_t *resp, int rows, int cols)
 {
+    // Trace only. The routine question this answers — "is the origin peak
+    // taking over?" — is `resp00_over_peak` in track.csv, one number per frame
+    // instead of ~500 B of profile.
+    if (VERBOSITY < 2) return;
     // Top 5 by |real| — peak_detect_sw's own metric, so these are exactly the
     // candidates it chose between. Selection sort over 5 ranks: 5 linear passes
     // with an explicit exclusion list, which avoids sorting the whole map.
@@ -1455,10 +1741,15 @@ static void apply_dc_correction(int16_t *accum, const int16_t *filter_all,
             accum[2 * bin + 1] = 0;
         }
     }
-    printf("  [B2] nulled 9 low-frequency bins, max|removed|=%ld%s\n",
-           max_removed,
-           max_removed >= 32000 ? "  (RAILED — as expected)"
-                                : "  (not railed — reconsider B2_NULL_BINS=0)");
+    // VP1, but ALWAYS when it rails — same rule as report_cint16()'s rails>0.
+    // This line and the Q1.15 one below were the two that escaped the first pass
+    // of console gating: 138 of the 183 B/frame the board actually printed at
+    // VERBOSITY=0, i.e. 12 ms of a 180 ms frame.
+    if (VERBOSITY >= 1 || max_removed >= 32000)
+        printf("  [B2] nulled 9 low-frequency bins, max|removed|=%ld%s\n",
+               max_removed,
+               max_removed >= 32000 ? "  (RAILED — as expected)"
+                                    : "  (not railed — reconsider B2_NULL_BINS=0)");
 #else
     // W[k] for a periodic Hann of length L: W[0] = L/2, W[±1] = -L/4, else 0.
     // The two axes have different lengths when the patch is not square.
@@ -1510,9 +1801,48 @@ static void apply_dc_correction(int16_t *accum, const int16_t *filter_all,
 
 // Persistent filter state (A_ch, B) across frames. See mosse_filter.h.
 static mosse::FilterState g_filter;
-// Target spectrum G — constant for the whole run, so it is built once at startup
-// from the closed form rather than transformed per frame.
+// Target spectrum G, CENTRED at (0,0). Used for DETECTION scale-setting and for
+// filter_init() on frame 0, where the crop really is centred on the target.
+// Heap staging for BO contents. MEASURED 2026-08-20 (runs/run_0820_1539.log):
+// the xrt::bo host mappings are WRITE-COMBINING — a bulk read out of one runs at
+// 696 MB/s against 7359 MB/s heap-to-heap (10.6x), while writes INTO one manage
+// 3470 MB/s (2.1x). So any loop that touches a BO element-by-element pays the
+// uncached read on every access. Copy the whole buffer out once, compute on the
+// copy, copy back only if the device needs the result. Sized once at startup;
+// never reallocated, because a per-call std::vector would put a malloc inside
+// the very loop being optimised.
+// The scene, HOST-SIDE. scale_extract() takes 33 bilinear crops per call, two
+// calls a frame, i.e. ~64k scattered reads — and it used to take them straight
+// out of frame_bo, a write-combining mapping where every load is a DRAM round
+// trip. Measured 6732 us/call against 261 us for scale_detect+update, so 96% of
+// the scale filter's cost was the mapping and none of it the DSST maths.
+//
+// So the scene now lives on the heap and is PUSHED to the device once per frame.
+// That direction is the cheap one: the probe measured writes into a BO at
+// 3470 MB/s against reads out at 696, so 2 MB costs ~600 us to push and would
+// cost ~2.9 ms to pull. inject_target_frame() also gets faster for free, since it
+// was writing into the same uncached mapping.
+//
+// INVARIANT: g_frame_host is the authority and frame_bo is a copy of it. Anything
+// that writes frame_bo directly (rc_control_cu_probe's zero-fill) must run BEFORE
+// the first push, or it silently reverts the scene — the same ordering trap the
+// background seeding already documents.
+static std::vector<uint8_t> g_frame_host;
+static std::vector<uint8_t> g_stage_a;   // row_bo in
+static std::vector<uint8_t> g_stage_b;   // transpose destination -> row_bo out
+static std::vector<uint8_t> g_stage_c;   // fcol_bo / resp_bo — a THIRD buffer on
+                                         // purpose. Reusing g_stage_b for the
+                                         // F_ch copy is safe only because the
+                                         // transpose has already been flushed to
+                                         // row_bo by then; that is an ordering
+                                         // constraint nothing would enforce, and
+                                         // 64 KB is cheaper than the bug.
 static std::vector<mosse::cfloat> g_target(PATCH_ELEMS);
+// Target spectrum G re-centred at THIS frame's measured displacement, rebuilt
+// per accepted frame for filter_update(). See the note at the update site: the
+// training target must sit where the object actually is in the patch being
+// trained on, and that is not (0,0) on any frame after the first.
+static std::vector<mosse::cfloat> g_target_shift(PATCH_ELEMS);
 // Per-channel 2-D spectra drained from gmio_fft_col_out this frame.
 static std::vector<mosse::cfloat> g_F_all((size_t)N_CHANNELS * PATCH_ELEMS);
 
@@ -1559,8 +1889,10 @@ static void publish_filter(xrt::bo &filter_bo, std::vector<int16_t> &scratch)
                                scratch.data(), &scale, &max_abs);
     pack_filter(scratch.data(), filter_bo.map<int16_t *>());
     filter_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
-    printf("  filter: Q1.15 scale %.4g, max|H| %.4g\n", (double)scale, (double)max_abs);
-    fflush(stdout);
+    // VP1. NOT carried by track.csv, so at VERBOSITY=0 this number is only
+    // visible via the report_cint16("H(q15)") line next to it, which prints
+    // unconditionally whenever a bin rails — the failure this would warn about.
+    VP1("  filter: Q1.15 scale %.4g, max|H| %.4g\n", (double)scale, (double)max_abs);
 }
 
 // -----------------------------------------------------------------------
@@ -1636,10 +1968,21 @@ static void fill_background(uint8_t *frame_buf, int rows, int cols)
         s = s * 1664525u + 1013904223u;
         return (double)(s >> 8) / (double)(1u << 24);   // [0,1)
     };
+    // WHOLE CYCLES PER FRAME, so the field is exactly periodic in both axes and
+    // BG_PAN's wraparound is seamless. With continuous frequencies the row wrap is
+    // a hard edge — measured 8.10 LSB mean discontinuity against 0.98 LSB between
+    // interior rows, i.e. 8x the natural texture gradient, running the full width
+    // of the frame. A 128-px ROI straddles it ~12% of frames at a fast pan, and an
+    // artificial edge is exactly the kind of feature a DCF locks onto. Rounding
+    // takes that to 1.02 LSB, indistinguishable from the interior.
+    //
+    // The LCG is consumed in the same order and the same number of times, so this
+    // only quantizes the six frequencies (they were already in [1,6] cycles);
+    // amplitudes, phases and the dither are untouched.
     struct { double fy, fx, ph, amp; } comp[6];
     for (auto &k : comp) {
-        k.fy  = (1.0 + 5.0 * next()) / (double)rows;
-        k.fx  = (1.0 + 5.0 * next()) / (double)cols;
+        k.fy  = std::round(1.0 + 5.0 * next()) / (double)rows;
+        k.fx  = std::round(1.0 + 5.0 * next()) / (double)cols;
         k.ph  = 2.0 * M_PI * next();
         k.amp = 0.4 + 0.6 * next();
     }
@@ -1690,15 +2033,93 @@ static void scene_init(int rows, int cols)
     g_dirty = DirtyRect{};                       // frame starts equal to background
 }
 
+// -----------------------------------------------------------------------
+// Background pan — camera motion, and the actual fix for background lock
+// -----------------------------------------------------------------------
+// WHY NOISE IS NOT THE FIX. `FRAME_NOISE` was introduced against a background
+// that repeated byte-for-byte, and it worked — in the scene of 2026-08-17, where
+// the frame buffer was never seeded and the ROI was mostly zeros, so the noise
+// really was the dominant varying content. Once the buffer WAS seeded the same
+// lever stopped working (resp00_over_peak back to 0.86; see the trap entry), and
+// the reason is structural: **independent additive noise does not decorrelate a
+// static pattern.** The background still correlates with itself at exactly zero
+// shift; the extra variance inflates the MOSSE numerator and the shared
+// denominator alike. Byte-identity was never the mechanism — high correlation
+// was — so raising the amplitude cannot help, it only buries the target too.
+//
+// What real video actually provides is that the background is not the SAME
+// background from frame to frame under the tracking window, because the camera
+// moves. Panning reproduces exactly that, and it is the honest test: correlating
+// this frame's ROI against a filter trained on a differently-offset patch of the
+// same texture field gives no zero-shift peak, which is the whole point.
+//
+// SCOPED TO THE ROI, same argument as scene_add_noise(). The pipeline only reads
+// the ROI window, so only that has to carry the new offset; the rest of the frame
+// keeps whatever pan it last had and nobody looks. The existing dirty-rect
+// machinery undoes it, so there is no new bookkeeping and no accumulation.
+//
+// SAMPLED, NOT REGENERATED. fill_background() is ~0.6-1.2 s on the A72. Reading
+// the cached field at a wrapped offset costs two memcpys per row.
+//
+// The pan is CONSTANT-VELOCITY and independent of the target trajectory. Both
+// matter: a pan that tracked the target would hold the background still in ROI
+// coordinates and rebuild the bug, and a periodic pan could resonate with
+// TRAJ_PERIOD. 31 and 47 are coprime to 1080 and 1920, so the offsets visit every
+// row and column before repeating, and fill_background() uses whole cycles per
+// frame so the wraparound is seamless.
+//
+// **THE MAGNITUDE HAD TO BE SWEPT** (scripts/bg_pan_sweep.py; the table is in the
+// Makefile next to BG_PAN_R). The texture's shortest wavelength is 180 rows, so
+// the obvious first guess of 3-5 px/frame moved the zero-shift correlation from
+// 0.60 to 0.61 — nothing. It takes ~31/47 to reach 0.09. Re-sweep if the texture
+// changes; the right pan is a property of its spectrum, not a constant.
+//
+// This should NOT move the shift budget: a panned sample of the same texture
+// field has the same amplitude statistics as an unpanned one. Watch |F| on the
+// first run anyway — that assumption is cheap to check and expensive to assume.
+#ifndef BG_PAN
+#  define BG_PAN 1
+#endif
+#ifndef BG_PAN_R
+#  define BG_PAN_R 3
+#endif
+#ifndef BG_PAN_C
+#  define BG_PAN_C 5
+#endif
+
+static int g_pan_r = 0, g_pan_c = 0;
+
+static inline int scene_wrap(int v, int n) { v %= n; return v < 0 ? v + n : v; }
+
+// Frame 0 must be pan (0,0): the startup seed memcpys the unpanned field into the
+// whole frame buffer, and the training frame has to agree with it.
+static void scene_set_pan(int frame)
+{
+#if BG_PAN
+    g_pan_r = BG_PAN_R * frame;
+    g_pan_c = BG_PAN_C * frame;
+#else
+    (void)frame;
+#endif
+}
+
+// With g_pan_r = g_pan_c = 0 this is bit-identical to the original single-memcpy
+// restore: sc == c0 and first == w, so the second memcpy is never reached.
 static void scene_restore(uint8_t *frame_buf, int rows, int cols)
 {
     if (g_dirty.r1 < g_dirty.r0) return;
     const int r0 = std::max(0, g_dirty.r0), r1 = std::min(rows - 1, g_dirty.r1);
     const int c0 = std::max(0, g_dirty.c0), c1 = std::min(cols - 1, g_dirty.c1);
-    const size_t w = (size_t)(c1 - c0 + 1);
-    for (int r = r0; r <= r1; ++r)
-        memcpy(frame_buf + (size_t)r * cols + c0,
-               g_background.data() + (size_t)r * cols + c0, w);
+    const int w  = c1 - c0 + 1;
+    for (int r = r0; r <= r1; ++r) {
+        const uint8_t *src = g_background.data()
+                           + (size_t)scene_wrap(r + g_pan_r, rows) * cols;
+        uint8_t       *dst = frame_buf + (size_t)r * cols + c0;
+        const int sc    = scene_wrap(c0 + g_pan_c, cols);
+        const int first = std::min(w, cols - sc);
+        memcpy(dst, src + sc, (size_t)first);
+        if (first < w) memcpy(dst + first, src, (size_t)(w - first));
+    }
     g_dirty = DirtyRect{};
 }
 
@@ -2094,12 +2515,13 @@ int main(int argc, char **argv)
                                box.h, box.w, (float)SCALE_SIGMA_FACTOR);
     std::vector<mosse::cfloat> scale_sample(
         (size_t)(scale.enabled() ? scale.sample_elems() : 1));
-    // Absolute bounds on the box, so a run of bad scale estimates cannot collapse
-    // the target to nothing or grow it past the frame. The PER-FRAME change is
-    // already bounded by the filter's own range (step^±(S-1)/2 = ±38% at the
-    // defaults), so this only has to catch accumulated drift.
+    // The initial box, which the absolute drift bounds are measured against. The
+    // bounds themselves now live with the rest of the scale gate — see
+    // DEFAULT_SCALE_MIN_REL / MAX_REL and scale_gate() in mosse_filter.h. They
+    // moved out of here because they were one veto of three and the other two
+    // have to be applied in the same place and reported in the same vocabulary;
+    // they also tightened from 0.25/4.0, which was so loose it never fired.
     const double box_h0 = box.h, box_w0 = box.w;
-    constexpr double SCALE_MIN_REL = 0.25, SCALE_MAX_REL = 4.0;
 
     printf("box: %.0fx%.0f px at (%.0f,%.0f)  padding %.2f  ->  roi %dx%d @(%d,%d)\n",
            box.h, box.w, box.row, box.col, (double)mosse::DEFAULT_PADDING,
@@ -2108,30 +2530,48 @@ int main(int argc, char **argv)
            "sigma %.2f/%.2f  target %.1f patch px\n",
            mosse::patch_dr_to_frame(1, roi0), (double)sigma_r, (double)sigma_c,
            mosse::target_h_in_patch(box, roi0));
-    if (mosse::DEFAULT_SCALE_N > 1)
+    if (scale.enabled()) {
         printf("scale: DSST 1-D filter, S=%d step=%.3f eta=%.3f sigma=%.2f  "
                "template %dx%d (d=%d)  range %.0f%%..%.0f%%\n",
                scale.n_scales, (double)scale.step, (double)mosse::DEFAULT_SCALE_ETA,
                (double)scale.sigma, scale.tmpl_h, scale.tmpl_w, scale.dims(),
                100.0 * std::pow((double)scale.step, -(scale.n_scales - 1) / 2.0),
                100.0 * std::pow((double)scale.step, (scale.n_scales - 1) / 2.0));
-    else
+        printf("scale gate: conf >= %.2f, argmax must be interior (|idx| < %d), "
+               "box within %.2fx..%.2fx of %.0fx%.0f — a veto HOLDS the size and "
+               "SKIPS the model update\n",
+               (double)mosse::DEFAULT_SCALE_CONF_MIN, (mosse::DEFAULT_SCALE_N - 1) / 2,
+               mosse::DEFAULT_SCALE_MIN_REL, mosse::DEFAULT_SCALE_MAX_REL,
+               box_h0, box_w0);
+    } else {
         printf("scale: DISABLED (SCALE_N=1) — box size is held fixed\n");
+    }
     if (roi0.roi_h != PATCH_ROWS || roi0.roi_w != PATCH_COLS)
         printf("     NOTE resample is NOT 1:1 — roi_crop's bilinear interpolator "
                "is live. It is covered by `make test_roi_crop` (17 cases) and by "
                "nothing before 2026-08-16.\n");
 
-    // Target spectrum: closed form, no FFT (see mosse_filter.h). CENTRED — a
-    // target displaced by (dr,dc) must produce a peak at (dr,dc), so G itself
-    // carries no offset. Per-axis sigma, because DSST §6.1 anchors it to "the
-    // target size in the translation dimensionS" and a non-square box has a
-    // different extent in each.
+    // Target spectrum: closed form, no FFT (see mosse_filter.h). CENTRED, and
+    // that is correct for exactly two things: setting the response scale, and
+    // filter_init() on frame 0, whose crop IS centred on the target.
+    //
+    // It is NOT the training target for any later frame. The old comment here
+    // read "a target displaced by (dr,dc) must produce a peak at (dr,dc), so G
+    // itself carries no offset" — true of DETECTION, false of TRAINING, and that
+    // conflation was the tracker's primary failure mode until 2026-08-20. See
+    // the filter_update() call site.
+    //
+    // Per-axis sigma, because DSST §6.1 anchors it to "the target size in the
+    // translation dimensionS" and a non-square box has a different extent in
+    // each.
     mosse::gaussian_target_spectrum(g_target.data(), PATCH_ROWS, PATCH_COLS,
                                     sigma_r, sigma_c, 0, 0);
 
     // Scratch for the row-major quantized filter, before pack_filter() converts
     // it to the col-FFT layout.
+    g_stage_a.resize(FFT_BYTES);
+    g_stage_b.resize(FFT_BYTES);
+    g_stage_c.resize(FFT_BYTES > RESP_BYTES ? FFT_BYTES : RESP_BYTES);
     std::vector<int16_t> filter_scratch((size_t)N_CHANNELS * PATCH_ELEMS * 2);
 
     if (ITER_CNT < 2)
@@ -2141,6 +2581,16 @@ int main(int argc, char **argv)
     printf("filter: sigma=%.1f eta=%.3f H_SHIFT=%d — frame 0 initialises, "
            "frame 1+ tracks\n",
            (double)mosse::DEFAULT_SIGMA, (double)mosse::DEFAULT_ETA, CMUL_H_SHIFT);
+    // MAKE THE LOG SELF-DESCRIBING. runs/.last_cfg recorded ITER_CNT=500 for a
+    // run that executed exactly 200 frames, and neither the frame count nor the
+    // console level appeared anywhere in the log itself — so which of the two
+    // was stale could not be settled from the artifact. A log that cannot state
+    // its own configuration is one reflash away from the stale-card trap.
+    printf("run: ITER_CNT=%d  VERBOSITY=%d  DUMP_BUFFERS=%d  shift %d-%d-%d  "
+           "N_CHANNELS=%d  %dx%d\n",
+           ITER_CNT, VERBOSITY, DUMP_BUFFERS,
+           FFT_SHIFT_CFG, IFFT_ROW_SHIFT_CFG, IFFT_COL_SHIFT_CFG,
+           N_CHANNELS, PATCH_ROWS, PATCH_COLS);
     fflush(stdout);
 
     // Tracked position, kept as ints because roi_crop takes integer coordinates.
@@ -2167,6 +2617,13 @@ int main(int argc, char **argv)
     int    trk_eval = 0, trk_ok = 0, trk_lost = 0;
     double trk_iou_sum = 0.0, trk_iou_min = 1.0;
     double trk_cerr_sum = 0.0, trk_cerr_max = 0.0;
+    // Scale-gate tally, mirroring the PSR gate's. Reported per REASON, not just
+    // as a hold count: a run that holds on AT_SEARCH_RAIL and one that holds on
+    // LOW_CONF need different next steps, and at these frame times the log has to
+    // say which without a rerun.
+    int    scale_n_eval = 0, scale_n_accept = 0, scale_n_hold = 0;
+    int    scale_reason_n[8] = {0};
+    double scale_conf_min_seen = 1e300, scale_conf_max_seen = -1e300;
 #if TRAJECTORY
     printf("trajectory: ELLIPSE amp (%.0f,%.0f) px, period %.0f frames, "
            "peak step ~%.1f px/frame — closed path, run length unbounded\n",
@@ -2205,6 +2662,17 @@ int main(int argc, char **argv)
            (unsigned)(OCCLUDE_MASK));
 #else
     printf("occlusion: none\n");
+#endif
+
+#if BG_PAN
+    printf("background: PANNING %+d,%+d px/frame (camera motion) — wraps after "
+           "%d/%d frames, so it does not repeat within the run\n",
+           BG_PAN_R, BG_PAN_C, FRAME_ROWS / (BG_PAN_R ? BG_PAN_R : 1),
+           FRAME_COLS / (BG_PAN_C ? BG_PAN_C : 1));
+#else
+    printf("background: STATIC — the ROI sees the same texture every frame, so a "
+           "zero-shift peak will grow and win. Watch resp00_over_peak in "
+           "track.csv; set BG_PAN=1 unless you are deliberately reproducing it\n");
 #endif
 
     // ------------------------------------------------------------------
@@ -2299,6 +2767,74 @@ int main(int argc, char **argv)
     rc_control_cu_probe(cam, frame_bo, FRAME_ROWS, FRAME_COLS);
 
     // ------------------------------------------------------------------
+    // BO-MAPPING ACCESS PROBE — is the ~40 ms in the element loops the MEMORY
+    // or the CODE?
+    // ------------------------------------------------------------------
+    // Measured 2026-08-20: transpose 33 ns/element, window mean+energy 55, unpack
+    // 63 — about 71 MB/s on a 64 KB buffer, i.e. 50-100x below what an A72 does on
+    // cached DRAM. All three run directly on xrt::bo mappings. Either those
+    // mappings are uncached/write-combining (fix: copy once, compute on the heap
+    // copy) or the loops are simply bad code (fix: -O3 -mcpu, drop fp64).
+    //
+    // THE TWO HYPOTHESES PREDICT OPPOSITE RESULTS HERE, which is the point — this
+    // probe can kill either one rather than only confirm the one being tested:
+    //   uncached mapping  -> BO memcpy and BO sum are BOTH ~50-100x slower than heap
+    //   bad codegen       -> BO memcpy ~= heap memcpy, and only the SUM is slow
+    {
+        const size_t N = FFT_BYTES;                 // 64 KB, the working size
+        std::vector<uint8_t> heap_a(N), heap_b(N);
+        int16_t *bo_p = row_bo.map<int16_t *>();
+        memset(heap_a.data(), 1, N);
+        // Warm up: first touch faults pages, and a cold TLB would be charged to
+        // whichever case ran first.
+        memcpy(heap_b.data(), heap_a.data(), N);
+        memcpy((void *)bo_p, heap_a.data(), N);
+
+        constexpr int REP = 64;
+        auto bench = [&](const char *tag, auto &&fn) {
+            fn();                                    // warm
+            const auto t0 = std::chrono::steady_clock::now();
+            for (int i = 0; i < REP; ++i) fn();
+            const double us = std::chrono::duration<double, std::micro>(
+                std::chrono::steady_clock::now() - t0).count() / REP;
+            printf("  %-28s %8.1f us   %8.1f MB/s\n", tag, us, N / us);
+            return us;
+        };
+        printf("[mem] BO-mapping access probe, %zu B x %d reps:\n", N, REP);
+        volatile long sink = 0;
+        const double h_cpy = bench("memcpy heap -> heap",
+            [&]{ memcpy(heap_b.data(), heap_a.data(), N); });
+        const double r_cpy = bench("memcpy BO   -> heap  (read)",
+            [&]{ memcpy(heap_b.data(), (const void *)bo_p, N); });
+        bench("memcpy heap -> BO    (write)",
+            [&]{ memcpy((void *)bo_p, heap_a.data(), N); });
+        const double h_sum = bench("sum int16, heap", [&]{
+            const int16_t *q = (const int16_t *)heap_a.data(); long a2 = 0;
+            for (size_t i = 0; i < N / 2; ++i) a2 += (long)q[i] * q[i];
+            sink = a2; });
+        const double b_sum = bench("sum int16, BO mapping", [&]{
+            long a2 = 0;
+            for (size_t i = 0; i < N / 2; ++i) a2 += (long)bo_p[i] * bo_p[i];
+            sink = a2; });
+        const double b_sumf = bench("sum fp64, BO mapping", [&]{
+            double a2 = 0.0;
+            for (size_t i = 0; i < N / 2; ++i) a2 += (double)bo_p[i] * bo_p[i];
+            sink = (long)a2; });
+        (void)sink;
+        printf("  -> BO read / heap read  = %.1fx      BO sum / heap sum = %.1fx\n",
+               h_cpy > 0 ? r_cpy / h_cpy : 0.0, h_sum > 0 ? b_sum / h_sum : 0.0);
+        printf("  -> fp64 sum / int sum on the SAME BO = %.2fx\n",
+               b_sum > 0 ? b_sumf / b_sum : 0.0);
+        printf("  -> VERDICT: %s\n",
+               (r_cpy > 4.0 * h_cpy)
+                 ? "UNCACHED MAPPING — the BO itself is slow to touch; copy once, "
+                   "compute on the heap copy"
+                 : "MAPPING IS FINE — the cost is in the loops; try -O3 -mcpu=cortex-a72 "
+                   "and drop fp64");
+        fflush(stdout);
+    }
+
+    // ------------------------------------------------------------------
     // Seed the frame buffer with the generated background — ONCE.
     // ------------------------------------------------------------------
     // WITHOUT THIS, THE BACKGROUND WAS NEVER IN THE FRAME AT ALL. scene_init()
@@ -2349,8 +2885,8 @@ int main(int argc, char **argv)
     // change. See the FFT_SHIFT block in the Makefile. Seeding without that is a
     // railed response.
     {
-        uint8_t *fp = frame_bo.map<uint8_t *>();
-        memcpy(fp, g_background.data(), FRAME_BYTES);
+        g_frame_host.assign(g_background.begin(), g_background.end());
+        memcpy(frame_bo.map<uint8_t *>(), g_frame_host.data(), FRAME_BYTES);
         frame_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
         printf("[scene] frame buffer seeded with the generated background "
                "(%zu B). Before this the pipeline read an unwritten buffer "
@@ -2362,6 +2898,7 @@ int main(int argc, char **argv)
 
         dma_reset_frame();
         rc_reset_frame();
+        ap_reset_frame();      // zeroes the slots AND starts the frame-body clock
 
         // Recomputed every frame: the scale filter moves box.h/box.w, so the
         // ROI is no longer a constant of the run.
@@ -2403,7 +2940,7 @@ int main(int argc, char **argv)
         // against the injected offset, which does not exist on an occluded frame.
         bool occluded = false;
         {
-            uint8_t *frame_ptr = frame_bo.map<uint8_t *>();
+            uint8_t *frame_ptr = g_frame_host.data();
             // Keyed off the filter state, not off `frame == 0`. The two agree in
             // the current flow, but "is the filter trained yet" is the condition
             // that actually decides where the target must be, and the init branch
@@ -2434,6 +2971,30 @@ int main(int argc, char **argv)
             // frame_is_occluded() for why the legacy mask is bounded at frame 32.
             occluded = frame_is_occluded(frame, init_frame);
 
+            // Advance the camera pan, then mark the window the pipeline is about
+            // to read as dirty. BOTH are needed and the order is load-bearing.
+            //
+            // scene_restore() — called at the top of inject_target_frame(), i.e.
+            // immediately after this — repaints the dirty rect from the background
+            // at the CURRENT pan. Without the extra mark it would only repaint
+            // what the PREVIOUS frame dirtied, and the ROI moves, so the part of
+            // the new ROI outside the old rect would still carry the old offset:
+            // a seam straight through the patch the filter is about to see. That
+            // is worse than no pan at all — an artificial edge is a feature the
+            // tracker would happily lock onto.
+            //
+            // scene_mark_dirty() unions, so this composes with the target and
+            // noise rects rather than replacing them. Centred on the TRACKER's
+            // position, not the target's, for the same reason scene_add_noise()
+            // is: when the two diverge it is the tracker's window that gets read.
+            // +4 px of margin covers roi_crop's bilinear taps at the border.
+            scene_set_pan(frame);
+            {
+                const int pr = pos_row - roi.roi_h / 2, pc = pos_col - roi.roi_w / 2;
+                scene_mark_dirty(pr - 4, pc - 4,
+                                 pr + roi.roi_h + 3, pc + roi.roi_w + 3);
+            }
+
             if (occluded) {
                 // A checkerboard, not a flat fill: full-scale structure with real
                 // spectral content in every band, so Stage A's zero-mean/unit-L2
@@ -2450,8 +3011,8 @@ int main(int argc, char **argv)
                 // impulse is symmetric, and a symmetric training patch makes a
                 // transposed pack_filter() and a wrong conjugation both invisible.
                 // See inject_target_frame().
-                inject_target_frame(frame_ptr, FRAME_ROWS, FRAME_COLS,
-                                    test_row, test_col, test_h, test_w);
+                AP_T(AP_SCENE, inject_target_frame(frame_ptr, FRAME_ROWS, FRAME_COLS,
+                                    test_row, test_col, test_h, test_w));
                 // Ground truth for the IoU report. Taken from what was actually
                 // DRAWN, not from the tracker's box — that is the whole point of
                 // TRAJECTORY=1, where the two are allowed to diverge.
@@ -2478,16 +3039,24 @@ int main(int argc, char **argv)
                                 nr - 4, nc - 4,
                                 nr + roi.roi_h + 3, nc + roi.roi_w + 3);
             }
-            frame_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);  // Flush host → device
+            // Push the host scene to the device, then flush. The memcpy is the
+            // price of keeping the authority on the heap; the probe puts it at
+            // ~600 us for 2 MB, against the ~13 ms of scattered uncached reads it
+            // removes from scale_extract.
+            AP_T(AP_FRAME_PUSH,
+                 memcpy(frame_bo.map<uint8_t *>(), g_frame_host.data(),
+                        FRAME_BYTES));
+            AP_T(AP_FRAME_SYNC,
+                 frame_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE));  // Flush host → device
             if (occluded)
                 printf("Frame %d: [OCCLUDED] checkerboard (square %d) — no target "
                        "in frame. The gate MUST hold position and freeze the "
                        "filter.\n", frame, OCCLUDE_SQUARE);
             else if (init_frame)
-                printf("Frame %d: [INIT] target CENTRED at (%d,%d)\n",
+                VP1("Frame %d: [INIT] target CENTRED at (%d,%d)\n",
                        frame, test_row, test_col);
             else
-                printf("Frame %d: target at pos+(%d,%d) = (%d,%d)\n",
+                VP1("Frame %d: target at pos+(%d,%d) = (%d,%d)\n",
                        frame, IMPULSE_DR, IMPULSE_DC, test_row, test_col);
             fflush(stdout);
         }
@@ -2509,7 +3078,7 @@ int main(int argc, char **argv)
 
         for (int ch = 0; ch < N_CHANNELS; ++ch) {
 
-            printf("[ch %d] START\n", ch); fflush(stdout);
+            VP2("[ch %d] START\n", ch);
 
             // ORDERING IS LOAD-BEARING — do not hoist the weights loop above this.
             //
@@ -2578,15 +3147,25 @@ int main(int argc, char **argv)
             // it deadlocks the other way, waiting on data conv2d has not been fed.
             // The two counts are equal by construction (static_assert above), so
             // one loop serves both.
-            for (int k = 0; k < CONV_INVOCATIONS; ++k) {
-                // Arm this firing's drain before feeding the weights that trigger
-                // it, so the output window is never the thing that blocks.
-                DMA_TX(DMA_FFT_ROW_OUT,
-                    gm_fft_row_out.async(row_bo, XCL_BO_SYNC_BO_AIE_TO_GMIO,
-                                         ROW_CHUNK_BYTES, k * ROW_CHUNK_BYTES));
-                DMA_TX(DMA_WEIGHTS,
-                    gm_weights.async(weights_bo, XCL_BO_SYNC_BO_GMIO_TO_AIE,
-                                     WEIGHT_CH_BYTES, ch * WEIGHT_CH_BYTES));
+            // Depth `dd` firings are issued before either port is waited on.
+            // dd == 1 is byte-for-byte the historical loop. gmio::wait() drains
+            // ALL outstanding transfers on its port, so the barrier count is
+            // CONV_INVOCATIONS/dd — which is exactly the quantity under test.
+            const int dd = drain_depth_for_frame(frame);
+            for (int k0 = 0; k0 < CONV_INVOCATIONS; k0 += dd) {
+                const int kn = (k0 + dd < CONV_INVOCATIONS) ? k0 + dd
+                                                            : CONV_INVOCATIONS;
+                for (int k = k0; k < kn; ++k) {
+                    // Arm this firing's drain before feeding the weights that
+                    // trigger it, so the output window is never the thing that
+                    // blocks.
+                    DMA_TX(DMA_FFT_ROW_OUT,
+                        gm_fft_row_out.async(row_bo, XCL_BO_SYNC_BO_AIE_TO_GMIO,
+                                             ROW_CHUNK_BYTES, k * ROW_CHUNK_BYTES));
+                    DMA_TX(DMA_WEIGHTS,
+                        gm_weights.async(weights_bo, XCL_BO_SYNC_BO_GMIO_TO_AIE,
+                                         WEIGHT_CH_BYTES, ch * WEIGHT_CH_BYTES));
+                }
                 DMA_T(DMA_WEIGHTS,     gm_weights.wait());
                 DMA_T(DMA_FFT_ROW_OUT, gm_fft_row_out.wait());
             }
@@ -2596,8 +3175,8 @@ int main(int argc, char **argv)
             // charged to the completion path rather than to the console, and this
             // instrumentation exists because of exactly that kind of leak.
             rc_tl_mark(TL_DRAIN);
-            printf("[ch %d] weights sent + row-FFT drained (%d x %zu B)\n",
-                   ch, CONV_INVOCATIONS, ROW_CHUNK_BYTES); fflush(stdout);
+            VP2("[ch %d] weights sent + row-FFT drained (%d x %zu B)\n",
+                ch, CONV_INVOCATIONS, ROW_CHUNK_BYTES);
 
             // Poll to completion FIRST, then wait(). Both are timed; the gap
             // between them is the whole question — see the RC_POLL note above.
@@ -2617,37 +3196,59 @@ int main(int argc, char **argv)
             if (_st != ERT_CMD_STATE_COMPLETED)
                 printf("[ch %d] roi_crop WARNING: terminal state %d, not COMPLETED\n",
                        ch, (int)_st);
-            printf("[ch %d] roi_crop done\n", ch); fflush(stdout);
-            printf("[ch %d] fft_row_out received\n", ch); fflush(stdout);
+            VP2("[ch %d] roi_crop done\n", ch);
+            VP2("[ch %d] fft_row_out received\n", ch);
 
             // Stage B: measure this channel's window-weighted feature mean and
             // spectral energy BEFORE transposing, while the row-major layout
             // still puts each row's DC bin at stride PATCH_COLS.
+            // ONE bulk read of row_bo, then mean, energy AND the transpose all
+            // run on the heap copy — three passes that used to pay the uncached
+            // load individually.
+            AP_T(AP_BO_STAGE,
+                 memcpy(g_stage_a.data(), row_bo.map<void *>(), FFT_BYTES));
             {
-                const int16_t *rf = row_bo.map<int16_t *>();
+                const int16_t *rf = (const int16_t *)g_stage_a.data();
+                const auto _wm0 = std::chrono::steady_clock::now();
                 const int32_t  mean_now = measure_window_mean(rf, g_mean_prev[ch]);
                 // B2 needs what conv2d failed to remove this frame.
                 residual_mean[ch] = (double)(mean_now - g_mean_prev[ch]);
                 g_mean_prev[ch]   = mean_now;
 
                 // B3: Parseval energy, for the filter scaling in the update step.
-                double e = 0.0;
+                //
+                // int64, NOT double, and this is BIT-EXACT rather than an
+                // approximation worth arguing about: every term is a product of
+                // two int16, so |term| <= 32767^2 = 1.07e9, and the full sum over
+                // 2*PATCH_ELEMS terms is at most 3.5e13 — below 2^53 = 9.0e15, so
+                // the old double accumulator was already representing exact
+                // integers at every step. Same value, and the probe measured fp64
+                // at 4.02x the int cost on the SAME buffer.
+                int64_t e = 0;
                 for (int i = 0; i < PATCH_ELEMS; ++i)
-                    e += (double)rf[2*i] * rf[2*i] + (double)rf[2*i+1] * rf[2*i+1];
-                g_energy[ch] = e / (double)PATCH_ELEMS;
+                    e += (int64_t)rf[2*i] * rf[2*i] + (int64_t)rf[2*i+1] * rf[2*i+1];
+                g_energy[ch] = (double)e / (double)PATCH_ELEMS;
 
                 // Feed mean_now back as the next frame's mean_prev (bytes 18:22).
                 uint8_t *wb = weights_bo.map<uint8_t *>() + ch * WEIGHT_CH_BYTES;
                 memcpy(wb + 18, &mean_now, sizeof(int32_t));
+                g_ap_us[AP_WINMEAN] += std::chrono::duration<double, std::micro>(
+                    std::chrono::steady_clock::now() - _wm0).count();
+                ++g_ap_n[AP_WINMEAN];
             }
 
             // APU: transpose row-FFT output in-place
-            transpose_inplace(row_bo.map<void *>(), PATCH_ROWS, PATCH_COLS, 4);
-            printf("[ch %d] transpose done\n", ch); fflush(stdout);
+            AP_T(AP_TRANSPOSE,
+                 transpose_to(g_stage_a.data(), g_stage_b.data(),
+                              PATCH_ROWS, PATCH_COLS, 4));
+            AP_T(AP_BO_STAGE,
+                 memcpy(row_bo.map<void *>(), g_stage_b.data(), FFT_BYTES));
+            VP2("[ch %d] transpose done\n", ch);
 
             // Pack [filter_chunk_c | accum_chunk_c] into cmul_bo for all chunks.
             // For ch=0 the accum half is zeroed; for ch>0 it carries the running sum.
             {
+                const auto _cp0 = std::chrono::steady_clock::now();
                 int16_t *flt = filter_bo.map<int16_t*>() + ch * (int)(PATCH_ELEMS * 2);
                 int16_t *acc = (ch == 0) ? nullptr : accum_bo.map<int16_t*>();
                 int16_t *dst = cmul_bo.map<int16_t*>();
@@ -2663,6 +3264,9 @@ int main(int argc, char **argv)
                         memset(dst + c * 2 * CMUL_CHUNK_INT16 + CMUL_CHUNK_INT16, 0,
                                CMUL_CHUNK_INT16 * sizeof(int16_t));
                 }
+                g_ap_us[AP_CMUL_PACK] += std::chrono::duration<double, std::micro>(
+                    std::chrono::steady_clock::now() - _cp0).count();
+                ++g_ap_n[AP_CMUL_PACK];
             }
 
             // Feed transposed data to col-FFT + combined [filter|accum] to cmul_accum
@@ -2694,38 +3298,44 @@ int main(int argc, char **argv)
                 DMA_T(DMA_FFT_COL_OUT, gm_fft_col_out.wait());
                 DMA_T(DMA_ACCUM_OUT,   gm_accum_out.wait());
             }
-            printf("[ch %d] accum_out + F_ch received (%d x %zu B)\n",
-                   ch, COL_CHUNKS, COL_CHUNK_BYTES); fflush(stdout);
+            VP2("[ch %d] accum_out + F_ch received (%d x %zu B)\n",
+                ch, COL_CHUNKS, COL_CHUNK_BYTES);
 
             // Stash this channel's spectrum for the filter update after the loop.
             // Converted out of the col-FFT layout here so all the filter maths
             // works in one consistent row-major order.
-            fcol_bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-            unpack_spectrum(fcol_bo.map<int16_t *>(),
-                            g_F_all.data() + (size_t)ch * PATCH_ELEMS);
+            // SPLIT, 2026-08-20. These were one slot and its 16.59 ms could not
+            // be apportioned between the transfer and the conversion — the same
+            // mistake as DMA_T timing async and wait together.
+            AP_T(AP_FCOL_SYNC, fcol_bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE));
+            AP_T(AP_BO_STAGE,
+                 memcpy(g_stage_c.data(), fcol_bo.map<void *>(), FFT_BYTES));
+            AP_T(AP_UNPACK,
+                 unpack_spectrum((const int16_t *)g_stage_c.data(),
+                                 g_F_all.data() + (size_t)ch * PATCH_ELEMS));
 
             // F_ch is the filter's only input. If it is wrong, everything
             // downstream is wrong for a reason that has nothing to do with the
             // filter maths — so check it before trusting any later number.
             // Reported in the col-FFT layout it arrives in: idx = v*ROWS + u.
             if (ch == 0) {
-                report_cint16("F_ch", fcol_bo.map<int16_t *>(),
+                report_cint16("F_ch", (const int16_t *)g_stage_c.data(),
                               PATCH_ROWS, PATCH_COLS, "colFFT");
-                dump_buffer("F_ch", frame, fcol_bo.map<void *>(), FFT_BYTES);
+                dump_buffer("F_ch", frame, g_stage_c.data(), FFT_BYTES);
             }
 
             DMA_T(DMA_FFT_COL_IN, gm_fft_col_in.wait());
-            printf("[ch %d] fft_col_in sent\n", ch); fflush(stdout);
+            VP2("[ch %d] fft_col_in sent\n", ch);
             DMA_T(DMA_CMUL_IN, gm_cmul_in.wait());
-            printf("[ch %d] cmul_in sent\n", ch); fflush(stdout);
+            VP2("[ch %d] cmul_in sent\n", ch);
         }
 
         // Stage B2: cancel the residual pre-window mean on the accumulated
         // spectrum. 9 bins × N_CHANNELS complex MACs — 144 operations for the
         // whole frame. Must run before the IFFT consumes accum_bo.
-        apply_dc_correction(accum_bo.map<int16_t *>(),
-                            filter_bo.map<int16_t *>(),
-                            residual_mean);
+        AP_T(AP_B2, apply_dc_correction(accum_bo.map<int16_t *>(),
+                                        filter_bo.map<int16_t *>(),
+                                        residual_mean));
 
         // Push the updated mean_prev values (written into bytes [18:22] of each
         // channel's weight buffer above) so the NEXT frame's conv2d sees them.
@@ -2739,7 +3349,7 @@ int main(int argc, char **argv)
         dump_buffer("accum", frame, accum_bo.map<void *>(), ACCUM_BYTES);
 
         // 3. IFFT: APU feeds accumulated spectrum to IFFT row input
-        printf("[ifft] START\n"); fflush(stdout);
+        VP2("[ifft] START\n");
         DMA_TX(DMA_IFFT_ROW_IN,
             gm_ifft_row_in.async(accum_bo, XCL_BO_SYNC_BO_GMIO_TO_AIE, ACCUM_BYTES, 0));
         // Drain per invocation, and before waiting on the input — see the
@@ -2751,12 +3361,17 @@ int main(int argc, char **argv)
             DMA_T(DMA_IFFT_ROW_OUT, gm_ifft_row_out.wait());
         }
         DMA_T(DMA_IFFT_ROW_IN, gm_ifft_row_in.wait());
-        printf("[ifft] rows done (%d x %zu B)\n", ROW_CHUNKS, ROW_CHUNK_BYTES);
-        fflush(stdout);
+        VP2("[ifft] rows done (%d x %zu B)\n", ROW_CHUNKS, ROW_CHUNK_BYTES);
 
         // APU: transpose IFFT row output in-place
-        transpose_inplace(row_bo.map<void *>(), PATCH_ROWS, PATCH_COLS, 4);
-        printf("[ifft] transpose done\n"); fflush(stdout);
+        AP_T(AP_BO_STAGE,
+             memcpy(g_stage_a.data(), row_bo.map<void *>(), FFT_BYTES));
+        AP_T(AP_TRANSPOSE,
+             transpose_to(g_stage_a.data(), g_stage_b.data(),
+                          PATCH_ROWS, PATCH_COLS, 4));
+        AP_T(AP_BO_STAGE,
+             memcpy(row_bo.map<void *>(), g_stage_b.data(), FFT_BYTES));
+        VP2("[ifft] transpose done\n");
 
         DMA_TX(DMA_IFFT_COL_IN,
             gm_ifft_col_in.async(row_bo, XCL_BO_SYNC_BO_GMIO_TO_AIE, FFT_BYTES, 0));
@@ -2767,16 +3382,20 @@ int main(int argc, char **argv)
             DMA_T(DMA_RESPONSE, gm_response.wait());
         }
         DMA_T(DMA_IFFT_COL_IN, gm_ifft_col_in.wait());
-        printf("[ifft] cols done → response received (%d x %zu B)\n",
-               COL_CHUNKS, COL_CHUNK_BYTES); fflush(stdout);
+        VP2("[ifft] cols done → response received (%d x %zu B)\n",
+            COL_CHUNKS, COL_CHUNK_BYTES);
 
         // Response diagnostics run on EVERY frame, including frame 0. Frame 0's
         // response is not a tracking result (the filter is zero, so it should be
         // ~0), but "is it actually zero" is worth knowing: a non-zero frame-0
         // response would mean the filter buffer is not what the host thinks.
-        report_cint16("response", resp_bo.map<int16_t *>(),
+        // One copy of the response out of the BO; every reader below uses it —
+        // report_cint16, both PSR scans, the resp00 ratio and the dump.
+        AP_T(AP_BO_STAGE,
+             memcpy(g_stage_c.data(), resp_bo.map<void *>(), RESP_BYTES));
+        report_cint16("response", (const int16_t *)g_stage_c.data(),
                       PATCH_ROWS, PATCH_COLS, "rowmajor");
-        dump_buffer("resp", frame, resp_bo.map<void *>(), RESP_BYTES);
+        dump_buffer("resp", frame, g_stage_c.data(), RESP_BYTES);
         // The peak is located ONCE, here, and the same PsrResult drives the
         // reporting, the position update and the gate. It used to be scanned three
         // times (twice inside report_psr, once in peak_detect_sw) — three
@@ -2791,11 +3410,16 @@ int main(int argc, char **argv)
         const bool          evaluate = g_filter.initialized;
         mosse::PsrResult    psr_abs{}, psr_sgn{};
         mosse::GateDecision gate{};          // accept=false until proven otherwise
+        mosse::ScaleDecision scale_gate_dec{};   // ditto for the size axis
+        bool scale_evaluated = false;
+        int  scale_idx = 0;                      // the level the detector proposed
 
         if (evaluate) {
-            const int16_t *resp = resp_bo.map<int16_t *>();
-            psr_abs = mosse::compute_psr(resp, PATCH_ROWS, PATCH_COLS, true);
-            psr_sgn = mosse::compute_psr(resp, PATCH_ROWS, PATCH_COLS, false);
+            const int16_t *resp = (const int16_t *)g_stage_c.data();
+            AP_T(AP_PSR, {
+                psr_abs = mosse::compute_psr(resp, PATCH_ROWS, PATCH_COLS, true);
+                psr_sgn = mosse::compute_psr(resp, PATCH_ROWS, PATCH_COLS, false);
+            });
             gate    = mosse::psr_gate(psr_abs, mosse::DEFAULT_PSR_MIN);
 
             // Suppressed on an occluded frame: report_response prints values "at
@@ -2812,8 +3436,8 @@ int main(int argc, char **argv)
 
         // 4. Peak detection and position update.
         if (!evaluate) {
-            printf("Frame %d: [INIT] response not evaluated — filter is being "
-                   "trained from this frame\n", frame);
+            VP1("Frame %d: [INIT] response not evaluated — filter is being "
+                "trained from this frame\n", frame);
         } else {
             const int  dr   = psr_abs.dr, dc = psr_abs.dc;
             const long peak = psr_abs.peak;
@@ -2858,8 +3482,8 @@ int main(int argc, char **argv)
             }
 
             const bool ok = (peak != 0 && dr == exp_dr && dc == exp_dc);
-            printf("Frame %d: displacement (%d,%d) bins = (%.2f,%.2f) frame px %s "
-                   "pos (%d,%d)  peak=%ld  [%s]\n",
+            VP1("Frame %d: displacement (%d,%d) bins = (%.2f,%.2f) frame px %s "
+                "pos (%d,%d)  peak=%ld  [%s]\n",
                    frame, dr, dc, dr_frame, dc_frame,
                    gate.accept ? "→" : "HELD, pos stays",
                    pos_row, pos_col, peak,
@@ -2873,9 +3497,16 @@ int main(int argc, char **argv)
             // The hint is suppressed when the frame was gated: there is no
             // expected displacement for a frame the tracker deliberately did not
             // act on, so printing one would read as a failure when it is a pass.
+            // VP1, NOT unconditional. The `ok` criterion derives exp_dr from
+            // IMPULSE_DR, so under TRAJECTORY=1 it fires on HEALTHY frames — see
+            // CLAUDE.md, "[MISMATCH vs injected offset] is meaningless under
+            // TRAJECTORY=1". An anomaly print that cries wolf every frame is not
+            // an anomaly print, and at VERBOSITY 0 it would have been most of the
+            // console on exactly the long trajectory run this gating exists for.
+            // IoU and centre error in track.csv are the valid scores.
             else if (!ok && !occluded && gate.accept)
-                printf("       expected displacement (%d,%d) bins "
-                       "(= injected (%d,%d) frame px / %.4f px per bin)\n",
+                VP1("       expected displacement (%d,%d) bins "
+                    "(= injected (%d,%d) frame px / %.4f px per bin)\n",
                        exp_dr, exp_dc, (int)llround(inj_dr), (int)llround(inj_dc),
                        mosse::patch_dr_to_frame(1, roi));
 
@@ -2891,26 +3522,49 @@ int main(int argc, char **argv)
             // occluded frame's scale peak is noise, and resizing the box from it
             // would walk the ROI off the target just as surely as moving it would.
             if (scale.enabled() && gate.accept && scale.initialized) {
-                const uint8_t *fp = frame_bo.map<uint8_t *>();
-                mosse::scale_extract(scale, fp, FRAME_ROWS, FRAME_COLS,
-                                     box.row, box.col, box.h, box.w,
-                                     scale_sample.data());
-                const mosse::ScaleResult sr =
-                    mosse::scale_detect(scale, scale_sample.data(),
-                                        mosse::DEFAULT_EPS_REL);
-                if (sr.valid) {
-                    const double nh = box.h * sr.factor;
-                    const double nw = box.w * sr.factor;
-                    const bool in_range =
-                        nh >= box_h0 * SCALE_MIN_REL && nh <= box_h0 * SCALE_MAX_REL &&
-                        nw >= box_w0 * SCALE_MIN_REL && nw <= box_w0 * SCALE_MAX_REL;
-                    if (in_range) { box.h = nh; box.w = nw; }
-                    printf("  [scale] level %+d  factor %.4f  peak %.3g  conf %.2f"
-                           "  box %.1fx%.1f%s\n",
-                           sr.idx, sr.factor, sr.peak, sr.psr, box.h, box.w,
-                           in_range ? "" : "  [CLAMPED: outside the absolute "
-                                           "bounds, size held]");
-                }
+                const uint8_t *fp = g_frame_host.data();
+                mosse::ScaleResult sr{};
+                // Split: scale_extract reads frame_bo DIRECTLY (33 crops), so it
+                // pays the uncached read; scale_detect is pure heap. 13.86 ms was
+                // one number and could not be apportioned.
+                AP_T(AP_SCALE_EXTRACT,
+                     mosse::scale_extract(scale, fp, FRAME_ROWS, FRAME_COLS,
+                                          box.row, box.col, box.h, box.w,
+                                          scale_sample.data()));
+                AP_T(AP_SCALE_MODEL,
+                     sr = mosse::scale_detect(scale, scale_sample.data(),
+                                              mosse::DEFAULT_EPS_REL));
+                // Gate before resizing — see scale_gate(). A veto holds the box
+                // AND, via scale_ok below, skips the model update, exactly as
+                // psr_gate holds the position and skips filter_update.
+                scale_gate_dec =
+                    mosse::scale_gate(sr, mosse::DEFAULT_SCALE_N,
+                                      box.h, box.w, box_h0, box_w0,
+                                      mosse::DEFAULT_SCALE_CONF_MIN,
+                                      mosse::DEFAULT_SCALE_MIN_REL,
+                                      mosse::DEFAULT_SCALE_MAX_REL);
+                scale_evaluated = true;
+                scale_idx       = sr.idx;
+                if (scale_gate_dec.accept) { box.h = scale_gate_dec.new_h;
+                                             box.w = scale_gate_dec.new_w; }
+                VP1("  [scale] level %+d  factor %.4f  peak %.3g  conf %.2f"
+                    "  box %.1fx%.1f  %s\n",
+                       sr.idx, sr.factor, sr.peak, sr.psr, box.h, box.w,
+                       mosse::scale_veto_tag(scale_gate_dec.reason));
+                if (!scale_gate_dec.accept)
+                    printf("  [scale]   HOLD — %s  (proposed %.1fx%.1f, "
+                           "threshold %.2f)\n",
+                           mosse::scale_veto_why(scale_gate_dec.reason),
+                           scale_gate_dec.new_h, scale_gate_dec.new_w,
+                           (double)scale_gate_dec.threshold);
+                ++scale_n_eval;
+                if (scale_gate_dec.conf < scale_conf_min_seen)
+                    scale_conf_min_seen = scale_gate_dec.conf;
+                if (scale_gate_dec.conf > scale_conf_max_seen)
+                    scale_conf_max_seen = scale_gate_dec.conf;
+                if (scale_gate_dec.accept) ++scale_n_accept;
+                else { ++scale_n_hold;
+                       ++scale_reason_n[(int)scale_gate_dec.reason]; }
             } else if (scale.enabled() && !gate.accept) {
                 printf("  [scale] FROZEN — gated frame, size held at %.1fx%.1f\n",
                        box.h, box.w);
@@ -2925,7 +3579,7 @@ int main(int argc, char **argv)
                 const double iou  = mosse::box_iou(est, truth);
                 const double cerr = std::hypot(est.row - truth.row,
                                                est.col - truth.col);
-                printf("       IoU %.4f  centre err %.2f px  vs injected box "
+                VP1("       IoU %.4f  centre err %.2f px  vs injected box "
                        "(%.0fx%.0f at (%.1f,%.1f); estimate %.0fx%.0f at "
                        "(%.1f,%.1f))%s\n",
                        iou, cerr, truth.h, truth.w, truth.row, truth.col,
@@ -2958,27 +3612,75 @@ int main(int argc, char **argv)
         // filter exists before it is ever applied) and on every ACCEPTED frame
         // thereafter — the same freeze rule as the translation filter, so one
         // gated frame cannot teach the scale filter what an occluder looks like.
-        if (scale.enabled() && (!g_filter.initialized || gate.accept)) {
-            const uint8_t *fp = frame_bo.map<uint8_t *>();
-            mosse::scale_extract(scale, fp, FRAME_ROWS, FRAME_COLS,
-                                 box.row, box.col, box.h, box.w,
-                                 scale_sample.data());
-            mosse::scale_update(scale, scale_sample.data(),
-                                mosse::DEFAULT_SCALE_ETA);
+        //
+        // AND on the SCALE gate as well, which is the half that stops the runaway.
+        // Holding the box while still training on the rejected frame is not a
+        // gate: the model learns the bad estimate anyway and proposes it again
+        // next frame, harder. Measured 2026-08-20: one accepted level -12 at
+        // conf 1.22 was enough to take the box 64.0 -> 50.5 and then thrash for
+        // the rest of the run. `scale_evaluated` distinguishes "the gate ran and
+        // said no" from "the gate never ran" (frame 0, an occluded frame, or a
+        // PSR-gated one) — only the first should block training, because the
+        // others are already covered by the conditions above.
+        if (scale.enabled() && (!g_filter.initialized || gate.accept)
+                            && !(scale_evaluated && !scale_gate_dec.accept)) {
+            const uint8_t *fp = g_frame_host.data();
+            AP_T(AP_SCALE_EXTRACT,
+                 mosse::scale_extract(scale, fp, FRAME_ROWS, FRAME_COLS,
+                                      box.row, box.col, box.h, box.w,
+                                      scale_sample.data()));
+            AP_T(AP_SCALE_MODEL,
+                 mosse::scale_update(scale, scale_sample.data(),
+                                     mosse::DEFAULT_SCALE_ETA));
         }
 
         bool published = false;
         if (!g_filter.initialized) {
-            mosse::filter_init(g_filter, g_F_all.data(), g_target.data(),
-                               N_CHANNELS, PATCH_ROWS, PATCH_COLS);
-            printf("  filter: INITIALISED from frame %d (single patch, no affine "
+            AP_T(AP_FILTER,
+                 mosse::filter_init(g_filter, g_F_all.data(), g_target.data(),
+                                    N_CHANNELS, PATCH_ROWS, PATCH_COLS));
+            VP1("  filter: INITIALISED from frame %d (single patch, no affine "
                    "perturbations)\n", frame);
-            publish_filter(filter_bo, filter_scratch);
+            AP_T(AP_PUBLISH, publish_filter(filter_bo, filter_scratch));
             published = true;
         } else if (gate.accept) {
-            mosse::filter_update(g_filter, g_F_all.data(), g_target.data(),
-                                 mosse::DEFAULT_ETA);
-            publish_filter(filter_bo, filter_scratch);
+            // THE TRAINING TARGET IS RE-CENTRED ON THE MEASURED DISPLACEMENT.
+            //
+            // g_F_all is the patch cropped at the PRE-update position, so the
+            // object in it sits at (dr,dc) — the bin the response just peaked at
+            // — not at the origin. Training that patch against a G centred at
+            // (0,0) teaches "object at (dr,dc) => peak at (0,0)".
+            //
+            // Why that compounds instead of averaging out. Let Q_t be the patch
+            // cropped exactly ON the object, so the patch we actually hold is
+            // P_t = Q_t shifted by +d_t. Correlation is shift equivariant, so
+            // resp(P_t) = resp(Q_t) shifted by +d_t. We need an on-target patch
+            // to peak at 0, i.e. resp(P_t) to peak at d_t — hence G must be
+            // centred at +d_t, the SAME sign as the detected peak. Training at 0
+            // instead teaches resp(Q_t) -> peak at -d_t; the next frame's patch
+            // is Q_{t+1} shifted by d_{t+1}, so that contribution lands at
+            // d_{t+1} - d_t, which under near-constant motion is (0,0). The
+            // origin peak therefore grows at the LEARNING RATE, which is why
+            // resp00_over_peak tracked 1-(1-eta)^k on hardware and was unmoved
+            // by BG_PAN cutting background correlation 6.6x. It was never
+            // background lock.
+            //
+            // By the shift theorem this IS "re-crop at the updated position",
+            // exactly, and for free — the alternative is 16 more roi_crop
+            // launches per frame. The only difference is that the Hann window
+            // stays centred where the crop was taken rather than on the object.
+            //
+            // Regression test, no hardware: scripts/mosse_loop_sim.py. Both arms,
+            // 30 frames — centred reaches resp00/peak 0.76 and loses lock, shifted
+            // holds 0.21 flat at 0.00 px error.
+            mosse::gaussian_target_spectrum(g_target_shift.data(),
+                                            PATCH_ROWS, PATCH_COLS,
+                                            sigma_r, sigma_c,
+                                            psr_abs.dr, psr_abs.dc);
+            AP_T(AP_FILTER,
+                 mosse::filter_update(g_filter, g_F_all.data(),
+                                      g_target_shift.data(), mosse::DEFAULT_ETA));
+            AP_T(AP_PUBLISH, publish_filter(filter_bo, filter_scratch));
             published = true;
         } else {
             // publish_filter is skipped as well as filter_update, and that is a
@@ -3033,20 +3735,58 @@ int main(int argc, char **argv)
             // filter exists; 0 is reported otherwise rather than a 0/0.
             double resp00_over_peak = 0.0;
             if (evaluate && psr_abs.peak != 0) {
-                const int16_t *r = resp_bo.map<int16_t *>();
+                const int16_t *r = (const int16_t *)g_stage_c.data();
                 // cint16: bin (0,0) is the first sample, real part at index 0.
                 // The peak scan is on |real|, so compare like with like.
                 resp00_over_peak = std::fabs((double)r[0])
                                  / std::fabs((double)psr_abs.peak);
             }
             csv_row(frame, occluded, evaluate, gate, psr_abs, resp00_over_peak,
-                    box, truth, iou, cerr, published);
-        }
+                    box, truth, iou, cerr, published,
+                    scale_evaluated, scale_idx, scale_gate_dec);
 
-        rc_report_frame(frame);
-        rc_report_timeline(frame);
-        rc_report_calls(frame);
-        dma_report_frame(frame);
+            // VERBOSITY 0: the ONE line per frame that keeps the frame period
+            // measurable. ~45 B, ~4 ms at 115200, 4% of the ~87 ms GMIO floor.
+            // Everything on it is already in track.csv — the point is not the
+            // data, it is having a timestampable per-frame marker for
+            // `picocom | ts`, which is how the frame time was measured in the
+            // first place. Printing nothing at all would have deleted that.
+            if (VERBOSITY < 1)
+                printf("f%d d%d,%d psr%.0f iou%.2f r00 %.2f\n",
+                       frame, psr_abs.dr, psr_abs.dc, gate.psr, iou,
+                       resp00_over_peak);
+            // Printed at EVERY verbosity while the sweep is armed: if a deep
+            // queue deadlocks, this is the record of which depths already worked.
+            if (FFT_DRAIN_DEPTH == 0)
+                printf("  [drain] frame %d depth %d: gmio_fft_row_out %.2f ms "
+                       "(%lu tx), weights %.2f ms\n",
+                       frame, drain_depth_for_frame(frame),
+                       g_dma[DMA_FFT_ROW_OUT].us / 1000.0,
+                       g_dma[DMA_FFT_ROW_OUT].calls,
+                       g_dma[DMA_WEIGHTS].us / 1000.0);
+        }
+        fflush(stdout);
+
+        // ~3.2 KB/frame of tables — 32% of the console, and at 115200 that was
+        // 277 ms of a 880 ms frame. First and last frame only; the DMA counters
+        // still accumulate every frame into the CUMULATIVE report at exit, so
+        // nothing is lost but the repetition. See trace_frame().
+        // ap_report_frame() stops the frame-body clock, so it must come LAST and
+        // must run on every frame — the run total would otherwise be a two-frame
+        // total, the same trap dma_accumulate_frame() exists to avoid.
+        double _dma_us = 0.0, _rc_us = 0.0;
+        for (int i = 0; i < DMA_N; ++i) _dma_us += g_dma[i].us;
+        for (int i = 0; i < RC_N;  ++i) _rc_us  += g_rc_us[i];
+        if (trace_frame(frame)) {
+            rc_report_frame(frame);
+            rc_report_timeline(frame);
+            rc_report_calls(frame);
+            dma_report_frame(frame);
+            ap_report_frame(frame, _dma_us, _rc_us);
+        } else {
+            dma_accumulate_frame();
+            ap_accumulate_frame();
+        }
     }
 
     csv_close();
@@ -3068,6 +3808,39 @@ int main(int argc, char **argv)
                "truth %.0fx%.0f at (%.1f,%.1f)\n",
                box.h, box.w, box.row, box.col,
                truth.h, truth.w, truth.row, truth.col);
+    }
+
+    // Scale-gate outcome across the run, reported per reason for the same reason
+    // the PSR gate's is: "held 14 frames" is unactionable, "held 14 frames, all
+    // AT_SEARCH_RAIL" says the search range is the problem, and "all LOW_CONF"
+    // says the scale response never became peaked. The conf range is printed
+    // because the threshold has to be re-derived whenever the geometry or the
+    // feature scale moves — it is not a universal constant.
+    if (scale_n_eval > 0) {
+        printf("\n[scale] SUMMARY over %d evaluated frame(s): %d accepted, "
+               "%d held  (threshold %.2f)\n",
+               scale_n_eval, scale_n_accept, scale_n_hold,
+               (double)mosse::DEFAULT_SCALE_CONF_MIN);
+        printf("  conf range %.2f .. %.2f\n",
+               scale_conf_min_seen, scale_conf_max_seen);
+        if (scale_n_hold) {
+            printf("  holds: ");
+            for (int i = 0; i < 8; ++i)
+                if (scale_reason_n[i])
+                    printf("%s x%d  ", mosse::scale_veto_tag((mosse::ScaleVeto)i),
+                           scale_reason_n[i]);
+            printf("\n");
+        }
+        // The two failure modes that a hold COUNT alone cannot distinguish.
+        if (scale_n_accept == 0)
+            printf("  -> NOTHING was ever accepted. The size estimate is frozen at "
+                   "its initial value, so a growing or shrinking target is not "
+                   "being tracked at all. Either the threshold is too high for "
+                   "this geometry or the scale filter is not working.\n");
+        else if (scale_n_hold > scale_n_accept)
+            printf("  -> more holds than accepts. The gate is doing its job only "
+                   "if the accepted frames track the true size; check the final "
+                   "box against truth above before raising the threshold.\n");
     }
 
     // Gate outcome across the run. Printed here for the same reason the DMA
@@ -3096,6 +3869,45 @@ int main(int argc, char **argv)
                (double)tot_n / ITER_CNT, tot_us / 1000.0 / ITER_CNT,
                N_CHANNELS, PATCH_ROWS, PATCH_COLS);
         fflush(stdout);
+
+        // APU CUMULATIVE. This is the number to read, not the two per-frame
+        // tables: frame 0 does filter_init rather than filter_update and never
+        // runs the scale detector, so it is the least representative frame in
+        // the run. Averaged over ITER_CNT, against the measured mean frame body.
+        {
+            const double mf = g_ap_run_us / ITER_CNT;
+            double apu = 0.0;
+            for (int i = 0; i < AP_N; ++i) apu += g_ap_tot_us[i];
+            double rc = 0.0;
+            for (int i = 0; i < RC_N; ++i) rc += g_rc_us_total[i];
+            printf("\n[apu] CUMULATIVE over %d frame(s), mean frame body %.2f ms:\n",
+                   ITER_CNT, mf / 1000.0);
+            printf("  %-20s %9s %10s %9s %7s\n",
+                   "stage", "calls/fr", "ms/frame", "us/call", "share");
+            for (int i = 0; i < AP_N; ++i) {
+                if (!g_ap_tot_n[i]) continue;
+                printf("  %-20s %9.1f %10.3f %9.1f %6.1f%%\n",
+                       g_ap_name[i], (double)g_ap_tot_n[i] / ITER_CNT,
+                       g_ap_tot_us[i] / 1000.0 / ITER_CNT,
+                       g_ap_tot_us[i] / (double)g_ap_tot_n[i],
+                       100.0 * g_ap_tot_us[i] / g_ap_run_us);
+            }
+            printf("  %-20s %9s %10.3f %9s %6.1f%%\n", "-- APU subtotal", "",
+                   apu / 1000.0 / ITER_CNT, "", 100.0 * apu / g_ap_run_us);
+            printf("  %-20s %9s %10.3f %9s %6.1f%%\n", "-- GMIO (DMA_T)", "",
+                   tot_us / 1000.0 / ITER_CNT, "", 100.0 * tot_us / g_ap_run_us);
+            printf("  %-20s %9s %10.3f %9s %6.1f%%\n", "-- roi_crop launch", "",
+                   rc / 1000.0 / ITER_CNT, "", 100.0 * rc / g_ap_run_us);
+            const double resid = g_ap_run_us - apu - tot_us - rc;
+            printf("  %-20s %9s %10.3f %9s %6.1f%%   <-- console, dumps, printf, "
+                   "uninstrumented\n", "== UNATTRIBUTED", "",
+                   resid / 1000.0 / ITER_CNT, "", 100.0 * resid / g_ap_run_us);
+            if (resid > 0.25 * g_ap_run_us)
+                printf("  NOTE: unattributed is over 25%% of the frame. This "
+                       "breakdown is NOT the frame — find the missing cost "
+                       "before acting on any line above it.\n");
+            fflush(stdout);
+        }
     }
 
     // ------------------------------------------------------------------

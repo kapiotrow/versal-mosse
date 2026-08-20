@@ -32,3 +32,4 @@ a.xclbin
 analyzer_input/
 *__pycache__*
 .ipcache/
+test-sequences/

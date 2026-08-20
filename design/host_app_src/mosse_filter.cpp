@@ -632,16 +632,33 @@ void filter_quantize_q15(const FilterState &st, const double *energy,
     // Two passes: the Q1.15 scale is global across channels, so the maximum has to
     // be known before anything is written. A per-channel scale would silently
     // reweight the channels relative to one another, and cmul_accum sums them.
-    float max_abs = 0.0f;
+    // SCAN ON THE SQUARED MAGNITUDE, then take ONE square root.
+    //
+    // std::abs() on a std::complex is hypot() — a libm call with its own scaling
+    // and overflow handling — and this loop ran it channels*n = 262144 times per
+    // frame. Measured 2026-08-20: `publish filter` was 12.16 ms/frame on the A72
+    // (9.83 with -O3), and a native x86 benchmark put filter_quantize_q15 at
+    // 9.63 ms of which -ffast-math removed 7.6 — i.e. essentially all of it was
+    // the transcendental.
+    //
+    // std::norm() is re*re + im*im, monotone in std::abs(), so it selects the SAME
+    // element; the hypot is then applied to that one element alone. This is exact
+    // rather than an approximation — the only way it can differ is if two elements
+    // are within a float ULP of each other, in which case max_abs is the same to
+    // within an ULP either way. Deliberately NOT -ffast-math, which would buy the
+    // same time by making every float operation in the file unsafe.
+    float  max_norm = 0.0f;
+    cfloat h_max(0.0f, 0.0f);
     for (int ch = 0; ch < st.channels; ++ch) {
         const cfloat *a = st.A.data() + (size_t)ch * n;
         const float   cs = chscale[(size_t)ch];
         for (size_t i = 0; i < n; ++i) {
             const cfloat h = a[i] * (cs / (st.B[i] + eps));
-            const float  m = std::abs(h);
-            if (m > max_abs) max_abs = m;
+            const float  m2 = h.real() * h.real() + h.imag() * h.imag();
+            if (m2 > max_norm) { max_norm = m2; h_max = h; }
         }
     }
+    const float max_abs = (max_norm > 0.0f) ? std::abs(h_max) : 0.0f;
 
     // Always normalize to the FULL int16 range, independent of CMUL_H_SHIFT.
     //
@@ -689,6 +706,97 @@ void filter_quantize_q15(const FilterState &st, const double *energy,
 
     if (out_scale)   *out_scale   = scale;
     if (out_max_abs) *out_max_abs = max_abs;
+}
+
+// -----------------------------------------------------------------------
+// Scale-update gating — see the header for the hardware data behind it
+// -----------------------------------------------------------------------
+ScaleDecision scale_gate(const ScaleResult &sr, int n_scales,
+                         double cur_h, double cur_w, double h0, double w0,
+                         float conf_min, double min_rel, double max_rel)
+{
+    ScaleDecision d;
+    d.conf      = sr.psr;
+    d.threshold = conf_min;
+    d.new_h     = cur_h * sr.factor;
+    d.new_w     = cur_w * sr.factor;
+
+    // Nothing to gate: the filter is off or has never been trained. Reported
+    // separately from a veto because it is not a rejection of anything.
+    if (!sr.valid) { d.reason = ScaleVeto::Invalid; return d; }
+
+    // STRUCTURAL FIRST. An argmax on the boundary of the search range is wrong
+    // by construction — the maximum it found is the edge of what was searched,
+    // not a maximum of the underlying function. Reported ahead of LowConf
+    // because it is the more specific finding when both fire, which is the usual
+    // case (frame 13 of the 2026-08-20 run: idx +16 of +/-16, conf 1.57).
+    //
+    // Guarded on n_scales > 2 so a degenerate filter cannot veto every frame:
+    // at n_scales <= 2 every index IS the rail.
+    const int rail = (n_scales - 1) / 2;
+    if (n_scales > 2 && rail > 0 && (sr.idx == rail || sr.idx == -rail)) {
+        d.reason = ScaleVeto::AtSearchRail;
+        return d;
+    }
+
+    // The absolute backstop is checked before the confidence test so that a
+    // proposal which is BOTH confident and out of bounds is reported as what it
+    // is. It is a drift bound, not a per-frame plausibility test.
+    const bool in_range = d.new_h >= h0 * min_rel && d.new_h <= h0 * max_rel &&
+                          d.new_w >= w0 * min_rel && d.new_w <= w0 * max_rel;
+    if (!in_range) { d.reason = ScaleVeto::OutOfRange; return d; }
+
+    // conf_min <= 0 disables the THRESHOLD test only, exactly as PSR_GATE_MIN=0
+    // does for the translation gate; the structural vetoes above still apply.
+    if (conf_min <= 0.0f) { d.accept = true; d.reason = ScaleVeto::Disabled; return d; }
+
+    if (sr.psr < (double)conf_min) { d.reason = ScaleVeto::LowConf; return d; }
+
+    d.accept = true;
+    d.reason = ScaleVeto::Accept;
+    return d;
+}
+
+const char *scale_veto_tag(ScaleVeto v)
+{
+    switch (v) {
+        case ScaleVeto::Accept:       return "ACCEPT";
+        case ScaleVeto::Disabled:     return "ACCEPT(conf gate disabled)";
+        case ScaleVeto::Invalid:      return "INVALID";
+        case ScaleVeto::AtSearchRail: return "AT_SEARCH_RAIL";
+        case ScaleVeto::LowConf:      return "LOW_CONF";
+        case ScaleVeto::OutOfRange:   return "OUT_OF_RANGE";
+    }
+    return "?";
+}
+
+const char *scale_veto_why(ScaleVeto v)
+{
+    switch (v) {
+        case ScaleVeto::Accept:
+            return "scale confidence is at or above the threshold and the argmax "
+                   "is interior — normal size tracking.";
+        case ScaleVeto::Disabled:
+            return "confidence threshold disabled (SCALE_CONF_MIN <= 0); the "
+                   "structural vetoes still apply.";
+        case ScaleVeto::Invalid:
+            return "the scale filter is disabled or not yet trained, so there is "
+                   "no estimate to accept or reject.";
+        case ScaleVeto::AtSearchRail:
+            return "the argmax sits ON the boundary of the search range, so it is "
+                   "the edge of what was searched rather than a maximum. The size "
+                   "envelope moves far slower than the filter steps, so the true "
+                   "level can never legitimately be at the rail.";
+        case ScaleVeto::LowConf:
+            return "scale confidence is below the threshold — the size response "
+                   "is not peaked enough to act on. This is the occlusion / "
+                   "deformation indicator for the size axis.";
+        case ScaleVeto::OutOfRange:
+            return "the proposed box leaves the absolute bounds relative to the "
+                   "initial size. This is a drift backstop, so hitting it means "
+                   "earlier frames were already wrong.";
+    }
+    return "?";
 }
 
 }  // namespace mosse

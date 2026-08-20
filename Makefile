@@ -50,7 +50,20 @@ FFT_COL_CASCADE_LEN := 1
 # window PATCH_ROWS*FFT_ROW_WS must stay a whole multiple of the FFT point size;
 # and ROW_CHUNKS must equal CONV_INVOCATIONS (static_assert in mosse_tracker.cpp)
 # or the interleaved weights/drain loop deadlocks.
-FFT_ROW_WS          := 8
+# 8 -> 16 ON HARDWARE 2026-08-20 (runs/run_0820_1716.log): frame 127.7 -> 89.5 ms,
+# 7.83 -> 11.17 FPS, tracking bit-identical. The row-FFT drain is a FIXED PER-
+# BARRIER cost, proved by the per-tx figure not moving when the payload doubled
+# (286.10 us/tx at 4096 B -> 289.09 us/tx at 8192 B), so halving the barrier count
+# halves the time. gmio_fft_row_out 73.22 -> 37.00 ms, gmio_weights 3.67 -> 1.88.
+# Next step is 32 (CONV_OUT_CHUNK 16 KB, 32 KB ping-pong, still under the 64 KB
+# tile limit); 64 would need 64 KB ping-pong and is the likely ceiling.
+# 16 -> 32 ON HARDWARE 2026-08-20 (runs/run_0820_1739.log): 89.5 -> 70.9 ms,
+# 11.17 -> 14.10 FPS, tracking bit-identical. us/tx held at 293.38 for a 16384 B
+# payload against 286.10 at 4096 B, so the fixed-per-barrier model holds over 4x.
+# 64 would need a 64 KB ping-pong (the whole tile) and is the likely ceiling.
+# NOTE it is not a free knob for every port: gmio_ifft_row_out got 4x WORSE
+# (0.148 -> 0.596 ms/frame) because it was already at the ~18 us/tx floor.
+FFT_ROW_WS          := 32
 FFT_COL_WS          := 8
 
 # FFT/IFFT output shifts. The invariant is
@@ -138,9 +151,20 @@ FFT_COL_WS          := 8
 # magnitudes at once" rule; it is unavoidable because the budget change is
 # DERIVED from the scene change. DUMP_BUFFERS=1 gives per-frame F_ch/accum/resp,
 # so check rails and response %FS first and adjust k by whole bits.
+# 4-4-4 SINCE 2026-08-20, down from 4-5-5, AND THIS ONE IS FROM HARDWARE.
+# runs/run_0820_1418.log: 200 frames, ch16, TRAJECTORY=1 SCALE_TRAJ=1, built at
+# 4-4-4 (see build/hw/.../aie.flagstamp, which is the authority — runs/.last_cfg
+# claimed 4-3-3 and is stale). rails=0 on EVERY frame, and the response peak ran
+# 16157..20994 = 49..64% of int16 range at the converged end. That is the healthy
+# band 4-5-5 undershot by 6-11x (it gave 1.1-4.5%).
+#
+# Leaving the default at the known-wrong 4-5-5 was also an active trap: the shifts
+# are AIE flags, so a host-only experiment invoked as `make sd_card TARGET=hw
+# SCALE_STEP=1.04` would have silently triggered a multi-hour graph rebuild AT A
+# DIFFERENT SHIFT BUDGET, i.e. moved two magnitudes at once without saying so.
 FFT_SHIFT           ?= 4
-IFFT_ROW_SHIFT      ?= 5
-IFFT_COL_SHIFT      ?= 5
+IFFT_ROW_SHIFT      ?= 4
+IFFT_COL_SHIFT      ?= 4
 
 # cmul_accum filter-product shift. INDEPENDENT of the invariant above.
 #
@@ -406,7 +430,36 @@ CROP_VPP_FLAGS  := --hls.clock $(VPP_CLOCK_FREQ):roi_crop
 # =========================================================
 # Host application compiler flags
 # =========================================================
-GCC_FLAGS  := -O2 -std=c++17 -D__linux__ -D__PS_ENABLE_AIE__
+# Host optimisation level. SEPARATE VARIABLE so it can be swept without editing
+# the flag list, and so a run's app.flagstamp records which one it used.
+#
+# -O2 with no -mcpu is what every run up to 2026-08-20 used. After the BO copy
+# pattern the frame is 143 ms of which `publish filter` (12.17 ms) and `filter
+# update` (11.17 ms) are pure heap compute — ~262k complex ops each, and the only
+# remaining lever on them is codegen.
+#
+# CAUTION, and this is why it is a separate build: -O3 can change floating-point
+# contraction (FMA), so the filter maths is not guaranteed bit-identical. The
+# acceptance test is the tracking summary — mean IoU 0.9174, worst 0.8326, centre
+# 1.30/3.52 px, final box 62x62. If those move, -O3 changed the arithmetic and
+# that is a decision to make deliberately, not a speedup to bank.
+#
+# -O3 -mcpu=cortex-a72 VERIFIED ON HARDWARE 2026-08-20 (runs/run_0820_1610.log):
+# tracking bit-identical, frame 134.6 -> 132.2 ms. It is worth 2.4 ms and ALL of
+# that is one slot — `publish filter` 12.16 -> 9.83. `filter update` got 0.27 ms
+# SLOWER and `scale extract` did not move, because both are std::complex<float>
+# arithmetic that GCC will not vectorise: C99 Annex G forces the libgcc __mulsc3
+# helper for complex multiply. Confirmed by cross-compiling mosse_filter.cpp:
+# -fcx-limited-range removes the __mulsc3 call and raises NEON fp ops 10 -> 17,
+# and a native benchmark puts filter_update at 0.915 -> 0.635 ms (1.6x).
+#
+#   make sd_card TARGET=hw HOST_OPT="-O3 -mcpu=cortex-a72 -fcx-limited-range" ...
+#
+# -fcx-limited-range only drops the Inf/NaN range handling in complex mul/div;
+# no value in this pipeline is near those. NOT -ffast-math, which buys the same
+# time by making every float operation in the file unsafe.
+HOST_OPT   ?= -O3 -mcpu=cortex-a72
+GCC_FLAGS  := $(HOST_OPT) -std=c++17 -D__linux__ -D__PS_ENABLE_AIE__
 GCC_FLAGS  += -DPATCH_ROWS=$(PATCH_ROWS)
 GCC_FLAGS  += -DPATCH_COLS=$(PATCH_COLS)
 GCC_FLAGS  += -DN_CHANNELS=$(N_CHANNELS)
@@ -494,6 +547,51 @@ GCC_FLAGS  += -DPSR_GATE_MIN=$(PSR_GATE_MIN)
 # turn it off from the build, which is how a 500-frame run ends up spending 99%
 # of its wall clock on diagnostics nobody reads.
 DUMP_BUFFERS ?= 1
+# Console verbosity. THIS IS A FRAME-RATE PARAMETER, not a cosmetic one.
+#
+# Measured 2026-08-20 over 198 frames of runs/run_0820_1244.log at
+# DUMP_BUFFERS=0: regressing frame period against console bytes gives slope
+# 92.5 us/byte (115200 8N1 is 86.8 us/byte) and an INTERCEPT OF ZERO. The frame
+# time WAS the UART. The 87 ms of GMIO, the 17 APU transposes, the ~2 MB/frame
+# of cmul packing memcpy and the filter update were all already hidden behind
+# the tty drain, and 79% of the ~10 KB/frame was instrumentation for problems
+# that are now closed (the 503 ms KDS latency, the roi_crop launch path).
+#
+#   0  one compact line per frame (~45 B, ~4 ms). USE FOR ANY LONG RUN.
+#   1  human-readable per-frame block; roi_crop/DMA tables on first+last frame
+#      only. Default.
+#   2  everything, including the 96 per-channel progress lines — the behaviour
+#      of every run before 2026-08-20.
+#
+# Anomalies print at EVERY level: a railed bin, a PSR/scale HOLD, a peak-
+# definition disagreement, a negative peak. Silencing those to save console is
+# how a shift-budget hunt goes wrong.
+#
+# ESTIMATED from the same run's byte categories (measure it, do not trust this):
+# at 128x128/ch16, DUMP_BUFFERS=0, level 2 is the measured ~880 ms; level 1
+# drops to ~1.2 KB/frame => ~105 ms; level 0 to ~45 B => the ~87 ms GMIO floor,
+# ~11 FPS. Level 1 is still console-bound; level 0 is the first configuration
+# where something other than the UART sets the frame time.
+VERBOSITY  := 1
+GCC_FLAGS  += -DVERBOSITY=$(VERBOSITY)
+# Row-FFT drain pipeline depth. 1 = the historical per-firing barrier; 0 = sweep
+# 1,2,4,8,16 in 40-frame blocks inside one run. See the note in mosse_tracker.cpp:
+# GMIO is 67% of the frame and gmio_fft_row_out is 73 of its 87 ms, so this is the
+# remaining question. Host-only.
+FFT_DRAIN_DEPTH := 1
+GCC_FLAGS  += -DFFT_DRAIN_DEPTH=$(FFT_DRAIN_DEPTH)
+# REPORT-ONLY on the host: the shift budget is an AIE parameter and the host does
+# no arithmetic with it. Passed anyway so the startup banner can state it, from
+# the SAME Makefile variables the graph gets — a log that cannot name its own
+# shift budget is how "4-5-5 is wrong and the Makefile still defaults to it"
+# survived as long as it did. Same one-variable-to-both-toolchains rule as
+# FFT_ROW_WS/FFT_COL_WS, for the same reason.
+GCC_FLAGS  += -DFFT_SHIFT_CFG=$(FFT_SHIFT)
+GCC_FLAGS  += -DIFFT_ROW_SHIFT_CFG=$(IFFT_ROW_SHIFT)
+GCC_FLAGS  += -DIFFT_COL_SHIFT_CFG=$(IFFT_COL_SHIFT)
+ifeq ($(TARGET),hw_emu)
+GCC_FLAGS  += -DHW_EMU_BUILD=1
+endif
 GCC_FLAGS  += -DDUMP_BUFFERS=$(DUMP_BUFFERS)
 
 # One CSV row per frame — frame, gate verdict, both PSR statistics, peak, the
@@ -639,6 +737,49 @@ GCC_FLAGS  += -DFRAME_TEXTURE=$(FRAME_TEXTURE)
 FRAME_NOISE    ?= 2
 GCC_FLAGS  += -DFRAME_NOISE=$(FRAME_NOISE)
 
+# Camera pan over the cached background, px/frame. HOST-ONLY. 0 = the static
+# background, i.e. the pre-2026-08-20 behaviour.
+#
+# THIS, NOT FRAME_NOISE, IS THE FIX FOR BACKGROUND LOCK. Independent additive
+# noise cannot decorrelate a static pattern — the background still correlates
+# with itself at exactly zero shift, and the extra variance inflates the MOSSE
+# numerator and the shared denominator alike. FRAME_NOISE=2 appeared to work on
+# 2026-08-17 only because the frame buffer was not yet seeded and the ROI was
+# mostly zeros, so the noise was the dominant varying content. Once seeding
+# landed, resp00_over_peak went straight back to 0.86 (measured 2026-08-20) and
+# raising the amplitude cannot recover it — it would only bury the target too.
+#
+# Panning is what real video actually provides: the tracking window sees a
+# different piece of the world every frame because the camera moves. Sampled from
+# the cached field at a wrapped offset (two memcpys per row over the ROI), so it
+# does NOT re-run fill_background(), which is ~0.6-1.2 s on the A72.
+#
+# Constant velocity and independent of TRAJECTORY on purpose: a pan that tracked
+# the target would hold the background still in ROI coordinates and rebuild the
+# bug, and a periodic one could resonate with TRAJ_PERIOD.
+#
+# THE VALUES ARE SWEPT, NOT GUESSED — scripts/bg_pan_sweep.py, seconds, no
+# hardware. It replicates fill_background() and Stage A and reports the normalised
+# zero-shift correlation between consecutive ROI patches after B2:
+#
+#   pan/frame     0,0    3,5    7,11   15,23  23,37  31,47  47,71  63,97
+#   corr@0shift  +0.60  +0.61  +0.64  +0.54  +0.31  +0.09  -0.25  -0.56
+#
+# **A SMALL PAN DOES NOTHING.** The texture is six sinusoids of 1-6 cycles per
+# frame, i.e. wavelengths of 180-1080 rows, so a 3-5 px shift moves it by under 2%
+# of the shortest period and the first guess at 3/5 was worthless (0.61 vs 0.60 at
+# no pan at all). |corr| is minimised near 31/47; beyond that it just
+# anti-correlates. Re-run the sweep if FRAME_TEXTURE or fill_background() changes
+# — the right pan is a property of the texture's spectrum, not a universal number.
+#
+# 31 and 47 are coprime to 1080 and 1920, so the offsets cycle through every row
+# and column before repeating. fill_background() rounds its frequencies to whole
+# cycles per frame precisely so this wraparound is seamless.
+BG_PAN         ?= 1
+BG_PAN_R       ?= 31
+BG_PAN_C       ?= 47
+GCC_FLAGS  += -DBG_PAN=$(BG_PAN) -DBG_PAN_R=$(BG_PAN_R) -DBG_PAN_C=$(BG_PAN_C)
+
 # ---------------------------------------------------------------------------
 # DSST 1-D scale filter — docs/1609.06141v1.pdf §5.1. HOST-ONLY.
 # ---------------------------------------------------------------------------
@@ -660,13 +801,56 @@ GCC_FLAGS  += -DFRAME_NOISE=$(FRAME_NOISE)
 # scale filter (rank <= S), so it can be added later as a pure optimisation with
 # a bit-exactness test against this path.
 SCALE_N            ?= 33
-SCALE_STEP         ?= 1.02
+# DSST 6.1's a. THE SEARCH RANGE a^((S-1)/2) IS WHAT MATTERS, not the resolution
+# — measured offline 2026-08-20 with `make scale_sim`, which reproduces the board's
+# f130 scale stall (runs/run_0820_1418.log). Sweeping a and S on the same envelope:
+#
+#   a=1.02 S=33  range 1.373  moving 12.6%  step 37.3%   1.00x cost   <- default
+#   a=1.03 S=33  range 1.605  moving  9.5%  step 42.9%   1.00x
+#   a=1.04 S=33  range 1.873  moving  8.6%  step  4.4%   1.00x        <- free win
+#   a=1.02 S=49  range 1.608  moving  8.3%  step 42.9%   2.20x
+#   a=1.02 S=65  range 1.885  moving  6.1%  step  6.1%   3.88x        <- best
+#
+# CONFIRMED ON HARDWARE 2026-08-20 (runs/run_0820_1513.log, 200 frames, identical to
+# run_0820_1418 in every other respect): 1.02 -> 1.04 took mean IoU 0.807 -> 0.917,
+# worst IoU 0.579 -> 0.833, max box error 31.4% -> 9.6%, mean centre error 2.47 ->
+# 1.30 px, worst 11.07 -> 3.52 px. Free: S is unchanged, so d*S^2 is unchanged.
+# NOW THE DEFAULT, deliberately deviating from DSST 6.1's 1.02.
+SCALE_STEP         ?= 1.04
 SCALE_ETA          ?= 0.025
 SCALE_SIGMA_FACTOR ?= 16.0
 SCALE_TMPL_AREA    ?= 512
 GCC_FLAGS  += -DSCALE_N=$(SCALE_N) -DSCALE_STEP=$(SCALE_STEP)
 GCC_FLAGS  += -DSCALE_ETA=$(SCALE_ETA) -DSCALE_SIGMA_FACTOR=$(SCALE_SIGMA_FACTOR)
 GCC_FLAGS  += -DSCALE_TMPL_AREA=$(SCALE_TMPL_AREA)
+
+# Scale-update gate — the size-axis analogue of PSR_GATE_MIN. HOST-ONLY.
+#
+# WHY IT EXISTS. Measured on hardware 2026-08-20 with position tracking EXACT
+# (IoU 1.0000, centre error 0.00 px through frame 5): the scale filter jumped to
+# level -12 on frame 6 and took the box 64.0 -> 50.5 in one step, which shrank the
+# ROI, which then broke position tracking. The collapse was previously recorded as
+# a SYMPTOM of background lock -> position drift; it is not, it fires first.
+#
+# SCALE_CONF_MIN is on ScaleResult::psr, which separates the two populations
+# cleanly on three independent hardware runs — healthy 2.24-3.31, collapsed
+# 0.72-1.87 — so 2.0 sits in the gap every time. It is NOT a universal constant:
+# re-derive it from the [scale] SUMMARY conf range after any change to the
+# geometry, the template size or the feature scale. 0 disables the threshold test
+# only; the structural vetoes (argmax on the search rail, proposed box outside the
+# absolute bounds) still apply, exactly as with PSR_GATE_MIN=0.
+#
+# SCALE_MIN_REL/MAX_REL tightened from 0.25/4.0, which was so loose it never fired
+# in any run on record. They are a DRIFT backstop, not a per-frame plausibility
+# test — the per-frame change is already bounded by the filter's own range
+# (step^±(S-1)/2 = ±37% at the defaults) — so they must still admit the test
+# sequence's own envelope (SCALE_TRAJ_AMP=0.30 => 0.70x..1.30x). 0.5/2.0 leaves
+# margin on both sides of that.
+SCALE_CONF_MIN     ?= 2.0
+SCALE_MIN_REL      ?= 0.5
+SCALE_MAX_REL      ?= 2.0
+GCC_FLAGS  += -DSCALE_CONF_MIN=$(SCALE_CONF_MIN)
+GCC_FLAGS  += -DSCALE_MIN_REL=$(SCALE_MIN_REL) -DSCALE_MAX_REL=$(SCALE_MAX_REL)
 
 # Occlusion injection, to prove the gate actually FIRES — it cannot on the normal
 # synthetic target, which measures PSR ~172 against a threshold of 7. Bitmask over
@@ -1068,6 +1252,42 @@ test_host:
 	    $(HOST_APP_SRC)/mosse_filter.cpp $(TEST_HOST_DIR)/test_mosse_filter.cpp \
 	    -o $(BUILD_DIR)/test_host
 	$(BUILD_DIR)/test_host $(TEST_HOST_DIR)/golden
+
+# -------------------------------------------------------
+# Closed-loop DSST scale simulation — no hardware
+# -------------------------------------------------------
+# Explains the frozen scale estimate in runs/run_0820_1418.log (est_h stuck at
+# 59.13 for frames 130..199 while truth went 48 -> 45 -> 63). Drives the REAL
+# scale_extract/scale_detect/scale_gate/scale_update through a closed loop with
+# the position held, which the hardware run could not do. Seconds, native g++.
+.PHONY: scale_sim
+scale_sim: $(BUILD_DIR)/scale_loop_sim
+	$(BUILD_DIR)/scale_loop_sim
+
+# Flagstamp prerequisite, for the reason CLAUDE.md records twice already: SCALE_N,
+# SCALE_ETA and SCALE_CONF_MIN are -D values that touch no source file, so a
+# source-only prerequisite list silently reuses the previous binary. Caught in the
+# act on 2026-08-20 — changing the SCALE_STEP default left the sim reporting
+# step=1.020 from a stale ELF.
+SCALE_SIM_STAMP := $(BUILD_DIR)/scale_sim.flagstamp
+$(SCALE_SIM_STAMP): FLAGS_FOR_STAMP := $(SCALE_N)/$(SCALE_STEP)/$(SCALE_ETA)/$(SCALE_SIGMA_FACTOR)/$(SCALE_TMPL_AREA)/$(SCALE_CONF_MIN)/$(SCALE_MIN_REL)/$(SCALE_MAX_REL)
+
+$(BUILD_DIR)/scale_loop_sim: $(SCALE_SIM_STAMP)                \
+                             $(HOST_APP_SRC)/mosse_filter.cpp \
+                             $(HOST_APP_SRC)/mosse_filter.h   \
+                             $(TEST_HOST_DIR)/scale_loop_sim.cpp
+	mkdir -p $(BUILD_DIR)
+	g++ -O2 -std=c++17 -Wall -Wextra -I$(HOST_APP_SRC) \
+	    -DCMUL_H_SHIFT=$(H_SHIFT) -DPSR_GATE_MIN=$(PSR_GATE_MIN) \
+	    -DMOSSE_SIGMA=$(MOSSE_SIGMA) -DSIGMA_FACTOR=$(SIGMA_FACTOR) \
+	    -DSIGMA_FROM_TARGET=$(SIGMA_FROM_TARGET) -DMOSSE_ETA=$(MOSSE_ETA) \
+	    -DTARGET_PADDING=$(TARGET_PADDING) \
+	    -DSCALE_N=$(SCALE_N) -DSCALE_STEP=$(SCALE_STEP) -DSCALE_ETA=$(SCALE_ETA) \
+	    -DSCALE_SIGMA_FACTOR=$(SCALE_SIGMA_FACTOR) -DSCALE_TMPL_AREA=$(SCALE_TMPL_AREA) \
+	    -DSCALE_CONF_MIN=$(SCALE_CONF_MIN) \
+	    -DSCALE_MIN_REL=$(SCALE_MIN_REL) -DSCALE_MAX_REL=$(SCALE_MAX_REL) \
+	    $(HOST_APP_SRC)/mosse_filter.cpp $(TEST_HOST_DIR)/scale_loop_sim.cpp \
+	    -o $@
 
 # -------------------------------------------------------
 # Native roi_crop test — the RESAMPLE path

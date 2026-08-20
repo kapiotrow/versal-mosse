@@ -775,6 +775,335 @@ void run_scale_tests()
         ScaleResult r = scale_detect(fresh, Z.data(), DEFAULT_EPS_REL);
         check_true("untrained -> invalid", !r.valid, "");
     }
+
+    // -------------------------------------------------------------------
+    // Scale-update gating. The values are the ones hardware actually produced
+    // on 2026-08-20, not invented ones — the point of the gate is that it
+    // separates THOSE two populations, so the test asserts against them.
+    // -------------------------------------------------------------------
+    printf("\nScale-update gate\n");
+    {
+        const double H0 = 64.0, W0 = 64.0;
+        const float  CONF = 2.0f;
+        const double MINR = 0.5, MAXR = 2.0;
+
+        auto mk = [](int idx, double factor, double conf) {
+            ScaleResult r;
+            r.idx = idx; r.factor = factor; r.psr = conf; r.valid = true;
+            return r;
+        };
+
+        // The five healthy frames: level +0, conf 3.30-3.31. All must pass.
+        {
+            ScaleDecision d = scale_gate(mk(0, 1.0, 3.31), S, H0, W0, H0, W0,
+                                         CONF, MINR, MAXR);
+            check_true("healthy (idx 0, conf 3.31) accepts", d.accept, "");
+            check_true("healthy reason", d.reason == ScaleVeto::Accept, "");
+        }
+        // Frame 6, the collapse that started the runaway: level -12, conf 1.22.
+        // This is the single frame the whole gate exists to reject.
+        {
+            ScaleDecision d = scale_gate(mk(-12, 0.7885, 1.22), S, H0, W0, H0, W0,
+                                         CONF, MINR, MAXR);
+            check_true("frame-6 collapse (idx -12, conf 1.22) HELD", !d.accept, "");
+            check_true("frame-6 reason is LOW_CONF",
+                       d.reason == ScaleVeto::LowConf, "");
+            check_double("frame-6 proposal recorded", d.new_h, 64.0 * 0.7885, 1e-9);
+        }
+        // Frame 13: argmax at exactly +16 of +/-16. Structural, and it must be
+        // reported as the rail even though conf (1.57) is also below threshold —
+        // that ordering is the whole reason the reasons are an enum.
+        {
+            ScaleDecision d = scale_gate(mk(16, 1.3728, 1.57), S, H0, W0, H0, W0,
+                                         CONF, MINR, MAXR);
+            check_true("search-rail (idx +16) HELD", !d.accept, "");
+            check_true("search-rail reason beats low-conf",
+                       d.reason == ScaleVeto::AtSearchRail, "");
+        }
+        // ...and the same at the negative rail, because a sign error here would
+        // veto one direction only and look like a working gate.
+        {
+            ScaleDecision d = scale_gate(mk(-16, 0.7284, 3.0), S, H0, W0, H0, W0,
+                                         CONF, MINR, MAXR);
+            check_true("negative search-rail HELD, high conf", !d.accept, "");
+            check_true("negative rail reason",
+                       d.reason == ScaleVeto::AtSearchRail, "");
+        }
+        // Interior neighbour of the rail must still pass, or the gate silently
+        // costs the outer levels of the search range.
+        {
+            ScaleDecision d = scale_gate(mk(15, 1.3459, 3.0), S, H0, W0, H0, W0,
+                                         CONF, MINR, MAXR);
+            check_true("idx 15 (interior) accepts", d.accept, "");
+        }
+        // Drift backstop: confident, interior, but the proposal leaves the bounds.
+        {
+            ScaleDecision d = scale_gate(mk(1, 1.02, 3.0), S, 20.0, 20.0, H0, W0,
+                                         CONF, MINR, MAXR);
+            check_true("below min_rel HELD", !d.accept, "");
+            check_true("below min_rel reason",
+                       d.reason == ScaleVeto::OutOfRange, "");
+        }
+        {
+            ScaleDecision d = scale_gate(mk(1, 1.02, 3.0), S, 130.0, 130.0, H0, W0,
+                                         CONF, MINR, MAXR);
+            check_true("above max_rel HELD", !d.accept, "");
+        }
+        // The test sequence's own envelope (0.70x..1.30x) must NOT be clipped, or
+        // the gate would fight the ground truth it is being scored against.
+        {
+            ScaleDecision a = scale_gate(mk(1, 1.0, 3.0), S, 64.0 * 0.70, 64.0 * 0.70,
+                                         H0, W0, CONF, MINR, MAXR);
+            ScaleDecision b = scale_gate(mk(1, 1.0, 3.0), S, 64.0 * 1.30, 64.0 * 1.30,
+                                         H0, W0, CONF, MINR, MAXR);
+            check_true("SCALE_TRAJ envelope 0.70x admitted", a.accept, "");
+            check_true("SCALE_TRAJ envelope 1.30x admitted", b.accept, "");
+        }
+        // Threshold off disables ONLY the confidence test — the structural vetoes
+        // must survive, exactly as they do for PSR_GATE_MIN=0.
+        {
+            ScaleDecision d = scale_gate(mk(-12, 0.7885, 1.22), S, H0, W0, H0, W0,
+                                         0.0f, MINR, MAXR);
+            check_true("conf_min=0 accepts a low-conf interior estimate",
+                       d.accept, "");
+            check_true("conf_min=0 reason", d.reason == ScaleVeto::Disabled, "");
+            ScaleDecision r = scale_gate(mk(16, 1.3728, 1.57), S, H0, W0, H0, W0,
+                                         0.0f, MINR, MAXR);
+            check_true("conf_min=0 still vetoes the search rail", !r.accept, "");
+        }
+        // An invalid result must never resize the box, and must say so as
+        // INVALID rather than masquerading as a rejection.
+        {
+            ScaleResult bad;                       // valid = false
+            ScaleDecision d = scale_gate(bad, S, H0, W0, H0, W0, CONF, MINR, MAXR);
+            check_true("invalid result HELD", !d.accept, "");
+            check_true("invalid reason", d.reason == ScaleVeto::Invalid, "");
+        }
+        // A degenerate filter must not veto everything: at S <= 2 every index IS
+        // the rail, and a gate that holds every frame would freeze the size
+        // silently.
+        {
+            ScaleDecision d = scale_gate(mk(0, 1.0, 3.0), 1, H0, W0, H0, W0,
+                                         CONF, MINR, MAXR);
+            check_true("S=1 does not trip the rail veto", d.accept, "");
+        }
+        // Every reason must have a tag and a sentence — a verdict with no
+        // explanation is the thing this design specifically does not ship.
+        {
+            bool all = true;
+            for (int i = 0; i <= (int)ScaleVeto::OutOfRange; ++i) {
+                const char *t = scale_veto_tag((ScaleVeto)i);
+                const char *w = scale_veto_why((ScaleVeto)i);
+                all = all && t && w && t[0] != '?' && w[0] != '?';
+            }
+            check_true("every ScaleVeto has a tag and a reason", all, "");
+        }
+    }
+}
+
+
+// ---------------------------------------------------------------------------
+// Training target — the defect fixed 2026-08-20
+// ---------------------------------------------------------------------------
+//
+// filter_update() is handed the patch cropped at the PRE-update position, so the
+// object in it sits at the measured displacement (dr,dc), not at the origin.
+// Training that patch against a G centred at (0,0) teaches "object at (dr,dc)
+// => peak at (0,0)", and under near-constant motion the error is coherent frame
+// to frame, so it compounds at the learning rate until the origin peak wins.
+//
+// A SINGLE UPDATE CANNOT SEE THIS — gen_filter_golden.py's one-shot check passed
+// throughout — so these tests run a small CLOSED LOOP and compare the two arms.
+// The hardware-free, full-size companion is scripts/mosse_loop_sim.py.
+namespace tt {
+
+constexpr int TR = 32, TC = 32, TCH = 2;
+constexpr float TSIGMA = 1.5f;
+
+using cf = mosse::cfloat;
+
+// Separable naive DFT — TR*TC is 1024 bins, so the O(N^3) form costs ~65k
+// complex multiplies per transform. No FFT dependency, which is the whole point
+// of mosse_filter.{h,cpp} having none.
+void dft2(const cf *in, cf *out, int rows, int cols, int sign)
+{
+    std::vector<cf> tmp((size_t)rows * cols);
+    for (int r = 0; r < rows; ++r)
+        for (int v = 0; v < cols; ++v) {
+            cf acc(0.0f, 0.0f);
+            for (int c = 0; c < cols; ++c) {
+                const double th = sign * 2.0 * M_PI * v * c / cols;
+                acc += in[(size_t)r * cols + c] * cf((float)std::cos(th),
+                                                     (float)std::sin(th));
+            }
+            tmp[(size_t)r * cols + v] = acc;
+        }
+    for (int v = 0; v < cols; ++v)
+        for (int u = 0; u < rows; ++u) {
+            cf acc(0.0f, 0.0f);
+            for (int r = 0; r < rows; ++r) {
+                const double th = sign * 2.0 * M_PI * u * r / rows;
+                acc += tmp[(size_t)r * cols + v] * cf((float)std::cos(th),
+                                                      (float)std::sin(th));
+            }
+            out[(size_t)u * cols + v] = acc;
+        }
+}
+
+// An asymmetric structured patch, wrapped, with the object centred at (or, oc).
+// Asymmetric because a symmetric blob hides sign errors — the same reason s7's
+// target is off-centre.
+void make_patch(cf *p, int or_, int oc_)
+{
+    for (int r = 0; r < TR; ++r)
+        for (int c = 0; c < TC; ++c) {
+            int dr = r - or_; if (dr >  TR / 2) dr -= TR; if (dr < -TR / 2) dr += TR;
+            int dc = c - oc_; if (dc >  TC / 2) dc -= TC; if (dc < -TC / 2) dc += TC;
+            const double v = 100.0 * std::exp(-(dr * dr + dc * dc) / 18.0)
+                           + 60.0 * std::exp(-((dr - 3) * (dr - 3)
+                                             + (dc + 4) * (dc + 4)) / 6.0);
+            p[(size_t)r * TC + c] = cf((float)v, 0.0f);
+        }
+}
+
+// One closed-loop run. `shifted` selects the fix. Returns resp00/peak per frame.
+std::vector<double> loop(bool shifted, int frames, int vr, int vc,
+                         std::vector<int> *drs, std::vector<int> *dcs)
+{
+    mosse::FilterState st;
+    std::vector<cf> patch((size_t)TR * TC), F((size_t)TCH * TR * TC);
+    std::vector<cf> G0((size_t)TR * TC), G((size_t)TR * TC);
+    std::vector<cf> S((size_t)TR * TC), resp((size_t)TR * TC);
+
+    mosse::gaussian_target_spectrum(G0.data(), TR, TC, TSIGMA, 0, 0);
+
+    // Object position, and the tracker's estimate of it. Both in patch bins;
+    // the crop offset is (est - true), i.e. where the object lands in the patch.
+    int t_r = 0, t_c = 0, e_r = 0, e_c = 0;
+    std::vector<double> out;
+
+    for (int f = 0; f < frames; ++f) {
+        // Crop at the ESTIMATE: the object appears at (true - est), wrapped.
+        make_patch(patch.data(), ((t_r - e_r) % TR + TR) % TR,
+                                 ((t_c - e_c) % TC + TC) % TC);
+        for (int ch = 0; ch < TCH; ++ch) {
+            // Two trivially different "channels": the patch, and its gradient.
+            std::vector<cf> in((size_t)TR * TC);
+            for (int i = 0; i < TR * TC; ++i)
+                in[i] = ch == 0 ? patch[i]
+                                : patch[i] - patch[(i + 1) % (TR * TC)];
+            dft2(in.data(), F.data() + (size_t)ch * TR * TC, TR, TC, -1);
+        }
+
+        if (f == 0) {
+            // Bootstrap: the crop IS centred on the object, so centred is right
+            // in both arms.
+            mosse::filter_init(st, F.data(), G0.data(), TCH, TR, TC);
+        } else {
+            // Detect: R = IDFT( sum F * conj(H) ), H = A / (B + eps).
+            double bsum = 0.0;
+            for (int i = 0; i < TR * TC; ++i) bsum += st.B[i];
+            const float eps = mosse::DEFAULT_EPS_REL * (float)(bsum / (TR * TC));
+            for (int i = 0; i < TR * TC; ++i) {
+                cf acc(0.0f, 0.0f);
+                for (int ch = 0; ch < TCH; ++ch)
+                    acc += F[(size_t)ch * TR * TC + i]
+                         * std::conj(st.A[(size_t)ch * TR * TC + i] / (st.B[i] + eps));
+                S[i] = acc;
+            }
+            dft2(S.data(), resp.data(), TR, TC, +1);
+
+            int bi = 0; double best = 0.0;
+            for (int i = 0; i < TR * TC; ++i) {
+                const double m = std::fabs(resp[i].real());
+                if (m > best) { best = m; bi = i; }
+            }
+            int dr = bi / TC, dc = bi % TC;
+            if (dr > TR / 2) dr -= TR;
+            if (dc > TC / 2) dc -= TC;
+            out.push_back(best > 0.0 ? std::fabs(resp[0].real()) / best : 0.0);
+            if (drs) drs->push_back(dr);
+            if (dcs) dcs->push_back(dc);
+
+            e_r += dr; e_c += dc;
+
+            mosse::gaussian_target_spectrum(G.data(), TR, TC, TSIGMA,
+                                            shifted ? dr : 0, shifted ? dc : 0);
+            mosse::filter_update(st, F.data(), G.data(), mosse::DEFAULT_ETA);
+        }
+        t_r += vr; t_c += vc;
+    }
+    return out;
+}
+
+}  // namespace tt
+
+void run_training_target_tests()
+{
+    printf("\n--- training target (filter_update G offset) ---\n");
+
+    // 1. THE SIGN. gaussian_target_spectrum(G,...,dr,dc) must be the spectrum of
+    //    a Gaussian peaked at spatial (dr,dc) — the SAME sign as the response's
+    //    peak index, not its negation. Everything above rests on this, and a
+    //    centred target would hide it (a centred real Gaussian has conj(G) = G).
+    {
+        using tt::cf;
+        std::vector<cf> G((size_t)tt::TR * tt::TC), g((size_t)tt::TR * tt::TC);
+        const int DR = 5, DC = -3;
+        mosse::gaussian_target_spectrum(G.data(), tt::TR, tt::TC, tt::TSIGMA, DR, DC);
+        tt::dft2(G.data(), g.data(), tt::TR, tt::TC, +1);
+        int bi = 0; double best = -1.0;
+        for (int i = 0; i < tt::TR * tt::TC; ++i)
+            if (g[i].real() > best) { best = g[i].real(); bi = i; }
+        int pr = bi / tt::TC, pc = bi % tt::TC;
+        if (pr > tt::TR / 2) pr -= tt::TR;
+        if (pc > tt::TC / 2) pc -= tt::TC;
+        check_int("G sign: peak row", pr, DR);
+        check_int("G sign: peak col", pc, DC);
+    }
+
+    // 2. THE REGRESSION. Same scene, same motion, same eta — only the training
+    //    target differs. Centred must let the origin peak grow; shifted must not.
+    {
+        std::vector<int> dr_s, dc_s;
+        const std::vector<double> cen = tt::loop(false, 10, 2, -1, nullptr, nullptr);
+        const std::vector<double> shf = tt::loop(true,  10, 2, -1, &dr_s, &dc_s);
+
+        double cen_max = 0.0, shf_max = 0.0;
+        for (double v : cen) if (v > cen_max) cen_max = v;
+        for (double v : shf) if (v > shf_max) shf_max = v;
+        printf("  resp00/peak max: centred %.3f, shifted %.3f\n", cen_max, shf_max);
+        printf("  centred:");  for (double v : cen) printf(" %.2f", v); printf("\n");
+        printf("  shifted:");  for (double v : shf) printf(" %.2f", v); printf("\n");
+
+        // ASSERT THE SHAPE, NOT AN ABSOLUTE LEVEL. Both arms start at the same
+        // value (~0.39 here) — that is this scene's own zero-shift
+        // autocorrelation at 32x32 with sigma 1.5, and it is not a defect.
+        // CLAUDE.md's 0.3 healthy ceiling is calibrated for the 128x128 ch16
+        // hardware geometry and does NOT transfer, the same way s7's PSR
+        // threshold does not transfer across geometries. What IS geometry
+        // independent is that the defect makes the ratio GROW at the learning
+        // rate while the fix leaves it flat or decaying.
+        check_true("centred G lets the origin peak grow", cen_max > 1.5 * cen[0],
+                   "the defect must still reproduce, or this test proves nothing");
+        check_true("shifted G does not let the origin peak grow",
+                   shf.back() <= shf[0],
+                   "flat or decaying is the property; the absolute level is the "
+                   "scene's own baseline");
+        check_true("shifted beats centred", shf_max < cen_max, "");
+
+        // The origin peak grows at the LEARNING RATE, which is the signature
+        // that separates this from background lock (which BG_PAN would move).
+        check_true("centred: resp00/peak is monotone over the first 5 frames",
+                   cen.size() >= 5 && cen[4] > cen[0], "");
+
+        // And the fix must actually track: constant velocity (2,-1) per frame.
+        bool tracked = !dr_s.empty();
+        for (size_t i = 1; i < dr_s.size(); ++i)
+            if (dr_s[i] != 2 || dc_s[i] != -1) tracked = false;
+        check_true("shifted G tracks constant velocity (2,-1) exactly", tracked,
+                   "every frame after the first must report the true step");
+    }
 }
 
 }  // namespace
@@ -890,6 +1219,7 @@ int main(int argc, char **argv)
     run_psr_tests();
     run_box_tests();
     run_scale_tests();
+    run_training_target_tests();
 
     printf("\n  OVERALL: %s (%d failure%s)\n\n",
            g_failures ? "FAIL" : "PASS", g_failures, g_failures == 1 ? "" : "s");
