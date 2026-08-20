@@ -648,7 +648,7 @@ ruled out). Trust the ORDERING; do not quote the sim's absolute magnitudes as th
 for **3.9× the scale-filter cost** — not worth it. ~8-10% box error is the practical floor of
 this filter as configured; the next real gain would be a different scale estimator, not a tune.
 
-### Result 2026-08-20: 880 → 70.9 ms, 1.14 → 14.10 FPS (12.4×)
+### Result 2026-08-20: 880 → 60.7 ms, 1.14 → 16.48 FPS (14.5×)
 
 `runs/run_0820_1620.log`. Tracking **bit-identical across all seven instrumented runs** — mean IoU
 0.9174, worst 0.8326, centre 1.30/3.52 px, box 62×62, PSR 25.75/83.04/127.10. Every optimisation
@@ -663,7 +663,8 @@ below was accepted on that test, and none of them changed a number the tracker p
 | `-O3 -mcpu=cortex-a72` | 132.2 | 7.56 |
 | hypot fix + `-fcx-limited-range` | 127.7 | 7.83 |
 | `FFT_ROW_WS` 8→16 (AIE rebuild) | 89.5 | 11.17 |
-| `FFT_ROW_WS` 16→32 | **70.9** | **14.10** |
+| `FFT_ROW_WS` 16→32 | 70.9 | 14.10 |
+| `FFT_ROW_WS` 32→64 | **60.7** | **16.48** |
 
 **GMIO is now 67.2% of the frame** (87.0 ms) against APU 31.8% (41.1 ms) and 1.0% unattributed.
 The APU is no longer where the frame is.
@@ -688,14 +689,52 @@ magnitudes are patch-specific". This is worse than that: the ORDERING did not tr
 because the working set crossed a cache boundary between the two machines.** Benchmark a
 host-side change on the host, or expect to be wrong about which fix matters.
 
-**Next, in order — and the first item now dwarfs the rest:**
-1. **GMIO, 87.0 ms, 67% of the frame.** `gmio_fft_row_out` alone is 73 ms at 286 µs/tx against
-   17.7-19.6 for its sibling output ports. **The depth-2 probe is DONE and it retired itself** —
-   see "XRT GMIO allows one outstanding async" below. The remaining candidates are the **weights
-   RTP** and **`FFT_ROW_WS` 8→16**, both of which need an AIE rebuild.
+**Next, in order. The APU is now two thirds of the frame (40.5 of 60.7 ms):**
+1. **`filter update` 10.85 ms** — memory-bound on ~8 MB/frame of heap, so the lever is TRAFFIC not
+   arithmetic (`-fcx-limited-range` bought only 0.48 ms). It and `filter_quantize_q15`
+   (`publish filter`, 5.59 ms) stream A and B back to back; fusing them saves re-reading A, ~4 ms.
+2. **`scale extract` 9.44 ms** — the real-input DFT, 3.11× on the d·S² transform, ~6 ms, and free
+   in accuracy. Shrinking S is NOT free and was measured: see "Scale filter stall".
+3. **`diag scan` 1.19 ms** — fold the rails check into `unpack_spectrum`, which already reads the
+   same data. Near-zero risk.
+4. **Memory-tile transpose**, now worth ~10 ms rather than the ~39 it was worth this morning —
+   `FFT_ROW_WS` collected most of it. Still the largest structural item; DSPLib reference
+   validated. Do 1-3 and re-measure first.
 2. `scale extract` 9.43 ms — the real-input DFT, 3.11× on the d·S² transform, ~6 ms.
 3. `filter update` 10.82 ms — memory-bound, so the lever is TRAFFIC not arithmetic. It and
    `filter_quantize_q15` both stream A and B back to back; fusing them would halve it.
+
+### `FFT_ROW_WS` 32→64 — 70.9 → 60.7 ms, 16.48 FPS. The knob is now exhausted.
+
+`runs/run_0820_1807.log`. Tracking bit-identical (tenth consecutive run).
+
+| WS | tx/channel | µs/tx | `gmio_fft_row_out` ms/frame |
+|---|---|---|---|
+| 8 | 16 | 286.10 | 73.22 |
+| 16 | 8 | 288.16 | 36.89 |
+| 32 | 4 | 293.38 | 18.78 |
+| **64** | **2** | **310.28** | **9.93** |
+
+**8× payload range for 8.5% cost growth — but the growth is accelerating** (0.7%, 1.8%, **5.8%**
+per doubling). That is the AIE's own production time surfacing, which it had to: the design spends
+~6.4 ms/frame actually computing (conv2d 4.1 + FFT/IFFT ~2.2), and that is now a large fraction of
+the 9.93 ms. **WS=128 is not worth it** — one chunk per channel, a 64 KB window with 128 KB
+ping-pong, for at most 3-4 ms before hitting the compute floor.
+`gmio_ifft_row_out` did NOT regress further (0.596 → 0.570 ms); the WS=32 anomaly stayed contained.
+
+**`FFT_ROW_WS` alone took `gmio_fft_row_out` 73.22 → 9.93 ms — 63 ms, from a Makefile variable.**
+
+**GMIO 21.0 ms (33.5%), APU 40.5 ms (64.5%).** GMIO is no longer the problem.
+
+**A 64 KB ping-pong DOES fit on a 64 KB tile.** The prediction that it would not was wrong —
+AIE-ML cores address neighbouring tiles' memory, so a window need not live entirely in the
+producer's tile. Cost of being wrong: 3 minutes, because `make graph` was run alone before
+committing to the full `sd_card` build. **Test an AIE placement question with `make graph`, not
+with a 25-minute package.**
+
+**Two structural projects shrank while a Makefile knob did the work** — the weights RTP (was the
+headline plan; `gmio_weights` is now 0.47 ms) and the memory-tile transpose (was ~39 ms this
+morning, now ~10). Exhaust the cheap knobs and re-measure before opening the graph.
 
 ### `FFT_ROW_WS` 16→32 — 89.5 → 70.9 ms, 14.10 FPS, and the fixed-cost model holds over 4×
 

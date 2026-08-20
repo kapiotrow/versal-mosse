@@ -63,7 +63,14 @@ FFT_COL_CASCADE_LEN := 1
 # 64 would need a 64 KB ping-pong (the whole tile) and is the likely ceiling.
 # NOTE it is not a free knob for every port: gmio_ifft_row_out got 4x WORSE
 # (0.148 -> 0.596 ms/frame) because it was already at the ~18 us/tx floor.
-FFT_ROW_WS          := 32
+# 32 -> 64 ON HARDWARE 2026-08-20 (runs/run_0820_1807.log): 70.9 -> 60.7 ms,
+# 14.10 -> 16.48 FPS, tracking bit-identical. us/tx 293.38 -> 310.28, i.e. the
+# flat per-barrier cost is finally bending (growth per doubling 0.7%, 1.8%, 5.8%)
+# as the AIE's own ~6.4 ms/frame of compute surfaces. THIS KNOB IS EXHAUSTED:
+# WS=128 means a 64 KB window / 128 KB ping-pong for at most 3-4 ms.
+# A 64 KB ping-pong DOES fit a 64 KB tile — AIE-ML cores address neighbouring
+# tiles' memory. Test placement with `make graph` (3 min), not `make sd_card`.
+FFT_ROW_WS          := 64
 FFT_COL_WS          := 8
 
 # FFT/IFFT output shifts. The invariant is
