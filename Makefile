@@ -537,6 +537,23 @@ GCC_FLAGS  += -DRC_TRACE_FRAMES=$(RC_TRACE_FRAMES)
 CONTROL_CU_RUNS ?= $(if $(filter hw,$(TARGET)),8,0)
 GCC_FLAGS  += -DCONTROL_CU_RUNS=$(CONTROL_CU_RUNS)
 
+# roi_crop launch path. 1 = user-managed CU via xrt::ip, the host writes the
+# AXI-Lite control registers and polls the CU's own ap_done. 0 = the original
+# KDS path (xrt::kernel/xrt::run + start/wait).
+#
+# WHY 1 IS THE DEFAULT. Measured on hardware 2026-08-20: the CU finishes in
+# 4.8 ms and KDS reports it 503.4 ms later, because the CU's completion
+# interrupt is never delivered (/proc/interrupts reads 0 on both zocl IRQs
+# while the CU's own ISR reads 0x3, latched and unserviced). That is a platform
+# interrupt-wiring defect — poll_threshold, a hand-cleared ISR and
+# Runtime.ert_polling all left the number unchanged — so the host stops asking
+# KDS and reads the status register itself.
+#
+# HOST-ONLY: no AIE flag, no PL re-synthesis, no libadf.a relink. Both modes
+# print the same RC_*/timeline tables, so a single log compares them directly.
+ROI_CROP_USER_MANAGED ?= 1
+GCC_FLAGS  += -DROI_CROP_USER_MANAGED=$(ROI_CROP_USER_MANAGED)
+
 # ---------------------------------------------------------------------------
 # Target box, ROI padding and sigma — Bolme §3.1/§3.2, Danelljan §3.1,
 # DSST (docs/1609.06141v1.pdf) §6.1. HOST-ONLY, same rule as PSR_GATE_MIN above:

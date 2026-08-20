@@ -50,6 +50,7 @@
 #include "xrt/xrt_bo.h"
 #include "xrt/xrt_aie.h"
 #include "experimental/xrt_aie.h"
+#include "experimental/xrt_ip.h"   // user-managed roi_crop — see CropIp below
 
 #include "mosse_filter.h"
 
@@ -331,10 +332,27 @@ static void dma_reset_frame(void)
 // one that no amount of poll-vs-wait comparison can distinguish.
 enum { RC_CTOR, RC_ARGS, RC_START, RC_POLL, RC_WAIT, RC_WAIT2, RC_N };
 
+// Which roi_crop launch path is compiled in. Defined here rather than next to
+// CropIp because the slot LABELS below depend on it, and a report that names
+// the wrong mechanism is worse than no report — see the CropIp block for the
+// measurements that made 1 the default.
+#ifndef ROI_CROP_USER_MANAGED
+#define ROI_CROP_USER_MANAGED 1
+#endif
+
+#if ROI_CROP_USER_MANAGED
+// User-managed: RC_POLL is a spin on the CU's own ap_done bit, and the two
+// wait slots are no-ops retained so the table shape stays comparable.
+static const char *g_rc_name[RC_N] = {
+    "crop_ip ctor", "crop_ip write args", "crop_ip ap_start",
+    "crop_ip poll ap_done", "crop (no wait)", "crop (no wait #2)"
+};
+#else
 static const char *g_rc_name[RC_N] = {
     "crop_run ctor", "crop_run set_arg", "crop_run start",
     "crop_run poll(state)", "crop_run wait", "crop_run wait #2"
 };
+#endif
 
 // Spin bound, seconds. Generous: hw_emu host time is ~1000x hardware, and a
 // spurious trip there would only mislabel a measurement that is meaningless in
@@ -501,12 +519,31 @@ static void rc_report_frame(int frame)
                "%lu poll iters%s\n",
                p, w, w2, g_rc_poll_iters,
                g_rc_poll_timeouts ? "  [SPIN TIMED OUT — poll figure truncated]" : "");
+#if ROI_CROP_USER_MANAGED
+        // The verdict on the fix itself. The KDS path costs 503.4 ms per call on
+        // this board and the CU is done at 4.8 ms, so anything still in the
+        // hundreds of ms means reading ap_done directly did NOT help — which
+        // would be a genuinely new fact, and would move the investigation into
+        // the PL/AIE rather than the driver. 50 ms sits two orders below the
+        // broken figure and one above the expected one, so neither outcome can
+        // land near the boundary.
+        printf("  -> %s\n",
+               (p < 50.0)
+                   ? "USER-MANAGED PATH IS WORKING: ap_done observed in ~ms, not "
+                     "~500 ms. The control-CU probe stays on KDS and should still "
+                     "pay ~512 ms in this same run — that contrast is the proof"
+                   : "USER-MANAGED PATH DID NOT HELP: the CU's own ap_done is "
+                     "still slow to appear, so the cost is NOT the driver's "
+                     "completion path. Re-read the timeline before changing "
+                     "anything else");
+#else
         printf("  -> %s\n",
                (p > 10.0 * w)
                    ? "the blocking cost is absorbed by the POLL SPIN; see the "
                      "timeline for whether the CU or its observation was slow"
                    : "the blocking cost is in XRT's wait(); the spin is the fix "
                      "IF the timeline shows the CU already done");
+#endif
         // Item 8. A wait() on a command that poll() has already seen reach a
         // terminal state cannot legitimately block on anything.
         if (g_rc_n[RC_WAIT2] && w2 > 1.0)
@@ -599,8 +636,143 @@ static void rc_report_timeline(int frame)
 }
 
 // -----------------------------------------------------------------------
+// roi_crop as a USER-MANAGED CU — the fix for the 503 ms completion cost
+// -----------------------------------------------------------------------
+// WHY THIS EXISTS. The instrumentation above localised roi_crop's ~505 ms per
+// channel to the host completion path, and four measurements then closed it:
+//
+//   1. poll(state) costs 503.4 ms and the wait() after it costs 2 us, so wait()
+//      was only ever blocking on a command state that had not flipped.
+//   2. drain -> poll is 503.4 ms against a 4.8 ms start -> drain, i.e. 99% of the
+//      cost lands after the CU consumed its last AXIS beat.
+//   3. camera_capture — no AXIS port, ~6 us of work — pays the same 512 ms, and
+//      1080 rows costs the same as 1 row. Fixed cost, not a datapath.
+//   4. /proc/interrupts shows ZERO on both zocl IRQs across every run, while the
+//      CU's own registers read GIER=1, IER=0x3, ISR=0x3. The CU raises its
+//      interrupt on every completion and re-latches within one run after the ISR
+//      is cleared by hand; nothing in the kernel ever receives it.
+//
+// So the CU is healthy, the interrupt is armed and asserted, and the delivery
+// path between the CU and the GIC is dead — a platform defect (see the boot-time
+// `zocl-drm: error -ENXIO: IRQ index 32 not found`, present on every probe).
+// KDS therefore waits on an interrupt that cannot arrive and falls back to a
+// ~500 ms timer. Nothing reachable from userspace fixes that: poll_threshold
+// (1000000), a hand-cleared ISR, and Runtime.ert_polling all left the number at
+// 503.4 ms.
+//
+// The fix is to stop asking KDS when the CU finished and read the CU's own
+// status register instead — the same ap_done bit, four orders of magnitude
+// sooner. xrt::ip does exactly that, and its 2025.2 implementation imposes no
+// control-protocol restriction: xrt_ip.cpp's ctor requires only that the IP is
+// in IP_LAYOUT with a base address and an address range.
+//
+// TWO CONSTRAINTS, both load-bearing:
+//
+//   - xrt::ip takes an EXCLUSIVE CU context by default, so the xrt::kernel for
+//     roi_crop must not be constructed at the same time. It isn't — see the
+//     #if at the kernel handles. (Runtime.rw_shared=true relaxes this if some
+//     future consumer needs the CU too.)
+//   - frame_buf is an m_axi pointer, so the CU needs a DEVICE address, which
+//     set_arg(0, bo) used to supply implicitly. bo.address() is that value.
+//
+// Register map is not guessed — it is read back from the running board:
+//   cat /sys/bus/platform/devices/CU.3.auto/cu_info
+// which reports base 0xa4010000, Protocol CTRL_CHAIN, and every offset below.
+namespace roi_crop_reg {
+    constexpr uint32_t CTRL          = 0x00;
+    constexpr uint32_t FRAME_BUF_LO  = 0x10;   // 64-bit m_axi pointer
+    constexpr uint32_t FRAME_BUF_HI  = 0x14;
+    constexpr uint32_t FRAME_ROWS_R  = 0x1c;   // _R suffix: FRAME_ROWS/FRAME_COLS
+    constexpr uint32_t FRAME_COLS_R  = 0x24;   // are already object-like macros
+    constexpr uint32_t ROI_ROW       = 0x2c;
+    constexpr uint32_t ROI_COL       = 0x34;
+    constexpr uint32_t ROI_H         = 0x3c;
+    constexpr uint32_t ROI_W         = 0x44;
+    constexpr uint32_t PATCH_ROWS_R  = 0x4c;
+    constexpr uint32_t PATCH_COLS_R  = 0x54;
+    constexpr uint32_t RECOMPUTE     = 0x5c;
+
+    // HLS ap_ctrl block, 0x00.
+    constexpr uint32_t AP_START      = 1u << 0;
+    constexpr uint32_t AP_DONE       = 1u << 1;
+    constexpr uint32_t AP_IDLE       = 1u << 2;
+    constexpr uint32_t AP_READY      = 1u << 3;
+    constexpr uint32_t AP_CONTINUE   = 1u << 4;
+}
+
+#if ROI_CROP_USER_MANAGED
+class CropIp {
+public:
+    CropIp(xrt::device &dev, const xrt::uuid &xclbin_id)
+        : m_ip(dev, xclbin_id, "roi_crop:{roi_crop_0}") {}
+
+    // Frame-invariant arguments, written once — the direct analogue of the
+    // hoisted set_arg() calls on the KDS path.
+    void set_static_args(const xrt::bo &frame_bo,
+                         uint32_t frame_rows, uint32_t frame_cols,
+                         uint32_t patch_rows, uint32_t patch_cols)
+    {
+        const uint64_t addr = frame_bo.address();
+        m_ip.write_register(roi_crop_reg::FRAME_BUF_LO, (uint32_t)(addr & 0xffffffffu));
+        m_ip.write_register(roi_crop_reg::FRAME_BUF_HI, (uint32_t)(addr >> 32));
+        m_ip.write_register(roi_crop_reg::FRAME_ROWS_R, frame_rows);
+        m_ip.write_register(roi_crop_reg::FRAME_COLS_R, frame_cols);
+        m_ip.write_register(roi_crop_reg::PATCH_ROWS_R, patch_rows);
+        m_ip.write_register(roi_crop_reg::PATCH_COLS_R, patch_cols);
+    }
+
+    // Per-frame geometry + the per-channel recompute flag.
+    void set_frame_args(uint32_t roi_row, uint32_t roi_col,
+                        uint32_t roi_h,   uint32_t roi_w, uint32_t recompute)
+    {
+        m_ip.write_register(roi_crop_reg::ROI_ROW,   roi_row);
+        m_ip.write_register(roi_crop_reg::ROI_COL,   roi_col);
+        m_ip.write_register(roi_crop_reg::ROI_H,     roi_h);
+        m_ip.write_register(roi_crop_reg::ROI_W,     roi_w);
+        m_ip.write_register(roi_crop_reg::RECOMPUTE, recompute);
+    }
+
+    void start() { m_ip.write_register(roi_crop_reg::CTRL, roi_crop_reg::AP_START); }
+
+    // Spin on the CU's own ap_done. Returns an ert_cmd_state so the call site's
+    // error check is identical to the KDS path's.
+    //
+    // ap_done is read-clear under ap_ctrl_hs and held until ap_continue under
+    // ap_ctrl_chain; this CU is CTRL_CHAIN, so the loop exits on the read that
+    // observes the bit and ap_continue then releases it. Writing AP_CONTINUE to
+    // an ap_ctrl_hs CU is ignored, so the sequence is correct under both.
+    ert_cmd_state poll_done()
+    {
+        const auto t0 = std::chrono::steady_clock::now();
+        for (;;) {
+            const uint32_t ctrl = m_ip.read_register(roi_crop_reg::CTRL);
+            ++g_rc_poll_iters;
+            if (ctrl & roi_crop_reg::AP_DONE) {
+                m_ip.write_register(roi_crop_reg::CTRL, roi_crop_reg::AP_CONTINUE);
+                return ERT_CMD_STATE_COMPLETED;
+            }
+            if (std::chrono::duration<double>(
+                    std::chrono::steady_clock::now() - t0).count() > RC_POLL_MAX_S) {
+                ++g_rc_poll_timeouts;
+                return ERT_CMD_STATE_TIMEOUT;
+            }
+            std::this_thread::yield();
+        }
+    }
+
+private:
+    xrt::ip m_ip;
+};
+#endif  // ROI_CROP_USER_MANAGED
+
+// -----------------------------------------------------------------------
 // Control CU probe (item 7)
 // -----------------------------------------------------------------------
+// NOTE: with ROI_CROP_USER_MANAGED=1 this probe becomes a WITHIN-RUN CONTROL
+// rather than a diagnostic. camera_capture stays on the KDS path, so it should
+// keep paying ~512 ms in the same run where roi_crop no longer does. That
+// contrast is the cleanest possible evidence that the fix is the fix, and it
+// costs 4 s at startup. Set CONTROL_CU_RUNS=0 once it stops being interesting.
 // WHY. Every launch-path number in this design is measured on roi_crop, so
 // nothing yet distinguishes "roi_crop's completion is slow" from "ANY CU
 // completion costs ~500 ms on this stack". Those have nothing in common: the
@@ -1829,7 +2001,12 @@ int main(int argc, char **argv)
     // PL kernel handles
     // ------------------------------------------------------------------
     auto cam  = xrt::kernel(device, uuid, "camera_capture:{camera_capture_0}");
+#if !ROI_CROP_USER_MANAGED
     auto crop = xrt::kernel(device, uuid, "roi_crop:{roi_crop_0}");
+#endif
+    // roi_crop is driven directly when ROI_CROP_USER_MANAGED=1. The xrt::kernel
+    // above must NOT also exist in that mode: xrt::ip opens an EXCLUSIVE CU
+    // context, and the two would contend for the same CU.
 
     // ------------------------------------------------------------------
     // One-time init
@@ -2052,16 +2229,69 @@ int main(int argc, char **argv)
     // hundreds of ms, that alone explained the old per-channel figure. Printed at
     // startup rather than through rc_report_frame(), which resets every frame.
     const auto _rc_t0 = std::chrono::steady_clock::now();
+#if ROI_CROP_USER_MANAGED
+    CropIp crop_ip(device, uuid);
+    crop_ip.set_static_args(frame_bo, (uint32_t)FRAME_ROWS, (uint32_t)FRAME_COLS,
+                            (uint32_t)PATCH_ROWS, (uint32_t)PATCH_COLS);
+    printf("[roi_crop] USER-MANAGED (xrt::ip) launch path, CU driven directly; "
+           "KDS completion bypassed. Constructed in %.3f ms\n",
+           std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now() - _rc_t0).count());
+#else
     xrt::run crop_run(crop);
     crop_run.set_arg(0, frame_bo);
     crop_run.set_arg(2, (uint32_t)FRAME_ROWS);
     crop_run.set_arg(3, (uint32_t)FRAME_COLS);
     crop_run.set_arg(8, (uint32_t)PATCH_ROWS);
     crop_run.set_arg(9, (uint32_t)PATCH_COLS);
-    printf("[roi_crop] crop_run constructed once (hoisted): %.3f ms\n",
+    printf("[roi_crop] KDS (xrt::run) launch path. crop_run constructed once "
+           "(hoisted): %.3f ms\n",
            std::chrono::duration<double, std::milli>(
                std::chrono::steady_clock::now() - _rc_t0).count());
+#endif
     fflush(stdout);
+
+    // The launch path is expressed as three lambdas so the per-channel call site
+    // below stays textually identical between the two modes — same RC_T slots,
+    // same timeline marks, same report. Only the bodies differ, which is what
+    // makes the two directly comparable in one log.
+    //
+    // crop_release() is the KDS wait()/wait#2 pair. It is deliberately kept as a
+    // no-op rather than deleted in user-managed mode: the report then still
+    // prints both rows at ~0.00 ms, which documents in the log itself that
+    // nothing is hiding there.
+    auto crop_set_args = [&](uint32_t roi_row, uint32_t roi_col,
+                             uint32_t roi_h, uint32_t roi_w, int ch) {
+#if ROI_CROP_USER_MANAGED
+        crop_ip.set_frame_args(roi_row, roi_col, roi_h, roi_w,
+                               (uint32_t)((ch == 0) ? 1 : 0));
+#else
+        crop_run.set_arg(4,  roi_row);
+        crop_run.set_arg(5,  roi_col);
+        crop_run.set_arg(6,  roi_h);                 // roi_h, FRAME px
+        crop_run.set_arg(7,  roi_w);                 // roi_w, FRAME px
+        crop_run.set_arg(10, (uint32_t)((ch == 0) ? 1 : 0));
+#endif
+    };
+    auto crop_start = [&]() {
+#if ROI_CROP_USER_MANAGED
+        crop_ip.start();
+#else
+        crop_run.start();
+#endif
+    };
+    auto crop_poll_done = [&]() -> ert_cmd_state {
+#if ROI_CROP_USER_MANAGED
+        return crop_ip.poll_done();
+#else
+        return rc_poll_until_done(crop_run);
+#endif
+    };
+    auto crop_release = [&]() {
+#if !ROI_CROP_USER_MANAGED
+        crop_run.wait();
+#endif
+    };
 
     // Control CU. Runs before the first frame so its zero-fill of frame_bo cannot
     // race the per-frame injection, and after the graph is up so the device state
@@ -2330,17 +2560,13 @@ int main(int argc, char **argv)
             // frame_buf / frame_rows / frame_cols / patch_rows / patch_cols are
             // already set and never change; only the ROI geometry (per frame) and
             // recompute (per channel) are re-set here.
-            RC_T(RC_ARGS, {
-                crop_run.set_arg(4,  (uint32_t)roi_row);
-                crop_run.set_arg(5,  (uint32_t)roi_col);
-                crop_run.set_arg(6,  (uint32_t)roi.roi_h);    // roi_h, FRAME px
-                crop_run.set_arg(7,  (uint32_t)roi.roi_w);    // roi_w, FRAME px
-                crop_run.set_arg(10, (uint32_t)((ch == 0) ? 1 : 0));
-            });
+            RC_T(RC_ARGS, crop_set_args((uint32_t)roi_row, (uint32_t)roi_col,
+                                        (uint32_t)roi.roi_h, (uint32_t)roi.roi_w,
+                                        ch));
             // Timeline zero. Everything the drain-anchored verdict rests on is
             // measured from here — see rc_tl_begin().
             rc_tl_begin();
-            RC_T(RC_START, crop_run.start());
+            RC_T(RC_START, crop_start());
             rc_tl_mark(TL_START);
 
             // Feed one weight buffer per conv2d firing AND drain one row-FFT
@@ -2378,13 +2604,14 @@ int main(int argc, char **argv)
             // wait() is still called: it is what actually releases the run object
             // for reuse, and it must be correct regardless of what poll reports.
             ert_cmd_state _st = ERT_CMD_STATE_COMPLETED;
-            RC_T(RC_POLL, _st = rc_poll_until_done(crop_run));
+            RC_T(RC_POLL, _st = crop_poll_done());
             rc_tl_mark(TL_POLL);
-            RC_T(RC_WAIT, crop_run.wait());
+            RC_T(RC_WAIT, crop_release());
             rc_tl_mark(TL_WAIT);
             // Second wait on the same completed command — see RC_WAIT2. Free when
             // the completion path is healthy, and the whole answer when it is not.
-            RC_T(RC_WAIT2, crop_run.wait());
+            // A no-op in user-managed mode; see crop_release().
+            RC_T(RC_WAIT2, crop_release());
             rc_tl_mark(TL_WAIT2);
             rc_tl_end();
             if (_st != ERT_CMD_STATE_COMPLETED)
