@@ -429,7 +429,13 @@ this one); Q4 post-ReLU maps through conv2d's exact integer datapath (patch-spec
 make weights                       # export layer-1 INT8 weights + hanning table
 make gen_vectors                   # generate aiesim test vectors
 make graph                         # compile AIE graph only
-make test_host                     # native unit tests for filter/PSR/scale/scale-gate/training-target/conversions (seconds)
+make test_host                     # native unit tests for filter/PSR/scale/scale-gate/training-target/
+                                   #   fusion/scale-reuse/real-DFT/conversions (seconds).
+                                   #   Builds and runs the suite TWICE — the second time with
+                                   #   -O3 -march=native -ffp-contract=fast, because the board's
+                                   #   compiler contracts mul+add into FMA by default and a
+                                   #   bit-exactness claim proven only at -O2 is proven on the
+                                   #   wrong machine. That build caught a real one.
 python3 scripts/mosse_loop_sim.py  # closed-loop MOSSE regression, centred-G vs shifted-G
 make scale_sim                     # closed-loop DSST scale sim — reproduces the f130 stall
 make test_roi_crop                 # native bit-exact roi_crop test, 17 cases, zero tolerance
@@ -487,7 +493,15 @@ scripts/  export_weights.py, gen_aiesim_vectors.py, gen_filter_golden.py,
           mosse_loop_sim.py   # closed-loop MOSSE, centred-G vs shifted-G, no hardware
 ```
 
-## Current status (2026-08-20)
+## Current status (2026-08-21)
+
+**Latest hardware: `runs/run_0821_1109.log`, 45.60 ms/frame ≈ 21.9 FPS**, APU 23.37 ms (51.3%)
+against GMIO 20.98 ms (46.0%), tracking mean IoU 0.9188 / worst 0.8353 / centre 1.37 px,
+rails 0, no gate or scale holds. APU and GMIO are now within 2.4 ms of each other, so
+**neither one alone is worth more than ~2×** — see "Result 2026-08-21" and the next-steps
+list under it.
+
+*(Historical, from 2026-08-20:)*
 
 **The tracker runs end to end on real VEK280 hardware at 128×128 ch16 on the real conv path, at
 0.88 s/frame.** Box state, patch↔frame conversions, IoU and the DSST scale filter all execute.
@@ -648,6 +662,84 @@ ruled out). Trust the ORDERING; do not quote the sim's absolute magnitudes as th
 for **3.9× the scale-filter cost** — not worth it. ~8-10% box error is the practical floor of
 this filter as configured; the next real gain would be a different scale estimator, not a tune.
 
+### Result 2026-08-21: 62.71 → 45.60 ms, 15.95 → 21.93 FPS. Host-only, one build.
+
+`runs/run_0821_1109.log`, 200 frames, same config as `run_0820_1807` (`ITER_CNT=200
+TRAJECTORY=1 SCALE_TRAJ=1 VERBOSITY=0 DUMP_BUFFERS=0`, 4-4-4, `SCALE_STEP=1.04`). Wall clock
+from the per-frame markers agrees with the instrument: 45.50 ms against 45.60.
+
+| slot | 0820_1807 | predicted | **0821_1109** |
+|---|---|---|---|
+| `scale extract` | 9.436 (2.0 calls) | 1.5-2.5 | **2.139 (1.0 call)** |
+| `filter update` → `filter upd+quant` | 10.177 | ~13 combined | **4.741** |
+| `publish filter` → `publish (pack)` | 5.595 | (combined) | **1.905** |
+| `diag scan (rails)` | 1.192 (4.0) | ~0.2 | **0.230 (3.0)** |
+| `BO<->heap stage` | 3.398 (51) | +0.1 | 3.499 (52) |
+| **APU subtotal** | **40.456** | ~28 | **23.373** |
+| GMIO (control — host-only change) | 21.016 | unchanged | 20.980 |
+| UNATTRIBUTED (control) | 1.176 | unchanged | 1.180 |
+| **frame** | **62.71** | 50-53 | **45.60** |
+
+**APU 51.3%, GMIO 46.0%** — the two are nearly equal again, so neither alone gets much past
+another 2×. Every call count confirms the change reached the binary: `scale extract` 1.0,
+`diag scan` 3.0, `BO<->heap` 52.
+
+**THE BATCH BEAT ITS PREDICTION BY 5-7 ms AND ALL THE EXCESS IS IN ONE PLACE.** Items 3 and 6
+landed on their estimates; the filter update came in at 4.741 against ~10 predicted. Since
+`publish (pack)` is now pack+sync alone at 1.905, the baseline's quantiser cost
+5.595 − 1.905 = **3.690 ms**, so the comparable work was 10.177 + 3.690 = **13.867 ms** and is
+now **4.741**. The fusion itself can only account for the scan's re-read of A and half the
+divides, ~1.8 ms of that. **The remaining ~7 ms is the channel-major B accumulation** — the
+incidental half of the change, flagged in advance as "could be another win or nothing".
+
+**So the standing claim needs refining, and this is the second time this slot has been
+mis-attributed.** CLAUDE.md said `filter update` was "memory-bound on ~8 MB/frame of heap, so
+the lever is TRAFFIC not arithmetic". Memory-bound was right; TRAFFIC was not. Flipping the B
+loop to channel-major moves **exactly the same bytes** — it changes only the *stream count*,
+from `st.channels` strided readers of `F_all` 128 KB apart to one sequential reader. On an A72
+whose prefetcher tracks a handful of streams, sixteen of them cost ~7 ms/frame. **The lever
+was ACCESS PATTERN.** A traffic-volume model would never have found it, and did not: it is
+the reason the prediction was 5 ms out.
+
+**Item 3's 3.11× transferred exactly.** `scale extract` went 4730 → 2138 µs/call while its
+bilinear sampling was untouched. Solving `S + D = 4730`, `S + D/3.11 = 2138` gives the
+transform at **D = 3819 µs (81% of the call)**, now 1228. That is the figure "Settled
+questions" measured offline for this exact d·S² transform, confirmed on the board.
+
+**TRACKING: BIT-IDENTICAL FOR FRAMES 0-126, THEN 71 OF 200 FRAMES DIFFER. That is the
+predicted signature of item 2 and not a defect.**
+
+| | 0820_1807 | 0821_1109 |
+|---|---|---|
+| mean / worst IoU | 0.9174 / 0.8326 | **0.9188 / 0.8353** |
+| mean / worst centre err | 1.30 / 3.52 px | 1.37 / 3.52 px |
+| final box (truth 63×63) | 62×62 | 64×64 |
+| PSR min / mean / max | 25.75 / 83.04 / 127.10 | 25.75 / **83.74** / 127.10 |
+| overlap precision @0.5 | 100.0% | 100.0% |
+| rails, gate holds, scale holds | 0 / 0 / 0 | 0 / 0 / 0 |
+
+**Why 127 identical frames is the STRONG result, not the weak one.** The box size is a
+function of the *integer* idx sequence alone (`box.h *= a^idx`), so the two paths stay
+bitwise identical as long as they make the same decisions — **including on frames where
+idx ≠ 0**. And idx ≠ 0 happened constantly before f127: `SCALE_TRAJ_AMP=0.30` takes truth
+from 64 to 83.2 px by f50, and IoU there is 0.94-0.95, which a box parked at 64 could not
+produce (it would read (64/83)² ≈ 0.59). So the shifted-target update agreed with a real
+re-extraction on every decision for 126 consecutive frames of a live scale envelope. That is
+much better evidence than the `idx = 0` identity, which is true by construction.
+
+**What happened at f127**: the native test measures the trained A differing by 2.0e-4 and B by
+1.1e-5 (the `|idx|` edge levels the shift cannot see). Near zero the detector is a noisy
+estimator with heavily overlapping decisions — CLAUDE.md already records idx 0 spanning
+−5.3%..+9.6% and idx −1 spanning −1.5%..+7.6% — so a 2e-4 perturbation eventually flips one
+near-tie argmax. From there the box-size sequences differ by one level and everything
+downstream differs. The runs end one scale level apart (61.5 vs 64.0 against a truth of 63.4),
+which is why mean IoU moved 0.0014 in the new run's favour and centre error 0.07 px against
+it. Both are inside this filter's own ~8-10% box-error floor.
+
+**The acceptance criterion stated before the run was met**: item 5 and item 6 are bit-exact by
+construction and *nothing* diverged in the first 126 frames, so no position difference on an
+identical-decision frame — which is what a bug in either would have produced.
+
 ### Result 2026-08-20: 880 → 60.7 ms, 1.14 → 16.48 FPS (14.5×)
 
 `runs/run_0820_1620.log`. Tracking **bit-identical across all seven instrumented runs** — mean IoU
@@ -689,20 +781,27 @@ magnitudes are patch-specific". This is worse than that: the ORDERING did not tr
 because the working set crossed a cache boundary between the two machines.** Benchmark a
 host-side change on the host, or expect to be wrong about which fix matters.
 
-**Next, in order. The APU is now two thirds of the frame (40.5 of 60.7 ms):**
-1. **`filter update` 10.85 ms** — memory-bound on ~8 MB/frame of heap, so the lever is TRAFFIC not
-   arithmetic (`-fcx-limited-range` bought only 0.48 ms). It and `filter_quantize_q15`
-   (`publish filter`, 5.59 ms) stream A and B back to back; fusing them saves re-reading A, ~4 ms.
-2. **`scale extract` 9.44 ms** — the real-input DFT, 3.11× on the d·S² transform, ~6 ms, and free
-   in accuracy. Shrinking S is NOT free and was measured: see "Scale filter stall".
-3. **`diag scan` 1.19 ms** — fold the rails check into `unpack_spectrum`, which already reads the
-   same data. Near-zero risk.
-4. **Memory-tile transpose**, now worth ~10 ms rather than the ~39 it was worth this morning —
-   `FFT_ROW_WS` collected most of it. Still the largest structural item; DSPLib reference
-   validated. Do 1-3 and re-measure first.
-2. `scale extract` 9.43 ms — the real-input DFT, 3.11× on the d·S² transform, ~6 ms.
-3. `filter update` 10.82 ms — memory-bound, so the lever is TRAFFIC not arithmetic. It and
-   `filter_quantize_q15` both stream A and B back to back; fusing them would halve it.
+**Next, in order. APU 23.4 ms and GMIO 21.0 ms of a 45.6 ms frame — nearly equal, so the
+next real gain needs BOTH sides or a structural change:**
+1. **`FFT_COL_WS` 8→32**, a Makefile knob and an AIE rebuild. `gmio_fft_col_out` (4.60 ms)
+   and `gmio_accum_out` (4.44) are 256 tx/frame each at 17.4-18.0 µs on 4096 B — the fixed
+   per-barrier floor, so 256→64 tx should cost the same per tx. ~4-6 ms. **Check the per-port
+   table afterwards, not just the total**: `gmio_ifft_row_out` regressed 0.148→0.596 ms when
+   its WS doubled, because with few transactions each `wait()` absorbs more AIE latency.
+2. **Memory-tile transpose**, worth ~12.4 ms — deletes `gmio_fft_row_out` (9.93),
+   `gmio_fft_col_in` (0.35) and ~2.1 ms of APU transpose. Largest structural item; DSPLib
+   reference validated. The open question is throughput at `tiling_dimension = {1,1}`.
+3. **The idle A72 core.** The boot log reads `SMP: Total of 2 processors activated` at
+   1.4 GHz and the host is single-threaded, so one core is idle for the whole frame. Safe
+   tier: the post-response tail splits into two independent halves — translation
+   update+publish and the scale filter touch disjoint state — for ~10 ms. Aggressive tier:
+   pipeline the tail against the next frame's GMIO, which makes H one frame stale and is
+   therefore an accuracy change to be scored on IoU, not asserted.
+4. **Hermitian symmetry in the host filter, ~7-8 ms** — `conv2d` emits cint16 with `imag = 0`,
+   so `F_ch` should be conjugate-symmetric and A/B half-redundant. **Verify the premise on a
+   `DUMP_BUFFERS=1` dump before building anything on it**: fixed-point rounding in the DSPLib
+   FFT does not guarantee the symmetry is exact, and this project has twice let an offline
+   model move a calibrated constant on an unverified premise.
 
 ### `FFT_ROW_WS` 32→64 — 70.9 → 60.7 ms, 16.48 FPS. The knob is now exhausted.
 

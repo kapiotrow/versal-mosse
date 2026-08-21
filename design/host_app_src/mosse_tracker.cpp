@@ -419,14 +419,20 @@ enum {
     AP_CMUL_PACK,    // [H|accum] packing memcpy, ~2 MB/frame
     AP_B2,           // apply_dc_correction
     AP_PSR,          // compute_psr x2
-    AP_FILTER,       // filter_init / filter_update
-    AP_PUBLISH,      // filter_quantize_q15 + pack_filter + sync
-    AP_SCALE_EXTRACT,// scale_extract, x2/frame — reads frame_bo DIRECTLY
-    AP_SCALE_MODEL,  // scale_detect + scale_update, pure heap
+    AP_FILTER,       // filter_init, or filter_update_quantize (update AND the
+                     // Q1.15 conversion) since the two were fused 2026-08-21
+    AP_PUBLISH,      // pack_filter + sync. NO LONGER the quantiser: that moved
+                     // into AP_FILTER with the fusion, so this slot dropping to
+                     // ~1 ms is the fusion landing, not the publish getting fast
+    AP_SCALE_EXTRACT,// scale_extract. ONE call/frame since 2026-08-21 (the
+                     // update reuses the detection sample); 2 on frame 0
+    AP_SCALE_MODEL,  // scale_detect + scale_update/_shifted, pure heap
     AP_DIAG_SCAN,    // report_cint16's max/rails scan. It runs at EVERY verbosity
                      // because rails detection is the point, so it is a real
-                     // per-frame cost that was sitting in UNATTRIBUTED — and one
-                     // of its four calls still scans a BO mapping (accum_bo).
+                     // per-frame cost that was sitting in UNATTRIBUTED. THREE
+                     // calls/frame since 2026-08-21, not four: F_ch's scan now
+                     // rides along with unpack_spectrum and its cost is in
+                     // AP_UNPACK. The accum scan reads a heap copy, not the BO.
     AP_N
 };
 static const char *g_ap_name[AP_N] = {
@@ -434,7 +440,7 @@ static const char *g_ap_name[AP_N] = {
     "window mean+energy",
     "fcol_bo.sync", "BO<->heap stage", "unpack F_ch", "cmul packing",
     "B2 correction", "PSR scan",
-    "filter update", "publish filter", "scale extract", "scale detect+update",
+    "filter upd+quant", "publish (pack)", "scale extract", "scale detect+update",
     "diag scan (rails)"
 };
 // The enum and the name table are two lists that must stay the same length, in
@@ -1476,31 +1482,63 @@ static void csv_close(void)
 
 // Peak magnitude and saturation count for a cint16 buffer. `rails > 0` means the
 // stage clipped, which is the failure mode the shift budget exists to prevent.
-// Indices are reported in the buffer's own layout — the caller says which.
+//
+// SPLIT into a scan and a printer 2026-08-21, so the scan can be folded into a
+// pass that is already reading the same bytes (see unpack_spectrum) instead of
+// being a second pass over 64 KB.
+struct Cint16Scan {
+    int64_t max_m2 = -1;      // squared magnitude of the peak bin
+    int     max_i  = 0;
+    int     rails  = 0;
+};
+
+// INTEGER, not fp64. The operands are int16 so re*re + im*im is at most
+// 2 * 32768^2 = 2.1e9 — exact in int64, and exact in double too, which is why
+// this selects bitwise the same peak bin as the fp64 loop it replaces. The
+// change is the arithmetic, not the answer: the same substitution took
+// `window mean + energy` from 901 us/call to 26 (34x) on the A72, because an
+// int64 MAC loop vectorises where an fp64 one on this core does not.
+static inline void scan_cint16_into(Cint16Scan &s, int re, int im, int i)
+{
+    const int64_t m = (int64_t)re * re + (int64_t)im * im;
+    if (m > s.max_m2) { s.max_m2 = m; s.max_i = i; }
+    // re and im are int16, so `>= 32767` IS `== 32767`. Written as the
+    // inequality to keep it readable next to the widened arithmetic.
+    if (re >= 32767 || re <= -32768 || im >= 32767 || im <= -32768) ++s.rails;
+}
+
+static Cint16Scan scan_cint16(const int16_t *b, int n)
+{
+    Cint16Scan s;
+    for (int i = 0; i < n; ++i) scan_cint16_into(s, b[2 * i], b[2 * i + 1], i);
+    return s;
+}
+
+// Printed at VERBOSITY >= 1, but ALWAYS when something railed. `rails` is the
+// shift-budget instrument and it is the one number here that track.csv does not
+// carry, so a quiet run must still shout when a bin saturates — silencing an
+// anomaly to save console is how a budget hunt goes wrong.
+static void report_cint16_scan(const char *tag, const Cint16Scan &s, int cols,
+                               const char *layout)
+{
+    if (VERBOSITY >= 1 || s.rails > 0)
+        printf("  [diag] %-9s max|.|=%7.0f at %s idx %d (%d,%d)  rails=%d%s\n",
+               tag, sqrt((double)s.max_m2), layout, s.max_i,
+               s.max_i / cols, s.max_i % cols, s.rails,
+               s.rails > 0 ? "   <-- RAILED" : "");
+}
+
+// Scan and print, for the buffers that no other pass touches. Indices are
+// reported in the buffer's own layout — the caller says which.
 static void report_cint16(const char *tag, const int16_t *b, int rows, int cols,
                           const char *layout)
 {
     const auto _ds0 = std::chrono::steady_clock::now();
-    double max_m = -1.0;
-    int    max_i = 0, rails = 0;
-    for (int i = 0; i < rows * cols; ++i) {
-        const double re = b[2 * i], im = b[2 * i + 1];
-        const double m  = re * re + im * im;
-        if (m > max_m) { max_m = m; max_i = i; }
-        if (re >= 32767.0 || re <= -32768.0 || im >= 32767.0 || im <= -32768.0) ++rails;
-    }
+    const Cint16Scan s = scan_cint16(b, rows * cols);
     g_ap_us[AP_DIAG_SCAN] += std::chrono::duration<double, std::micro>(
         std::chrono::steady_clock::now() - _ds0).count();
     ++g_ap_n[AP_DIAG_SCAN];
-
-    // Printed at VERBOSITY >= 1, but ALWAYS when something railed. `rails` is
-    // the shift-budget instrument and it is the one number here that track.csv
-    // does not carry, so a quiet run must still shout when a bin saturates —
-    // silencing an anomaly to save console is how a budget hunt goes wrong.
-    if (VERBOSITY >= 1 || rails > 0)
-        printf("  [diag] %-9s max|.|=%7.0f at %s idx %d (%d,%d)  rails=%d%s\n",
-               tag, sqrt(max_m), layout, max_i, max_i / cols, max_i % cols, rails,
-               rails > 0 ? "   <-- RAILED" : "");
+    report_cint16_scan(tag, s, cols, layout);
 }
 
 // The decisive report: where the response actually peaks, and — the number that
@@ -1852,13 +1890,22 @@ static std::vector<mosse::cfloat> g_F_all((size_t)N_CHANNELS * PATCH_ELEMS);
 // Un-transposing here means everything downstream (G, A, H) is row-major, and the
 // filter written back to filter_bo has to be re-transposed on the way out. Doing
 // it in one place beats carrying two layouts through the maths.
-static void unpack_spectrum(const int16_t *src, mosse::cfloat *dst)
+//
+// `scan`, when non-null, collects the max/rails diagnostic FOR FREE: this loop
+// already reads every one of the 16384 cint16 values that report_cint16() would
+// re-read in a second pass. The four standalone scans cost 1.19 ms/frame on the
+// A72 (runs/run_0820_1807.log), which is 1.9% of the frame spent reading data
+// twice. Indices are the SOURCE's, i.e. col-FFT layout — the same convention
+// report_cint16("F_ch", ...) used, so the printed line does not change meaning.
+static void unpack_spectrum(const int16_t *src, mosse::cfloat *dst,
+                            Cint16Scan *scan = nullptr)
 {
     for (int k = 0; k < PATCH_COLS; ++k)
         for (int m = 0; m < PATCH_ROWS; ++m) {
             const size_t s = (size_t)k * PATCH_ROWS + m;
-            dst[(size_t)m * PATCH_COLS + k] =
-                mosse::cfloat((float)src[2 * s], (float)src[2 * s + 1]);
+            const int re = src[2 * s], im = src[2 * s + 1];
+            dst[(size_t)m * PATCH_COLS + k] = mosse::cfloat((float)re, (float)im);
+            if (scan) scan_cint16_into(*scan, re, im, (int)s);
         }
 }
 
@@ -1882,11 +1929,13 @@ static void pack_filter(const int16_t *rowmajor, int16_t *dst_bo)
 // Build H from the current filter state and push it to the device.
 // Reports the Q1.15 scale and the peak magnitude: a spiky filter that leaves the
 // response far below the cint16 rails shows up here and nowhere else.
-static void publish_filter(xrt::bo &filter_bo, std::vector<int16_t> &scratch)
+// H already quantised into `scratch`: convert to the col-FFT layout and push.
+// Split out of publish_filter() so the fused update+quantise path can share it —
+// the layout conversion and the sync are the same either way, and duplicating
+// them is how the two paths would drift.
+static void publish_packed(xrt::bo &filter_bo, const std::vector<int16_t> &scratch,
+                           float scale, float max_abs)
 {
-    float scale = 0.0f, max_abs = 0.0f;
-    mosse::filter_quantize_q15(g_filter, g_energy, mosse::DEFAULT_EPS_REL,
-                               scratch.data(), &scale, &max_abs);
     pack_filter(scratch.data(), filter_bo.map<int16_t *>());
     filter_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     // VP1. NOT carried by track.csv, so at VERBOSITY=0 this number is only
@@ -1894,6 +1943,20 @@ static void publish_filter(xrt::bo &filter_bo, std::vector<int16_t> &scratch)
     // unconditionally whenever a bin rails — the failure this would warn about.
     VP1("  filter: Q1.15 scale %.4g, max|H| %.4g\n", (double)scale, (double)max_abs);
 }
+
+// Quantise from the current filter state and push. Frame 0's path: filter_init()
+// has just run, so there is no update to fuse the quantiser into.
+static void publish_filter(xrt::bo &filter_bo, std::vector<int16_t> &scratch)
+{
+    float scale = 0.0f, max_abs = 0.0f;
+    mosse::filter_quantize_q15(g_filter, g_energy, mosse::DEFAULT_EPS_REL,
+                               scratch.data(), &scale, &max_abs);
+    publish_packed(filter_bo, scratch, scale, max_abs);
+}
+
+// H before the Q1.15 scaling, handed to filter_update_quantize() so the 2 MB
+// allocation happens once rather than per frame. Private to the fused path.
+static std::vector<mosse::cfloat> g_h_scratch;
 
 // -----------------------------------------------------------------------
 // Test data injection (for hw_emu validation)
@@ -2572,6 +2635,9 @@ int main(int argc, char **argv)
     g_stage_a.resize(FFT_BYTES);
     g_stage_b.resize(FFT_BYTES);
     g_stage_c.resize(FFT_BYTES > RESP_BYTES ? FFT_BYTES : RESP_BYTES);
+    // Sized here, not on first use: filter_update_quantize() would otherwise do a
+    // 2 MB allocation inside frame 1's timed body and put it in AP_FILTER.
+    g_h_scratch.resize((size_t)N_CHANNELS * PATCH_ELEMS);
     std::vector<int16_t> filter_scratch((size_t)N_CHANNELS * PATCH_ELEMS * 2);
 
     if (ITER_CNT < 2)
@@ -3310,17 +3376,20 @@ int main(int argc, char **argv)
             AP_T(AP_FCOL_SYNC, fcol_bo.sync(XCL_BO_SYNC_BO_FROM_DEVICE));
             AP_T(AP_BO_STAGE,
                  memcpy(g_stage_c.data(), fcol_bo.map<void *>(), FFT_BYTES));
-            AP_T(AP_UNPACK,
-                 unpack_spectrum((const int16_t *)g_stage_c.data(),
-                                 g_F_all.data() + (size_t)ch * PATCH_ELEMS));
-
+            //
             // F_ch is the filter's only input. If it is wrong, everything
             // downstream is wrong for a reason that has nothing to do with the
-            // filter maths — so check it before trusting any later number.
-            // Reported in the col-FFT layout it arrives in: idx = v*ROWS + u.
+            // filter maths — so it is checked before any later number is
+            // trusted. The check now rides ALONG WITH the unpack rather than
+            // rescanning the same 64 KB afterwards; its cost therefore lands in
+            // AP_UNPACK, and AP_DIAG_SCAN reports 3 calls/frame, not 4.
+            Cint16Scan fch_scan;
+            AP_T(AP_UNPACK,
+                 unpack_spectrum((const int16_t *)g_stage_c.data(),
+                                 g_F_all.data() + (size_t)ch * PATCH_ELEMS,
+                                 ch == 0 ? &fch_scan : nullptr));
             if (ch == 0) {
-                report_cint16("F_ch", (const int16_t *)g_stage_c.data(),
-                              PATCH_ROWS, PATCH_COLS, "colFFT");
+                report_cint16_scan("F_ch", fch_scan, PATCH_COLS, "colFFT");
                 dump_buffer("F_ch", frame, g_stage_c.data(), FFT_BYTES);
             }
 
@@ -3344,7 +3413,17 @@ int main(int argc, char **argv)
         // The accumulated spectrum, after B2, as the IFFT will see it. Same
         // col-FFT layout as F_ch. `rails > 0` here is the saturation the shift
         // budget exists to prevent.
-        report_cint16("accum", accum_bo.map<int16_t *>(),
+        // Staged to the heap FIRST. This was the one diagnostic still scanning a
+        // BO mapping element by element, and those mappings are write-combining:
+        // the startup probe measures reads out of them at 294 MB/s against
+        // 1707 on the heap, so a 64 KB scan in place costs ~223 us where a bulk
+        // memcpy costs 94 and the scan of the copy ~25. Same fix, same reason as
+        // the copy pattern applied everywhere else — see CLAUDE.md, "never
+        // compute on a BO mapping". g_stage_a is free here; the IFFT transpose
+        // below overwrites it anyway.
+        AP_T(AP_BO_STAGE,
+             memcpy(g_stage_a.data(), accum_bo.map<void *>(), ACCUM_BYTES));
+        report_cint16("accum", (const int16_t *)g_stage_a.data(),
                       PATCH_ROWS, PATCH_COLS, "colFFT");
         dump_buffer("accum", frame, accum_bo.map<void *>(), ACCUM_BYTES);
 
@@ -3624,14 +3703,41 @@ int main(int argc, char **argv)
         // others are already covered by the conditions above.
         if (scale.enabled() && (!g_filter.initialized || gate.accept)
                             && !(scale_evaluated && !scale_gate_dec.accept)) {
-            const uint8_t *fp = g_frame_host.data();
-            AP_T(AP_SCALE_EXTRACT,
-                 mosse::scale_extract(scale, fp, FRAME_ROWS, FRAME_COLS,
-                                      box.row, box.col, box.h, box.w,
-                                      scale_sample.data()));
-            AP_T(AP_SCALE_MODEL,
-                 mosse::scale_update(scale, scale_sample.data(),
-                                     mosse::DEFAULT_SCALE_ETA));
+            if (scale_evaluated && scale_gate_dec.accept) {
+                // THE SECOND EXTRACTION IS REDUNDANT AND IT WAS 4.73 ms.
+                //
+                // Both calls crop at the SAME centre (box.row, box.col); only the
+                // size differs, and it differs by exactly the accepted factor
+                // a^idx. Level n of an extraction at box*a^idx is therefore
+                // box*a^(idx+n) — level idx+n of the extraction already sitting
+                // in scale_sample. Training on that sample against a target
+                // shifted by idx levels is the same update, by the shift theorem,
+                // and the shift is exact rather than approximate.
+                //
+                // This is the manoeuvre filter_update() already makes with
+                // (psr_abs.dr, psr_abs.dc), one axis down, and with the same sign
+                // convention: G is centred at +idx, the level the detector
+                // reported. See scale_update_shifted() in mosse_filter.h for the
+                // derivation and what the |idx| edge levels cost — on hardware
+                // the detector proposed only -1/0/+1 across 199 frames, and at
+                // idx = 0 (174 of them) the two paths are bitwise identical.
+                AP_T(AP_SCALE_MODEL,
+                     mosse::scale_update_shifted(scale, scale_sample.data(),
+                                                 scale_idx,
+                                                 mosse::DEFAULT_SCALE_ETA));
+            } else {
+                // The gate never ran — frame 0's bootstrap, or a frame where the
+                // scale filter is not yet trained. There is no detection sample
+                // to reuse and no idx to shift by, so extract as before.
+                const uint8_t *fp = g_frame_host.data();
+                AP_T(AP_SCALE_EXTRACT,
+                     mosse::scale_extract(scale, fp, FRAME_ROWS, FRAME_COLS,
+                                          box.row, box.col, box.h, box.w,
+                                          scale_sample.data()));
+                AP_T(AP_SCALE_MODEL,
+                     mosse::scale_update(scale, scale_sample.data(),
+                                         mosse::DEFAULT_SCALE_ETA));
+            }
         }
 
         bool published = false;
@@ -3677,10 +3783,26 @@ int main(int argc, char **argv)
                                             PATCH_ROWS, PATCH_COLS,
                                             sigma_r, sigma_c,
                                             psr_abs.dr, psr_abs.dc);
+            //
+            // FUSED with the quantiser. Unfused, A (2 MB at ch16) is streamed
+            // four times a frame — written by the update, then read twice by
+            // filter_quantize_q15, which recomputes the same 262144 divides on
+            // both passes. filter_update_quantize() forms H in the pass that
+            // writes A and keeps it, so the write-out is a scalar multiply.
+            // Measured cost before the fusion: 10.18 + 5.60 = 15.78 ms of a
+            // 62.7 ms frame. BIT-IDENTICAL output, asserted by memcmp in
+            // run_fusion_tests() at BOTH -O2 and -ffp-contract=fast — the first
+            // cut was not, and only the contraction build could see it.
+            float q15_scale = 0.0f, q15_max = 0.0f;
             AP_T(AP_FILTER,
-                 mosse::filter_update(g_filter, g_F_all.data(),
-                                      g_target_shift.data(), mosse::DEFAULT_ETA));
-            AP_T(AP_PUBLISH, publish_filter(filter_bo, filter_scratch));
+                 mosse::filter_update_quantize(g_filter, g_F_all.data(),
+                                               g_target_shift.data(),
+                                               mosse::DEFAULT_ETA,
+                                               g_energy, mosse::DEFAULT_EPS_REL,
+                                               g_h_scratch, filter_scratch.data(),
+                                               &q15_scale, &q15_max));
+            AP_T(AP_PUBLISH,
+                 publish_packed(filter_bo, filter_scratch, q15_scale, q15_max));
             published = true;
         } else {
             // publish_filter is skipped as well as filter_update, and that is a

@@ -1259,6 +1259,26 @@ test_host:
 	    $(HOST_APP_SRC)/mosse_filter.cpp $(TEST_HOST_DIR)/test_mosse_filter.cpp \
 	    -o $(BUILD_DIR)/test_host
 	$(BUILD_DIR)/test_host $(TEST_HOST_DIR)/golden
+	@echo ""
+	@echo "=== second build: FMA contraction enabled ==============================="
+	@echo "The board's compiler contracts mul+add into FMA by default"
+	@echo "(-ffp-contract=fast is GCC's default on aarch64); this dev host at -O2"
+	@echo "does not, so a bit-exactness claim proven only above is proven on the"
+	@echo "wrong machine. filter_update_quantize()'s 'bitwise identical' checks"
+	@echo "FAILED here on the first cut and passed at -O2 — see the two-loop note"
+	@echo "in mosse_filter.cpp. Cheap to keep, and it is the only thing standing"
+	@echo "between a fused fast path and a silently different H."
+	g++ -O3 -march=native -ffp-contract=fast -fcx-limited-range \
+	    -std=c++17 -Wall -Wextra -I$(HOST_APP_SRC) \
+	    -DCMUL_H_SHIFT=$(H_SHIFT) -DPSR_GATE_MIN=$(PSR_GATE_MIN) \
+	    -DMOSSE_SIGMA=$(MOSSE_SIGMA) -DSIGMA_FACTOR=$(SIGMA_FACTOR) \
+	    -DSIGMA_FROM_TARGET=$(SIGMA_FROM_TARGET) -DMOSSE_ETA=$(MOSSE_ETA) \
+	    -DTARGET_PADDING=$(TARGET_PADDING) \
+	    -DSCALE_N=$(SCALE_N) -DSCALE_STEP=$(SCALE_STEP) -DSCALE_ETA=$(SCALE_ETA) \
+	    -DSCALE_SIGMA_FACTOR=$(SCALE_SIGMA_FACTOR) -DSCALE_TMPL_AREA=$(SCALE_TMPL_AREA) \
+	    $(HOST_APP_SRC)/mosse_filter.cpp $(TEST_HOST_DIR)/test_mosse_filter.cpp \
+	    -o $(BUILD_DIR)/test_host_fma
+	$(BUILD_DIR)/test_host_fma $(TEST_HOST_DIR)/golden
 
 # -------------------------------------------------------
 # Closed-loop DSST scale simulation — no hardware

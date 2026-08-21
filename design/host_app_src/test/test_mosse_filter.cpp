@@ -1038,6 +1038,278 @@ std::vector<double> loop(bool shifted, int frames, int vr, int vc,
 
 }  // namespace tt
 
+// -----------------------------------------------------------------------
+// filter_update_quantize() — the fused update+publish path
+// -----------------------------------------------------------------------
+// BIT-IDENTICAL, ASSERTED, NOT INTENDED. The fusion exists to save memory
+// traffic and half the divides; if it also perturbed the last bit of H it would
+// end ten consecutive hardware runs of bit-identical tracking and make the next
+// before/after comparison unreadable. That property is cheap to keep (the fused
+// loop is textually the two original loops) and worthless unless it is checked,
+// so this compares raw bytes — memcmp, not a tolerance.
+void run_fusion_tests()
+{
+    using namespace mosse;
+    printf("\n--- filter_update_quantize (fused update + publish) ---\n");
+
+    constexpr int R = 16, C = 16, CH = 4;
+    const size_t n = (size_t)R * C, n_all = n * CH;
+    const float  eta = 0.125f, eps_rel = 1e-3f;
+
+    Lcg rng(987654);
+    std::vector<cfloat> F0(n_all), F1(n_all), G(n);
+    auto fill = [&](std::vector<cfloat> &v) {
+        for (auto &z : v)
+            z = cfloat((float)rng.next(1000) / 1000.0f,
+                       (float)rng.next(1000) / 1000.0f);
+    };
+    fill(F0); fill(F1);
+    // A shifted target, so conj(G) != G and a conjugation slip cannot hide.
+    gaussian_target_spectrum(G.data(), R, C, 2.0f, 3, -2);
+
+    std::vector<double> energy((size_t)CH);
+    for (int ch = 0; ch < CH; ++ch) energy[(size_t)ch] = 0.5 + 0.25 * ch;
+
+    // Two states with the SAME history: init from F0, then one update on F1.
+    FilterState ref, fus;
+    filter_init(ref, F0.data(), G.data(), CH, R, C);
+    filter_init(fus, F0.data(), G.data(), CH, R, C);
+
+    std::vector<int16_t> H_ref(n_all * 2, 0), H_fus(n_all * 2, 0);
+    float s_ref = 0.0f, m_ref = 0.0f, s_fus = 0.0f, m_fus = 0.0f;
+
+    filter_update(ref, F1.data(), G.data(), eta);
+    filter_quantize_q15(ref, energy.data(), eps_rel, H_ref.data(), &s_ref, &m_ref);
+
+    std::vector<cfloat> h_scratch;
+    filter_update_quantize(fus, F1.data(), G.data(), eta, energy.data(), eps_rel,
+                           h_scratch, H_fus.data(), &s_fus, &m_fus);
+
+    check_true("fused A bitwise identical",
+               memcmp(ref.A.data(), fus.A.data(), n_all * sizeof(cfloat)) == 0,
+               "the numerator must not shift by an ulp");
+    check_true("fused B bitwise identical",
+               memcmp(ref.B.data(), fus.B.data(), n * sizeof(float)) == 0,
+               "channel-major accumulation keeps the ch order, so it must");
+    check_true("fused H(q15) bitwise identical",
+               memcmp(H_ref.data(), H_fus.data(), n_all * 2 * sizeof(int16_t)) == 0,
+               "this is the buffer the AIE consumes");
+    check_true("fused scale/max|H| identical",
+               s_ref == s_fus && m_ref == m_fus, "");
+    check_true("fused H reaches full scale", m_fus > 0.0f && s_fus > 0.0f, "");
+
+    // The scratch is the caller's and must be reusable without being cleared —
+    // a second call on a shorter state must not read stale tail elements.
+    filter_update_quantize(fus, F0.data(), G.data(), eta, energy.data(), eps_rel,
+                           h_scratch, H_fus.data(), &s_fus, &m_fus);
+    filter_update(ref, F0.data(), G.data(), eta);
+    filter_quantize_q15(ref, energy.data(), eps_rel, H_ref.data(), &s_ref, &m_ref);
+    check_true("fused identical on reuse",
+               memcmp(H_ref.data(), H_fus.data(), n_all * 2 * sizeof(int16_t)) == 0
+               && memcmp(ref.A.data(), fus.A.data(), n_all * sizeof(cfloat)) == 0,
+               "h_scratch is reused across frames, not reallocated");
+
+    // `energy = nullptr` skips Stage B3 in both paths and must stay equivalent.
+    filter_update_quantize(fus, F1.data(), G.data(), eta, nullptr, eps_rel,
+                           h_scratch, H_fus.data(), &s_fus, &m_fus);
+    filter_update(ref, F1.data(), G.data(), eta);
+    filter_quantize_q15(ref, nullptr, eps_rel, H_ref.data(), &s_ref, &m_ref);
+    check_true("fused identical without B3",
+               memcmp(H_ref.data(), H_fus.data(), n_all * 2 * sizeof(int16_t)) == 0,
+               "energy == nullptr path");
+}
+
+// -----------------------------------------------------------------------
+// scale_update_shifted() — training on the DETECTION sample
+// -----------------------------------------------------------------------
+// The claim under test: an extraction at box*a^idx is the extraction already in
+// hand, shifted idx levels along the scale axis — so training on the sample in
+// hand against a target shifted by idx is the same thing, and the second
+// scale_extract() of the frame (4.73 ms on the A72) is redundant.
+//
+// Asserted in the frequency domain, where scale_extract() leaves the sample: a
+// shift of idx levels is multiplication by exp(+2*pi*i*m*idx/S). The residual
+// that survives is the |idx| levels at the far end of the range, which a real
+// re-extraction would have cropped and this cannot — that is the approximation,
+// and it is bounded here rather than asserted away.
+void run_scale_reuse_tests()
+{
+    using namespace mosse;
+    printf("\n--- scale_update_shifted (reuse the detection sample) ---\n");
+
+    constexpr int S = 33, FR = 256, FC = 256;
+    std::vector<uint8_t> frame((size_t)FR * FC, 60);
+    for (int r = 96; r < 160; ++r)
+        for (int c = 96; c < 160; ++c)
+            frame[(size_t)r * FC + c] = 200;
+
+    ScaleFilter sf;
+    scale_filter_config(sf, S, 1.02f, 64.0, 64.0, 16.0f);
+    const int d = sf.dims();
+
+    std::vector<cfloat> Z((size_t)sf.sample_elems()), Fn((size_t)sf.sample_elems());
+
+    // 1. THE EXTRACTION IDENTITY, which is the whole argument. Extract at `box`
+    //    and at `box * a^idx`; the second must be the first multiplied by the
+    //    linear phase of an idx-level shift.
+    {
+        const int idx = 3;
+        const double box = 64.0, boxn = box * std::pow((double)sf.step, (double)idx);
+        scale_extract(sf, frame.data(), FR, FC, 128.0, 128.0, box,  box,  Z.data());
+        scale_extract(sf, frame.data(), FR, FC, 128.0, 128.0, boxn, boxn, Fn.data());
+
+        double scale = 0.0, worst = 0.0;
+        for (int l = 0; l < d; ++l)
+            for (int m = 0; m < S; ++m) {
+                const double ph = 2.0 * M_PI * (double)m * (double)idx / (double)S;
+                const cfloat pred = Z[(size_t)l * S + m]
+                                  * cfloat((float)std::cos(ph), (float)std::sin(ph));
+                const cfloat got  = Fn[(size_t)l * S + m];
+                scale = std::max(scale, (double)std::abs(got));
+                worst = std::max(worst, (double)std::abs(got - pred));
+            }
+        // 10% of peak: the residual is the idx levels at the end of the range
+        // that a re-extraction sees and a shift cannot. At idx = 3 of 33 that is
+        // 9% of the sample, so this bound is the identity holding everywhere it
+        // can and failing only where it must.
+        check_double("shift identity (idx=+3)", worst / scale, 0.0, 0.10);
+    }
+
+    // 2. idx = 0 — 174 of 199 hardware frames — must be EXACT, not close: the
+    //    shift is the identity and the code must take the unshifted path.
+    {
+        ScaleFilter a = sf, b = sf;
+        scale_extract(sf, frame.data(), FR, FC, 128.0, 128.0, 64.0, 64.0, Z.data());
+        scale_update(a, Z.data(), 1.0f);
+        scale_update_shifted(b, Z.data(), 0, 1.0f);
+        check_true("idx=0 bitwise identical",
+                   a.st.A.size() == b.st.A.size()
+                   && memcmp(a.st.A.data(), b.st.A.data(),
+                             a.st.A.size() * sizeof(cfloat)) == 0
+                   && memcmp(a.st.B.data(), b.st.B.data(),
+                             a.st.B.size() * sizeof(float)) == 0,
+                   "the shift is the identity at idx = 0");
+    }
+
+    // 3. END TO END: the trained model must be the same whichever way it got
+    //    there. Train one filter the old way (re-extract at the resized box) and
+    //    one the new way (shift the target), from the same starting state.
+    {
+        const int idx = 2;
+        const double box = 64.0, boxn = box * std::pow((double)sf.step, (double)idx);
+
+        ScaleFilter base;
+        scale_filter_config(base, S, 1.02f, 64.0, 64.0, 16.0f);
+        scale_extract(base, frame.data(), FR, FC, 128.0, 128.0, box, box, Z.data());
+        scale_update(base, Z.data(), 1.0f);
+
+        ScaleFilter old_way = base, new_way = base;
+        scale_extract(base, frame.data(), FR, FC, 128.0, 128.0, boxn, boxn, Fn.data());
+        scale_update(old_way, Fn.data(), DEFAULT_SCALE_ETA);
+        scale_update_shifted(new_way, Z.data(), idx, DEFAULT_SCALE_ETA);
+
+        double sA = 0.0, wA = 0.0;
+        for (size_t i = 0; i < old_way.st.A.size(); ++i) {
+            sA = std::max(sA, (double)std::abs(old_way.st.A[i]));
+            wA = std::max(wA, (double)std::abs(old_way.st.A[i] - new_way.st.A[i]));
+        }
+        double sB = 0.0, wB = 0.0;
+        for (size_t i = 0; i < old_way.st.B.size(); ++i) {
+            sB = std::max(sB, (double)std::fabs(old_way.st.B[i]));
+            wB = std::max(wB, (double)std::fabs(old_way.st.B[i] - new_way.st.B[i]));
+        }
+        check_double("trained A matches re-extract", wA / sA, 0.0, 0.05);
+        // B sees |F|^2 and the phase ramp is unimodular, so B is affected ONLY by
+        // the edge levels — it should agree more tightly than A, and if it does
+        // not, the shift is being applied to the magnitude somewhere.
+        check_double("trained B matches re-extract", wB / sB, 0.0, 0.02);
+    }
+
+    // 4. The detector must still behave: train at 64, present a box 10% too
+    //    small, train via the shifted path, and the model must not be corrupted
+    //    — the next detection on a correct box still reports level 0.
+    {
+        ScaleFilter sf2;
+        scale_filter_config(sf2, S, 1.02f, 64.0, 64.0, 16.0f);
+        scale_extract(sf2, frame.data(), FR, FC, 128.0, 128.0, 64.0, 64.0, Z.data());
+        scale_update(sf2, Z.data(), 1.0f);
+
+        scale_extract(sf2, frame.data(), FR, FC, 128.0, 128.0, 58.0, 58.0, Fn.data());
+        const ScaleResult rs = scale_detect(sf2, Fn.data(), DEFAULT_EPS_REL);
+        check_true("under-sized box still detected", rs.idx > 0, "");
+        scale_update_shifted(sf2, Fn.data(), rs.idx, DEFAULT_SCALE_ETA);
+
+        scale_extract(sf2, frame.data(), FR, FC, 128.0, 128.0, 64.0, 64.0, Z.data());
+        const ScaleResult r0 = scale_detect(sf2, Z.data(), DEFAULT_EPS_REL);
+        check_int("model still reports level 0 after shifted training", r0.idx, 0);
+    }
+}
+
+// -----------------------------------------------------------------------
+// scale_extract()'s real-input DFT
+// -----------------------------------------------------------------------
+// The sample is real by construction, so its transform along the scale axis must
+// be conjugate-symmetric. real_dft_with_table() computes only the first half and
+// MIRRORS the rest, which is free only if the mirror is exact — hence a bitwise
+// check rather than a tolerance. A tolerance here would pass just as happily on
+// an asymmetric twiddle table, which is the thing that can silently break it.
+void run_real_dft_tests()
+{
+    using namespace mosse;
+    printf("\n--- scale_extract real-input DFT ---\n");
+
+    constexpr int S = 33, FR = 256, FC = 256;
+    std::vector<uint8_t> frame((size_t)FR * FC, 60);
+    Lcg rng(4242);
+    // Textured, not flat: a flat frame normalises to zero and every bin with it,
+    // which would make the symmetry check vacuous.
+    for (auto &px : frame) px = (uint8_t)(100 + rng.next(60));   // [40,160]
+    for (int r = 96; r < 160; ++r)
+        for (int c = 96; c < 160; ++c)
+            frame[(size_t)r * FC + c] = (uint8_t)(200 + rng.next(20));
+
+    ScaleFilter sf;
+    scale_filter_config(sf, S, 1.02f, 64.0, 64.0, 16.0f);
+    const int d = sf.dims();
+    std::vector<cfloat> F((size_t)sf.sample_elems());
+    scale_extract(sf, frame.data(), FR, FC, 128.0, 128.0, 64.0, 64.0, F.data());
+
+    bool herm = true, nonzero = false;
+    for (int l = 0; l < d && herm; ++l)
+        for (int k = 1; k <= S / 2; ++k) {
+            const cfloat a = F[(size_t)l * S + k];
+            const cfloat b = F[(size_t)l * S + (S - k)];
+            if (std::abs(a) > 0.0f) nonzero = true;
+            if (!(a.real() == b.real() && a.imag() == -b.imag())) { herm = false; break; }
+        }
+    check_true("spectrum is Hermitian (bitwise)", herm && nonzero,
+               "F[S-k] must be exactly conj(F[k])");
+
+    // Bin 0 of a real transform is real, and the DC bin is the sample's sum —
+    // which per-level zero-meaning does NOT force to zero, since the mean is
+    // removed along the template axis, not the scale axis.
+    bool dc_real = true;
+    for (int l = 0; l < d; ++l)
+        if (F[(size_t)l * S].imag() != 0.0f) { dc_real = false; break; }
+    check_true("bin 0 is exactly real", dc_real, "");
+
+    // Round-trip: the inverse transform of a Hermitian spectrum is real. This is
+    // what would fail if the mirror were conjugated the wrong way round — a sign
+    // error the symmetry check above cannot see, because it only compares the two
+    // halves with each other.
+    std::vector<cfloat> row((size_t)S), back((size_t)S);
+    double worst_im = 0.0, scale = 0.0;
+    for (int l = 0; l < d; ++l) {
+        for (int k = 0; k < S; ++k) row[(size_t)k] = F[(size_t)l * S + k];
+        dft_1d(row.data(), back.data(), S, true);
+        for (int k = 0; k < S; ++k) {
+            worst_im = std::max(worst_im, (double)std::fabs(back[(size_t)k].imag()));
+            scale    = std::max(scale,    (double)std::fabs(back[(size_t)k].real()));
+        }
+    }
+    check_double("inverse transform is real", worst_im / scale, 0.0, 1e-5);
+}
+
 void run_training_target_tests()
 {
     printf("\n--- training target (filter_update G offset) ---\n");
@@ -1220,6 +1492,9 @@ int main(int argc, char **argv)
     run_box_tests();
     run_scale_tests();
     run_training_target_tests();
+    run_fusion_tests();
+    run_scale_reuse_tests();
+    run_real_dft_tests();
 
     printf("\n  OVERALL: %s (%d failure%s)\n\n",
            g_failures ? "FAIL" : "PASS", g_failures, g_failures == 1 ? "" : "s");

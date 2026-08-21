@@ -65,6 +65,12 @@ double g_pos_err  = 0.0;
 // difference between the sim (recovers) and the board (did not).
 int    g_pan_r = 0, g_pan_c = 0;
 double g_step_ratio = 0.70;  // --step-ratio: size of the `step` arm's jump
+// --reuse / --re-extract: train the model on the DETECTION sample with a shifted
+// target (scale_update_shifted) instead of re-extracting at the resized box.
+// Defaults to the tracker's behaviour so `make scale_sim` scores what the board
+// runs; --re-extract restores the old path, which is what makes this a
+// controlled comparison rather than an assertion.
+bool   g_reuse    = true;
 bool   g_no_gate  = false;   // --no-gate: accept every proposal, to separate
                              // "the detector cannot see it" from "the gate
                              // refused it". Those have opposite fixes.
@@ -224,11 +230,19 @@ Result run(const std::string &arm, int frames, float eta, int n_scales,
             }
         }
 
-        // Model update: re-extract at the UPDATED box, then train. Same ordering
-        // as mosse_tracker.cpp.
-        mosse::scale_extract(sf, frame.data(), FR, FC, br, bc, box, box,
-                             sample.data());
-        mosse::scale_update(sf, sample.data(), eta);
+        // Model update. Same ordering as mosse_tracker.cpp, and the same choice:
+        // either re-extract at the UPDATED box, or train on the detection sample
+        // already in `sample` against a target shifted by the accepted level.
+        // The two are the same update in exact arithmetic — see
+        // scale_update_shifted() — and this flag is here so that claim is tested
+        // in the loop rather than only element by element in test_host.
+        if (g_reuse && sf.initialized) {
+            mosse::scale_update_shifted(sf, sample.data(), idx, eta);
+        } else {
+            mosse::scale_extract(sf, frame.data(), FR, FC, br, bc, box, box,
+                                 sample.data());
+            mosse::scale_update(sf, sample.data(), eta);
+        }
 
         hist.push_back(box);
         const double rel = box / th - 1.0;
@@ -280,6 +294,8 @@ int main(int argc, char **argv)
         else if (a == "--every")       g_every = atoi(val("10"));
         else if (a == "--conf-min")    g_conf_min = (float)atof(val("2.0"));
         else if (a == "--no-gate")     g_no_gate = true;
+        else if (a == "--reuse")       g_reuse = true;
+        else if (a == "--re-extract")  g_reuse = false;
         else if (a == "--step-ratio")  g_step_ratio = atof(val("0.70"));
         else if (a == "--sigma-factor") g_sigma_f = (float)atof(val("16.0"));
         else if (a == "--pos-err")     g_pos_err = atof(val("0"));
@@ -288,6 +304,9 @@ int main(int argc, char **argv)
     }
 
     printf("\nDSST scale filter — closed loop, position held, no hardware\n");
+    printf("  update trains on the %s\n",
+           g_reuse ? "DETECTION sample, target shifted by idx (scale_update_shifted)"
+                   : "RE-EXTRACTED sample at the resized box (scale_update)");
     printf("  S=%d step=%.3f eta=%.3f corrections/frame=%d  conf_min=%.2f%s  frames=%d\n",
            n_scales, (double)step, (double)eta, corrections,
            (double)g_conf_min, g_no_gate ? " GATE BYPASSED" : "", frames);

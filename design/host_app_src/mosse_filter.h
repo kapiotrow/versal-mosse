@@ -394,6 +394,29 @@ void filter_quantize_q15(const FilterState &st, const double *energy,
                          float eps_rel, int16_t *out,
                          float *out_scale, float *out_max_abs);
 
+// filter_update() followed by filter_quantize_q15(), fused. BIT-IDENTICAL output
+// to calling the two in sequence — asserted element by element in
+// run_fusion_tests(), not merely intended.
+//
+// WHY. Measured on the A72 2026-08-20 (runs/run_0820_1807.log): `filter update`
+// 10.18 ms/frame and `publish filter` 5.60 ms, together a quarter of a 62.7 ms
+// frame, and -fcx-limited-range bought only 0.48 ms of it because the pair is
+// memory-bound rather than arithmetic-bound. Unfused, A is streamed FOUR times
+// per frame — written by the update, then read twice by the quantiser, which
+// recomputes the same divide on both passes. Fused, H is formed once in the pass
+// that writes A and parked in `h_scratch`; the write-out is a scalar multiply.
+// The B accumulation is also flipped to channel-major, which turns st.channels
+// strided readers of F_all into one sequential one.
+//
+// `h_scratch` is the caller's, resized on first use and reused thereafter, so a
+// 2 MB allocation does not land in the per-frame path. It holds H BEFORE the
+// Q1.15 scaling and is otherwise private to this function.
+void filter_update_quantize(FilterState &st, const cfloat *F_all,
+                            const cfloat *G, float eta,
+                            const double *energy, float eps_rel,
+                            std::vector<cfloat> &h_scratch,
+                            int16_t *out, float *out_scale, float *out_max_abs);
+
 // -----------------------------------------------------------------------
 // 1-D scale filter — DSST (docs/1609.06141v1.pdf) §5.1
 // -----------------------------------------------------------------------
@@ -540,6 +563,34 @@ ScaleResult scale_detect(const ScaleFilter &sf, const cfloat *Z, float eps_rel);
 // Train. First call initialises (eta = 1 against a zeroed state), as for the
 // translation filter.
 void scale_update(ScaleFilter &sf, const cfloat *F, float eta);
+
+// Train on the sample that was extracted for DETECTION, i.e. at the box BEFORE
+// the accepted resize, by shifting the target `idx` levels instead of
+// re-extracting at the resized box.
+//
+// THE IDENTITY THIS RESTS ON IS EXACT, not an approximation. Level n of an
+// extraction at box*a^idx crops box*a^idx*a^n = box*a^(idx+n), which is level
+// idx+n of the extraction already in hand — same centre, same template, same
+// Hann window, same per-level normalisation. So F_new[k] = Z[k+idx], a pure
+// shift along the scale axis, and by the shift theorem
+//
+//     conj(G_0)[m] * F_new[m]  ==  conj(G_idx)[m] * Z[m]
+//
+// where G_idx = gaussian_target_spectrum(..., dc = idx). Both the numerator and
+// |F|^2 in the denominator are therefore unchanged, in exact arithmetic, by
+// training on Z against a shifted target instead. This is the same manoeuvre the
+// translation filter already makes with psr_abs.dr/dc — one axis down — and the
+// SIGN is the same: G is centred at +idx, the level the detector reported.
+//
+// WHAT IT COSTS. Only the |idx| levels at the far end of the search range differ:
+// the re-extraction would have cropped genuinely new levels there, whereas here
+// they simply are not trained on. On hardware the detector proposed only -1, 0
+// or +1 across 199 frames (run_0820_1807.log), so that is at most one level of
+// 33, and at idx = 0 — 174 of those 199 frames — the two are identical.
+//
+// WHAT IT BUYS. scale_extract() is 4.73 ms/call and ran twice per frame, 15% of
+// the frame; this removes one of the two calls.
+void scale_update_shifted(ScaleFilter &sf, const cfloat *F, int idx, float eta);
 
 // -----------------------------------------------------------------------
 // Scale-update gating — the direct analogue of psr_gate() for the size axis

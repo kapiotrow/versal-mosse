@@ -315,9 +315,23 @@ void twiddle_table(std::vector<cfloat> &w, int n, bool inverse)
 {
     const double sgn = inverse ? +1.0 : -1.0;
     w.resize((size_t)n);
-    for (int j = 0; j < n; ++j) {
+    // BUILT CONJUGATE-SYMMETRIC BY CONSTRUCTION: w[n-j] = conj(w[j]).
+    //
+    // Mathematically that is just cos(2*pi*(n-j)/n) = cos(2*pi*j/n), so it looks
+    // like a tidiness change. It is not — it is what makes the Hermitian mirror
+    // in real_dft_with_table() EXACT rather than merely close. Evaluating
+    // std::cos/std::sin at the two arguments independently agrees only to within
+    // an ulp, and bin n-k is then not bitwise conj(bin k), so the mirrored half
+    // of the spectrum would differ from a directly computed one in the last
+    // bit. Mirroring is only free if it is exact.
+    //
+    // Second-order benefit: the arguments actually evaluated are all <= pi, where
+    // the library's argument reduction has nothing to do.
+    const int half = n / 2;
+    for (int j = 0; j <= half; ++j) {
         const double a = sgn * 2.0 * M_PI * (double)j / (double)n;
         w[(size_t)j] = cfloat((float)std::cos(a), (float)std::sin(a));
+        if (j > 0 && n - j > half) w[(size_t)(n - j)] = std::conj(w[(size_t)j]);
     }
 }
 
@@ -337,6 +351,45 @@ void dft_with_table(const cfloat *in, cfloat *out, int n,
         }
         if (inverse) { re /= (double)n; im /= (double)n; }
         out[k] = cfloat((float)re, (float)im);
+    }
+}
+
+// REAL-INPUT forward transform, exploiting Hermitian symmetry. Same table, same
+// summation order, same accumulator type as dft_with_table() — so for a purely
+// real input the bins it computes are BITWISE what the complex routine produced.
+//
+// WHY IT EXISTS. scale_extract() feeds this a sample that is real BY
+// CONSTRUCTION (each element is a windowed, normalised pixel; the imaginary part
+// was literally written as 0.0f). The complex routine then spent half its
+// multiplies on that zero and computed all n bins, of which only n/2+1 carry
+// information. Two independent factors:
+//
+//   real input      4 mul + 4 add per tap  ->  2 mul + 2 add        2.0x
+//   Hermitian out   n bins computed        ->  n/2+1 bins           1.9x at n=33
+//
+// which is the 3.11x that "Settled questions" measured for this exact transform,
+// and at 9.44 ms/frame of scale_extract on the A72 it is worth several ms.
+//
+// The mirror out[n-k] = conj(out[k]) is exact given a conjugate-symmetric
+// twiddle table — see twiddle_table(). The `n - k > kmax` guard is for even n,
+// where k = n/2 is its own mirror and must not be overwritten.
+void real_dft_with_table(const float *in, cfloat *out, int n,
+                         const std::vector<cfloat> &w)
+{
+    const int kmax = n / 2;
+    for (int k = 0; k <= kmax; ++k) {
+        double re = 0.0, im = 0.0;
+        int idx = 0;                       // (k*t) mod n, stepped rather than %
+        for (int t = 0; t < n; ++t) {
+            const double x = (double)in[t];
+            re += x * (double)w[(size_t)idx].real();
+            im += x * (double)w[(size_t)idx].imag();
+            idx += k;
+            if (idx >= n) idx -= n;
+        }
+        out[k] = cfloat((float)re, (float)im);
+        const int km = n - k;
+        if (k > 0 && km > kmax) out[km] = cfloat((float)re, (float)(-im));
     }
 }
 
@@ -443,6 +496,12 @@ void scale_extract(const ScaleFilter &sf, const uint8_t *frame,
     hann_into(wc, sf.tmpl_w);
 
     std::vector<double> buf((size_t)d);
+    // The real sample, in the same [l*S + k] layout F_out uses — so the scale
+    // axis is contiguous and the transform below reads it as a plain vector.
+    // Held separately from F_out only because the transform cannot be done in
+    // place; it replaces the per-dimension gather/scatter the complex path
+    // needed, so it costs no traffic.
+    std::vector<float> re_sample((size_t)d * (size_t)S);
 
     for (int n = -half; n <= half; ++n) {
         const double a  = std::pow((double)sf.step, (double)n);
@@ -475,19 +534,22 @@ void scale_extract(const ScaleFilter &sf, const uint8_t *frame,
         // rows = 1: element (l, n) lives at l*S + (n + half).
         const int k = n + half;
         for (int l = 0; l < d; ++l)
-            F_out[(size_t)l * S + k] = cfloat((float)(buf[(size_t)l] * inv), 0.0f);
+            re_sample[(size_t)l * S + k] = (float)(buf[(size_t)l] * inv);
     }
 
     // Transform each feature dimension along the SCALE axis. The twiddle table is
     // built ONCE for all d transforms — see the note on twiddle_table: doing it
     // per transform would put ~2M sin/cos calls in the per-frame path.
-    std::vector<cfloat> w, tmp((size_t)S), out((size_t)S);
+    //
+    // REAL-INPUT transform: the sample is real by construction, so half the
+    // multiplies and half the output bins were redundant — see
+    // real_dft_with_table(). Bitwise identical to the complex path it replaces
+    // on the bins it computes, and exactly conjugate on the mirrored ones.
+    std::vector<cfloat> w;
     twiddle_table(w, S, false);
-    for (int l = 0; l < d; ++l) {
-        for (int k = 0; k < S; ++k) tmp[(size_t)k] = F_out[(size_t)l * S + k];
-        dft_with_table(tmp.data(), out.data(), S, w, false);
-        for (int k = 0; k < S; ++k) F_out[(size_t)l * S + k] = out[(size_t)k];
-    }
+    for (int l = 0; l < d; ++l)
+        real_dft_with_table(re_sample.data() + (size_t)l * S,
+                            F_out + (size_t)l * S, S, w);
 }
 
 ScaleResult scale_detect(const ScaleFilter &sf, const cfloat *Z, float eps_rel)
@@ -568,6 +630,26 @@ void scale_update(ScaleFilter &sf, const cfloat *F, float eta)
     }
 }
 
+void scale_update_shifted(ScaleFilter &sf, const cfloat *F, int idx, float eta)
+{
+    if (!sf.enabled()) return;
+
+    // idx = 0 is the common case on hardware (174 of 199 frames in
+    // runs/run_0820_1807.log) and the shift is then the identity, so take the
+    // unshifted path rather than rebuilding an identical G.
+    if (idx == 0) { scale_update(sf, F, eta); return; }
+
+    std::vector<cfloat> Gs((size_t)sf.n_scales);
+    gaussian_target_spectrum(Gs.data(), 1, sf.n_scales, sf.sigma, 0, idx);
+
+    if (!sf.initialized) {
+        filter_init(sf.st, F, Gs.data(), sf.dims(), 1, sf.n_scales);
+        sf.initialized = true;
+    } else {
+        filter_update(sf.st, F, Gs.data(), eta);
+    }
+}
+
 void filter_init(FilterState &st, const cfloat *F_all,
                  const cfloat *G, int channels, int rows, int cols)
 {
@@ -604,6 +686,123 @@ void filter_update(FilterState &st, const cfloat *F_all,
     }
 
     st.initialized = true;
+}
+
+void filter_update_quantize(FilterState &st, const cfloat *F_all,
+                            const cfloat *G, float eta,
+                            const double *energy, float eps_rel,
+                            std::vector<cfloat> &h_scratch,
+                            int16_t *out, float *out_scale, float *out_max_abs)
+{
+    const size_t n     = st.elems();
+    const size_t n_all = n * (size_t)st.channels;
+    const float  keep  = 1.0f - eta;
+
+    // ---- B, exactly as filter_update() computes it -------------------------
+    //
+    // CHANNEL-MAJOR, which filter_update() is not. The published form reads
+    // F_all[ch*n + i] with ch innermost, i.e. st.channels concurrent streams
+    // 128 KB apart at ch16 — sixteen strided readers against a prefetcher that
+    // tracks a handful. Accumulating into a scratch map instead makes F_all a
+    // single sequential read and keeps the map (64 KB at 128x128) in cache.
+    //
+    // BIT-IDENTICAL, not merely equivalent: each element's channel sum is still
+    // accumulated in ch order 0..channels-1, which is the only thing float
+    // addition is sensitive to here. Nothing is reassociated.
+    if (h_scratch.size() < n_all) h_scratch.resize(n_all);
+    std::vector<float> esum(n, 0.0f);
+    for (int ch = 0; ch < st.channels; ++ch) {
+        const cfloat *f = F_all + (size_t)ch * n;
+        for (size_t i = 0; i < n; ++i)
+            esum[i] += f[i].real() * f[i].real() + f[i].imag() * f[i].imag();
+    }
+    for (size_t i = 0; i < n; ++i) st.B[i] = eta * esum[i] + keep * st.B[i];
+
+    // ---- eps and the per-channel scale, exactly as filter_quantize_q15() ----
+    double b_sum = 0.0;
+    for (size_t i = 0; i < n; ++i) b_sum += st.B[i];
+    const float eps = eps_rel * (float)(b_sum / (double)(n ? n : 1));
+
+    std::vector<float> chscale((size_t)st.channels, 1.0f);
+    if (energy) {
+        for (int ch = 0; ch < st.channels; ++ch) {
+            const double e = energy[ch];
+            chscale[(size_t)ch] = (e > 0.0) ? (float)(1.0 / std::sqrt(e)) : 0.0f;
+        }
+    }
+
+    // ---- A update AND the max-|H| scan, in ONE pass ------------------------
+    //
+    // THIS IS THE POINT OF THE FUSION. Unfused, A (2 MB at 128x128 ch16) is
+    // streamed four times per frame: filter_update reads it and writes it, then
+    // filter_quantize_q15 reads it for the max scan and again for the write-out,
+    // recomputing the same divide both times. Here H is formed once, where A is
+    // already in a register, and parked in h_scratch; the write-out is then a
+    // multiply by a scalar. Half the divides (262144 -> 131072 at ch16) and one
+    // fewer 2 MB read, at the price of one 2 MB scratch.
+    //
+    // The expression `a[i] * (cs / (st.B[i] + eps))` is copied verbatim from
+    // filter_quantize_q15 and the final scaling is still `h * scale` applied to
+    // that same intermediate — so the int16 output is BITWISE what the unfused
+    // pair produces. run_fusion_tests() in test_mosse_filter.cpp asserts exactly
+    // that, because "equivalent" here would silently end ten consecutive runs of
+    // bit-identical tracking and make the next hardware comparison unreadable.
+    float  max_norm = 0.0f;
+    cfloat h_max(0.0f, 0.0f);
+    for (int ch = 0; ch < st.channels; ++ch) {
+        cfloat       *a  = st.A.data() + (size_t)ch * n;
+        const cfloat *f  = F_all + (size_t)ch * n;
+        cfloat       *hs = h_scratch.data() + (size_t)ch * n;
+        const float   cs = chscale[(size_t)ch];
+
+        // TWO LOOPS, NOT ONE, AND THAT IS THE POINT. Interleaving the two
+        // statements in a single loop body is what a first cut does, and it is
+        // measurably wrong: GCC contracts mul+add into FMA per expression, and
+        // -ffp-contract=fast is its DEFAULT on aarch64, so the interleaved body
+        // vectorises differently and contracts differently from the standalone
+        // loop in filter_update(). run_fusion_tests() built with
+        // -ffp-contract=fast catches it — `fused A bitwise identical` FAILS —
+        // which is precisely why that check exists and is not run only at -O2.
+        //
+        // Split per channel instead. Each loop below is then byte-for-byte the
+        // loop it replaces, so the codegen and therefore the last bit are the
+        // same; and the re-read of `a` costs no DRAM traffic because a channel is
+        // n * 8 = 128 KB at 128x128, written and re-read inside the A72's 1 MB
+        // L2. The 2 MB whole-of-A round trip that filter_quantize_q15 paid is
+        // what actually goes away.
+        for (size_t i = 0; i < n; ++i)
+            a[i] = eta * std::conj(G[i]) * f[i] + keep * a[i];
+
+        for (size_t i = 0; i < n; ++i) {
+            const cfloat h = a[i] * (cs / (st.B[i] + eps));
+            hs[i] = h;
+            const float m2 = h.real() * h.real() + h.imag() * h.imag();
+            if (m2 > max_norm) { max_norm = m2; h_max = h; }
+        }
+    }
+    st.initialized = true;
+
+    const float max_abs = (max_norm > 0.0f) ? std::abs(h_max) : 0.0f;
+    constexpr float Q15_FULL_SCALE = 32767.0f;
+    const float scale = (max_abs > 0.0f) ? (Q15_FULL_SCALE / max_abs) : 0.0f;
+
+    // ---- write-out: no divide, no second read of A -------------------------
+    for (size_t i = 0; i < n_all; ++i) {
+        const cfloat h = h_scratch[i] * scale;
+        float re = std::nearbyint(h.real());
+        float im = std::nearbyint(h.imag());
+        // -32767, not -32768 — see filter_quantize_q15() for why cmul_accum
+        // cannot be handed the full negative rail.
+        if (re >  32767.0f) re =  32767.0f;
+        if (re < -32767.0f) re = -32767.0f;
+        if (im >  32767.0f) im =  32767.0f;
+        if (im < -32767.0f) im = -32767.0f;
+        out[2 * i]     = (int16_t)re;
+        out[2 * i + 1] = (int16_t)im;
+    }
+
+    if (out_scale)   *out_scale   = scale;
+    if (out_max_abs) *out_max_abs = max_abs;
 }
 
 void filter_quantize_q15(const FilterState &st, const double *energy,
