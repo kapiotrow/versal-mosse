@@ -125,16 +125,52 @@ public:
 class IFFT2D_graph : public graph
 {
 public:
+#if MEMTILE_TRANSPOSE
+    port<input>  ifft_row_in;   // ← gmio_ifft_row_in  (accumulated spectrum from APU)
+    port<output> ifft_col_out;  // → gmio_response       (final correlation response)
+#else
     port<input>  ifft_row_in;   // ← gmio_ifft_row_in  (accumulated spectrum from APU)
     port<output> ifft_row_out;  // → gmio_ifft_row_out  (APU reads and transposes)
     port<input>  ifft_col_in;   // ← gmio_ifft_col_in   (APU-transposed data)
     port<output> ifft_col_out;  // → gmio_response       (final correlation response)
+#endif
 
     IFFTrows_graph ifft_rows;
     IFFTcols_graph ifft_cols;
 
+#if MEMTILE_TRANSPOSE
+    // The inverse transpose. Identical in structure to memTileFwd — the recorded
+    // claim that only the forward pass was a plain 2D-FFT transpose was wrong in
+    // both directions: cmul sits DOWNSTREAM of the column FFT, so both row->col
+    // paths in this design are textbook transposes. This one runs once per
+    // FRAME rather than once per channel, so it is the cheaper half.
+    adf::shared_buffer<FFT_2D_TT_DATA> memTileInv;
+#endif
+
     IFFT2D_graph()
     {
+#if MEMTILE_TRANSPOSE
+        memTileInv = adf::shared_buffer<FFT_2D_TT_DATA>::create(
+                         {PATCH_COLS, PATCH_ROWS}, 1, 1);
+        adf::num_buffers(memTileInv) = 2;
+
+        adf::write_access(memTileInv.in[0]) = adf::tiling({
+            .buffer_dimension = {PATCH_COLS, PATCH_ROWS},
+            .tiling_dimension = {PATCH_COLS, PATCH_ROWS},
+            .offset           = {0, 0}});
+
+        adf::read_access(memTileInv.out[0]) = adf::tiling({
+            .buffer_dimension = {PATCH_COLS, PATCH_ROWS},
+            .tiling_dimension = {1, 1},
+            .offset           = {0, 0},
+            .tile_traversal   = {{.dimension = 1, .stride = 1, .wrap = PATCH_ROWS},
+                                 {.dimension = 0, .stride = 1, .wrap = PATCH_COLS}}});
+
+        adf::connect<>(ifft_row_in,        ifft_rows.row_in);
+        adf::connect<>(ifft_rows.row_out,  memTileInv.in[0]);
+        adf::connect<>(memTileInv.out[0],  ifft_cols.col_in);
+        adf::connect<>(ifft_cols.col_out,  ifft_col_out);
+#else
         adf::connect<>(ifft_row_in,          ifft_rows.row_in);
         adf::connect<>(ifft_rows.row_out,    ifft_row_out);
 
@@ -143,5 +179,6 @@ public:
 
         // NOTE: ifft_row_out and ifft_col_in are NOT connected here.
         // APU reads via gmio_ifft_row_out, transposes, writes via gmio_ifft_col_in.
+#endif
     }
 };

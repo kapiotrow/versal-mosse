@@ -71,7 +71,48 @@ FFT_COL_CASCADE_LEN := 1
 # A 64 KB ping-pong DOES fit a 64 KB tile — AIE-ML cores address neighbouring
 # tiles' memory. Test placement with `make graph` (3 min), not `make sd_card`.
 FFT_ROW_WS          := 64
+# 8, and DO NOT RAISE IT WITHOUT READING "FFT_COL_WS 8->32 IS A NET LOSS" in
+# CLAUDE.md. 32 was tried on hardware 2026-08-21 and cost 9.57 ms/frame: the pair
+# gmio_fft_col_out + gmio_accum_out went 9.00 -> 18.32 ms even though the
+# transaction count fell 4x, because gmio_fft_col_out's per-tx cost exploded
+# 17.86 -> 266.63 us. The knob that took gmio_fft_row_out 73 -> 9.9 ms does NOT
+# transfer to this port pair, and the mechanism is not yet understood.
 FFT_COL_WS          := 8
+
+# Do the row->col transposes in AIE-ML memory tiles instead of the DDR round trip
+# through the APU. 0 = the DDR path every recorded run used. EXPERIMENTAL: the
+# graph side is written and mapped, the host side is NOT — with this at 1 the
+# four transpose GMIOs cease to exist and mosse_tracker.cpp will not link.
+# `make graph MEMTILE_TRANSPOSE=1` is the placement check; see CLAUDE.md.
+# 1 since 2026-08-21: proven on hardware (45.60 -> 35.58 ms, tracking unchanged).
+# Promoted to the default so it cannot be forgotten on one of the two toolchains
+# — a mismatch is a board deadlock, not a compile error. Set 0 for the DDR path.
+MEMTILE_TRANSPOSE   ?= 1
+
+# Launch roi_crop one channel ahead so its ~325 us/channel of PL execution hides
+# behind the host's APU work. Host-only, and inert unless MEMTILE_TRANSPOSE=1 —
+# on the DDR path the row-FFT drain already covers the CU. Set 0 to bisect.
+ROI_CROP_PIPELINE   ?= 1
+
+# Give cmul_accum's accum_prev its own input port instead of packing it behind H.
+# Deletes the host's 2 MB/frame packing memcpy, which IS an uncached BO read
+# (2.871 ms measured). NOTE: `make aiesim` needs 0 — the single-port design works
+# around a cycle-approximate ISS deadlock that does not exist on hardware.
+CMUL_SPLIT_ACCUM    ?= 1
+
+# Regroup cmul's accumulator output through a memory tile so gmio_accum_out is
+# drained once per CHANNEL (16 tx/frame) instead of once per chunk (256 tx).
+# Its cost is per-transaction, not per-byte — the DMA probe measured 14.4 us for
+# 64 B against 22.8 us for 128 KB — so this is ~4.31 -> ~0.3 ms. It also
+# decouples the accumulator from gmio_fft_col_out, which is what made
+# FFT_COL_WS=32 a net loss even though accum_out won there.
+# 0 — TRIED AND REVERTED 2026-08-21. It did exactly what it was designed to do
+# (gmio_accum_out 256 tx -> 16) and saved NOTHING: per-tx cost went 16.83 ->
+# 280.62 us, total 4.310 -> 4.490 ms, frame 29.61 -> 29.97. That port's cost was
+# never per-barrier overhead — it is the host waiting for the AIE to produce the
+# accumulator. See "CMUL_ACCUM_MEMTILE IS A NET LOSS" in CLAUDE.md before
+# reaching for this again.
+CMUL_ACCUM_MEMTILE  ?= 0
 
 # FFT/IFFT output shifts. The invariant is
 #     2*FFT_SHIFT + IFFT_ROW_SHIFT + IFFT_COL_SHIFT = 12
@@ -295,6 +336,9 @@ AIE_FLAGS  += --Xpreproc="-DFFT_ROW_CASCADE_LEN=$(FFT_ROW_CASCADE_LEN)"
 AIE_FLAGS  += --Xpreproc="-DFFT_COL_CASCADE_LEN=$(FFT_COL_CASCADE_LEN)"
 AIE_FLAGS  += --Xpreproc="-DFFT_ROW_WS=$(FFT_ROW_WS)"
 AIE_FLAGS  += --Xpreproc="-DFFT_COL_WS=$(FFT_COL_WS)"
+AIE_FLAGS  += --Xpreproc="-DMEMTILE_TRANSPOSE=$(MEMTILE_TRANSPOSE)"
+AIE_FLAGS  += --Xpreproc="-DCMUL_SPLIT_ACCUM=$(CMUL_SPLIT_ACCUM)"
+AIE_FLAGS  += --Xpreproc="-DCMUL_ACCUM_MEMTILE=$(CMUL_ACCUM_MEMTILE)"
 # ITER_CNT is deliberately NOT here. It appears in NO file under design/aie_src —
 # the frame count is purely a host loop bound — but while it was in AIE_FLAGS it
 # landed in aie.flagstamp, so changing the number of frames forced a libadf.a
@@ -482,6 +526,18 @@ GCC_FLAGS  += -DITER_CNT=$(ITER_CNT)
 # Same single-source-of-truth rule as the FFT/IFFT shifts above.
 GCC_FLAGS  += -DFFT_ROW_WS=$(FFT_ROW_WS)
 GCC_FLAGS  += -DFFT_COL_WS=$(FFT_COL_WS)
+# Must reach BOTH toolchains from this one variable: at 1 the graph deletes four
+# GMIO ports and the host must stop driving them. A mismatch is not a compile
+# error on either side alone — it is a deadlock on the board.
+GCC_FLAGS  += -DMEMTILE_TRANSPOSE=$(MEMTILE_TRANSPOSE)
+# Host-only: no AIE counterpart, so it does NOT need to reach AIE_FLAGS.
+GCC_FLAGS  += -DROI_CROP_PIPELINE=$(ROI_CROP_PIPELINE)
+# Shared by both toolchains: at 1 the graph gains gmio_accum_in and the host must
+# stop packing. A mismatch deadlocks rather than failing to compile.
+GCC_FLAGS  += -DCMUL_SPLIT_ACCUM=$(CMUL_SPLIT_ACCUM)
+# Shared by both toolchains: at 1 the host drains accum_out once per CHANNEL
+# instead of once per chunk. A mismatch is a stalled drain, not a compile error.
+GCC_FLAGS  += -DCMUL_ACCUM_MEMTILE=$(CMUL_ACCUM_MEMTILE)
 # Offset of the synthetic test impulse from the tracked position. A correct
 # pipeline must report exactly this displacement; (0,0) would be untestable
 # because it is also what a zero response yields. Sweep to check other offsets:

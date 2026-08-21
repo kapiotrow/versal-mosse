@@ -146,20 +146,76 @@ public:
 // The row→col path is broken: row_out and col_in are separate external
 // ports wired to GMIO in MOSSE_graph (APU manages the DDR transpose).
 // ---------------------------------------------------------------
+// MEMTILE_TRANSPOSE: do the row->col transpose in an AIE-ML memory tile instead
+// of a DDR round trip through the APU. Off by default — the DDR path is what
+// every recorded run used. See CLAUDE.md, "Memory-tile transpose".
+#ifndef MEMTILE_TRANSPOSE
+#  define MEMTILE_TRANSPOSE 0
+#endif
+
 class FFT2D_graph : public graph
 {
 public:
+#if MEMTILE_TRANSPOSE
+    // TWO external ports. The row->col path closes INSIDE the graph, so
+    // fft_row_out and fft_col_in (and their two GMIOs) do not exist.
+    port<input>  fft_row_in;   // ← conv2d_kernel output (window)
+    port<output> fft_col_out;  // → cmul_accum_kernel input (internal)
+#else
     // Four external ports — all wired from the parent MOSSE_graph
     port<input>  fft_row_in;   // ← conv2d_kernel output (window)
     port<output> fft_row_out;  // → gmio_fft_row_out (DDR, APU reads and transposes)
     port<input>  fft_col_in;   // ← gmio_fft_col_in  (APU-transposed data)
     port<output> fft_col_out;  // → cmul_accum_kernel input (internal)
+#endif
 
     FFTrows_graph fft_rows;
     FFTcols_graph fft_cols;
 
+#if MEMTILE_TRANSPOSE
+    // The transpose itself. Ported from DSPLib's own 2D FFT — see
+    // Vitis_Libraries/dsp/L2/include/aie/fft_ifft_2d_graph.hpp:242-260, which
+    // puts exactly this between its front and back FFT. Write the plane
+    // contiguously, read it with the traversal dimensions swapped; walking
+    // dimension 1 in the INNER loop is what makes the read a transpose.
+    //
+    // buffer_dimension[0] is the contiguous dimension (adf/types.h:393). The row
+    // FFT emits each row's PATCH_COLS bins contiguously, so dimension 0 is COLS
+    // and dimension 1 is ROWS — the same {D1, D2} = {front point size, back
+    // point size} convention DSPLib uses.
+    //
+    // 128x128 cint16 = 64 KB, 128 KB with the ping-pong, against a 512 KB
+    // AIE-ML memory tile. num_buffers = 2 is load-bearing and not an
+    // optimisation: a transpose is a global dependency (the column pass cannot
+    // start until the whole plane is written), so without ping-pong this
+    // serialises the channels harder than the DDR path it replaces.
+    adf::shared_buffer<FFT_2D_TT_DATA> memTileFwd;
+#endif
+
     FFT2D_graph()
     {
+#if MEMTILE_TRANSPOSE
+        memTileFwd = adf::shared_buffer<FFT_2D_TT_DATA>::create(
+                         {PATCH_COLS, PATCH_ROWS}, 1, 1);
+        adf::num_buffers(memTileFwd) = 2;
+
+        adf::write_access(memTileFwd.in[0]) = adf::tiling({
+            .buffer_dimension = {PATCH_COLS, PATCH_ROWS},
+            .tiling_dimension = {PATCH_COLS, PATCH_ROWS},
+            .offset           = {0, 0}});
+
+        adf::read_access(memTileFwd.out[0]) = adf::tiling({
+            .buffer_dimension = {PATCH_COLS, PATCH_ROWS},
+            .tiling_dimension = {1, 1},
+            .offset           = {0, 0},
+            .tile_traversal   = {{.dimension = 1, .stride = 1, .wrap = PATCH_ROWS},
+                                 {.dimension = 0, .stride = 1, .wrap = PATCH_COLS}}});
+
+        adf::connect<>(fft_row_in,        fft_rows.row_in);
+        adf::connect<>(fft_rows.row_out,  memTileFwd.in[0]);
+        adf::connect<>(memTileFwd.out[0], fft_cols.col_in);
+        adf::connect<>(fft_cols.col_out,  fft_col_out);
+#else
         adf::connect<>(fft_row_in,        fft_rows.row_in);
         adf::connect<>(fft_rows.row_out,  fft_row_out);
 
@@ -169,5 +225,6 @@ public:
         // NOTE: fft_row_out and fft_col_in are NOT connected to each other here.
         // The APU reads fft_row_out via gmio_fft_row_out, transposes the matrix
         // in DDR, then writes to fft_col_in via gmio_fft_col_in.
+#endif
     }
 };

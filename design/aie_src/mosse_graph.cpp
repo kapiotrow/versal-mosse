@@ -289,6 +289,33 @@ int main(int argc, char **argv)
     // the PLIO → conv2d → row_FFT → transpose chain entirely.  The gmio_fft_row_out
     // GMIO still runs (to keep the graph alive) but its output is discarded.
     // ----------------------------------------------------------------
+#if MEMTILE_TRANSPOSE
+    // ----------------------------------------------------------------
+    // MEMTILE PATH: steps 2 and 3 DO NOT EXIST.
+    //
+    // The row->col transpose closes inside the graph through memTileFwd, so
+    // there is no fft_row_out to drain, nothing to transpose on the host, and
+    // no fft_col_in to feed. The pre-computed fft_col_in.bin bypass is also
+    // unreachable by construction — which is a feature: this harness can only
+    // run the REAL PatchIn -> conv2d -> row FFT -> transpose -> col FFT chain,
+    // so a PASS here is a statement about the whole path.
+    //
+    // What still has to happen is the weights feed. conv2d's `weights` is an
+    // input_buffer and ADF acquires one per FIRING, so the harness must supply
+    // PATCH_ROWS/FFT_ROW_WS of them per channel or conv2d blocks on the acquire
+    // and the row FFT starves — the root cause of every historical "PLIO hang".
+    // Previously they were fed one per drained invocation, which paced them for
+    // free. With the drain gone they are queued up front; gm2aie_nb does not
+    // block, and ADF consumes them in order.
+    {
+        constexpr int N_INV = PATCH_ROWS / FFT_ROW_WS;
+        printf("[aiesim] steps 2/3: SKIPPED — memTileFwd does the transpose "
+               "in-graph. Queueing %d weights buffers for conv2d.\n", N_INV);
+        fflush(stdout);
+        for (int inv = 0; inv < N_INV; ++inv)
+            mosse_graph.gmio_weights.gm2aie_nb(weights_buf, 64);
+    }
+#else
     char fci_path[512];
     snprintf(fci_path, sizeof(fci_path), "%s/fft_col_in.bin", scenario_dir);
     bool use_precomputed = load_cint16_bin(fci_path, fft_scratch, PATCH_ELEMS);
@@ -397,6 +424,7 @@ int main(int argc, char **argv)
     printf("[aiesim] fft_col_in[col=0,r=17]: {%d,%d}\n",
            fft_scratch[17*2], fft_scratch[17*2+1]);
     fflush(stdout);
+#endif  // !MEMTILE_TRANSPOSE
 
     // Step 4: fft_cols + cmul → accum_out
     // Arm output GMIO first, then fire all input GMIOs.
@@ -457,8 +485,10 @@ int main(int argc, char **argv)
                 (int8_t*)fcol_out_buf + inv * CMUL_INV_BYTES,   CMUL_INV_BYTES);
             mosse_graph.gmio_cmul_in.gm2aie_nb(
                 (int8_t*)cmul_in_buf  + inv * CMUL_IN_INV_BYTES, CMUL_IN_INV_BYTES);
+#if !MEMTILE_TRANSPOSE
             mosse_graph.gmio_fft_col_in.gm2aie_nb(
                 (int8_t*)fft_scratch  + inv * CMUL_INV_BYTES,   CMUL_INV_BYTES);
+#endif
             mosse_graph.gmio_fft_col_out.wait();
             mosse_graph.gmio_accum_out.wait();
         }
@@ -561,13 +591,38 @@ int main(int argc, char **argv)
     printf("[aiesim] step 6: waiting for ifft_row_out (%d × %d B)...\n",
            N_IFFT_INV, IFFT_INV_BYTES); fflush(stdout);
     for (int inv = 0; inv < N_IFFT_INV; ++inv) {
+#if MEMTILE_TRANSPOSE
+        // No ifft_row_out to drain — memTileInv takes it straight to the column
+        // IFFT. Only the accumulated spectrum goes in.
+        mosse_graph.gmio_ifft_row_in.gm2aie_nb(
+            (int8_t*)accum_buf   + inv * IFFT_INV_BYTES, IFFT_INV_BYTES);
+#else
         mosse_graph.gmio_ifft_row_out.aie2gm_nb(
             (int8_t*)fft_scratch + inv * IFFT_INV_BYTES, IFFT_INV_BYTES);
         mosse_graph.gmio_ifft_row_in.gm2aie_nb(
             (int8_t*)accum_buf   + inv * IFFT_INV_BYTES, IFFT_INV_BYTES);
         mosse_graph.gmio_ifft_row_out.wait();
+#endif
     }
     printf("[aiesim] step 6: ifft_row done\n"); fflush(stdout);
+#if MEMTILE_TRANSPOSE
+    // The prints and the saturation scan below read fft_scratch, which on the
+    // memtile path is NEVER WRITTEN — ifft_row_out does not exist, so nothing
+    // drains into it. Printing it anyway produced plausible-looking numbers in
+    // the first memtile aiesim run ({16992,26880}...) that mean nothing at all.
+    // Say so rather than print them: this project has lost days to output that
+    // looks current and is not (see the "H(q15): unchanged" guard in the host).
+    printf("[aiesim] ifft_row_out: NOT OBSERVABLE — memTileInv carries the row "
+           "IFFT straight to the column IFFT, so there is no host-visible "
+           "intermediate. The row-IFFT saturation scan is skipped with it; "
+           "rails would show in the response instead.\n");
+    fflush(stdout);
+    // Declared in BOTH branches: the verdict line and the OVERALL conjunction
+    // below read it unconditionally. `true` is the honest value here — the stage
+    // is not skipped, it is not OBSERVABLE, so it cannot contribute a FAIL. The
+    // saturation it would have caught still shows up in the response check.
+    const bool ifft_row_sat_pass = true;
+#else
 
     printf("[aiesim] ifft_row_out[0..3]: {%d,%d} {%d,%d} {%d,%d} {%d,%d}\n",
            fft_scratch[0], fft_scratch[1],
@@ -609,8 +664,12 @@ int main(int argc, char **argv)
         fflush(stdout);
     }
 
+#endif  // MEMTILE_TRANSPOSE — end of the ifft_row_out observability block
+
     // Step 7: APU transpose for IFFT
+#if !MEMTILE_TRANSPOSE
     transpose_inplace(fft_scratch, PATCH_ROWS, PATCH_COLS);
+#endif
 
     // Step 8: col IFFT — same per-invocation loop fix.
     constexpr int RESP_INV_BYTES = PATCH_COLS * FFT_COL_WS * 4;   // 1024 B
@@ -620,8 +679,10 @@ int main(int argc, char **argv)
     for (int inv = 0; inv < N_RESP_INV; ++inv) {
         mosse_graph.gmio_response.aie2gm_nb(
             (int8_t*)resp_buf   + inv * RESP_INV_BYTES, RESP_INV_BYTES);
+#if !MEMTILE_TRANSPOSE
         mosse_graph.gmio_ifft_col_in.gm2aie_nb(
             (int8_t*)fft_scratch + inv * RESP_INV_BYTES, RESP_INV_BYTES);
+#endif
         mosse_graph.gmio_response.wait();
     }
     printf("[aiesim] step 8: response done\n"); fflush(stdout);
@@ -846,6 +907,50 @@ int main(int argc, char **argv)
         free(golden);
     }
 
+    // ------------------------------------------------------------------
+    // HERMITIAN SYMMETRY OF F_ch — the premise behind halving the host filter.
+    //
+    // conv2d emits cint16 with imag = 0, so the 2-D spectrum of a REAL input
+    // must satisfy F(u,v) = conj(F(-u,-v)) and A/B in the host filter are
+    // half-redundant. In EXACT arithmetic that is a theorem; in cint16 it is a
+    // question, because DSPLib's DIT butterflies do not compute a conjugate pair
+    // by symmetric operations and every stage rounds. Measured here rather than
+    // assumed — CLAUDE.md records two occasions where an unverified premise moved
+    // a calibrated constant.
+    //
+    // Layout: the tap is col-FFT order, element [v*PATCH_ROWS + u] is bin (u,v).
+    // conj => the real parts match and the imaginary parts are opposite.
+    {
+        double max_res = 0.0, max_mag = 0.0, sum_res = 0.0;
+        int    n_bad = 0, n_pairs = 0;
+        int    worst_u = 0, worst_v = 0;
+        for (int u = 0; u < PATCH_ROWS; ++u)
+            for (int v = 0; v < PATCH_COLS; ++v) {
+                const int uu = (PATCH_ROWS - u) % PATCH_ROWS;
+                const int vv = (PATCH_COLS - v) % PATCH_COLS;
+                const int i  = v  * PATCH_ROWS + u;
+                const int j  = vv * PATCH_ROWS + uu;
+                const double re1 = fcol_out_buf[2*i],   im1 = fcol_out_buf[2*i+1];
+                const double re2 = fcol_out_buf[2*j],   im2 = fcol_out_buf[2*j+1];
+                const double res = fabs(re1 - re2) + fabs(im1 + im2);
+                const double mag = sqrt(re1*re1 + im1*im1);
+                if (mag > max_mag) max_mag = mag;
+                if (res > max_res) { max_res = res; worst_u = u; worst_v = v; }
+                if (res > 0.0) ++n_bad;
+                sum_res += res;
+                ++n_pairs;
+            }
+        printf("[aiesim] F_ch Hermitian check: max|residual| = %.0f LSB at bin "
+               "(%d,%d), mean %.3f, %d/%d bins asymmetric, max|F| = %.0f\n",
+               max_res, worst_u, worst_v, sum_res / (double)n_pairs,
+               n_bad, n_pairs, max_mag);
+        printf("[aiesim]   -> relative asymmetry %.3f%% of max|F|. Halving the "
+               "host filter is safe if this is well under the ~0.05%% that one "
+               "int16 LSB of H represents.\n",
+               max_mag > 0.0 ? 100.0 * max_res / max_mag : 0.0);
+        fflush(stdout);
+    }
+
     printf("\n=== scenario result ===\n");
     printf("  Peak:  {%d,%d} at flat index %d (r=%d, c=%d)  expected idx=%d (r=%d, c=%d)"
            "  err=%d px (tol=%d)  %s\n",
@@ -875,7 +980,12 @@ int main(int argc, char **argv)
            exp.snr_ratio_pct ? (psr_ok?"OK":"FAIL") : "n/a",
            exp.fcol_corr_pct ? (fcol_ok?"OK":"FAIL") : "n/a",
            acc0_pass?"OK":"FAIL",
-           sat_pass?"OK":"FAIL", resp_sat_pass?"OK":"FAIL", ifft_row_sat_pass?"OK":"FAIL");
+           sat_pass?"OK":"FAIL", resp_sat_pass?"OK":"FAIL",
+           // n/a, not OK, on the memtile path: the row-IFFT output is not
+           // host-visible there, so this check did not run. Printing OK for a
+           // check that never executed is the same class of lie as printing the
+           // stale buffer it used to read — see the NOT OBSERVABLE note above.
+           MEMTILE_TRANSPOSE ? "n/a" : (ifft_row_sat_pass?"OK":"FAIL"));
 
     bool pass = loc_ok && norm_ok && imag_ok && snr_ok && psr_ok && fcol_ok && acc0_pass
                 && sat_pass && resp_sat_pass && ifft_row_sat_pass;

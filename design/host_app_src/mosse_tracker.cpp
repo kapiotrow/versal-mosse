@@ -252,6 +252,7 @@ static_assert(ROW_CHUNKS == CONV_INVOCATIONS,
 // `calls` is the transaction count and `us` is total host time in async+wait.
 enum {
     DMA_WEIGHTS, DMA_FFT_ROW_OUT, DMA_FFT_COL_IN, DMA_FFT_COL_OUT, DMA_CMUL_IN,
+    DMA_ACCUM_IN,
     DMA_ACCUM_OUT, DMA_IFFT_ROW_IN, DMA_IFFT_ROW_OUT, DMA_IFFT_COL_IN,
     DMA_RESPONSE, DMA_N
 };
@@ -265,10 +266,18 @@ struct DmaStat {
 static DmaStat g_dma[DMA_N] = {
     {"gmio_weights",      0, 0.0}, {"gmio_fft_row_out",  0, 0.0},
     {"gmio_fft_col_in",   0, 0.0}, {"gmio_fft_col_out",  0, 0.0},
-    {"gmio_cmul_in",      0, 0.0}, {"gmio_accum_out",    0, 0.0},
+    {"gmio_cmul_in",      0, 0.0}, {"gmio_accum_in",     0, 0.0},
+    {"gmio_accum_out",    0, 0.0},
     {"gmio_ifft_row_in",  0, 0.0}, {"gmio_ifft_row_out", 0, 0.0},
     {"gmio_ifft_col_in",  0, 0.0}, {"gmio_response",     0, 0.0},
 };
+// The enum and this table are two ordered lists that must stay in step — the
+// same coupling the AP_* slots already guard. Adding DMA_ACCUM_IN in the middle
+// of the enum without adding it here would have silently RENAMED every port
+// after it in the report, which is the kind of plausible-looking output this
+// project has lost days to.
+static_assert(sizeof(g_dma) / sizeof(g_dma[0]) == DMA_N,
+              "g_dma name table is out of sync with the DMA_* enum");
 static DmaStat g_dma_total[DMA_N];
 
 #define DMA_T(slot, stmt) do {                                                  \
@@ -1153,6 +1162,7 @@ static void dma_report_frame(int frame)
 // which made every one of the rows*cols element reads an uncached load: measured
 // 547 us for 64 KB, i.e. 33 ns/element. The scatter is unavoidable; doing it on
 // an uncached buffer is not. Callers now bulk-copy in and out around this.
+#if !MEMTILE_TRANSPOSE   // both call sites are the DDR transpose path
 static void transpose_to(const void *src_v, void *dst_v,
                          int rows, int cols, size_t elem_bytes)
 {
@@ -1163,6 +1173,7 @@ static void transpose_to(const void *src_v, void *dst_v,
             memcpy(dst + ((size_t)c * rows + r) * elem_bytes,
                    src + ((size_t)r * cols + c) * elem_bytes, elem_bytes);
 }
+#endif  // !MEMTILE_TRANSPOSE
 
 // Peak detection used to live here as peak_detect_sw(). It is gone: it performed
 // a bit-identical |real| scan to mosse::compute_psr(..., use_abs=true) — same
@@ -1501,7 +1512,15 @@ struct Cint16Scan {
 static inline void scan_cint16_into(Cint16Scan &s, int re, int im, int i)
 {
     const int64_t m = (int64_t)re * re + (int64_t)im * im;
-    if (m > s.max_m2) { s.max_m2 = m; s.max_i = i; }
+    // TIE-BREAK ON THE LOWER INDEX, not on visit order. The scan used to be a
+    // strict `>` fed in increasing-index order, so ties resolved to the lowest
+    // index by accident of the loop. unpack_spectrum now visits in BLOCKED
+    // order, which would silently pick a different bin whenever two bins share a
+    // magnitude — an all-zero buffer is the obvious case, and it would report a
+    // different `max|.| at idx N` line from one build to the next with nothing
+    // else changed. Making the rule explicit keeps the reported index identical
+    // and makes the scan independent of traversal order for good.
+    if (m > s.max_m2 || (m == s.max_m2 && i < s.max_i)) { s.max_m2 = m; s.max_i = i; }
     // re and im are int16, so `>= 32767` IS `== 32767`. Written as the
     // inequality to keep it readable next to the widened arithmetic.
     if (re >= 32767 || re <= -32768 || im >= 32767 || im <= -32768) ++s.rails;
@@ -1669,6 +1688,10 @@ static double  g_energy[N_CHANNELS]    = {0.0};
 // Called BEFORE transpose_inplace(), while the layout is still row-major:
 // element [r][k] lives at index r*PATCH_COLS + k, so the row DC bins are at
 // stride PATCH_COLS.
+#if !MEMTILE_TRANSPOSE
+// Reads the ROW-FFT output, which does not reach the host on the memtile path —
+// measure_window_mean_fch() replaces it. Compiled out rather than left dead so
+// the build stays warning-clean and the dependency is visible in the source.
 static int32_t measure_window_mean(const int16_t *row_fft, int32_t mean_prev)
 {
     // Σw over one axis, in Q1.15 units; the 2D weight sum is its square.
@@ -1691,6 +1714,85 @@ static int32_t measure_window_mean(const int16_t *row_fft, int32_t mean_prev)
     // converges to the true window-weighted mean over a few frames.
     return mean_prev + (int32_t)llround(residual);
 }
+#endif  // !MEMTILE_TRANSPOSE
+
+// -----------------------------------------------------------------------
+// MEMTILE_TRANSPOSE: recovering Stage B1's mean and Stage B3's energy from F_ch
+// -----------------------------------------------------------------------
+// THE NON-OBVIOUS COST OF DELETING gmio_fft_row_out. measure_window_mean() and
+// the Parseval energy loop both read row_bo — the ROW-FFT output — and with the
+// transpose inside the graph that buffer stops existing on the host. Two things
+// depend on them and both are load-bearing:
+//
+//   mean_now  -> weights bytes [18:22] -> conv2d Stage B1 on the NEXT frame.
+//                Without it B1 is inert and the ch16 response rails flat
+//                (CLAUDE.md, "mean_prev seeding": F_ch 32768 railed -> 53).
+//   g_energy  -> Stage B3 in filter_quantize_q15.
+//
+// Both are recoverable from F_ch, which the host still receives on
+// gmio_fft_col_out, and at no extra DMA — it is already staged in g_stage_c.
+//
+//   MEAN. measure_window_mean sums the real part of each row's bin 0, i.e.
+//   SUM_r X_row[r][0]. The column FFT evaluated at frequency 0 IS that sum, so
+//   it lands in F_ch bin (0,0) — element 0 of the col-FFT layout — attenuated by
+//   the column pass's FFT_SHIFT and by DSPLib's ADDITIVE cint16 loss of ~21 per
+//   pass (CLAUDE.md: "the loss is additive, not a gain factor"). Undo both.
+//
+//   ENERGY. Parseval: the column DFT multiplies total energy by PATCH_ROWS and
+//   the shift divides it by 2^(2*FFT_SHIFT). Those are the SAME constants for
+//   every channel, and filter_quantize_q15 renormalises H globally to full
+//   scale, so a common factor on every g_energy[ch] cancels exactly. The factor
+//   is applied anyway, purely so the logged magnitudes stay comparable with
+//   every run recorded before this change.
+//
+// THIS IS NOT BIT-EXACT WITH THE DDR PATH, AND THAT MATTERS FOR HOW THE RUN IS
+// SCORED. The shift, the rounding and the additive loss are undone
+// approximately, so mean_now differs by a few LSB, feeds back into conv2d's B1,
+// and moves the whole datapath. **The memtile build CANNOT be accepted on the
+// bit-identical criterion that every host change since 2026-08-20 used.** Score
+// it on IoU/PSR/centre error being statistically unchanged instead, and expect
+// the frame-0 F_ch fingerprint to move. mean_now is a feedback loop by
+// construction ("even if the scale factor above is slightly off, mean_prev
+// converges over a few frames"), which is what makes the approximation safe.
+#if MEMTILE_TRANSPOSE
+// DSPLib's per-pass additive DC loss, cint16. See CLAUDE.md: row_dc =
+// PATCH_COLS*c - 21, accum0 = PATCH_ROWS*row_dc - 21.
+static constexpr int DSPLIB_DC_LOSS = 21;
+
+static int32_t measure_window_mean_fch(const int16_t *fch, int32_t mean_prev)
+{
+    int64_t sum_w = 0;
+    for (int i = 0; i < PATCH_COLS; ++i) sum_w += (int64_t)HTAB[i];
+
+    // Col-FFT layout: element [k*PATCH_ROWS + m] is bin (m,k), so bin (0,0) is
+    // element 0 and its real part is int16 index 0.
+    const int64_t dc_sum = ((int64_t)fch[0] + DSPLIB_DC_LOSS) << FFT_SHIFT_CFG;
+
+    const double sw = (double)sum_w / 32768.0;
+    if (sw <= 0.0) return mean_prev;
+    const double residual = (double)dc_sum / (sw * sw);
+    return mean_prev + (int32_t)llround(residual);
+}
+
+// Parseval, with the column pass's constants undone so the value stays on the
+// same scale as the row-FFT figure this replaces.
+static double measure_energy_fch(const int16_t *fch)
+{
+    int64_t e = 0;
+    for (size_t i = 0; i < PATCH_ELEMS; ++i)
+        e += (int64_t)fch[2*i] * fch[2*i] + (int64_t)fch[2*i+1] * fch[2*i+1];
+    const double col_gain = (double)PATCH_ROWS
+                          / (double)((int64_t)1 << (2 * FFT_SHIFT_CFG));
+    return (double)e / (double)PATCH_ELEMS / col_gain;
+}
+
+#if !B2_NULL_BINS
+#  error "MEMTILE_TRANSPOSE with B2_NULL_BINS=0 is not supported: the SUBTRACT \
+mode needs residual_mean at the accuracy of the row-FFT DC bins, and the F_ch \
+derivation above is only good to a few LSB. Use B2_NULL_BINS=1 (the default), \
+which ignores residual_mean entirely."
+#endif
+#endif  // MEMTILE_TRANSPOSE
 
 // Stage B2 — remove the residual pre-window mean from the accumulated spectrum.
 //
@@ -1745,6 +1847,16 @@ static int32_t measure_window_mean(const int16_t *row_fft, int32_t mean_prev)
 // is upstream: stop the feature map's mean from reaching the FFT at all. Note
 // gmio_fft_col_out still reports rails=5 per frame, which is that same upstream
 // DC and is NOT addressed by anything in this function.
+// Software-pipeline roi_crop: launch channel ch+1's crop immediately after ch's
+// ap_done, so the CU's PL execution overlaps the host's APU work instead of
+// being spun on. Only meaningful with MEMTILE_TRANSPOSE — on the DDR path the
+// row-FFT drain already covers the CU, which is exactly why RC_POLL read
+// 0.067 ms/frame there and 5.196 once the drain was deleted.
+#ifndef ROI_CROP_PIPELINE
+#  define ROI_CROP_PIPELINE 1
+#endif
+#define RC_PIPELINE (ROI_CROP_PIPELINE && MEMTILE_TRANSPOSE)
+
 #ifndef B2_NULL_BINS
 #  define B2_NULL_BINS 1
 #endif
@@ -1900,13 +2012,40 @@ static std::vector<mosse::cfloat> g_F_all((size_t)N_CHANNELS * PATCH_ELEMS);
 static void unpack_spectrum(const int16_t *src, mosse::cfloat *dst,
                             Cint16Scan *scan = nullptr)
 {
-    for (int k = 0; k < PATCH_COLS; ++k)
-        for (int m = 0; m < PATCH_ROWS; ++m) {
-            const size_t s = (size_t)k * PATCH_ROWS + m;
-            const int re = src[2 * s], im = src[2 * s + 1];
-            dst[(size_t)m * PATCH_COLS + k] = mosse::cfloat((float)re, (float)im);
-            if (scan) scan_cint16_into(*scan, re, im, (int)s);
-        }
+    // BLOCKED, because this is a transpose and a transpose written as two nested
+    // loops is a cache-miss generator.
+    //
+    // The source walk is contiguous (s = k*PATCH_ROWS + m, m innermost) but the
+    // destination stride is PATCH_COLS * sizeof(cfloat) = 1024 B, so the naive
+    // form issues 16384 scattered 8-byte stores, each landing on its own cache
+    // line, against a 128 KB destination that does not fit in L1 or stay in L2.
+    // It measured 181 us/call = 11 ns/element, ~2.9 ms/frame over 16 channels.
+    //
+    // With BLK = 16 the working set per tile is 16 destination rows x 128 B plus
+    // 16 source columns x 64 B — about 3 KB, comfortably L1-resident — so each
+    // cache line fetched is fully used before eviction instead of once.
+    //
+    // BLK divides both dimensions at every supported patch size (64, 128, 256),
+    // asserted rather than assumed so a future geometry cannot silently drop the
+    // tail of the spectrum.
+    constexpr int BLK = 16;
+    static_assert(PATCH_ROWS % BLK == 0 && PATCH_COLS % BLK == 0,
+                  "unpack_spectrum's block size must divide the patch dimensions");
+
+    for (int k0 = 0; k0 < PATCH_COLS; k0 += BLK)
+        for (int m0 = 0; m0 < PATCH_ROWS; m0 += BLK)
+            for (int k = k0; k < k0 + BLK; ++k) {
+                const int16_t     *sp = src + 2 * ((size_t)k * PATCH_ROWS + m0);
+                mosse::cfloat     *dp = dst + (size_t)m0 * PATCH_COLS + k;
+                for (int m = 0; m < BLK; ++m) {
+                    const int re = sp[2 * m], im = sp[2 * m + 1];
+                    dp[(size_t)m * PATCH_COLS] = mosse::cfloat((float)re, (float)im);
+                    if (scan)
+                        scan_cint16_into(*scan,
+                                         re, im,
+                                         (int)((size_t)k * PATCH_ROWS + m0 + m));
+                }
+            }
 }
 
 // Write the quantized filter into filter_bo, converting row-major back to the
@@ -2443,14 +2582,21 @@ int main(int argc, char **argv)
     // GMIO handles (names must match MOSSE_graph constructor strings exactly)
     // ------------------------------------------------------------------
     xrt::aie::buffer gm_weights     (device, uuid, "gmio_weights");
+#if CMUL_SPLIT_ACCUM
+    xrt::aie::buffer gm_accum_in    (device, uuid, "gmio_accum_in");
+#endif
+#if !MEMTILE_TRANSPOSE
     xrt::aie::buffer gm_fft_row_out (device, uuid, "gmio_fft_row_out");
     xrt::aie::buffer gm_fft_col_in  (device, uuid, "gmio_fft_col_in");
+#endif
     xrt::aie::buffer gm_fft_col_out (device, uuid, "gmio_fft_col_out");
     xrt::aie::buffer gm_cmul_in     (device, uuid, "gmio_cmul_in");
     xrt::aie::buffer gm_accum_out   (device, uuid, "gmio_accum_out");
     xrt::aie::buffer gm_ifft_row_in (device, uuid, "gmio_ifft_row_in");
+#if !MEMTILE_TRANSPOSE
     xrt::aie::buffer gm_ifft_row_out(device, uuid, "gmio_ifft_row_out");
     xrt::aie::buffer gm_ifft_col_in (device, uuid, "gmio_ifft_col_in");
+#endif
     xrt::aie::buffer gm_response    (device, uuid, "gmio_response");
 
     // ------------------------------------------------------------------
@@ -3142,6 +3288,40 @@ int main(int argc, char **argv)
         // accumulated spectrum after the loop.
         double residual_mean[N_CHANNELS] = {0.0};
 
+        // ---- roi_crop launch, hoisted so it can be issued a channel ahead ----
+        //
+        // Sets this channel's geometry, starts the CU, and feeds the weights the
+        // resulting patch needs. The weights feed lives HERE and not at the call
+        // site because the ordering between the two is load-bearing: conv2d
+        // consumes one weights buffer per firing and a firing cannot complete
+        // until it has read its share of the PatchIn stream, so sending
+        // CONV_INVOCATIONS of them with blocking waits BEFORE starting the crop
+        // deadlocks on the second — the host waits for the AIE to free a buffer,
+        // the AIE waits for patch data nobody has sent. Keeping start and feed in
+        // one function makes that order impossible to get wrong from outside.
+#if RC_PIPELINE
+        auto crop_launch = [&](int c) {
+            RC_T(RC_ARGS, crop_set_args((uint32_t)roi_row, (uint32_t)roi_col,
+                                        (uint32_t)roi.roi_h, (uint32_t)roi.roi_w,
+                                        c));
+            rc_tl_begin();
+            RC_T(RC_START, crop_start());
+            rc_tl_mark(TL_START);
+            for (int k = 0; k < CONV_INVOCATIONS; ++k) {
+                DMA_TX(DMA_WEIGHTS,
+                    gm_weights.async(weights_bo, XCL_BO_SYNC_BO_GMIO_TO_AIE,
+                                     WEIGHT_CH_BYTES, c * WEIGHT_CH_BYTES));
+                DMA_T(DMA_WEIGHTS, gm_weights.wait());
+            }
+        };
+
+        // PRIME THE PIPELINE. Channel 0's crop is launched before the loop; from
+        // then on each iteration launches ch+1 immediately after retiring ch, so
+        // roi_crop's PL execution runs concurrently with the host's APU work for
+        // the channel that just finished.
+        crop_launch(0);
+#endif
+
         for (int ch = 0; ch < N_CHANNELS; ++ch) {
 
             VP2("[ch %d] START\n", ch);
@@ -3195,28 +3375,21 @@ int main(int argc, char **argv)
             // frame_buf / frame_rows / frame_cols / patch_rows / patch_cols are
             // already set and never change; only the ROI geometry (per frame) and
             // recompute (per channel) are re-set here.
+#if !RC_PIPELINE
             RC_T(RC_ARGS, crop_set_args((uint32_t)roi_row, (uint32_t)roi_col,
                                         (uint32_t)roi.roi_h, (uint32_t)roi.roi_w,
                                         ch));
-            // Timeline zero. Everything the drain-anchored verdict rests on is
-            // measured from here — see rc_tl_begin().
             rc_tl_begin();
             RC_T(RC_START, crop_start());
             rc_tl_mark(TL_START);
-
-            // Feed one weight buffer per conv2d firing AND drain one row-FFT
-            // window per firing, in the same loop.
-            //
-            // These MUST interleave. Draining after the weights loop deadlocks
-            // (fft_rows fills its one armed output window, blocks conv2d, and the
-            // weights queue freezes — the observed 6-of-64 stall). Draining before
-            // it deadlocks the other way, waiting on data conv2d has not been fed.
-            // The two counts are equal by construction (static_assert above), so
-            // one loop serves both.
-            // Depth `dd` firings are issued before either port is waited on.
-            // dd == 1 is byte-for-byte the historical loop. gmio::wait() drains
-            // ALL outstanding transfers on its port, so the barrier count is
-            // CONV_INVOCATIONS/dd — which is exactly the quantity under test.
+#if MEMTILE_TRANSPOSE
+            for (int k = 0; k < CONV_INVOCATIONS; ++k) {
+                DMA_TX(DMA_WEIGHTS,
+                    gm_weights.async(weights_bo, XCL_BO_SYNC_BO_GMIO_TO_AIE,
+                                     WEIGHT_CH_BYTES, ch * WEIGHT_CH_BYTES));
+                DMA_T(DMA_WEIGHTS, gm_weights.wait());
+            }
+#else
             const int dd = drain_depth_for_frame(frame);
             for (int k0 = 0; k0 < CONV_INVOCATIONS; k0 += dd) {
                 const int kn = (k0 + dd < CONV_INVOCATIONS) ? k0 + dd
@@ -3235,6 +3408,8 @@ int main(int argc, char **argv)
                 DMA_T(DMA_WEIGHTS,     gm_weights.wait());
                 DMA_T(DMA_FFT_ROW_OUT, gm_fft_row_out.wait());
             }
+#endif
+#endif  // !RC_PIPELINE — pipelined builds launched this channel last iteration
             // Marked BEFORE the printf: this line is ~50 chars, i.e. ~4 ms of
             // console at 115200 baud, and it sits between the drain and the poll.
             // 4 ms against a 500 ms gap changes no conclusion, but it would be
@@ -3265,12 +3440,38 @@ int main(int argc, char **argv)
             VP2("[ch %d] roi_crop done\n", ch);
             VP2("[ch %d] fft_row_out received\n", ch);
 
+#if RC_PIPELINE
+            // LAUNCH THE NEXT CHANNEL HERE — as early as the CU allows.
+            //
+            // roi_crop is a single user-managed CU, so ch+1 cannot start until
+            // ch's ap_done, which the poll above just confirmed. Everything below
+            // in this iteration — the cmul feed, the col-FFT and accumulator
+            // drains, and ~0.4 ms/channel of APU work — now runs while ch+1's
+            // crop executes in the PL.
+            //
+            // WHY THIS IS WORTH 5 ms. roi_crop's own execution was never free; it
+            // was hidden behind the row-FFT drain, and CLAUDE.md said so in
+            // advance: "the CU finishes inside the drain loop. If the drain ever
+            // shrinks the spin will start spinning for real." The memtile deleted
+            // that drain outright and the spin duly started spinning — RC_POLL
+            // went 0.067 -> 5.196 ms/frame, 325 us/channel. This puts the CU back
+            // under cover, without the DDR round trip that used to provide it.
+            //
+            // Ordering safety: conv2d cannot run ahead of the memtile's
+            // ping-pong, so the graph self-limits to ONE channel of lookahead —
+            // fft_rows(ch+1) fills the second buffer while fft_cols(ch) drains
+            // the first, and fft_rows(ch+2) blocks until the first is free. The
+            // host cannot outrun that even if it wanted to.
+            if (ch + 1 < N_CHANNELS) crop_launch(ch + 1);
+#endif
+
             // Stage B: measure this channel's window-weighted feature mean and
             // spectral energy BEFORE transposing, while the row-major layout
             // still puts each row's DC bin at stride PATCH_COLS.
             // ONE bulk read of row_bo, then mean, energy AND the transpose all
             // run on the heap copy — three passes that used to pay the uncached
             // load individually.
+#if !MEMTILE_TRANSPOSE
             AP_T(AP_BO_STAGE,
                  memcpy(g_stage_a.data(), row_bo.map<void *>(), FFT_BYTES));
             {
@@ -3310,7 +3511,35 @@ int main(int argc, char **argv)
             AP_T(AP_BO_STAGE,
                  memcpy(row_bo.map<void *>(), g_stage_b.data(), FFT_BYTES));
             VP2("[ch %d] transpose done\n", ch);
+#endif  // !MEMTILE_TRANSPOSE — no row-FFT output on the host, nothing to
+        // transpose, and Stage B1's mean / Stage B3's energy move to the F_ch
+        // block further down.
 
+#if CMUL_SPLIT_ACCUM
+            // NO PACKING. accum_prev has its own port, so H comes straight from
+            // filter_bo and the running sum straight from accum_bo — the 2 MB of
+            // BO->BO memcpy that `cmul packing` measured (2.871 ms/frame, which
+            // is exactly 2 MB at the probe's 696 MB/s uncached BO read rate) is
+            // simply not performed.
+            //
+            // IN-PLACE ON accum_bo IS SAFE, and it is worth saying why rather
+            // than discovering it. cmul reads chunk c of accum_bo and later
+            // writes chunk c of accum_bo; chunks are distinct addresses and the
+            // read of chunk c always precedes the write of chunk c, so whichever
+            // order the two DMAs interleave, no chunk is read after it has been
+            // updated this channel. A separate double buffer would reintroduce
+            // the copy this change exists to remove.
+            //
+            // ch0 must see a ZERO accumulator — the packed path memset the accum
+            // half for ch0 and this replaces that.
+            if (ch == 0) {
+                const auto _cp0 = std::chrono::steady_clock::now();
+                memset(accum_bo.map<void *>(), 0, ACCUM_BYTES);
+                g_ap_us[AP_CMUL_PACK] += std::chrono::duration<double, std::micro>(
+                    std::chrono::steady_clock::now() - _cp0).count();
+                ++g_ap_n[AP_CMUL_PACK];
+            }
+#else
             // Pack [filter_chunk_c | accum_chunk_c] into cmul_bo for all chunks.
             // For ch=0 the accum half is zeroed; for ch>0 it carries the running sum.
             {
@@ -3334,12 +3563,24 @@ int main(int argc, char **argv)
                     std::chrono::steady_clock::now() - _cp0).count();
                 ++g_ap_n[AP_CMUL_PACK];
             }
+#endif  // CMUL_SPLIT_ACCUM
 
             // Feed transposed data to col-FFT + combined [filter|accum] to cmul_accum
+#if !MEMTILE_TRANSPOSE
             DMA_TX(DMA_FFT_COL_IN,
                 gm_fft_col_in.async(row_bo, XCL_BO_SYNC_BO_GMIO_TO_AIE, FFT_BYTES, 0));
+#endif
+#if CMUL_SPLIT_ACCUM
+            DMA_TX(DMA_CMUL_IN,
+                gm_cmul_in.async(filter_bo, XCL_BO_SYNC_BO_GMIO_TO_AIE,
+                                 FFT_BYTES, (size_t)ch * FFT_BYTES));
+            DMA_TX(DMA_ACCUM_IN,
+                gm_accum_in.async(accum_bo, XCL_BO_SYNC_BO_GMIO_TO_AIE,
+                                  ACCUM_BYTES, 0));
+#else
             DMA_TX(DMA_CMUL_IN,
                 gm_cmul_in.async(cmul_bo, XCL_BO_SYNC_BO_GMIO_TO_AIE, CMUL_IN_BYTES, 0));
+#endif
 
             // Drain the accumulator WHILE the inputs are still in flight.
             //
@@ -3354,6 +3595,42 @@ int main(int argc, char **argv)
             // It must be armed here for the same reason accum_out is — an
             // un-drained output window stalls the col FFT, which stalls the input
             // DMAs we would otherwise be waiting on.
+#if CMUL_ACCUM_MEMTILE
+            // THE ACCUMULATOR IS NO LONGER DRAINED PER CHUNK. memTileAcc buffers
+            // the whole channel's accumulator on-chip, so one transfer of
+            // ACCUM_BYTES replaces COL_CHUNKS of COL_CHUNK_BYTES: 256 tx/frame
+            // becomes 16. gmio_accum_out's cost is per-transaction, not per-byte
+            // — 14.4 us for 64 B against 22.8 us for 128 KB on the DMA probe — so
+            // this is the whole ~4 ms.
+            //
+            // THE DEADLOCK THE OLD LOOP AVOIDED IS GONE WITH IT, and this is the
+            // load-bearing half of the argument. The comment above says draining
+            // must not be sequenced after the input waits, because cmul stalls on
+            // a full OUTPUT WINDOW, which stalls the col FFT, which stalls the
+            // input DMAs. cmul's output window now drains into the memory tile at
+            // AIE speed rather than waiting on a host-driven DDR transfer, so it
+            // cannot be the thing that blocks: the memtile holds a full channel
+            // (64 KB) and ping-pongs, so channel k's drain to DDR overlaps
+            // channel k+1's accumulation.
+            //
+            // The F_ch tap still drains per chunk — it is fed directly by the col
+            // FFT, not through the tile, and its window granularity is unchanged.
+            // Decoupling the two is the entire point: FFT_COL_WS used to move
+            // them together, and at WS=32 the accumulator WON (4.42 -> 1.25 ms)
+            // while the tap lost catastrophically (4.57 -> 17.07).
+            DMA_TX(DMA_ACCUM_OUT,
+                gm_accum_out.async(accum_bo, XCL_BO_SYNC_BO_AIE_TO_GMIO,
+                                   ACCUM_BYTES, 0));
+            for (int k = 0; k < COL_CHUNKS; ++k) {
+                DMA_TX(DMA_FFT_COL_OUT,
+                    gm_fft_col_out.async(fcol_bo, XCL_BO_SYNC_BO_AIE_TO_GMIO,
+                                         COL_CHUNK_BYTES, k * COL_CHUNK_BYTES));
+                DMA_T(DMA_FFT_COL_OUT, gm_fft_col_out.wait());
+            }
+            DMA_T(DMA_ACCUM_OUT, gm_accum_out.wait());
+            VP2("[ch %d] accum_out (1 x %zu B) + F_ch (%d x %zu B) received\n",
+                ch, ACCUM_BYTES, COL_CHUNKS, COL_CHUNK_BYTES);
+#else
             for (int k = 0; k < COL_CHUNKS; ++k) {
                 DMA_TX(DMA_ACCUM_OUT,
                     gm_accum_out.async(accum_bo, XCL_BO_SYNC_BO_AIE_TO_GMIO,
@@ -3366,6 +3643,7 @@ int main(int argc, char **argv)
             }
             VP2("[ch %d] accum_out + F_ch received (%d x %zu B)\n",
                 ch, COL_CHUNKS, COL_CHUNK_BYTES);
+#endif
 
             // Stash this channel's spectrum for the filter update after the loop.
             // Converted out of the col-FFT layout here so all the filter maths
@@ -3388,14 +3666,45 @@ int main(int argc, char **argv)
                  unpack_spectrum((const int16_t *)g_stage_c.data(),
                                  g_F_all.data() + (size_t)ch * PATCH_ELEMS,
                                  ch == 0 ? &fch_scan : nullptr));
+
+#if MEMTILE_TRANSPOSE
+            // Stage B1's mean and Stage B3's energy, derived from F_ch because
+            // the row-FFT output no longer reaches the host. See the derivation
+            // above measure_window_mean_fch(). Same slot as before so the
+            // CUMULATIVE table stays comparable — it is the same work on a
+            // different buffer, and it reads g_stage_c, which the unpack just
+            // brought onto the heap, so it costs no DMA.
+            {
+                const int16_t *fc = (const int16_t *)g_stage_c.data();
+                const auto _wm0 = std::chrono::steady_clock::now();
+                const int32_t mean_now = measure_window_mean_fch(fc, g_mean_prev[ch]);
+                residual_mean[ch] = (double)(mean_now - g_mean_prev[ch]);
+                g_mean_prev[ch]   = mean_now;
+                g_energy[ch]      = measure_energy_fch(fc);
+
+                // Feed mean_now back as the NEXT frame's mean_prev (bytes 18:22).
+                // weights_bo is synced once after the channel loop, unchanged.
+                uint8_t *wb = weights_bo.map<uint8_t *>() + ch * WEIGHT_CH_BYTES;
+                memcpy(wb + 18, &mean_now, sizeof(int32_t));
+
+                g_ap_us[AP_WINMEAN] += std::chrono::duration<double, std::micro>(
+                    std::chrono::steady_clock::now() - _wm0).count();
+                ++g_ap_n[AP_WINMEAN];
+            }
+#endif
             if (ch == 0) {
                 report_cint16_scan("F_ch", fch_scan, PATCH_COLS, "colFFT");
                 dump_buffer("F_ch", frame, g_stage_c.data(), FFT_BYTES);
             }
 
+#if !MEMTILE_TRANSPOSE
             DMA_T(DMA_FFT_COL_IN, gm_fft_col_in.wait());
+#endif
             VP2("[ch %d] fft_col_in sent\n", ch);
             DMA_T(DMA_CMUL_IN, gm_cmul_in.wait());
+#if CMUL_SPLIT_ACCUM
+            DMA_T(DMA_ACCUM_IN, gm_accum_in.wait());
+#endif
             VP2("[ch %d] cmul_in sent\n", ch);
         }
 
@@ -3433,15 +3742,18 @@ int main(int argc, char **argv)
             gm_ifft_row_in.async(accum_bo, XCL_BO_SYNC_BO_GMIO_TO_AIE, ACCUM_BYTES, 0));
         // Drain per invocation, and before waiting on the input — see the
         // accum_out loop above for why the input wait cannot come first.
+#if !MEMTILE_TRANSPOSE
         for (int k = 0; k < ROW_CHUNKS; ++k) {
             DMA_TX(DMA_IFFT_ROW_OUT,
                 gm_ifft_row_out.async(row_bo, XCL_BO_SYNC_BO_AIE_TO_GMIO,
                                       ROW_CHUNK_BYTES, k * ROW_CHUNK_BYTES));
             DMA_T(DMA_IFFT_ROW_OUT, gm_ifft_row_out.wait());
         }
+#endif
         DMA_T(DMA_IFFT_ROW_IN, gm_ifft_row_in.wait());
         VP2("[ifft] rows done (%d x %zu B)\n", ROW_CHUNKS, ROW_CHUNK_BYTES);
 
+#if !MEMTILE_TRANSPOSE
         // APU: transpose IFFT row output in-place
         AP_T(AP_BO_STAGE,
              memcpy(g_stage_a.data(), row_bo.map<void *>(), FFT_BYTES));
@@ -3454,13 +3766,16 @@ int main(int argc, char **argv)
 
         DMA_TX(DMA_IFFT_COL_IN,
             gm_ifft_col_in.async(row_bo, XCL_BO_SYNC_BO_GMIO_TO_AIE, FFT_BYTES, 0));
+#endif
         for (int k = 0; k < COL_CHUNKS; ++k) {
             DMA_TX(DMA_RESPONSE,
                 gm_response.async(resp_bo, XCL_BO_SYNC_BO_AIE_TO_GMIO,
                                   COL_CHUNK_BYTES, k * COL_CHUNK_BYTES));
             DMA_T(DMA_RESPONSE, gm_response.wait());
         }
+#if !MEMTILE_TRANSPOSE
         DMA_T(DMA_IFFT_COL_IN, gm_ifft_col_in.wait());
+#endif
         VP2("[ifft] cols done → response received (%d x %zu B)\n",
             COL_CHUNKS, COL_CHUNK_BYTES);
 
@@ -3879,6 +4194,9 @@ int main(int argc, char **argv)
                        resp00_over_peak);
             // Printed at EVERY verbosity while the sweep is armed: if a deep
             // queue deadlocks, this is the record of which depths already worked.
+#if !MEMTILE_TRANSPOSE
+            // The sweep instruments gmio_fft_row_out, which no longer exists on
+            // the memtile path; it would print a row of zeros every frame.
             if (FFT_DRAIN_DEPTH == 0)
                 printf("  [drain] frame %d depth %d: gmio_fft_row_out %.2f ms "
                        "(%lu tx), weights %.2f ms\n",
@@ -3886,6 +4204,7 @@ int main(int argc, char **argv)
                        g_dma[DMA_FFT_ROW_OUT].us / 1000.0,
                        g_dma[DMA_FFT_ROW_OUT].calls,
                        g_dma[DMA_WEIGHTS].us / 1000.0);
+#endif
         }
         fflush(stdout);
 

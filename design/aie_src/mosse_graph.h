@@ -58,6 +58,13 @@
 
 using namespace adf;
 
+// Regroup cmul's accumulator output through a memory tile so the host can drain
+// a whole channel in ONE transfer instead of one per chunk. Off by default; the
+// DDR-per-chunk path is what every run before 2026-08-21 used.
+#ifndef CMUL_ACCUM_MEMTILE
+#  define CMUL_ACCUM_MEMTILE 0
+#endif
+
 class MOSSE_graph : public graph
 {
 public:
@@ -88,6 +95,8 @@ public:
 
     // cmul_accum combined input and output (shared serially)
     input_gmio  gmio_cmul_in;       // [H_ch* | prev_Σ] packed per chunk ← DDR (APU writes)
+                                    //   H_ch* ALONE when CMUL_SPLIT_ACCUM
+    input_gmio  gmio_accum_in;      // prev_Σ, its own port when CMUL_SPLIT_ACCUM
     output_gmio gmio_accum_out;     // updated partial sum → DDR
 
     // IFFT input: APU writes accumulated spectrum after all channels
@@ -112,6 +121,14 @@ public:
     kernel conv2d;
     kernel cmul;
 
+#if CMUL_ACCUM_MEMTILE
+    // Regrouping buffer for the accumulator output — see the connect below.
+    // PATCH_ROWS*PATCH_COLS cint16 = 64 KB, 128 KB with the ping-pong, against a 512 KB
+    // AIE-ML memory tile. num_buffers = 2 so channel k's drain to DDR can overlap
+    // channel k+1's accumulation.
+    adf::shared_buffer<FFT_2D_TT_DATA> memTileAcc;
+#endif
+
     MOSSE_graph()
     {
         // --- PLIO ---
@@ -122,15 +139,35 @@ public:
 
         // --- GMIO (burst_length = 64 bytes, bandwidth = 1000 MB/s estimate) ---
         gmio_weights     = input_gmio::create("gmio_weights",      64, 1000);
+#if !MEMTILE_TRANSPOSE
         gmio_fft_row_out = output_gmio::create("gmio_fft_row_out", 64, 1000);
         gmio_fft_col_in  = input_gmio::create("gmio_fft_col_in",   64, 1000);
+#endif
         gmio_fft_col_out = output_gmio::create("gmio_fft_col_out", 64, 1000);
         gmio_cmul_in     = input_gmio::create("gmio_cmul_in",       64, 1000);
+#if CMUL_SPLIT_ACCUM
+        gmio_accum_in    = input_gmio::create("gmio_accum_in",      64, 1000);
+#endif
         gmio_accum_out   = output_gmio::create("gmio_accum_out",   64, 1000);
         gmio_ifft_row_in = input_gmio::create("gmio_ifft_row_in",  64, 1000);
+#if !MEMTILE_TRANSPOSE
         gmio_ifft_row_out= output_gmio::create("gmio_ifft_row_out",64, 1000);
         gmio_ifft_col_in = input_gmio::create("gmio_ifft_col_in",  64, 1000);
+#endif
         gmio_response    = output_gmio::create("gmio_response",    64, 1000);
+
+#if CMUL_ACCUM_MEMTILE
+        memTileAcc = adf::shared_buffer<FFT_2D_TT_DATA>::create({PATCH_ROWS * PATCH_COLS}, 1, 1);
+        adf::num_buffers(memTileAcc) = 2;
+        adf::write_access(memTileAcc.in[0]) = adf::tiling({
+            .buffer_dimension = {PATCH_ROWS * PATCH_COLS},
+            .tiling_dimension = {PATCH_ROWS * PATCH_COLS},
+            .offset           = {0}});
+        adf::read_access(memTileAcc.out[0]) = adf::tiling({
+            .buffer_dimension = {PATCH_ROWS * PATCH_COLS},
+            .tiling_dimension = {PATCH_ROWS * PATCH_COLS},
+            .offset           = {0}});
+#endif
 
         // --- Custom kernel instantiation ---
         conv2d = kernel::create(conv2d_kernel);
@@ -158,11 +195,13 @@ public:
         adf::connect<>(conv2d.out[0], fft2d.fft_row_in);
         adf::dimensions(conv2d.out[0]) = {CONV_OUT_CHUNK};
 
+#if !MEMTILE_TRANSPOSE
         // fft2d row-FFT output → GMIO (DDR, APU reads and transposes)
         adf::connect<>(fft2d.fft_row_out, gmio_fft_row_out.in[0]);
 
         // GMIO (APU-transposed) → fft2d col-FFT input
         adf::connect<>(gmio_fft_col_in.out[0], fft2d.fft_col_in);
+#endif
 
         // fft2d col-FFT output → cmul.in[0] (fft_col_in, acquired 1st — must be first)
         // fft_col_out is a tile-to-tile window port; its lock is set by the col-FFT tile
@@ -193,22 +232,68 @@ public:
         // the Makefile before diagnosing one.
         adf::connect<>(fft2d.fft_col_out, gmio_fft_col_out.in[0]);
 
+#if CMUL_SPLIT_ACCUM
+        // gmio_cmul_in → cmul.in[1] (H only), gmio_accum_in → cmul.in[2] (prev_Σ).
+        // Splitting them deletes the host's 2 MB/frame packing memcpy, which the
+        // startup probe shows IS an uncached BO read: 2.871 ms measured against
+        // 3.01 predicted at 696 MB/s. Same bytes on the wire, one fewer touch of
+        // them. See cmul_accum_kernel.h for why the packed form existed at all.
+        adf::connect<>(gmio_cmul_in.out[0], cmul.in[1]);
+        adf::dimensions(cmul.in[1]) = {PATCH_COLS * FFT_COL_WS};
+        adf::connect<>(gmio_accum_in.out[0], cmul.in[2]);
+        adf::dimensions(cmul.in[2]) = {PATCH_COLS * FFT_COL_WS};
+#else
         // gmio_cmul_in → cmul.in[1] ([filter | accum_prev] packed; single GMIO lock)
         adf::connect<>(gmio_cmul_in.out[0], cmul.in[1]);
         adf::dimensions(cmul.in[1]) = {2 * PATCH_COLS * FFT_COL_WS};
+#endif
 
+#if CMUL_ACCUM_MEMTILE
+        // cmul output → memory tile → gmio_accum_out (DDR)
+        //
+        // WHY. gmio_accum_out is 256 tx/frame (16 chunks x 16 channels) at
+        // ~16.8 us each = 4.31 ms, the largest single GMIO item. Its cost is
+        // per-TRANSACTION, not per-byte: the DMA probe measured 14.4 us for 64
+        // bytes and 22.8 us for 128 KB. Buffering a whole channel's accumulator
+        // on-tile lets the host drain it in ONE transfer per channel instead of
+        // 16 — 256 tx -> 16 tx, ~4.31 -> ~0.3 ms.
+        //
+        // THIS IS THE FEED-FORWARD PATTERN, NOT THE READ-MODIFY-WRITE ONE. The
+        // accumulator's *state* still round-trips through DDR on gmio_accum_in;
+        // what moves on-tile is only the OUTPUT REGROUPING. That is why this is a
+        // plain producer->consumer shared_buffer and needs no cycle and no
+        // 16-deep delay line — see the accumulator entry in CLAUDE.md for why the
+        // full on-tile accumulator does.
+        //
+        // Whole-buffer tiling on both sides, exactly as memTileFwd does: the
+        // producer writes it in CMUL_N-sized pieces (16 firings) and the consumer
+        // takes the plane in one go. memTileFwd already proved a chunked producer
+        // write against a whole-buffer access pattern.
+        //
+        // It also DECOUPLES the accumulator from gmio_fft_col_out, which is the
+        // whole point. Both were drained at the col-FFT's window granularity, so
+        // FFT_COL_WS moved them together — and at WS=32 accum_out WON
+        // (4.42 -> 1.25) while fft_col_out lost catastrophically
+        // (4.57 -> 17.07), which is what made that knob a net loss.
+        adf::connect<>(cmul.out[0], memTileAcc.in[0]);
+        adf::dimensions(cmul.out[0]) = {PATCH_COLS * FFT_COL_WS};
+        adf::connect<>(memTileAcc.out[0], gmio_accum_out.in[0]);
+#else
         // cmul output → gmio_accum_out (DDR)
         adf::connect<>(cmul.out[0], gmio_accum_out.in[0]);
         adf::dimensions(cmul.out[0]) = {PATCH_COLS * FFT_COL_WS};
+#endif
 
         // IFFT: APU reads gmio_accum_out, writes accumulated spectrum to gmio_ifft_row_in
         adf::connect<>(gmio_ifft_row_in.out[0],  ifft2d.ifft_row_in);
 
+#if !MEMTILE_TRANSPOSE
         // ifft2d row-IFFT output → GMIO (APU reads and transposes)
         adf::connect<>(ifft2d.ifft_row_out, gmio_ifft_row_out.in[0]);
 
         // GMIO (APU-transposed) → ifft2d col-IFFT input
         adf::connect<>(gmio_ifft_col_in.out[0], ifft2d.ifft_col_in);
+#endif
 
         // ifft2d col-IFFT output → gmio_response (APU reads for peak detection)
         adf::connect<>(ifft2d.ifft_col_out, gmio_response.in[0]);

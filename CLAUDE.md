@@ -245,7 +245,7 @@ orchestration, never core count. **`runtime<ratio>` is not utilization**: the ma
 | **total** | **~6.4** | from ~21.6 before vectorization |
 
 These are the compiler's scheduled cycles — real cycles on an in-order VLIW core absent memory
-stalls, trustworthy for sizing but not a profile. Tile map: `15_0` conv2d, `24_0` cmul_accum,
+stalls, trustworthy for sizing but not a profile. Tile map: `15_0` conv2d, `24_1` cmul_accum (spanning `24_0`..`24_2` since `FFT_COL_WS=32`),
 `15_1`/`29_0` forward FFT, `14_0`/`22_0` IFFT.
 
 ### Frame time — 177 ms/frame, 5.65 FPS, and it is now COMPUTE (2026-08-20)
@@ -495,7 +495,17 @@ scripts/  export_weights.py, gen_aiesim_vectors.py, gen_filter_golden.py,
 
 ## Current status (2026-08-21)
 
-**Latest hardware: `runs/run_0821_1109.log`, 45.60 ms/frame ≈ 21.9 FPS**, APU 23.37 ms (51.3%)
+**Best hardware to date: `runs/run_0821_1635.log`, 28.64 ms/frame = 34.92 FPS** — adds the
+blocked `unpack_spectrum` to the config below. `unpack F_ch` 2.902 → 1.780 ms, tracking
+bit-identical, GMIO unchanged (11.093 → 11.142) as the control.
+**The day: 62.71 → 28.64 ms, 15.95 → 34.92 FPS — 2.19×.**
+
+*(previous:)* **`runs/run_0821_1452.log`, 29.61 ms/frame = 33.77 FPS** — memory-tile
+transposes + software-pipelined roi_crop + split cmul ports (`MEMTILE_TRANSPOSE=1
+ROI_CROP_PIPELINE=1 CMUL_SPLIT_ACCUM=1`). Tracking unchanged throughout: mean IoU 0.9188,
+worst 0.8353, centre 1.37/3.52 px, PSR 25.75/83.75/127.08.
+APU 16.33 ms (55.2%), GMIO 11.09 (37.5%), roi_crop 1.02 (3.4%).
+**The day: 62.71 → 29.61 ms, 15.95 → 33.77 FPS — 2.12×, with tracking never once regressing.**, APU 23.37 ms (51.3%)
 against GMIO 20.98 ms (46.0%), tracking mean IoU 0.9188 / worst 0.8353 / centre 1.37 px,
 rails 0, no gate or scale holds. APU and GMIO are now within 2.4 ms of each other, so
 **neither one alone is worth more than ~2×** — see "Result 2026-08-21" and the next-steps
@@ -662,6 +672,357 @@ ruled out). Trust the ORDERING; do not quote the sim's absolute magnitudes as th
 for **3.9× the scale-filter cost** — not worth it. ~8-10% box error is the practical floor of
 this filter as configured; the next real gain would be a different scale estimator, not a tune.
 
+### Blocked `unpack_spectrum` — ON HARDWARE: 29.61 → 28.64 ms, 33.77 → 34.92 FPS
+
+`runs/run_0821_1635.log`, wall 28.54 vs instrument 28.64. **Tracking bit-identical to
+`run_0821_1452`**, which a pure loop reordering must be — and was proven byte-identical offline
+first, on random, all-zero, single-spike and tie-heavy inputs.
+
+| | `run_0821_1452` | **`run_0821_1635`** |
+|---|---|---|
+| `unpack F_ch` | 2.902 (181.3 µs/call) | **1.780 (111.3 µs/call)** |
+| APU | 16.328 | **15.307** |
+| GMIO (control) | 11.093 | 11.142 |
+| frame | 29.61 | **28.64** |
+
+**x86 said 4.66×; the A72 gave 1.63×, and the prediction band was still too optimistic.** I
+predicted 1.4-2.2 ms and got 1.12 — under by 20%. The caution was right in direction (do not
+transfer a cache-boundary result between these machines) and still under-called the gap.
+
+**AND THE REMAINING 1.78 ms IS PROBABLY NOT MEMORY ANY MORE.** 111.3 µs / 16384 elements =
+6.8 ns/element ≈ **9.5 cycles at 1.4 GHz**, for two int16 loads, two int→float converts and one
+8-byte store. That is in the range of the arithmetic itself, not of cache misses — the naive
+form's 11 ns/element had roughly 4 ns of miss penalty in it and blocking removed that. **Further
+blocking will not help**; the next lever on this slot would be NEON-vectorising the int16→float
+conversion (`SSHLL` + `SCVTF`, 4-8 elements at a time), worth maybe 1 ms, and it is the only
+remaining idea for it.
+
+### `CMUL_ACCUM_MEMTILE` IS A NET LOSS — 29.61 → 29.97 ms. REVERTED. (2026-08-21)
+
+`runs/run_0821_1531.log`. **The change did exactly what it was designed to do and saved
+nothing.** Tracking bit-identical to `run_0821_1452`, so this is purely a cost result.
+
+| | `run_0821_1452` | `run_0821_1531` |
+|---|---|---|
+| `gmio_accum_out` tx/frame | 256 | **16** ✅ as designed |
+| `gmio_accum_out` µs/tx | 16.83 | **280.62** |
+| `gmio_accum_out` ms/frame | 4.310 | **4.490** |
+| `gmio_fft_col_out` (control) | 4.355 | 4.550 |
+| **pair total** | **8.665** | **9.039** |
+| frame | 29.61 | **29.97** |
+
+**16× FEWER TRANSACTIONS CHANGED THE COST BY NOTHING. That retires a whole class of ideas about
+this port.** `gmio_accum_out`'s 4.31 ms was never per-barrier overhead — it is the host waiting
+for the AIE to PRODUCE the accumulator. The pair `fft_col_out + accum_out` ≈ 8.7 ms *is* the
+col-FFT + cmul pipeline's production time for 16 channels, and no regrouping, windowing or
+transaction-count change can touch it. The extra 0.37 ms is the memtile hop the data now takes
+on its way to DDR.
+
+**THE PREMISE WAS A NUMBER THIS FILE ALREADY WARNED AGAINST USING, AND I USED IT ANYWAY.** The
+item was justified by "at `FFT_COL_WS=32` `gmio_accum_out` WON (4.42 → 1.25)". But the WS=32
+entry three sections down says, in bold: *"IT IS NOT ATTRIBUTION SHUFFLING BETWEEN THE TWO
+SIBLINGS... The pair total refutes that: 9.00 → 18.32."* At WS=32 the accumulator looked cheap
+only because `fft_col_out` — waited FIRST in the interleaved loop — had absorbed the production
+wait. The single-port number was an artifact of wait ordering, exactly as recorded, and it was
+still taken as evidence that the port had per-barrier cost to recover.
+
+**THE RULE, NOW STATED AS A RULE: NEVER SIZE A CHANGE FROM ONE MEMBER OF AN INTERLEAVED
+async/wait GROUP. SUM THE GROUP.** The same effect has now appeared four times — `gmio_fft_row_out`
+absorbing the weights feed, the `fft_col_out`/`accum_out` pair under `FFT_COL_WS`,
+`gmio_cmul_in` absorbing both inputs after the port split, and here. Three of those are recorded
+above. It is the single most repeated measurement error in this design.
+
+**What the negative result buys.** The ~8.7 ms pair is AIE production, so the only lever left on
+it is overlap, not transfer efficiency — software-pipeline the CHANNEL loop the way `roi_crop`
+was pipelined, so channel k's drain overlaps channel k−1's ~0.4 ms of APU work. The memtile
+ping-pong already permits one channel of lookahead in the graph; it is the host that serialises.
+That is the same manoeuvre that turned 5.196 ms into 1.020 on `roi_crop`.
+
+**Reverted**: `CMUL_ACCUM_MEMTILE ?= 0`, with the measurement recorded at the variable. The
+graph code stays behind the flag — it is correct, it simply does not pay.
+
+### Accumulator: the ON-TILE version needs a DELAY LINE### Accumulator: the ON-TILE version needs a DELAY LINE, not a shared_buffer — split ports done instead (2026-08-21)
+
+**THE STATED PLAN DOES NOT WORK AS STATED, AND THE REASON IS STRUCTURAL.** "Accumulator in a
+memory tile" was sized at ~6 ms and listed as "same mechanism as the transpose, no new API".
+It is not the same mechanism. The transpose is a feed-forward hand-off between two *different*
+kernels; the accumulator is a **read-modify-write by ONE kernel across invocations**
+(`accum_next = accum_prev + F⊙conj(H)`), which as a `shared_buffer` is a graph CYCLE
+`cmul → memtile → cmul`.
+
+Worse than the cycle, and this is the part that kills the naive version: the required delay is
+**not one invocation, it is `CMUL_N_CHUNKS` (16)**. Invocation (ch, c) needs `accum[ch-1][c]`,
+not what invocation (ch, c-1) just wrote, because cmul walks chunks inner and channels outer. A
+1-chunk ping-pong buffer would feed it the wrong chunk. Expressing that needs a 16-deep delay
+line in the memtile with lock semantics that admit a full pass of lag — a dataflow problem, not
+a re-connection.
+
+The other route — keep the accumulator in cmul's own tile memory — needs all 16 chunk
+accumulators resident (16 × 4 KB = 64 KB, the whole tile) on top of the existing port buffers.
+It does not fit, and AIE-ML kernels cannot address a memory tile as random-access scratch.
+
+**So `gmio_accum_out`'s 4.31 ms/frame stays for now.** Recorded rather than quietly dropped,
+because the ~6 ms figure is still sitting in the next-steps list of anyone reading this later.
+One cheap lead survives: at `FFT_COL_WS=32`, `gmio_accum_out` went **4.42 → 1.25 ms — it WON**;
+only `gmio_fft_col_out` lost (4.57 → 17.07). The two are coupled solely because cmul's window
+size is inherited from the col-FFT's. Decoupling the F_ch tap's drain granularity from the
+accumulator's would let the accumulator take the win alone.
+
+### `CMUL_SPLIT_ACCUM` — ON HARDWARE: 31.48 → 29.61 ms, 31.81 → 33.77 FPS
+
+What *is* deliverable, and it is most of the win: give `accum_prev` its own kernel port
+(`cmul.in[2]`, fed by a new `gmio_accum_in`) instead of packing it behind H in `cmul_in`.
+Graph compiles clean at 128×128 ch16 (0 errors, 0 critical warnings); `cmul` lands at (14,0)
+with `pi2` local to the core and every buffer 4 KB, so there is none of the tile pressure the
+`FFT_COL_WS=32` attempt hit.
+
+**This deletes the `cmul packing` slot outright, and the arithmetic says what that slot really
+was**: 16 channels × 128 KB = 2 MB/frame of BO→BO memcpy at the startup probe's 696 MB/s
+uncached-read rate = **3.01 ms predicted, 2.871 measured**. It was never a copy that happened to
+be slow — it WAS the uncached read. The host now feeds H straight from `filter_bo` and the
+running sum straight from `accum_bo`. Expected frame **31.48 → ~28.6 ms, ~35 FPS**.
+
+**MEASURED, `runs/run_0821_1452.log`** (wall 29.51 vs instrument 29.61). **Tracking
+BIT-IDENTICAL to `run_0821_1402` on all 200 frames** — the kernel reads the same bytes from a
+different port, and that is exactly what the frames say.
+
+| slot | `run_0821_1402` | **`run_0821_1452`** |
+|---|---|---|
+| `cmul packing` | 2.871 (16 calls) | **0.009 (1 call — ch0's memset)** |
+| `gmio_cmul_in` | 0.347 @ 21.71 µs/tx | **1.001 @ 62.55 µs/tx** |
+| `gmio_accum_in` | — | **0.266 @ 16.63 µs/tx** |
+| APU | 19.063 | **16.328** |
+| GMIO | 10.240 | **11.093** |
+| **frame** | **31.48** | **29.61** |
+
+**THE PACKING PREDICTION WAS EXACT AND THE NET WAS 1 ms SHORT, BECAUSE THE SECOND PORT IS NOT
+FREE.** `cmul packing` went 2.871 → 0.009, the full predicted saving. But `gmio_cmul_in` got
+**2.9× more expensive per transaction (21.71 → 62.55 µs) despite its payload HALVING**, and
+`gmio_accum_in` added 0.266. Net −1.94 ms against a predicted −2.87.
+
+The pair total is the honest number: `cmul_in + accum_in` = **1.267 ms against the old
+`cmul_in`'s 0.347**, so splitting the port cost +0.92 ms of DMA to save 2.86 ms of uncached
+memcpy. Only ~0.32 ms of that is the extra per-barrier fixed cost (32 tx/frame instead of 16);
+the rest is cmul acquiring two GMIO-backed input buffers per invocation instead of one, with
+`cmul_in`'s wait — issued first — absorbing both. **That is the same "the first wait in an
+interleaved pair absorbs the sync" effect already recorded for `gmio_fft_row_out` and for the
+`fft_col_out`/`accum_out` pair. Sum an interleaved group before believing any member of it.**
+
+**In-place on `accum_bo` is safe, reasoned rather than discovered:** cmul reads chunk c and
+later writes chunk c; chunks are distinct addresses and the read of c always precedes the write
+of c, so no chunk is read after being updated this channel. A double buffer would reintroduce
+the copy this change exists to remove. ch0 gets a `memset` of `accum_bo` in place of the packed
+path's zero-fill of the accum half.
+
+**The single-port design was never a hardware constraint.** `cmul_accum_kernel.h` says so
+outright: it works around a Vitis 2025.2 *cycle-approximate aiesim* deadlock, and "on real
+AIE-ML hardware both approaches are equivalent". **`make aiesim` therefore needs
+`CMUL_SPLIT_ACCUM=0`**; hardware does not.
+
+**A `static_assert` now ties the `DMA_*` enum to its name table.** Inserting `DMA_ACCUM_IN`
+mid-enum without updating the table would have silently RENAMED every port after it in the
+report — the AP_* slots already had this guard and the DMA ones did not.
+
+**`MEMTILE_TRANSPOSE` is now the Makefile default (1)**, since it is proven on hardware and a
+one-sided flag is a board deadlock rather than a compile error.
+
+### Software-pipelined roi_crop — ON HARDWARE: 35.58 → 31.48 ms, 28.14 → 31.81 FPS
+
+`runs/run_0821_1402.log`, 200 frames, wall clock 31.44 ms against the instrument's 31.48.
+**Tracking is BIT-IDENTICAL to `run_0821_1348` on all 200 frames** — as it must be, since this
+changes only *when* work is issued, not what is computed.
+
+| slot | `run_0821_1348` | **`run_0821_1402`** |
+|---|---|---|
+| **`roi_crop launch`** | 5.196 | **1.020** |
+| GMIO (control) | 10.124 | 10.240 |
+| APU (control) | 19.101 | 19.063 |
+| **frame** | **35.58** | **31.48** |
+
+**THE TIME WAS ELIMINATED, NOT MOVED, AND THAT WAS THE CHECK THAT MATTERED.** The memtile run
+had just taught the opposite lesson — its frame total matched the prediction while the
+attribution was wrong, with conv2d's production reappearing in `roi_crop launch`. So the test
+here was whether GMIO or APU would absorb the 4.2 ms. Neither did: GMIO moved +0.116, APU
+−0.038. The crop genuinely now runs underneath the host's work.
+
+**THE 1.02 ms RESIDUAL IS EXACTLY CHANNEL 0, AND THE TIMELINE NAMES IT.** Frame 199:
+
+```
+  ch   start()     drain      poll      wait    wait#2 | drain->poll
+   0     0.001     0.083     1.046     1.046     1.046 |       0.963
+   1     0.001     1.042     1.043     1.043     1.044 |       0.001
+   2     0.001     1.112     1.113     1.113     1.114 |       0.001
+```
+
+Channel 0 spins for **0.963 ms**; channels 1-15 exit on their first read. Channel 0 is the
+`recompute=1` pass — the full Stage A (bilinear resample, log, zero-mean, unit-L2, int8
+quantize) over 16384 output pixels — and it is launched *before* the channel loop, so it has
+nothing to overlap with. Channels 1-15 only re-stream the cached patch and are now completely
+hidden. The magnitude corroborates independently: CLAUDE.md measured roi_crop at **245.5 µs for
+a 64×64 recompute**, and 128×128 is 4× the pixels ≈ 1 ms.
+
+**Removing that last millisecond needs the FRAME boundary restructured, not the channel loop.**
+The obvious move — launch frame f+1's ch0 crop at the end of frame f, behind the ~9 ms APU tail
+— does not work as stated: roi_crop reads `frame_buf`, and frame f+1's scene is not generated
+or pushed until the top of frame f+1, so it would crop the previous frame. Hiding it means
+generating and pushing the scene one frame early. That is 3.2% of the frame for a reordering
+that touches the scene/tracking boundary; not worth it against the items below.
+
+**Balance now: APU 60.5%, GMIO 32.5%, roi_crop 3.2%, unattributed 3.7%.**
+
+### MEMORY-TILE TRANSPOSE — ON HARDWARE### MEMORY-TILE TRANSPOSE — ON HARDWARE: 45.60 → 35.58 ms, 21.93 → 28.14 FPS (2026-08-21)
+
+`runs/run_0821_1348.log`, 200 frames. Wall clock agrees with the instrument: 35.54 vs 35.58.
+Both transposes (forward and inverse) now happen in AIE-ML memory tiles; the four transpose
+GMIOs and both APU transposes are gone. **Cumulative for the day: 62.71 → 35.58 ms, 1.76×.**
+
+| | `run_0821_1109` | predicted | **`run_0821_1348`** |
+|---|---|---|---|
+| frame | 45.60 | ~35 | **35.58** |
+| FPS | 21.93 | ~28 | **28.14** |
+| GMIO | 20.98 | ~15 | **10.12** |
+| APU | 23.37 | ~18.9 | **19.10** |
+| roi_crop launch | 0.067 | *not predicted* | **5.196** |
+| tx/frame | 628 | 577 | **577** ✓ |
+
+**TRACKING IS EFFECTIVELY IDENTICAL, AND THAT IS BETTER THAN PREDICTED.** The pre-registered
+warning said this build could not be scored bit-identically because `mean_now` is now derived
+from F_ch. Measured: **every displacement on all 200 frames is identical**, every IoU identical,
+every gate verdict identical, mean IoU 0.9188 / worst 0.8353 / centre 1.37/3.52 px / final box
+64×64 — all unchanged. Six frames of 200 differ, and only in the last printed digit of PSR
+(118→119) or `resp00_over_peak` (0.00→0.01). PSR min 25.75 identical, max 127.10→127.08. So the
+F_ch derivation of Stage B1's mean and Stage B3's energy reproduces the datapath to well under
+one response LSB. The caution was right to state in advance; the derivation was simply more
+accurate than the caution assumed.
+
+**THE FRAME TOTAL MATCHED THE PREDICTION AND THE ATTRIBUTION DID NOT — read this before sizing
+the next item.** The prediction was "`gmio_fft_col_out` must grow to ~9-10 ms absorbing conv2d's
+~5.3 ms/frame of production, GMIO ~15". Measured: `gmio_fft_col_out` **did not move**
+(4.573 → 4.345) and GMIO came in at 10.12, better than predicted. conv2d's production went
+somewhere else entirely:
+
+| port / slot | before | after |
+|---|---|---|
+| `roi_crop launch` | 0.067 | **5.196** |
+| `gmio_ifft_row_in` | 0.021 | **0.304** (304 µs/tx) |
+| `gmio_weights` | 0.463 | 0.546 |
+| `gmio_fft_col_out` | 4.573 | 4.345 |
+| `gmio_accum_out` | 4.423 | 4.276 |
+
+**AND CLAUDE.md PREDICTED THE roi_crop ONE, IN WRITING, MONTHS OF WORK EARLIER.** The
+`ROI_CROP_USER_MANAGED` entry says: *"the spin exits on its first read every time — the CU
+finishes inside the drain loop. **If the drain ever shrinks (`FFT_ROW_WS` 8→16 halves it) the
+spin will start spinning for real**."* The drain did not shrink, it was deleted, and the spin now
+spins for real: 5.196 ms/frame = **325 µs/channel of roi_crop's own PL execution**, previously
+hidden entirely behind the row-FFT drain. `gmio_ifft_row_in` absorbed the IFFT chain's
+production the same way, for the same reason.
+
+**So the 10 ms this item was sized at was real, but ~5 ms of it was uncovering a cost that was
+always being paid and never visible.** That is not a disappointment — it is the next item,
+already named, now with a number: software-pipeline `roi_crop` one channel ahead (launch k+1
+before polling k) and most of the 5.2 ms should hide behind the APU work again. Frame ~31 ms,
+~32 FPS.
+
+**Per-firing weights async/wait costs 0.083 ms/frame** (0.463 → 0.546), confirming that pairing
+them after the abort did not reintroduce the lock-step — the wait is a 64-byte host→AIE
+transfer, not an AIE round trip.
+
+**The APU table confirms the change reached the binary**: the `transpose` row is GONE (zero
+calls, so it does not print), `BO↔heap stage` is 18 calls/frame against 52, and `window
+mean+energy` is 0.374 ms on the F_ch path against 0.421 on the row-FFT path.
+
+**Balance now: APU 53.7%, GMIO 28.5%, roi_crop 14.6%.** GMIO has gone from the dominant cost to
+under a third; the APU is the frame again, and `roi_crop` is suddenly the third-largest item.
+
+**FIRST HARDWARE ATTEMPT ABORTED AT FRAME 0 — `runs/run_0821_1342.log`, and the constraint was
+already in this file.**
+
+```
+terminate called after throwing an instance of 'xrt_core::error'
+  what(): Asynchronous operation is already initiated.
+          Multiple 'async' calls are not supported: Invalid argument
+```
+
+The rewritten weights feed queued all `CONV_INVOCATIONS` asyncs on `gmio_weights` and waited
+once. **XRT GMIO allows ONE outstanding async per port** — the identical error the depth-2 drain
+probe hit in `runs/run_0820_1629.log`. Removing the drain loop does not relax it: the constraint
+is XRT's, not the loop's. Fixed by pairing async with wait per firing. **The general lesson: an
+existing constraint does not become inapplicable because the code around it changed.** Every
+async site in `mosse_tracker.cpp` was audited afterwards — 11 pairs, one outstanding per port.
+
+### How it was de-risked, in order, and what each step cost
+
+Worth keeping as a template: the whole item cost ~1 h of machine time and ONE wasted board run.
+
+1. `make graph MEMTILE_TRANSPOSE=1` — 5 min. Maps clean, GMIO 10 → 6, and the generated buffer
+   descriptors showed `{1,1}` tiling compiles to **ONE 2-D BD** (`length 16384, stepsize {128,1},
+   wrap {128,128}`), not per-element transactions. That retired the item's biggest stated risk.
+2. `make aiesim_plio` at 64×64 ch1 — 20 min. **OVERALL: PASS**, F_ch correlation with golden
+   0.9986, peak within 1 px. Proves the transpose is *correct*, which the descriptors cannot.
+   The `fft_col_in.bin` bypass is unreachable with the memtile, so this ran the whole real chain.
+3. Host restructure, then `make graph` again at the REAL geometry — 5 min, and it **failed**,
+   catching a break introduced after step 2. The stale `Map_Report.csv` in the build dir still
+   showed the previous run's healthy 6-port table; only the compiler's `ERROR:1` line was true.
+4. Board run — aborted on the async constraint above.
+5. Board run — the result at the top of this entry.
+
+### `FFT_COL_WS` 8→32 IS A NET LOSS### `FFT_COL_WS` 8→32 IS A NET LOSS — 45.60 → 55.17 ms. REVERTED. (2026-08-21)
+
+`runs/run_0821_1152.log`. **The default is back at 8** and the Makefile carries a warning at
+the variable. Tracking was **bit-identical across all 200 frames** to `run_0821_1109`, so the
+datapath and the windowing are correct — this is purely a cost result.
+
+| | WS=8 (`run_0821_1109`) | WS=32 (`run_0821_1152`) |
+|---|---|---|
+| frame | **45.60 ms, 21.93 FPS** | 55.17 ms, 18.13 FPS |
+| GMIO | 20.98 (46.0%) | **30.58 (55.4%)** |
+| APU (control) | 23.373 | 23.398 |
+| tx/frame | 628 | 232 |
+
+**THE PRE-REGISTERED PREDICTIONS WERE 2 OF 3 RIGHT AND CATASTROPHICALLY WRONG ON THE ONE THAT
+MATTERED**, which is the whole value of having written them down first:
+
+| port | tx/frame | predicted | measured | |
+|---|---|---|---|---|
+| `gmio_accum_out` | 256 → 64 | ~1.2, wins | **1.252 ms @ 19.57 µs/tx** | ✅ exact |
+| `gmio_response` | 16 → 4 | ~0.5-0.6, loses | **0.532 ms @ 133.04 µs/tx** | ✅ exact |
+| `gmio_fft_col_out` | 256 → 64 | ~1.2, wins | **17.065 ms @ 266.63 µs/tx** | ❌ **14.9× worse per tx** |
+
+**IT IS NOT ATTRIBUTION SHUFFLING BETWEEN THE TWO SIBLINGS, AND THAT IS THE KEY READING.**
+They are drained in one interleaved loop with `fft_col_out` waited first, so the naive story is
+that it simply absorbed what `accum_out` used to pay. The pair total refutes that:
+**9.00 → 18.32 ms.** Roughly 9.3 ms of genuinely new cost appeared. Always sum an interleaved
+pair before believing either half of it.
+
+**And "it is absorbing AIE production latency" does not survive arithmetic either.** The col
+FFT is ~34 µs/channel of scheduled work and cmul ~8 µs, so production is ~42 µs/channel against
+the 1066 µs/channel now being paid on this port — 25×. 266 µs for a 16 KB transfer is 61 MB/s,
+against 229 MB/s for the same port at WS=8 and 5.76 GB/s for the largest transfer the DMA probe
+ever measured. Something got slower; it is not a barrier count and it is not the transfer.
+
+**The leading suspect is the tile spill, flagged as a constraint BEFORE the run and not taken
+seriously enough as a cost.** `Map_Report.csv` at WS=32 puts `cmul` at (24,1) spanning three
+tiles, with (24,0) holding `pi0`+`po0` ping-pong at **65536/65536 B** and (24,1) holding `pi1`
+at **65536/65536**. The core therefore reaches across a tile boundary for its input and output
+windows while the shim DMAs the same banks. At WS=8 those buffers total 32 KB and are local.
+**Unverified** — the mapper report proves the placement, not that the placement is what costs
+9.3 ms.
+
+**Cheapest discriminator if this is ever reopened: `FFT_COL_WS=16`.** Its buffers come to
+exactly 64 KB (`pi0`/`po0` 16 KB each, `pi1` 32 KB), so `make graph` alone — free, 5 minutes —
+says whether they land in ONE tile. If they do and a run behaves like WS=8, the mechanism is
+the spill; if WS=16 also loses, the knob is simply dead on this port pair. Expected upside is
+only ~4.5 ms (the pair halving), against ~12 ms for the memory-tile transpose, so **weigh that
+before spending another build-flash-run cycle on it.**
+
+**THE GENERAL LESSON: A KNOB THAT WON 7× ON ONE PORT LOST 4× ON ANOTHER, AND THE DESIGN GAVE NO
+WARNING.** `FFT_ROW_WS` took `gmio_fft_row_out` 73.22 → 9.93 ms across four points with per-tx
+cost pinned at 286-310 µs. The identical change on `gmio_fft_col_out` — same kind of port, same
+drain structure, same payload sizes — went the other way. The "overhead-dominated vs
+production-dominated" discriminator this was built on called `accum_out` and `response` exactly
+right and still failed, because it has no term for where the mapper puts the buffers. **Do not
+generalise a windowing result from one port to another without a hardware run.**
+
 ### Result 2026-08-21: 62.71 → 45.60 ms, 15.95 → 21.93 FPS. Host-only, one build.
 
 `runs/run_0821_1109.log`, 200 frames, same config as `run_0820_1807` (`ITER_CNT=200
@@ -781,16 +1142,29 @@ magnitudes are patch-specific". This is worse than that: the ORDERING did not tr
 because the working set crossed a cache boundary between the two machines.** Benchmark a
 host-side change on the host, or expect to be wrong about which fix matters.
 
-**Next, in order. APU 23.4 ms and GMIO 21.0 ms of a 45.6 ms frame — nearly equal, so the
-next real gain needs BOTH sides or a structural change:**
-1. **`FFT_COL_WS` 8→32**, a Makefile knob and an AIE rebuild. `gmio_fft_col_out` (4.60 ms)
-   and `gmio_accum_out` (4.44) are 256 tx/frame each at 17.4-18.0 µs on 4096 B — the fixed
-   per-barrier floor, so 256→64 tx should cost the same per tx. ~4-6 ms. **Check the per-port
-   table afterwards, not just the total**: `gmio_ifft_row_out` regressed 0.148→0.596 ms when
-   its WS doubled, because with few transactions each `wait()` absorbs more AIE latency.
-2. **Memory-tile transpose**, worth ~12.4 ms — deletes `gmio_fft_row_out` (9.93),
-   `gmio_fft_col_in` (0.35) and ~2.1 ms of APU transpose. Largest structural item; DSPLib
-   reference validated. The open question is throughput at `tiling_dimension = {1,1}`.
+**Next, in order. APU 19.1 ms, GMIO 10.2 ms, roi_crop 1.0 ms of a 31.5 ms frame. The APU is
+60% of the frame and is now a FLAT TAIL — biggest single item 4.7 ms — so there is no dominant
+slot left to attack; the remaining wins are structural:**
+-1. ~~**`CMUL_ACCUM_MEMTILE=1`**~~ — **TRIED AND REVERTED, a 0.36 ms LOSS.** The accumulator
+   port's cost is AIE production, not DMA overhead; see the entry below.
+-3. ~~**`unpack F_ch` blocked transpose**~~ — **DONE, 29.61 → 28.64 ms.** See below.
+-0. **Software-pipeline the CHANNEL loop — the only remaining lever on the 8.7 ms
+   `fft_col_out`+`accum_out` pair.** That pair is the col-FFT + cmul production time for 16
+   channels, proven immune to transaction count. Overlap it with the host's ~0.4 ms/channel of
+   APU work, exactly as `roi_crop` was pipelined (5.196 → 1.020 ms). The graph already permits
+   one channel of lookahead; the host serialises it.
+-2. ~~**Hermitian symmetry in the host filter**~~ — **REFUTED AND RETIRED**, see "Settled
+   questions". The premise is false in fixed point and would inject its worst error exactly
+   where H is largest.
+
+0. ~~**Software-pipelined `roi_crop`**~~ — **DONE, 35.58 → 31.48 ms.** Residual 1.02 ms is
+   channel 0's Stage A pass, structurally exposed at the frame boundary; see the entry below.
+
+1. ~~**`FFT_COL_WS` 8→32**~~ — **TRIED AND REVERTED, a 9.57 ms LOSS.** See the entry above.
+   The cheap-knob era is over: this was the last Makefile variable with a plausible win, and
+   it went the wrong way. Everything below is structural.
+2. ~~**Memory-tile transpose**~~ — **DONE on hardware 2026-08-21, 45.60 → 35.58 ms.** See the
+   entry above. The `{1,1}` throughput question resolved to one 2-D buffer descriptor.
 3. **The idle A72 core.** The boot log reads `SMP: Total of 2 processors activated` at
    1.4 GHz and the host is single-threaded, so one core is idle for the whole frame. Safe
    tier: the post-response tail splits into two independent halves — translation
@@ -926,9 +1300,17 @@ Same observation the fDSST entry makes about the scale filter; it applies to the
 - The transpose read is `tiling_dimension = {1,1}` — one element per step with a large stride.
   Supported, but **no throughput figure for 128×128 cint16 at that granularity**. Measure it in
   aiesim; it could be fast or it could reintroduce a per-element cost.
-- **Do not adopt `fft_ifft_2d_graph` wholesale.** Our dataflow is not a plain 2D FFT — per-channel
-  `cmul_accum` sits between the row and column passes. Borrow the `shared_buffer` pattern, not the
-  graph. (The accumulator is the second memory-tile candidate: CLAUDE.md's own "on-tile would need
+- **THE STATED BLOCKER WAS WRONG — CORRECTED 2026-08-21.** This entry claimed "our dataflow is not
+  a plain 2D FFT — per-channel `cmul_accum` sits between the row and column passes". It does not.
+  `mosse_graph.h` wires `fft2d.fft_col_out → cmul.in[0]`, i.e. **cmul is DOWNSTREAM of the column
+  FFT**, and the Map_Report clusters agree (fft_rows (15,1) → fft_cols (29,0) → cmul (24,1)).
+  Between the row and column passes there is nothing but the DDR round trip. **Both transposes —
+  forward and inverse — are therefore textbook 2D-FFT transposes and the DSPLib pattern applies to
+  each directly.** Still borrow the `shared_buffer` pattern rather than the whole graph, but for a
+  different and much weaker reason: we need the `gmio_fft_col_out` tap on the column FFT's output
+  and our own `cmul` downstream of it. Verify a claimed structural blocker against the wiring
+  before letting it defer a 10 ms item for a week.
+- (The accumulator is the second memory-tile candidate: CLAUDE.md's own "on-tile would need
   a Memory Tile" note, worth another ~7.7 ms.)
 
 ### XRT GMIO allows ONE outstanding async per port — the depth-2 probe is retired
@@ -1410,6 +1792,42 @@ Two principles that have repeatedly earned their keep: **instruments before chan
   DFT's 3.11× is therefore worth ~9 ms/frame — 5% of the frame, for a change that is already
   justified on its own terms (the features are real by construction). The PCA verdict stands;
   the "non-bottleneck" verdict does not.
+- **HALVING THE HOST FILTER ON HERMITIAN SYMMETRY DOES NOT WORK. Measured 2026-08-21, aiesim,
+  and the premise is false in fixed point.** `conv2d` emits cint16 with `imag = 0`, so the 2-D
+  spectrum of a real input is Hermitian *in exact arithmetic* and A/B look half-redundant —
+  worth ~4 ms across `filter upd+quant`, `publish` and `unpack F_ch`. Measured on the real
+  chain (64×64 ch1, s6, `make aiesim_plio`), the F_ch tap gives:
+
+  ```
+  max|residual| = 12 LSB at bin (0,1), mean 1.379, 3924/4096 bins asymmetric, max|F| = 444
+  ```
+
+  **95.8% of bins differ from their conjugate partner.** DSPLib's DIT butterflies do not compute
+  a conjugate pair by symmetric operations and every stage rounds, so the symmetry is destroyed
+  at the ~1 LSB level everywhere.
+
+  **THE CONTROL IS WHAT MAKES THIS CONCLUSIVE.** The float golden for the same scenario,
+  quantised to int16, is Hermitian to **0 LSB across all 4096 bins**. So the index convention is
+  right, conv2d's output really is real, and int16 storage alone preserves the symmetry — the
+  asymmetry is attributable to the fixed-point FFT and to nothing else. Without that control a
+  12 LSB residual could just as easily have been a wrong conjugate index.
+
+  **AND THE ERROR LANDS IN THE WORST POSSIBLE PLACE.** The residual is additive rounding noise
+  (mean 1.4 LSB, and this file already establishes that DSPLib's cint16 loss is "additive, not a
+  gain factor"), so at 128×128 where max|F| ≈ 2010 it would be ~0.6% rather than 2.7%. Still
+  >> the ~0.003% that one int16 LSB of H represents — but the decisive point is *which* bins
+  suffer. **max|H| sits where |F| is SMALLEST**, because that is where the regularised inverse
+  peaks (recorded under H's quantization ceiling). A fixed ~1.4 LSB asymmetry is proportionally
+  most damaging exactly at the low-|F| bins, i.e. mirroring would inject its largest errors into
+  the largest filter coefficients.
+
+  Cost of finding out: one 20-minute aiesim run and no board time. The check is now permanent in
+  the harness (`F_ch Hermitian check`), so any future FFT change re-tests it for free.
+  **What is NOT refuted**: the same symmetry argument for the AIE's own forward transform —
+  DSPLib's `fft_ifft_2d_graph` halves its memory tile for real input via a different kernel
+  (`fft_dit_2ch_real_graph`), which computes only the independent half rather than computing
+  both and discarding one. That saves work instead of reconstructing it, so per-stage rounding
+  never enters the argument.
 - **Channel pruning is moot** with ReLU off — no structurally dead channels remain. (The
   grayscale collapse does leave ch0/ch9/ch14 collinear up to sign, i.e. 14 independent filters,
   and collinear channels add exactly coherently in the accumulator. The real fix is RGB.)

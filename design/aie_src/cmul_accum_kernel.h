@@ -50,8 +50,35 @@ using namespace adf;
 #endif
 static_assert(CMUL_H_SHIFT >= 0 && CMUL_H_SHIFT <= 30, "CMUL_H_SHIFT out of range");
 
+// CMUL_SPLIT_ACCUM: give accum_prev its OWN input port instead of packing it
+// behind H in cmul_in.
+//
+// WHY. The packing is a host memcpy of 128 KB per channel, 2 MB/frame, and both
+// sources are xrt::bo mappings — which are write-combining, so the READ side runs
+// at 696 MB/s (startup probe). 2 MB at 696 MB/s is 3.01 ms; the `cmul packing`
+// slot measures 2.871. It is not a copy that happens to be slow, it IS the
+// uncached read, and splitting the port deletes it outright rather than
+// optimising it.
+//
+// The single-port design was never about hardware — the header note below says
+// so: it works around a Vitis 2025.2 cycle-approximate aiesim deadlock, and "on
+// real AIE-ML hardware both approaches are equivalent". `make aiesim` therefore
+// needs CMUL_SPLIT_ACCUM=0; hardware does not.
+//
+// This is also the prerequisite for holding the accumulator in a memory tile:
+// once accum_prev arrives on its own port, its source can be changed from a GMIO
+// to a shared_buffer without touching the kernel again.
+#ifndef CMUL_SPLIT_ACCUM
+#  define CMUL_SPLIT_ACCUM 0
+#endif
+
 void cmul_accum_kernel(
     input_buffer<cint16_t>  &fft_col_in,  // in[0]: F_ch ← fft2d.fft_col_out (tile-to-tile, must be first)
     output_buffer<cint16_t> &accum_out,   // out[0]: updated Σ → gmio_accum_out
+#if CMUL_SPLIT_ACCUM
+    input_buffer<cint16_t>  &cmul_in,     // in[1]: H_ch* only ← gmio_cmul_in
+    input_buffer<cint16_t>  &accum_in     // in[2]: prev_Σ    ← gmio_accum_in
+#else
     input_buffer<cint16_t>  &cmul_in      // in[1]: [H_ch* | prev_Σ] packed ← gmio_cmul_in
+#endif
 );

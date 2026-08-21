@@ -105,10 +105,18 @@ alignas(32) static cint16_t acc_local[CMUL_N];
 void cmul_accum_kernel(
     input_buffer<cint16_t>  &fft_col_in,
     output_buffer<cint16_t> &accum_out,
+#if CMUL_SPLIT_ACCUM
+    input_buffer<cint16_t>  &cmul_in,
+    input_buffer<cint16_t>  &accum_in)
+{
+    cint16_t* flt_src = cmul_in.data();
+    cint16_t* acc_src = accum_in.data();
+#else
     input_buffer<cint16_t>  &cmul_in)
 {
     cint16_t* flt_src = cmul_in.data();
     cint16_t* acc_src = flt_src + CMUL_N;
+#endif
 
     // Vector copy: 128-bit (v8cint16) loads from memory tile 13_0.
     // Vector loads use the vector bus — not subject to the scalar read penalty.
