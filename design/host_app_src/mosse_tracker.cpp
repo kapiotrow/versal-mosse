@@ -260,16 +260,17 @@ enum {
 struct DmaStat {
     const char   *name;
     unsigned long calls;
-    double        us;
+    double        us;        // async + wait, i.e. total host time on this port
+    double        wait_us;   // the BLOCKING half alone — see the macros below
 };
 
 static DmaStat g_dma[DMA_N] = {
-    {"gmio_weights",      0, 0.0}, {"gmio_fft_row_out",  0, 0.0},
-    {"gmio_fft_col_in",   0, 0.0}, {"gmio_fft_col_out",  0, 0.0},
-    {"gmio_cmul_in",      0, 0.0}, {"gmio_accum_in",     0, 0.0},
-    {"gmio_accum_out",    0, 0.0},
-    {"gmio_ifft_row_in",  0, 0.0}, {"gmio_ifft_row_out", 0, 0.0},
-    {"gmio_ifft_col_in",  0, 0.0}, {"gmio_response",     0, 0.0},
+    {"gmio_weights",      0, 0.0, 0.0}, {"gmio_fft_row_out",  0, 0.0, 0.0},
+    {"gmio_fft_col_in",   0, 0.0, 0.0}, {"gmio_fft_col_out",  0, 0.0, 0.0},
+    {"gmio_cmul_in",      0, 0.0, 0.0}, {"gmio_accum_in",     0, 0.0, 0.0},
+    {"gmio_accum_out",    0, 0.0, 0.0},
+    {"gmio_ifft_row_in",  0, 0.0, 0.0}, {"gmio_ifft_row_out", 0, 0.0, 0.0},
+    {"gmio_ifft_col_in",  0, 0.0, 0.0}, {"gmio_response",     0, 0.0, 0.0},
 };
 // The enum and this table are two ordered lists that must stay in step — the
 // same coupling the AP_* slots already guard. Adding DMA_ACCUM_IN in the middle
@@ -280,21 +281,41 @@ static_assert(sizeof(g_dma) / sizeof(g_dma[0]) == DMA_N,
               "g_dma name table is out of sync with the DMA_* enum");
 static DmaStat g_dma_total[DMA_N];
 
+// SPLIT 2026-08-21. These two used to share one accumulator, so every port's
+// figure was `async` + `wait` fused — and this file's own methodology note says
+// "DMA_T times async AND wait together — split them before drawing conclusions
+// from any single port". That split was done for the roi_crop path in the 503 ms
+// hunt and never for the GMIO ports.
+//
+// WHY IT MATTERS NOW: the wait half is the host BLOCKED, i.e. CPU that a second
+// A72 core could be using. The async half is real host work that a second core
+// cannot recover. Sizing the threading work needs the two apart, and the
+// CMUL_ACCUM_MEMTILE result (16x fewer transactions, identical cost) says most
+// of it should be wait — this measures rather than infers that.
+//
+// `us` keeps its old meaning (async + wait) so every figure recorded before
+// today stays directly comparable; `wait_us` is the new half.
 #define DMA_T(slot, stmt) do {                                                  \
+        const auto _t0 = std::chrono::steady_clock::now();                       \
+        stmt;                                                                    \
+        const double _d = std::chrono::duration<double, std::micro>(              \
+            std::chrono::steady_clock::now() - _t0).count();                      \
+        g_dma[slot].us      += _d;                                               \
+        g_dma[slot].wait_us += _d;                                               \
+    } while (0)
+
+#define DMA_TX(slot, stmt) do {                                                 \
         const auto _t0 = std::chrono::steady_clock::now();                       \
         stmt;                                                                    \
         g_dma[slot].us += std::chrono::duration<double, std::micro>(              \
             std::chrono::steady_clock::now() - _t0).count();                      \
-    } while (0)
-
-#define DMA_TX(slot, stmt) do {                                                 \
-        DMA_T(slot, stmt);                                                        \
         ++g_dma[slot].calls;                                                      \
     } while (0)
 
 static void dma_reset_frame(void)
 {
-    for (int i = 0; i < DMA_N; ++i) { g_dma[i].calls = 0; g_dma[i].us = 0.0; }
+    for (int i = 0; i < DMA_N; ++i) { g_dma[i].calls = 0; g_dma[i].us = 0.0;
+                                      g_dma[i].wait_us = 0.0; }
 }
 
 // -----------------------------------------------------------------------
@@ -458,6 +479,15 @@ static const char *g_ap_name[AP_N] = {
 static_assert(sizeof(g_ap_name) / sizeof(g_ap_name[0]) == AP_N,
               "g_ap_name is out of sync with the AP_* enum");
 
+// Wall time the helper thread's work OVERLAPPED the main thread's, per frame and
+// cumulative. WITHOUT THIS THE TABLE LIES: with TAIL_PARALLEL the AP_FILTER slot
+// is filled on core 1 while AP_SCALE_* is filled on core 0, so the subtotal
+// counts wall time the frame never spent and UNATTRIBUTED goes NEGATIVE
+// (-1.503 ms in runs/run_0821_1712.log). A residual that cannot physically exist
+// is exactly the kind of plausible-looking output this project has lost days to.
+static double        g_ap_overlap_us     = 0.0;   // this frame
+static double        g_ap_overlap_tot_us = 0.0;   // run
+
 static double        g_ap_us[AP_N];        // this frame
 static unsigned long g_ap_n[AP_N];         // calls this frame
 static double        g_ap_tot_us[AP_N];    // whole run
@@ -477,6 +507,7 @@ static std::chrono::steady_clock::time_point g_ap_frame_t0;
 static void ap_reset_frame(void)
 {
     for (int i = 0; i < AP_N; ++i) { g_ap_us[i] = 0.0; g_ap_n[i] = 0; }
+    g_ap_overlap_us = 0.0;
     g_ap_frame_t0 = std::chrono::steady_clock::now();
 }
 
@@ -489,6 +520,7 @@ static void ap_accumulate_frame(void)
     g_ap_frame_us = std::chrono::duration<double, std::micro>(
         std::chrono::steady_clock::now() - g_ap_frame_t0).count();
     g_ap_run_us += g_ap_frame_us;
+    g_ap_overlap_tot_us += g_ap_overlap_us;
     for (int i = 0; i < AP_N; ++i) {
         g_ap_tot_us[i] += g_ap_us[i];
         g_ap_tot_n[i]  += g_ap_n[i];
@@ -1119,8 +1151,9 @@ static void dma_accumulate_frame(void)
     for (int i = 0; i < DMA_N; ++i) {
         if (!g_dma[i].calls && g_dma[i].us == 0.0) continue;
         g_dma_total[i].name   = g_dma[i].name;
-        g_dma_total[i].calls += g_dma[i].calls;
-        g_dma_total[i].us    += g_dma[i].us;
+        g_dma_total[i].calls   += g_dma[i].calls;
+        g_dma_total[i].us      += g_dma[i].us;
+        g_dma_total[i].wait_us += g_dma[i].wait_us;
     }
 }
 
@@ -1132,8 +1165,10 @@ static void dma_report_frame(int frame)
     for (int i = 0; i < DMA_N; ++i) {
         if (!g_dma[i].calls && g_dma[i].us == 0.0) continue;
         const double per = g_dma[i].calls ? g_dma[i].us / g_dma[i].calls : 0.0;
-        printf("  %-18s %6lu tx  %9.3f ms  %7.2f us/tx\n",
-               g_dma[i].name, g_dma[i].calls, g_dma[i].us / 1000.0, per);
+        printf("  %-18s %6lu tx  %9.3f ms  %7.2f us/tx   wait %8.3f ms (%3.0f%%)\n",
+               g_dma[i].name, g_dma[i].calls, g_dma[i].us / 1000.0, per,
+               g_dma[i].wait_us / 1000.0,
+               g_dma[i].us > 0.0 ? 100.0 * g_dma[i].wait_us / g_dma[i].us : 0.0);
         tot_us += g_dma[i].us;
         tot_n  += g_dma[i].calls;
     }
@@ -2065,6 +2100,35 @@ static void pack_filter(const int16_t *rowmajor, int16_t *dst_bo)
     }
 }
 
+static std::vector<mosse::cfloat> g_h_scratch;
+
+// Q1.15 scale/peak produced by filter_update_quantize. GLOBAL rather than local
+// because with TAIL_PARALLEL the producer is a different thread from the
+// consumer (publish_packed), joined in between.
+static float g_q15_scale = 0.0f, g_q15_max = 0.0f;
+// AP_FILTER's accumulator at the moment the helper was launched, so the join can
+// recover the helper's own elapsed time by difference.
+static double g_ap_filter_at_launch = 0.0;
+#if TAIL_PARALLEL
+static std::thread g_filter_thr;
+#endif
+
+// The translation-filter update, as a callable so it can run on either thread.
+// Pure heap: no XRT, no shared state with the scale filter. AP_FILTER is written
+// from whichever thread runs it — a distinct slot from the scale path's
+// AP_SCALE_*, so the two never touch the same counter.
+static std::vector<int16_t> *g_filter_scratch_p = nullptr;
+static void filter_update_work(void)
+{
+    AP_T(AP_FILTER,
+         mosse::filter_update_quantize(g_filter, g_F_all.data(),
+                                       g_target_shift.data(),
+                                       mosse::DEFAULT_ETA,
+                                       g_energy, mosse::DEFAULT_EPS_REL,
+                                       g_h_scratch, g_filter_scratch_p->data(),
+                                       &g_q15_scale, &g_q15_max));
+}
+
 // Build H from the current filter state and push it to the device.
 // Reports the Q1.15 scale and the peak magnitude: a spiky filter that leaves the
 // response far below the cint16 rails shows up here and nowhere else.
@@ -2095,7 +2159,7 @@ static void publish_filter(xrt::bo &filter_bo, std::vector<int16_t> &scratch)
 
 // H before the Q1.15 scaling, handed to filter_update_quantize() so the 2 MB
 // allocation happens once rather than per frame. Private to the fused path.
-static std::vector<mosse::cfloat> g_h_scratch;
+
 
 // -----------------------------------------------------------------------
 // Test data injection (for hw_emu validation)
@@ -2785,6 +2849,9 @@ int main(int argc, char **argv)
     // 2 MB allocation inside frame 1's timed body and put it in AP_FILTER.
     g_h_scratch.resize((size_t)N_CHANNELS * PATCH_ELEMS);
     std::vector<int16_t> filter_scratch((size_t)N_CHANNELS * PATCH_ELEMS * 2);
+    // filter_scratch is a local; filter_update_work() may run on the second core
+    // and needs it by address. Bound once, immediately after it exists.
+    g_filter_scratch_p = &filter_scratch;
 
     if (ITER_CNT < 2)
         printf("WARNING: ITER_CNT=%d. Frame 0 is consumed by filter initialisation,\n"
@@ -3904,6 +3971,60 @@ int main(int argc, char **argv)
                        exp_dr, exp_dc, (int)llround(inj_dr), (int)llround(inj_dc),
                        mosse::patch_dr_to_frame(1, roi));
 
+            // ---- TRANSLATION FILTER UPDATE, ON THE SECOND CORE ----------
+            //
+            // Launched HERE, before the scale filter, because from this point
+            // the two are independent: both need the PSR result and the updated
+            // position, neither needs the other. State is disjoint —
+            // filter_update_quantize touches g_filter / g_F_all / g_energy /
+            // g_target_shift / g_h_scratch / filter_scratch, the scale path
+            // touches box / scale / scale_sample / the scale counters. The one
+            // frame-scope value they might have shared, sigma_r/sigma_c, is
+            // computed once before the frame loop and never written here.
+            //
+            // WHY THIS SHAPE AND NOT THE OBVIOUS ONE. The first cut moved the
+            // SCALE work onto the helper instead. That breaks a real ordering
+            // constraint: the IoU/centre-error accumulation a few lines below
+            // reads `box` AFTER the scale update, so with the scale work in
+            // flight it would have scored a stale box and quietly reported the
+            // wrong tracking numbers. Launching the FILTER side instead needs no
+            // code motion at all, which is worth more here than the extra ms.
+            //
+            // PUBLISH DELIBERATELY STAYS ON THE MAIN THREAD. pack_filter +
+            // filter_bo.sync are the only XRT calls in the tail, and keeping XRT
+            // single-threaded is a discipline this design should not trade for
+            // 1.9 ms. So the overlap is scale (2.62) against the update (4.72),
+            // and the tail goes 9.25 -> ~6.63 ms.
+            //
+            // Frame 0 never gets here (evaluate == g_filter.initialized), so the
+            // bootstrap runs filter_init serially exactly as before.
+#if TAIL_PARALLEL
+            if (gate.accept) {
+                // BUILD THE TRAINING TARGET BEFORE THE LAUNCH, NOT AFTER.
+                //
+                // filter_update_quantize CONSUMES g_target_shift, and in the
+                // serial code this call sits down in the `else if (gate.accept)`
+                // branch — i.e. after the scale filter and after the join. The
+                // first cut left it there and started the helper anyway, so the
+                // helper trained on the PREVIOUS frame's target. Measured
+                // (runs/run_0821_1706.log): mean IoU 0.9188 -> 0.4794, centre
+                // error 1.37 -> 13.01 px, 22 scale HOLDs where there had been 0,
+                // diverging from frame 2.
+                //
+                // The state review that preceded that run asked "does the scale
+                // path TOUCH anything the filter path touches?" and answered no,
+                // correctly. It failed to ask the other question: "is everything
+                // the helper READS already written when it starts?" For a thread
+                // launch both must hold, and only the second one catches this.
+                mosse::gaussian_target_spectrum(g_target_shift.data(),
+                                                PATCH_ROWS, PATCH_COLS,
+                                                sigma_r, sigma_c,
+                                                psr_abs.dr, psr_abs.dc);
+                g_ap_filter_at_launch = g_ap_us[AP_FILTER];
+                g_filter_thr = std::thread(filter_update_work);
+            }
+#endif
+
             // SCALE ESTIMATION — DSST §5.1, Algorithm 1.
             //
             // Order is load-bearing and the paper states why: "Typically, the
@@ -4056,6 +4177,35 @@ int main(int argc, char **argv)
         }
 
         bool published = false;
+#if TAIL_PARALLEL
+        // JOIN POINT for the translation-filter update started before the scale
+        // block. See the launch site for the dependency argument.
+        //
+        // The overlap is measured here rather than estimated. Let H be the
+        // helper's own elapsed time (the AP_FILTER delta across the region) and
+        // W the time this thread then spends blocked in join(). The region's
+        // WALL cost is (main's own work + W), while the slots credit
+        // (main's own work + H) — so the double-count is exactly H - W, which is
+        // min(helper, main) however the two happen to line up.
+        if (g_filter_thr.joinable()) {
+            const auto   _j0 = std::chrono::steady_clock::now();
+            g_filter_thr.join();
+            const double _jw = std::chrono::duration<double, std::micro>(
+                std::chrono::steady_clock::now() - _j0).count();
+            // H IS READ AFTER THE JOIN, NOT BEFORE. The helper writes
+            // g_ap_us[AP_FILTER] when it finishes, so sampling it before join()
+            // reads a value that has not been written yet — it came back 0 every
+            // frame, the `ovl > 0` guard suppressed both new lines, and
+            // runs/run_0821_1720.log still printed the impossible -1.492 ms
+            // residual. join() is the synchronisation point that makes the
+            // helper's write visible; reading before it was also a data race.
+            //
+            // The same read-before-write ordering mistake as the g_target_shift
+            // bug two builds ago, made in the code written to explain that bug.
+            const double _hf = g_ap_us[AP_FILTER] - g_ap_filter_at_launch;
+            g_ap_overlap_us += (_hf > _jw) ? (_hf - _jw) : 0.0;
+        }
+#endif
         if (!g_filter.initialized) {
             AP_T(AP_FILTER,
                  mosse::filter_init(g_filter, g_F_all.data(), g_target.data(),
@@ -4094,10 +4244,12 @@ int main(int argc, char **argv)
             // Regression test, no hardware: scripts/mosse_loop_sim.py. Both arms,
             // 30 frames — centred reaches resp00/peak 0.76 and loses lock, shifted
             // holds 0.21 flat at 0.00 px error.
+#if !TAIL_PARALLEL
             mosse::gaussian_target_spectrum(g_target_shift.data(),
                                             PATCH_ROWS, PATCH_COLS,
                                             sigma_r, sigma_c,
                                             psr_abs.dr, psr_abs.dc);
+#endif  // TAIL_PARALLEL builds fill g_target_shift BEFORE launching the helper
             //
             // FUSED with the quantiser. Unfused, A (2 MB at ch16) is streamed
             // four times a frame — written by the update, then read twice by
@@ -4108,16 +4260,15 @@ int main(int argc, char **argv)
             // 62.7 ms frame. BIT-IDENTICAL output, asserted by memcmp in
             // run_fusion_tests() at BOTH -O2 and -ffp-contract=fast — the first
             // cut was not, and only the contraction build could see it.
-            float q15_scale = 0.0f, q15_max = 0.0f;
-            AP_T(AP_FILTER,
-                 mosse::filter_update_quantize(g_filter, g_F_all.data(),
-                                               g_target_shift.data(),
-                                               mosse::DEFAULT_ETA,
-                                               g_energy, mosse::DEFAULT_EPS_REL,
-                                               g_h_scratch, filter_scratch.data(),
-                                               &q15_scale, &q15_max));
+#if TAIL_PARALLEL
+            // Already computed on core 1 while this thread ran the scale filter;
+            // g_q15_scale/g_q15_max were filled there. Only the publish is left,
+            // and it stays HERE because it is the one part that touches XRT.
+#else
+            filter_update_work();
+#endif
             AP_T(AP_PUBLISH,
-                 publish_packed(filter_bo, filter_scratch, q15_scale, q15_max));
+                 publish_packed(filter_bo, filter_scratch, g_q15_scale, g_q15_max));
             published = true;
         } else {
             // publish_filter is skipped as well as filter_update, and that is a
@@ -4294,21 +4445,40 @@ int main(int argc, char **argv)
     {
         double        tot_us = 0.0;
         unsigned long tot_n  = 0;
+        double tot_wait = 0.0;
         printf("\n[dma] CUMULATIVE over %d frame(s):\n", ITER_CNT);
         for (int i = 0; i < DMA_N; ++i) {
             if (!g_dma_total[i].calls) continue;
-            printf("  %-18s %6lu tx  %9.3f ms  %7.2f us/tx\n",
+            printf("  %-18s %6lu tx  %9.3f ms  %7.2f us/tx   wait %9.3f ms (%3.0f%%)\n",
                    g_dma_total[i].name, g_dma_total[i].calls,
                    g_dma_total[i].us / 1000.0,
-                   g_dma_total[i].us / g_dma_total[i].calls);
-            tot_us += g_dma_total[i].us;
-            tot_n  += g_dma_total[i].calls;
+                   g_dma_total[i].us / g_dma_total[i].calls,
+                   g_dma_total[i].wait_us / 1000.0,
+                   g_dma_total[i].us > 0.0
+                       ? 100.0 * g_dma_total[i].wait_us / g_dma_total[i].us : 0.0);
+            tot_us  += g_dma_total[i].us;
+            tot_wait += g_dma_total[i].wait_us;
+            tot_n   += g_dma_total[i].calls;
         }
-        printf("  %-18s %6lu tx  %9.3f ms  %7.2f us/tx\n", "TOTAL", tot_n,
-               tot_us / 1000.0, tot_n ? tot_us / tot_n : 0.0);
+        printf("  %-18s %6lu tx  %9.3f ms  %7.2f us/tx   wait %9.3f ms (%3.0f%%)\n",
+               "TOTAL", tot_n, tot_us / 1000.0, tot_n ? tot_us / tot_n : 0.0,
+               tot_wait / 1000.0, tot_us > 0.0 ? 100.0 * tot_wait / tot_us : 0.0);
         printf("  per frame: %.0f tx, %.3f ms  (N_CHANNELS=%d, %dx%d)\n",
                (double)tot_n / ITER_CNT, tot_us / 1000.0 / ITER_CNT,
                N_CHANNELS, PATCH_ROWS, PATCH_COLS);
+        // THE NUMBER THE THREADING DECISION RESTS ON.
+        //
+        // `wait` is the host blocked in gmio::wait() with nothing to do — CPU a
+        // second A72 core could be spending on the per-channel unpack/mean work.
+        // `async` is real host time (descriptor setup, the driver path) that a
+        // second core cannot recover. Sizing the helper thread against the wrong
+        // one of these is exactly the mistake the CMUL_ACCUM_MEMTILE attempt
+        // made in the other direction.
+        printf("  HOST BLOCKED in wait(): %.3f ms/frame of %.3f ms GMIO "
+               "(%.0f%%); host-side async work %.3f ms/frame\n",
+               tot_wait / 1000.0 / ITER_CNT, tot_us / 1000.0 / ITER_CNT,
+               tot_us > 0.0 ? 100.0 * tot_wait / tot_us : 0.0,
+               (tot_us - tot_wait) / 1000.0 / ITER_CNT);
         fflush(stdout);
 
         // APU CUMULATIVE. This is the number to read, not the two per-frame
@@ -4339,7 +4509,22 @@ int main(int argc, char **argv)
                    tot_us / 1000.0 / ITER_CNT, "", 100.0 * tot_us / g_ap_run_us);
             printf("  %-20s %9s %10.3f %9s %6.1f%%\n", "-- roi_crop launch", "",
                    rc / 1000.0 / ITER_CNT, "", 100.0 * rc / g_ap_run_us);
-            const double resid = g_ap_run_us - apu - tot_us - rc;
+            // The slots sum to more wall time than the frame spent, by exactly
+            // the overlap measured at the join. Report BOTH: the subtotal keeps
+            // its old meaning so every figure recorded before threading stays
+            // comparable, and the wall figure is the one the residual is
+            // computed from.
+            const double ovl = g_ap_overlap_tot_us;
+            if (ovl > 0.0) {
+                printf("  %-20s %9s %10.3f %9s %6.1f%%   <-- ran CONCURRENTLY on "
+                       "core 1; the subtotal above counts it, the frame does not\n",
+                       "-- of which OVERLAP", "", -ovl / 1000.0 / ITER_CNT, "",
+                       -100.0 * ovl / g_ap_run_us);
+                printf("  %-20s %9s %10.3f %9s %6.1f%%\n", "-- APU wall", "",
+                       (apu - ovl) / 1000.0 / ITER_CNT, "",
+                       100.0 * (apu - ovl) / g_ap_run_us);
+            }
+            const double resid = g_ap_run_us - (apu - ovl) - tot_us - rc;
             printf("  %-20s %9s %10.3f %9s %6.1f%%   <-- console, dumps, printf, "
                    "uninstrumented\n", "== UNATTRIBUTED", "",
                    resid / 1000.0 / ITER_CNT, "", 100.0 * resid / g_ap_run_us);

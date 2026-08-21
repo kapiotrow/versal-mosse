@@ -495,7 +495,12 @@ scripts/  export_weights.py, gen_aiesim_vectors.py, gen_filter_golden.py,
 
 ## Current status (2026-08-21)
 
-**Best hardware to date: `runs/run_0821_1635.log`, 28.64 ms/frame = 34.92 FPS** — adds the
+**Best hardware to date: `runs/run_0821_1725.log`, 26.29 ms/frame = 38.04 FPS** (26.23 in
+`run_0821_1712`; same config, the difference is noise — `_1725` adds the overlap accounting) —
+`MEMTILE_TRANSPOSE=1 ROI_CROP_PIPELINE=1 CMUL_SPLIT_ACCUM=1 TAIL_PARALLEL=1`.
+Tracking unchanged since the training-target fix: mean IoU 0.9188, worst 0.8353,
+centre 1.37/3.52 px.
+**The day: 62.71 → 26.23 ms, 15.95 → 38.15 FPS — 2.39×, tracking never once regressing.** — adds the
 blocked `unpack_spectrum` to the config below. `unpack F_ch` 2.902 → 1.780 ms, tracking
 bit-identical, GMIO unchanged (11.093 → 11.142) as the control.
 **The day: 62.71 → 28.64 ms, 15.95 → 34.92 FPS — 2.19×.**
@@ -671,6 +676,198 @@ ruled out). Trust the ORDERING; do not quote the sim's absolute magnitudes as th
 8.6% / 10.3% / 9.2% at eta 0.025 / 0.05 / 0.1). `SCALE_N=65` at a=1.04 gives 7.0% against 8.6%
 for **3.9× the scale-filter cost** — not worth it. ~8-10% box error is the practical floor of
 this filter as configured; the next real gain would be a different scale estimator, not a tune.
+
+### Parallel-for inside `filter_update_quantize` — ATTEMPTED AND ABANDONED (2026-08-21)
+
+Not shipped. **~0.96 ms (3.6%) was not worth what every formulation cost in bit-exactness**, and
+the reason generalises to any future parallel-for in this file.
+
+**The gain was bounded before it started, and modelling it first was the right call.** The tail
+is `max(scale 2.89, filter 4.80) + publish 1.91 = 6.71 ms`, and **`publish` cannot move to the
+other core** — it consumes `filter_scratch`/`q15_scale`, so filter→publish is a serial
+dependency and 6.71 ms IS the critical path. Splitting the filter internally only helps after
+the scale filter frees core 0 at t = 2.89, i.e. on its last 1.91 ms: 4.80 → 3.84, saving 0.96.
+
+**THREE FORMULATIONS, EACH BIT-EXACT UNDER `-O2` AND EACH 1 ULP OFF UNDER
+`-ffp-contract=fast`.** The failure was always the same 82/1024 elements of **A** at
+**1.49e-08**, with **B, H(q15), scale and max|H| all bitwise identical**:
+
+| split | result |
+|---|---|
+| by ELEMENT range | A 1 ulp off. Not reassociation — B was exact, which is what an element split protects. |
+| by CHANNEL, inner loops full `[0,n)` | A 1 ulp off. So the loop BOUND was not the cause either. |
+| + `noinline` wrapper so the body is emitted once | worker counts finally agree with each other — **but the fused path then stopped matching `filter_update` + `filter_quantize_q15`**, breaking the golden-anchored equivalence test. |
+
+**Root cause: GCC's FMA contraction is sensitive to INLINING CONTEXT, not just to the
+expression.** With `nw == 1` the worker body inlines into the fast path; with `nw > 1` it is
+instantiated out-of-line for the thread, and the two contract `eta*conj(G[i])*f[i] + keep*a[i]`
+differently. Forcing one instantiation fixes that and simultaneously changes the fused path's
+codegen away from the reference. There is no free position here — any restructuring of this
+function moves the last bit somewhere.
+
+**Why 1 ulp of A was disqualifying.** A is carried frame to frame at eta = 0.125, so a per-frame
+1-ulp injection settles at ~1/eta = 8 ulps ≈ 1.2e-7 relative. Against H's int16 quantisation
+that is ~0.004 LSB — H stays identical almost always, but across 262144 elements and 200 frames
+some bins flip. Tracking would come back *nearly* identical, which is exactly the outcome that
+makes the bit-identical acceptance criterion useless — and that criterion caught the
+`g_target_shift` race this same afternoon.
+
+**REVERTED CLEANLY**: `mosse_filter.{h,cpp}` and `test_mosse_filter.cpp` restored from git, the
+Makefile knob removed. `make test_host` passes both builds again.
+
+**What survives for the next attempt.** (1) The `-ffp-contract=fast` second build in
+`make test_host` found every one of these, and `-O2` found none — it is the only instrument here
+that works. (2) An element-range split really does protect B's channel-order sum; that reasoning
+was sound and is worth reusing. (3) The `|H|` max scan needs a lowest-global-index tie-break to
+be split at all, since `std::abs()` is `hypot()` and two elements with identical `re²+im²` can
+hypot one ulp apart. (4) **Parallelise across FUNCTIONS, not inside them** — the tail split
+worked precisely because it moved a whole function to the other core and touched no arithmetic.
+
+### TAIL SPLIT ONTO THE SECOND A72 CORE — 28.71 → 26.23 ms, 38.15 FPS (2026-08-21)
+
+`runs/run_0821_1712.log`, wall 26.21. **Tracking bit-identical to `run_0821_1635`** — mean IoU
+0.9188, worst 0.8353, centre 1.37/3.52 px, PSR 25.75/83.75/127.08, 199/199 scale accepted. The
+first threading in this design. **`TAIL_PARALLEL=1`, `-pthread` now in `GCC_FLAGS`** (verified
+in the ELF with `readelf -d`, because `-pthread` reaching the compile but not the link builds
+fine and then aborts on `std::thread`).
+
+```
+launch:  filter_update_quantize   (4.80 ms, pure heap)  -> core 1
+main:    scale detect + update    (2.89 ms)             -> core 0
+join
+main:    publish_packed           (1.91 ms)
+```
+
+Tail 9.25 → ~6.7 ms. **`publish` stays on the main thread deliberately**: `pack_filter` +
+`filter_bo.sync` are the only XRT calls in the tail, and keeping XRT single-threaded is worth
+more than the 1.9 ms. Frame 0 never launches (evaluate == `g_filter.initialized`), so the
+bootstrap runs serially as before.
+
+**THE FIRST ATTEMPT SILENTLY CORRUPTED TRACKING, AND THE REVIEW THAT CLEARED IT ASKED THE WRONG
+QUESTION.** `runs/run_0821_1706.log`: mean IoU 0.9188 → **0.4794**, centre 1.37 → 13.01 px, 22
+scale HOLDs where there had been 0, diverging from frame 2. Cause: `filter_update_quantize`
+CONSUMES `g_target_shift`, and the `gaussian_target_spectrum()` that fills it sits ~200 lines
+later in the `else if (gate.accept)` branch — after the scale filter and after the join. **The
+helper trained every frame on the PREVIOUS frame's target**, i.e. it reintroduced the
+training-target defect this file already fixed once.
+
+The pre-run review asked *"does the scale path TOUCH anything the filter path touches?"* and
+answered no, correctly. It never asked *"is everything the helper READS already written when it
+starts?"* **For a thread launch both must hold, and only the second question catches this.**
+Disjointness is about concurrent WRITES; this was a read-before-write ordering violation
+entirely inside the helper's own inputs. Fixed by building the target immediately before the
+launch, and every read the helper makes is now audited at the launch site.
+
+**THE BIT-IDENTICAL ACCEPTANCE TEST IS WHAT CAUGHT IT** — at frame 2, unambiguously, on the
+first run. A tolerance-based check would have shrugged at IoU 0.48. That criterion has now paid
+for itself on a class of bug it was never designed for.
+
+**Overlap accounting — FIXED, `runs/run_0821_1725.log`.** With TAIL_PARALLEL the `AP_FILTER`
+slot is filled on core 1 while `AP_SCALE_*` is filled on core 0, so the subtotal counted wall
+time the frame never spent and `UNATTRIBUTED` went **negative (−1.503 ms)** — a residual that
+cannot physically exist. The table now measures the double-count instead of hiding it:
+
+```
+-- APU subtotal      15.639    <- old meaning, comparable to every pre-threading run
+-- of which OVERLAP  -2.762    <- ran CONCURRENTLY on core 1
+-- APU wall          12.876    <- what the frame actually spent; the residual uses this
+== UNATTRIBUTED      +1.261
+```
+
+**HOW IT IS MEASURED, NOT ESTIMATED.** Let H be the helper's own elapsed time (the `AP_FILTER`
+delta across the region) and W the time the main thread then spends blocked in `join()`. The
+region's WALL cost is (main's own work + W); the slots credit (main's own work + H). The
+double-count is exactly **H − W**, which equals `min(helper, main)` however the two line up,
+without needing to know which finished first.
+
+**IT VALIDATES ITSELF, WHICH IS WHY THE PREDICTIONS WERE WRITTEN FIRST.** Overlap came to 2.762
+against a predicted 2.9 = `min(helper 4.80, scale 2.89)` — 95.6% of the theoretical maximum, the
+rest being launch/join overhead. And the residual returned to **+1.261** against **+1.17 before
+threading**: the unattributed cost (console, printf) did not change, so a residual back at its
+old value means the correction removes exactly the double-count and nothing else. A correction
+tuned merely to erase a negative number would have had no reason to land there.
+
+**THE FIRST CUT OF THE INSTRUMENT HAD THE SAME BUG AS THE FEATURE IT MEASURES.** It sampled
+`g_ap_us[AP_FILTER]` BEFORE `join()` — but the helper writes that counter when it finishes, so
+H read 0 every frame, the `ovl > 0` guard suppressed both lines, and `run_0821_1720` still
+printed the impossible −1.492. Read-before-write across a thread boundary, in the code written
+to explain a read-before-write bug. **Disjoint-state reasoning catches neither; the question
+that does is "is every value this read depends on already written, and is there a
+synchronisation point between?"**
+Cost differed sharply though, and that is the useful half: the `g_target_shift` version
+corrupted tracking and took a full build-flash-run to find; this one only broke a diagnostic and
+failed SILENTLY rather than printing a plausible wrong number, because the guard suppressed the
+line. **Failing loudly-or-not-at-all beats failing plausibly.**
+
+*Cosmetic, if this section is ever touched again*: the OVERLAP and APU-wall lines print after the
+GMIO and roi_crop rows, so "of which" reads as if it might refer to those. It refers to the APU
+subtotal three lines up.
+- **Both halves got ~4% slower** (`scale extract` 2.139 → 2.248, `filter upd+quant` 4.721 →
+  4.802). That is the two cores contending for one memory controller — real, already inside the
+  2.48 ms net, and a warning for the parallel-for items: **`filter upd+quant` is memory-bound,
+  so splitting it across cores will return well under 2×.**
+
+### THE FRAME IS 84% CPU-BOUND, NOT WAIT-BOUND — async/wait split, 2026-08-21
+
+`runs/run_0821_1651.log`. `DMA_TX` and `DMA_T` shared one accumulator, so every port figure was
+`async` + `wait` fused — the split this file has demanded since the 503 ms hunt ("DMA_T times
+async AND wait together — split them before drawing conclusions from any single port") and which
+was done for the roi_crop path and never for the GMIO ports. Frame 28.64 → 28.71 (the instrument
+costs 0.07 ms), tracking bit-identical.
+
+```
+HOST BLOCKED in wait(): 4.508 ms/frame of 11.116 ms GMIO (41%)
+host-side async work:   6.608 ms/frame
+```
+
+| port | total | wait | **async** |
+|---|---|---|---|
+| `gmio_fft_col_out` | 4.383 | 1.653 | **2.730** |
+| `gmio_accum_out` | 4.301 | 1.424 | **2.878** |
+| `gmio_cmul_in` | 1.003 | 0.816 | 0.187 |
+| `gmio_weights` | 0.562 | 0.129 | 0.433 |
+| `gmio_ifft_row_in` | 0.304 | 0.288 | 0.016 |
+| others | 0.564 | 0.199 | 0.364 |
+| **TOTAL** | **11.116** | **4.508** | **6.608** |
+
+**ONLY 41% OF GMIO IS BLOCKING.** The two 256-tx ports cost **11.0 µs of host CPU per `async()`
+call** — 5.6 ms/frame spent issuing descriptors, 20% of the frame, and it was invisible while the
+two halves shared a counter.
+
+**THIS REINTERPRETS THE `CMUL_ACCUM_MEMTILE` FAILURE, AND TURNS IT FROM A DEAD END INTO A
+PREREQUISITE.** At 256 tx `accum_out` was 2.88 async + 1.42 wait. When the memtile cut it to
+16 tx, async fell to ~0.18 and wait grew to ~4.3 — total unchanged. The port's floor is AIE
+production (~4.3 ms) and **the async work was already hidden inside it**. The recorded conclusion
+("16× fewer transactions changed nothing, therefore the cost is AIE production") was right about
+the floor and wrong about the mechanism: 2.88 ms of host CPU was being usefully absorbed, and the
+memtile freed it into idle waiting that a single-threaded host had no use for. **Alone it loses
+0.36 ms; paired with a second core it is worth ~2.7 ms of freed CPU.**
+
+**AND IT RESIZES THE SECOND-CORE OPPORTUNITY, IN THE OPPOSITE DIRECTION FROM THE FRAMING.** The
+plan was "use the ~8-9 ms of idle CPU during GMIO waits". There is only 4.5 ms of it. But the
+real number is larger, not smaller:
+
+```
+total host CPU/frame = APU 15.41 + GMIO async 6.61 + roi_crop 1.02 + unattributed 1.17
+                     = 24.2 ms of a 28.7 ms frame  =  84% CPU-BOUND
+```
+
+The second core's value is **splitting 24 ms of work, not filling 4.5 ms of gaps**. Perfect
+two-core use floors at ≈ max(12.1, AIE production, dependency chain) ≈ **12-15 ms, 65-80 FPS**.
+
+That reorders the designs: **parallel-for on the big compute loops moves UP** (it attacks the
+24 ms directly), the **tail split stays the safest start**, and **filling the wait gaps moves
+DOWN** — 3.9 ms of per-channel work into a 4.5 ms window is nearly no slack, and it is the design
+that touches the deadlock-sensitive channel loop.
+
+**Two open questions closed as a by-product.** `gmio_cmul_in`'s 62.67 µs/tx after the port split
+is **81% wait** — cmul blocking on two input-buffer acquisitions, real and not recoverable by
+batching. `gmio_ifft_row_in` is **95% wait** at 304 µs/tx — pure IFFT-chain production, as
+assumed.
+
+**A target that was invisible until now: 6.6 ms/frame of XRT descriptor cost, 23% of the frame.**
+The only lever visible is fewer, larger transactions — i.e. `CMUL_ACCUM_MEMTILE` — which pays
+only once a second thread exists to absorb the resulting wait.
 
 ### Blocked `unpack_spectrum` — ON HARDWARE: 29.61 → 28.64 ms, 33.77 → 34.92 FPS
 
@@ -1148,6 +1345,14 @@ slot left to attack; the remaining wins are structural:**
 -1. ~~**`CMUL_ACCUM_MEMTILE=1`**~~ — **TRIED AND REVERTED, a 0.36 ms LOSS.** The accumulator
    port's cost is AIE production, not DMA overhead; see the entry below.
 -3. ~~**`unpack F_ch` blocked transpose**~~ — **DONE, 29.61 → 28.64 ms.** See below.
+-4. **Second A72 core — FIRST PIECE LANDED (tail split, 2.48 ms). Remaining:**
+   The frame is 84% CPU-bound (24.2 of 28.7 ms), so the lever is splitting work, not filling
+   waits. In order: (a) **tail split** — `scale extract` ∥ `filter upd+quant`, independent after
+   the PSR, disjoint state, ~2.6 ms, no accuracy change, no XRT interaction; (b) parallel-for
+   over channels inside `filter_update_quantize` (expect well under 2× — it is memory-bound and
+   the two cores share a controller); (c) re-enable `CMUL_ACCUM_MEMTILE`, which only pays once a
+   helper exists. Needs `-pthread` (absent today) and `sched_setaffinity`; keep XRT calls on the
+   main thread only.
 -0. **Software-pipeline the CHANNEL loop — the only remaining lever on the 8.7 ms
    `fft_col_out`+`accum_out` pair.** That pair is the col-FFT + cmul production time for 16
    channels, proven immune to transaction count. Overlap it with the host's ~0.4 ms/channel of

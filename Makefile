@@ -114,6 +114,18 @@ CMUL_SPLIT_ACCUM    ?= 1
 # reaching for this again.
 CMUL_ACCUM_MEMTILE  ?= 0
 
+# Run the translation-filter update on the SECOND A72 core while the main thread
+# does the scale filter. They are independent after the PSR — disjoint state, no
+# shared buffers — so this is pure overlap with no accuracy change. Worth ~2.6 ms
+# of the 9.25 ms frame tail. The board has two cores (boot log: "SMP: Total of 2
+# processors activated") and the host has used one of them all along.
+# NOTE: publish (pack + sync) stays on the MAIN thread deliberately — it is the
+# only part of the tail that touches XRT, and keeping XRT single-threaded is a
+# discipline this design should not give up for 1.9 ms.
+TAIL_PARALLEL       ?= 1
+
+
+
 # FFT/IFFT output shifts. The invariant is
 #     2*FFT_SHIFT + IFFT_ROW_SHIFT + IFFT_COL_SHIFT = 12
 # which fixes the response scale, so weight can be moved between the forward and
@@ -538,6 +550,8 @@ GCC_FLAGS  += -DCMUL_SPLIT_ACCUM=$(CMUL_SPLIT_ACCUM)
 # Shared by both toolchains: at 1 the host drains accum_out once per CHANNEL
 # instead of once per chunk. A mismatch is a stalled drain, not a compile error.
 GCC_FLAGS  += -DCMUL_ACCUM_MEMTILE=$(CMUL_ACCUM_MEMTILE)
+# Host-only, and it needs -pthread in BOTH the compile and the link.
+GCC_FLAGS  += -DTAIL_PARALLEL=$(TAIL_PARALLEL) -pthread
 # Offset of the synthetic test impulse from the tracked position. A correct
 # pipeline must report exactly this displacement; (0,0) would be untestable
 # because it is also what a zero response yields. Sweep to check other offsets:
