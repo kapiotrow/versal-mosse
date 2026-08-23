@@ -1,0 +1,20 @@
+name rgb_recompute_cached
+frame_rows 400
+frame_cols 400
+roi_row 150
+roi_col 150
+roi_h 127
+roi_w 127
+patch_rows 128
+patch_cols 128
+twice 1
+in_ch 3
+exp_mean 56820
+exp_var 18163506
+exp_inv_q 492
+exp_beats 12288
+step_y 254
+step_x 254
+fy_nonzero 127
+fx_nonzero 127
+why the 48 KB static buffer must re-stream byte-identically

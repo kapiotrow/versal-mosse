@@ -54,6 +54,19 @@
 
 #include "mosse_filter.h"
 
+// The conv2d weight-buffer layout, shared verbatim with the AIE kernel. The
+// host WRITES into that buffer every frame (mean_prev), so a layout it merely
+// remembers is a layout it can silently corrupt: at CONV_IN_CH=3 the grayscale
+// mean_prev offset (18) lands inside the B plane's taps. No <adf.h> in this
+// header, by design.
+#include "conv_weight_layout.h"
+
+// Luma scene -> the interleaved buffer the device reads. Its own translation
+// unit, with no XRT header, so `make test_scene` compiles and tests it natively
+// in seconds — the same reason mosse_filter.{h,cpp} is separate. Both of its
+// failure modes (wrong interleave, missed touch) are silent on hardware.
+#include "scene_colour.h"
+
 // -----------------------------------------------------------------------
 // Build-time constants (set via Makefile -D flags)
 // -----------------------------------------------------------------------
@@ -192,9 +205,17 @@ constexpr size_t CMUL_IN_BYTES     = PATCH_ELEMS * 4 * 2;       // [filter|accum
 constexpr int    CMUL_CHUNK_INT16  = PATCH_COLS * FFT_COL_WS * 2; // int16_t per half-chunk
 constexpr int    CMUL_N_CHUNKS     = PATCH_ROWS / FFT_COL_WS;
 constexpr size_t RESP_BYTES        = PATCH_ELEMS * 4;
-constexpr size_t FRAME_BYTES       = (size_t)FRAME_ROWS * FRAME_COLS;  // single-channel grayscale uint8
-// conv2d weights: 3×3×3 INT8 = 27 bytes, padded to 64-byte GMIO alignment
-constexpr size_t WEIGHT_CH_BYTES   = 64;
+// Pixels in a frame, and BYTES in the device-side frame buffer. They differ at
+// CONV_IN_CH=3, where frame_bo is PIXEL-INTERLEAVED R G B — the layout
+// roi_crop.h documents and roi_crop reads. 2 MB grayscale, 6 MB RGB.
+//
+// frame_cols is still passed to roi_crop in PIXELS: the kernel applies the
+// * ROI_IN_CH itself. Do not pre-multiply it, or the ROI walks off the row.
+constexpr size_t FRAME_PIXELS      = (size_t)FRAME_ROWS * FRAME_COLS;
+constexpr size_t FRAME_BYTES       = FRAME_PIXELS * CONV_IN_CH;
+// conv2d weights: CONV_WEIGHT_BYTES_RAW INT8 taps (9 gray / 27 RGB) plus the
+// scalar fields, padded to 64-byte GMIO alignment. See conv_weight_layout.h.
+constexpr size_t WEIGHT_CH_BYTES   = CONV_WEIGHT_BYTES_PAD;
 // conv2d emits one row-FFT window (PATCH_ROWS*FFT_ROW_WS samples) per invocation,
 // so it fires this many times per patch. Its `weights` input_buffer is consumed
 // once per invocation, so the host must send the weight buffer once per firing.
@@ -437,6 +458,12 @@ static unsigned long g_rc_n_total[RC_N];
 enum {
     AP_SCENE,        // inject_target_frame + scene_restore + BG_PAN
     AP_FRAME_PUSH,   // memcpy g_frame_host -> frame_bo (2 MB)
+    AP_COLOURISE,    // luma scene -> interleaved RGB, touched rect only.
+                     // Zero at CONV_IN_CH=1 (the call compiles away). Given its
+                     // OWN slot for the same reason AP_BO_STAGE has one: it is
+                     // the cost RGB ADDS to the host, and a cost folded into
+                     // AP_FRAME_PUSH would also have doubled that slot's call
+                     // count and halved its per-call figure.
     AP_FRAME_SYNC,   // frame_bo.sync host->device (2 MB)
     AP_TRANSPOSE,    // transpose_inplace, 17x 64 KB per frame
     AP_WINMEAN,      // measure_window_mean + the Parseval energy loop
@@ -466,7 +493,7 @@ enum {
     AP_N
 };
 static const char *g_ap_name[AP_N] = {
-    "scene gen", "frame push (2MB)", "frame_bo.sync", "transpose",
+    "scene gen", "frame push (2MB)", "colourise RGB", "frame_bo.sync", "transpose",
     "window mean+energy",
     "fcol_bo.sync", "BO<->heap stage", "unpack F_ch", "cmul packing",
     "B2 correction", "PSR scan",
@@ -1658,8 +1685,9 @@ static void report_response(const int16_t *resp, int rows, int cols)
 }
 
 // Load the INT8 conv2d weights exported by `make weights` into a host buffer.
-// Layout per channel (64 B, see design/aie_src/weights/layer0.h):
-//   [0:9] int8 3×3 kernel, [9] out_shift, [10:14] int32 bias_acc (LE)
+// Layout per channel (64 B): conv_weight_layout.h, derived from CONV_IN_CH.
+// Byte 63 of each buffer carries the layout tag the exporter wrote; a build/file
+// mismatch is checked at load time below.
 // The file ships 16 channels; a build with fewer uses the leading prefix.
 // Returns false (and leaves the buffer zeroed) if the file cannot be read, so a
 // missing weights file degrades to "output is zero" instead of garbage.
@@ -1687,7 +1715,7 @@ static bool load_conv_weights(const char *path, uint8_t *dst, size_t bytes)
 // -----------------------------------------------------------------------
 
 // Per-channel window-weighted feature mean, fed back to conv2d as mean_prev in
-// the next frame's weight buffer (bytes [18:22]). Zero on the first frame.
+// the next frame's weight buffer (at CONV_W_OFF_MEAN). Zero on the first frame.
 static int32_t g_mean_prev[N_CHANNELS] = {0};
 // Per-channel spectral energy, for the B3 filter scaling.
 static double  g_energy[N_CHANNELS]    = {0.0};
@@ -1759,7 +1787,7 @@ static int32_t measure_window_mean(const int16_t *row_fft, int32_t mean_prev)
 // transpose inside the graph that buffer stops existing on the host. Two things
 // depend on them and both are load-bearing:
 //
-//   mean_now  -> weights bytes [18:22] -> conv2d Stage B1 on the NEXT frame.
+//   mean_now  -> weights[CONV_W_OFF_MEAN] -> conv2d Stage B1 on the NEXT frame.
 //                Without it B1 is inert and the ch16 response rails flat
 //                (CLAUDE.md, "mean_prev seeding": F_ch 32768 railed -> 53).
 //   g_energy  -> Stage B3 in filter_quantize_q15.
@@ -2013,6 +2041,25 @@ static mosse::FilterState g_filter;
 // the first push, or it silently reverts the scene — the same ordering trap the
 // background seeding already documents.
 static std::vector<uint8_t> g_frame_host;
+
+// THE SCENE IS GENERATED IN LUMA AND COLOURISED ON THE WAY OUT.
+//
+// Every scene function — fill_background, the pan/dirty-rect restore,
+// inject_target_frame, scene_add_noise, the occluder — is single-plane, and so
+// is scale_extract, which crops 33 windows out of the frame every frame. Making
+// all of that plane-aware would be a large invasive rewrite of code that is
+// correct and measured. Instead the luma scene stays exactly as it is and one
+// colourise pass expands it into the interleaved buffer the device reads.
+//
+// At CONV_IN_CH=1 there is NO second buffer and NO copy: g_frame_host IS the
+// luma scene, byte for byte as before. The shipping path does not pay for RGB.
+#if CONV_IN_CH == 3
+static std::vector<uint8_t> g_scene_luma;
+static inline uint8_t *scene_luma() { return g_scene_luma.data(); }
+#else
+static inline uint8_t *scene_luma() { return g_frame_host.data(); }
+#endif
+
 static std::vector<uint8_t> g_stage_a;   // row_bo in
 static std::vector<uint8_t> g_stage_b;   // transpose destination -> row_bo out
 static std::vector<uint8_t> g_stage_c;   // fcol_bo / resp_bo — a THIRD buffer on
@@ -2289,14 +2336,33 @@ static void fill_background(uint8_t *frame_buf, int rows, int cols)
 // target-sized.
 static std::vector<uint8_t> g_background;
 
-struct DirtyRect { int r0 = 0, c0 = 0, r1 = -1, c1 = -1; };   // inclusive; empty if r1 < r0
+// ONE rect type, shared with scene_colour. It used to be declared here with the
+// same four fields, which is how two vocabularies for the same thing start.
+using DirtyRect = scene::Rect;
 static DirtyRect g_dirty;
+
+// EVERY LUMA WRITE MUST BE COLOURISED, so a second rect accumulates the union of
+// everything written this frame. g_dirty cannot serve: scene_restore CLEARS it,
+// and the restored region is itself a write that must be re-colourised. So this
+// one is fed from both the restore and every mark_dirty, and is cleared only by
+// the colourise pass just before the push.
+//
+// The invariant to preserve when adding a scene function: if it writes luma, its
+// rect must reach scene_touch(). Miss one and the device sees last frame's
+// colour there — which would look like a plausible tracking result, not a bug.
+static DirtyRect g_touched;
+
+static inline void scene_touch(int r0, int c0, int r1, int c1)
+{
+    scene::rect_union(g_touched, r0, c0, r1, c1);
+}
 
 static void scene_init(int rows, int cols)
 {
     g_background.resize((size_t)rows * cols);
     fill_background(g_background.data(), rows, cols);
     g_dirty = DirtyRect{};                       // frame starts equal to background
+    g_touched = DirtyRect{};
 }
 
 // -----------------------------------------------------------------------
@@ -2377,6 +2443,8 @@ static void scene_restore(uint8_t *frame_buf, int rows, int cols)
     const int r0 = std::max(0, g_dirty.r0), r1 = std::min(rows - 1, g_dirty.r1);
     const int c0 = std::max(0, g_dirty.c0), c1 = std::min(cols - 1, g_dirty.c1);
     const int w  = c1 - c0 + 1;
+    // The restored region is a luma write like any other.
+    scene_touch(r0, c0, r1, c1);
     for (int r = r0; r <= r1; ++r) {
         const uint8_t *src = g_background.data()
                            + (size_t)scene_wrap(r + g_pan_r, rows) * cols;
@@ -2389,8 +2457,97 @@ static void scene_restore(uint8_t *frame_buf, int rows, int cols)
     g_dirty = DirtyRect{};
 }
 
+// -----------------------------------------------------------------------
+// Colourise — luma scene -> the interleaved RGB buffer the device reads
+// -----------------------------------------------------------------------
+// ONLY THE TOUCHED RECT. The frame is 2.07 M pixels and colourising all of it
+// every frame would cost more than the push it feeds; the scene machinery
+// already tracks what changed, and outside that rect the RGB buffer is still
+// correct from the startup pass. This is the same argument that makes the
+// dirty-rect restore cheap, applied one stage later.
+//
+// FRAME_RGB_MODE picks what "colour" means for the SYNTHETIC bench. Neither
+// choice is a claim about real video — the VOT frame source supplies its own
+// colour and ignores this entirely.
+//
+//   0  REPLICATE. All three planes carry luma. This is the hardware analogue of
+//      the offline `rgb-lum` control arm: 27 taps, RGB plumbing, no colour. If
+//      an RGB run beats gray here, the win is bookkeeping and not chroma.
+//   1  TINT (default). A fixed per-plane gain, so the scene has real chromatic
+//      contrast for the JOINT normalisation to preserve. The gains are applied
+//      in Q8 and the target rect gets a different, warmer set than the
+//      background, which is what makes the target distinguishable in chroma and
+//      not only in luma.
+//
+// The gains are deliberately mild (0.75x .. 1.25x): a saturating tint would clip
+// at 255 and hand Stage A a flat plane, which is the one outcome that would make
+// the RGB path look broken for a reason that is not the RGB path.
+#ifndef FRAME_RGB_MODE
+#  define FRAME_RGB_MODE 1
+#endif
+static_assert(FRAME_RGB_MODE == scene::MODE_REPLICATE ||
+              FRAME_RGB_MODE == scene::MODE_TINT,
+              "FRAME_RGB_MODE must be 0 (replicate) or 1 (tint)");
+
+#if CONV_IN_CH == 3
+// Target rect for the tint, set once per frame before the colourise pass.
+static DirtyRect g_tint_target;
+
+// Thin wrappers over scene_colour, which owns the colour rule, the clipping and
+// the verifier. Nothing here reimplements any of it: the tracker's job is to
+// supply its globals and the frame geometry.
+static inline void scene_colourise(int rows, int cols)
+{
+    scene::colourise(g_frame_host.data(), g_scene_luma.data(),
+                     rows, cols, CONV_IN_CH, FRAME_RGB_MODE,
+                     g_tint_target, g_touched);
+}
+
+// SCENE_VERIFY: re-expand the WHOLE frame and compare.
+//
+// The incremental pass is correct only if EVERY luma write reached
+// scene_touch(). That invariant is invisible: miss one and the device reads last
+// frame's colour there, the tracker still produces a peak, and the run looks
+// like a slightly worse result rather than a bug. This turns it into an abort
+// with coordinates.
+//
+// O(frame) per frame, so it is opt-in. Run it for a few frames after any change
+// to a scene function, then turn it off — a debugging instrument, not a per-run
+// cost. `make test_scene` covers the same invariant natively, including the
+// missed-touch case, so this is the on-board backstop rather than the only net.
+#ifndef SCENE_VERIFY
+#  define SCENE_VERIFY 0
+#endif
+#if SCENE_VERIFY
+static std::vector<uint8_t> g_colour_ref;
+static void scene_verify(int rows, int cols, int frame)
+{
+    size_t first = 0;
+    const size_t bad = scene::verify(g_frame_host.data(), g_scene_luma.data(),
+                                     rows, cols, CONV_IN_CH, FRAME_RGB_MODE,
+                                     g_tint_target, g_colour_ref, &first);
+    if (!bad) return;
+    const size_t px = first / CONV_IN_CH;
+    printf("FATAL [scene] frame %d: incremental colourise disagrees with a full "
+           "pass on %zu of %zu bytes, first at (r=%zu, c=%zu, plane=%zu).\n"
+           "  A luma write did not reach scene_touch(). See the invariant note "
+           "on g_touched and in scene_colour.h.\n",
+           frame, bad, FRAME_BYTES, px / (size_t)cols, px % (size_t)cols,
+           first % CONV_IN_CH);
+    fflush(stdout);
+    abort();
+}
+#else
+static inline void scene_verify(int, int, int) {}
+#endif
+#else
+static inline void scene_colourise(int, int) { /* gray: g_frame_host IS the scene */ }
+static inline void scene_verify(int, int, int) {}
+#endif
+
 static void scene_mark_dirty(int r0, int c0, int r1, int c1)
 {
+    scene_touch(r0, c0, r1, c1);
     if (g_dirty.r1 < g_dirty.r0) { g_dirty = DirtyRect{r0, c0, r1, c1}; return; }
     g_dirty.r0 = std::min(g_dirty.r0, r0);  g_dirty.c0 = std::min(g_dirty.c0, c0);
     g_dirty.r1 = std::max(g_dirty.r1, r1);  g_dirty.c1 = std::max(g_dirty.c1, c1);
@@ -2576,6 +2733,14 @@ static void inject_target_frame(uint8_t *frame_buf, int rows, int cols,
     // The shape spans dc in [-2*sw, 8*sw], so the column extent is asymmetric.
     scene_mark_dirty(r0, (int)std::floor(tc - 2.0 * sw) - 1,
                      r1, (int)std::ceil (tc + 8.0 * sw) + 1);
+#if CONV_IN_CH == 3
+    // The same rect is what the tint treats as "target", so the drawn object
+    // carries a different hue from the background it sits on. Set here rather
+    // than at the call site so the two can never disagree about where the
+    // target is — they are the same two lines of geometry.
+    g_tint_target = DirtyRect{r0, (int)std::floor(tc - 2.0 * sw) - 1,
+                              r1, (int)std::ceil (tc + 8.0 * sw) + 1};
+#endif
 
     for (int r = std::max(0, r0); r <= std::min(rows - 1, r1); ++r) {
         const double dr = (double)r - tr;
@@ -2714,7 +2879,7 @@ int main(int argc, char **argv)
     // SEED mean_prev BEFORE FRAME 0. Without this Stage B1 is INERT on the one
     // frame the filter is trained from, and at 16 channels that is fatal.
     //
-    // layer0_weights.bin has bytes [18:22] = 0, so frame 0 ran with mean_prev=0
+    // layer0_weights.bin ships mean_prev = 0, so frame 0 ran with mean_prev=0
     // and conv2d emitted its full DC pedestal (bias_acc >> out_shift ~ 24689 for
     // ch0). filter_init then learned from a DC-dominated spectrum, and frame 1 —
     // where B1 IS active — applies a filter matched to features that no longer
@@ -2736,11 +2901,26 @@ int main(int argc, char **argv)
         uint8_t *wb = weights_bo.map<uint8_t *>();
         for (int ch = 0; ch < N_CHANNELS; ++ch) {
             uint8_t *w = wb + ch * WEIGHT_CH_BYTES;
+
+            // THE LAYOUT TAG IS CHECKED HERE, ONCE, BEFORE ANY BYTE IS READ.
+            // A CONV_IN_CH=3 file read by a CONV_IN_CH=1 build takes out_shift
+            // out of the G plane and bias_acc out of G/B taps: no crash, no
+            // warning, sixteen plausible channels and a meaningless tracker.
+            // Byte 63 is 0 in files exported before the tag existed, which were
+            // all grayscale.
+            const int tag = (int)w[CONV_W_OFF_TAG];
+            if (tag != CONV_IN_CH && !(tag == 0 && CONV_IN_CH == 1)) {
+                printf("FATAL: %s ch%d has layout tag %d, this build is "
+                       "CONV_IN_CH=%d. Re-run: make weights CONV_IN_CH=%d\n",
+                       WEIGHTS_FILE, ch, tag, CONV_IN_CH, CONV_IN_CH);
+                return 1;
+            }
+
             int32_t bias;
-            memcpy(&bias, w + 10, sizeof(int32_t));
-            const int shift = (int)w[9];
+            memcpy(&bias, w + CONV_W_OFF_BIAS, sizeof(int32_t));
+            const int shift = (int)w[CONV_W_OFF_SHIFT];
             const int32_t seed = bias >> shift;
-            memcpy(w + 18, &seed, sizeof(int32_t));
+            memcpy(w + CONV_W_OFF_MEAN, &seed, sizeof(int32_t));
             g_mean_prev[ch] = seed;
         }
         printf("mean_prev seeded from bias_acc>>out_shift: ch0=%d ch%d=%d "
@@ -3043,7 +3223,11 @@ int main(int argc, char **argv)
     // Control CU. Runs before the first frame so its zero-fill of frame_bo cannot
     // race the per-frame injection, and after the graph is up so the device state
     // matches what roi_crop will see. See rc_control_cu_probe().
-    rc_control_cu_probe(cam, frame_bo, FRAME_ROWS, FRAME_COLS);
+    // FRAME_COLS * CONV_IN_CH, not FRAME_COLS: camera_capture zero-fills
+    // rows*cols BYTES, and at 3 planes the buffer is three times as wide. The
+    // seed below overwrites all of it either way, so this only matters for the
+    // probe's own claim to be filling the buffer it says it fills.
+    rc_control_cu_probe(cam, frame_bo, FRAME_ROWS, FRAME_COLS * CONV_IN_CH);
 
     // ------------------------------------------------------------------
     // BO-MAPPING ACCESS PROBE — is the ~40 ms in the element loops the MEMORY
@@ -3164,12 +3348,24 @@ int main(int argc, char **argv)
     // change. See the FFT_SHIFT block in the Makefile. Seeding without that is a
     // railed response.
     {
+#if CONV_IN_CH == 3
+        // Luma scene first, then colourise the WHOLE frame once. The per-frame
+        // pass only covers the touched rect, so everything outside it must be
+        // correct from here — this is the pass that makes that true.
+        g_scene_luma.assign(g_background.begin(), g_background.end());
+        g_frame_host.assign(FRAME_BYTES, 0);
+        g_tint_target = DirtyRect{};              // no target drawn yet
+        scene_touch(0, 0, FRAME_ROWS - 1, FRAME_COLS - 1);
+        scene_colourise(FRAME_ROWS, FRAME_COLS);
+#else
         g_frame_host.assign(g_background.begin(), g_background.end());
+#endif
         memcpy(frame_bo.map<uint8_t *>(), g_frame_host.data(), FRAME_BYTES);
         frame_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
         printf("[scene] frame buffer seeded with the generated background "
-               "(%zu B). Before this the pipeline read an unwritten buffer "
-               "outside the dirty rect — see the note here.\n", FRAME_BYTES);
+               "(%zu B, %d plane%s). Before this the pipeline read an unwritten "
+               "buffer outside the dirty rect — see the note here.\n",
+               FRAME_BYTES, CONV_IN_CH, CONV_IN_CH == 1 ? "" : "s");
         fflush(stdout);
     }
 
@@ -3219,7 +3415,9 @@ int main(int argc, char **argv)
         // against the injected offset, which does not exist on an occluded frame.
         bool occluded = false;
         {
-            uint8_t *frame_ptr = g_frame_host.data();
+            // The scene functions are all single-plane; scene_colourise()
+            // below expands what they wrote into g_frame_host.
+            uint8_t *frame_ptr = scene_luma();
             // Keyed off the filter state, not off `frame == 0`. The two agree in
             // the current flow, but "is the filter trained yet" is the condition
             // that actually decides where the target must be, and the init branch
@@ -3322,6 +3520,12 @@ int main(int argc, char **argv)
             // price of keeping the authority on the heap; the probe puts it at
             // ~600 us for 2 MB, against the ~13 ms of scattered uncached reads it
             // removes from scale_extract.
+            // LAST luma write to FIRST device byte. Everything that draws into
+            // the scene has run by here — restore, target, occluder, noise — so
+            // the touched rect is complete and this is the only place the two
+            // representations are guaranteed to agree.
+            AP_T(AP_COLOURISE, scene_colourise(FRAME_ROWS, FRAME_COLS));
+            scene_verify(FRAME_ROWS, FRAME_COLS, frame);   // no-op unless SCENE_VERIFY
             AP_T(AP_FRAME_PUSH,
                  memcpy(frame_bo.map<uint8_t *>(), g_frame_host.data(),
                         FRAME_BYTES));
@@ -3563,9 +3767,9 @@ int main(int argc, char **argv)
                     e += (int64_t)rf[2*i] * rf[2*i] + (int64_t)rf[2*i+1] * rf[2*i+1];
                 g_energy[ch] = (double)e / (double)PATCH_ELEMS;
 
-                // Feed mean_now back as the next frame's mean_prev (bytes 18:22).
+                // Feed mean_now back as the next frame's mean_prev.
                 uint8_t *wb = weights_bo.map<uint8_t *>() + ch * WEIGHT_CH_BYTES;
-                memcpy(wb + 18, &mean_now, sizeof(int32_t));
+                memcpy(wb + CONV_W_OFF_MEAN, &mean_now, sizeof(int32_t));
                 g_ap_us[AP_WINMEAN] += std::chrono::duration<double, std::micro>(
                     std::chrono::steady_clock::now() - _wm0).count();
                 ++g_ap_n[AP_WINMEAN];
@@ -3749,10 +3953,10 @@ int main(int argc, char **argv)
                 g_mean_prev[ch]   = mean_now;
                 g_energy[ch]      = measure_energy_fch(fc);
 
-                // Feed mean_now back as the NEXT frame's mean_prev (bytes 18:22).
+                // Feed mean_now back as the NEXT frame's mean_prev.
                 // weights_bo is synced once after the channel loop, unchanged.
                 uint8_t *wb = weights_bo.map<uint8_t *>() + ch * WEIGHT_CH_BYTES;
-                memcpy(wb + 18, &mean_now, sizeof(int32_t));
+                memcpy(wb + CONV_W_OFF_MEAN, &mean_now, sizeof(int32_t));
 
                 g_ap_us[AP_WINMEAN] += std::chrono::duration<double, std::micro>(
                     std::chrono::steady_clock::now() - _wm0).count();
@@ -3782,7 +3986,7 @@ int main(int argc, char **argv)
                                         filter_bo.map<int16_t *>(),
                                         residual_mean));
 
-        // Push the updated mean_prev values (written into bytes [18:22] of each
+        // Push the updated mean_prev values (written at CONV_W_OFF_MEAN of each
         // channel's weight buffer above) so the NEXT frame's conv2d sees them.
         weights_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
 
@@ -4037,7 +4241,10 @@ int main(int argc, char **argv)
             // occluded frame's scale peak is noise, and resizing the box from it
             // would walk the ROI off the target just as surely as moving it would.
             if (scale.enabled() && gate.accept && scale.initialized) {
-                const uint8_t *fp = g_frame_host.data();
+                // LUMA, not the interleaved buffer: the DSST scale filter is an
+                // intensity template and keeping it on luma means RGB costs it
+                // no recalibration at all.
+                const uint8_t *fp = scene_luma();
                 mosse::ScaleResult sr{};
                 // Split: scale_extract reads frame_bo DIRECTLY (33 crops), so it
                 // pays the uncached read; scale_detect is pure heap. 13.86 ms was
@@ -4165,7 +4372,10 @@ int main(int argc, char **argv)
                 // The gate never ran — frame 0's bootstrap, or a frame where the
                 // scale filter is not yet trained. There is no detection sample
                 // to reuse and no idx to shift by, so extract as before.
-                const uint8_t *fp = g_frame_host.data();
+                // LUMA, not the interleaved buffer: the DSST scale filter is an
+                // intensity template and keeping it on luma means RGB costs it
+                // no recalibration at all.
+                const uint8_t *fp = scene_luma();
                 AP_T(AP_SCALE_EXTRACT,
                      mosse::scale_extract(scale, fp, FRAME_ROWS, FRAME_COLS,
                                           box.row, box.col, box.h, box.w,

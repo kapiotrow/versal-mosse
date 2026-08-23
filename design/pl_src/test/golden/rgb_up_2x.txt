@@ -1,4 +1,4 @@
-name up_2x
+name rgb_up_2x
 frame_rows 200
 frame_cols 200
 roi_row 30
@@ -8,13 +8,13 @@ roi_w 64
 patch_rows 128
 patch_cols 128
 twice 0
-in_ch 1
-exp_mean 55400
-exp_var 2202344
-exp_inv_q 1413
-exp_beats 4096
+in_ch 3
+exp_mean 56648
+exp_var 3495177
+exp_inv_q 1121
+exp_beats 12288
 step_y 128
 step_x 128
 fy_nonzero 64
 fx_nonzero 64
-why FIRST nonzero fy ever; fy=128 is max-weight interpolation
+why interpolator active on all three planes, shared fy/fx

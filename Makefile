@@ -378,6 +378,27 @@ AIE_FLAGS  += --Xpreproc="-DCMUL_H_SHIFT=$(H_SHIFT)"
 # commands, so this costs them nothing.
 CONV2D_MODE ?= 0
 AIE_FLAGS  += --Xpreproc="-DCONV2D_ECHO_TEST=$(CONV2D_MODE)"
+# conv2d input planes. 1 = grayscale (what ships), 3 = RGB.
+#
+# CONV_IN_CH REACHES BOTH TOOLCHAINS (AIE_FLAGS and GCC_FLAGS) FROM THIS ONE
+# VARIABLE. It has to: it picks the conv2d weight-buffer layout, which the graph
+# READS and the host WRITES (mean_prev) every frame, and the two offsets differ
+# (18 vs 36). A #ifndef default on the host side is not a safety net — it is what
+# would make the mismatch silent, exactly as FFT_ROW_WS/FFT_COL_WS once did.
+# The exporter stamps the layout into byte 63 of every channel buffer and the
+# host checks it at startup, so a stale layer0_weights.bin fails loudly.
+#
+# Wiring status at CONV_IN_CH=3: export_weights.py YES, conv2d_kernel.cpp YES
+# and VECTORIZED (27 aie::mac over CONV_VEC lanes; the static_assert on grayscale
+# guards the SEPARATE gray vectorized block, which RGB never reaches), roi_crop
+# YES, host YES. Remaining gap: gen_aiesim_vectors.py, and no hardware run.
+CONV_IN_CH ?= 1
+AIE_FLAGS  += --Xpreproc="-DCONV_IN_CH=$(CONV_IN_CH)"
+# conv2d's AIE stack in BYTES, applied only at CONV_IN_CH=3. The 27-tap MAC
+# chain measured 1344 against the 1024-byte default and the mapper REFUSED to
+# produce a libadf.a. See the stack_size() note in mosse_graph.h.
+CONV2D_STACK ?= 2048
+AIE_FLAGS  += --Xpreproc="-DCONV2D_STACK=$(CONV2D_STACK)"
 # cmul_accum arithmetic: 1 = vectorized aie::mac (default), 0 = the original
 # scalar loop. BIT-IDENTICAL by construction and checked by
 #   make x86sim_check KUT=cmul SCENARIO=s7
@@ -488,7 +509,12 @@ VPP_FLAGS  += --temp_dir $(BUILD_DIR)/_x
 # =========================================================
 CAM_VPP_FLAGS   := --hls.clock $(VPP_CLOCK_FREQ):camera_capture
 
+# ROI_IN_CH comes from CONV_IN_CH — ONE knob for both engines. roi_crop decides
+# what the AXIS wire carries and conv2d decides how to unpack it; a disagreement
+# is not a compile error at either end, it is a graph that runs and produces a
+# wrong feature map. See CLAUDE.md's rule on constants both engines derive from.
 CROP_VPP_FLAGS  := --hls.clock $(VPP_CLOCK_FREQ):roi_crop
+CROP_VPP_FLAGS  += -D ROI_IN_CH=$(CONV_IN_CH)
 
 # =========================================================
 # Host application compiler flags
@@ -526,6 +552,9 @@ GCC_FLAGS  := $(HOST_OPT) -std=c++17 -D__linux__ -D__PS_ENABLE_AIE__
 GCC_FLAGS  += -DPATCH_ROWS=$(PATCH_ROWS)
 GCC_FLAGS  += -DPATCH_COLS=$(PATCH_COLS)
 GCC_FLAGS  += -DN_CHANNELS=$(N_CHANNELS)
+# Selects the conv2d weight-buffer layout the host writes mean_prev into. MUST
+# match the AIE build and the exported .bin — see the CONV_IN_CH note above.
+GCC_FLAGS  += -DCONV_IN_CH=$(CONV_IN_CH)
 GCC_FLAGS  += -DITER_CNT=$(ITER_CNT)
 # THE HOST MUST AGREE WITH THE GRAPH ABOUT WINDOW SIZE. These were missing until
 # 2026-08-14, and the failure mode was silent and expensive: mosse_tracker.cpp
@@ -562,6 +591,13 @@ GCC_FLAGS  += -DIMPULSE_DR=$(IMPULSE_DR)
 GCC_FLAGS  += "-DIMPULSE_DC=($(IMPULSE_DC))"
 GCC_FLAGS  += -DFRAME_ROWS=1080
 GCC_FLAGS  += -DFRAME_COLS=1920
+# What "colour" means for the SYNTHETIC scene at CONV_IN_CH=3. 1 = per-plane
+# tint with a warmer target (real chroma for the joint normalisation to carry);
+# 0 = replicate luma into all three planes, which is the hardware analogue of the
+# offline `rgb-lum` control — same 27 taps and same plumbing, no colour. Inert at
+# CONV_IN_CH=1, and irrelevant once a real frame source supplies its own colour.
+FRAME_RGB_MODE ?= 1
+GCC_FLAGS  += -DFRAME_RGB_MODE=$(FRAME_RGB_MODE)
 # The host builds H in Q1.15 to match the shift cmul_accum applies to the product.
 # Same value as the AIE_FLAGS line above — see the H_SHIFT comment block.
 GCC_FLAGS  += -DCMUL_H_SHIFT=$(H_SHIFT)
@@ -1026,7 +1062,7 @@ KERNEL_XOS := $(CAM_XO) $(CROP_XO)
 # =========================================================
 # Rules
 # =========================================================
-.PHONY: help kernels graph gen_vectors aiesim graph_fft aiesim_fft xsa application package sd_card run_emu weights test_host test_roi_crop cleanall
+.PHONY: help kernels graph gen_vectors aiesim graph_fft aiesim_fft xsa application package sd_card run_emu weights test_host test_roi_crop test_scene cleanall
 
 help:
 	@echo ""
@@ -1063,9 +1099,18 @@ $(CAM_XO): $(PL_SRC_REPO)/camera_capture/camera_capture.cpp
 	mkdir -p $(BUILD_DIR)
 	v++ $(VPP_FLAGS) $(CAM_VPP_FLAGS) -c -k camera_capture $< -o $@
 
-$(CROP_XO): $(PL_SRC_REPO)/roi_crop/roi_crop.cpp
+# The .xo needs a flag stamp for the same reason libadf.a and the ELF do:
+# CONV_IN_CH touches no source file, so a source-only prerequisite list would
+# happily reuse a grayscale roi_crop.xo in an RGB build — and the failure is a
+# wrong feature map, not a build error.
+CROP_FLAGS_STAMP := $(BUILD_DIR)/crop.flagstamp
+$(CROP_FLAGS_STAMP): FLAGS_FOR_STAMP := $(CROP_VPP_FLAGS)
+
+$(CROP_XO): $(CROP_FLAGS_STAMP) $(PL_SRC_REPO)/roi_crop/roi_crop.cpp \
+            $(PL_SRC_REPO)/roi_crop/roi_crop.h
 	mkdir -p $(BUILD_DIR)
-	v++ $(VPP_FLAGS) $(CROP_VPP_FLAGS) -c -k roi_crop $< -o $@
+	v++ $(VPP_FLAGS) $(CROP_VPP_FLAGS) -c -k roi_crop \
+	    $(PL_SRC_REPO)/roi_crop/roi_crop.cpp -o $@
 
 # -------------------------------------------------------
 # AIE graph
@@ -1109,8 +1154,24 @@ $(LIBADF_A): $(AIE_FLAGS_STAMP)                \
 	mkdir -p $(BUILD_DIR)
 	cd $(BUILD_DIR) && aiecompiler $(AIE_FLAGS) $(GRAPH_SRC_CPP) 2>&1 | tee aiecompiler.log
 
+# BIAS_SCALE: `roi` (default since 2026-08-23) derives bias_acc against
+# ROI_NORM_Q = 32, the scale roi_crop actually emits. `127` restores the
+# historical int8-full-scale assumption, under which bias_acc was ~4x oversized
+# and out_shift pushed the SIGNAL down to make room for it.
+#
+# THE DEFAULT CHANGED, AND IT INVALIDATES THE SHIFT BUDGET. Every hardware
+# measurement recorded in CLAUDE.md up to 2026-08-23 — the 4-4-4 budget, mean
+# IoU 0.9188, the 38.04 FPS run — was taken at 127. The correction moves the
+# effective input scale, so 4-4-4 must be re-swept over >= 20 frames before any
+# tracking number from a `roi` build is trusted. It only pays at CONV_RELU=0
+# (held-out peak/max-sidelobe: 12.82 base+ReLU, 3.92 corrected+ReLU, 16.25
+# corrected+no-ReLU), which is the shipping configuration.
+#
+# `make weights BIAS_SCALE=127` reverts, bit-for-bit apart from the layout tag.
+BIAS_SCALE ?= roi
+
 weights:
-	cd $(PROJECT_REPO) && env PYTHONHOME= PYTHONPATH= uv run --extra weights python3 scripts/export_weights.py $(AIE_SRC_REPO)/weights $(PATCH_COLS)
+	cd $(PROJECT_REPO) && env PYTHONHOME= PYTHONPATH= uv run --extra weights python3 scripts/export_weights.py $(AIE_SRC_REPO)/weights $(PATCH_COLS) --in-ch $(CONV_IN_CH) --bias-scale $(BIAS_SCALE)
 
 # int8 samples per PatchIn beat. mosse_graph.h creates PatchIn as plio_32_bits,
 # so 4; change to 16 if the PLIO ever goes back to plio_128_bits.
@@ -1120,6 +1181,7 @@ gen_vectors:
 	cd $(PROJECT_REPO) && env PYTHONHOME= PYTHONPATH= \
 	    GEN_PATCH_ROWS=$(PATCH_ROWS) \
 	    GEN_PATCH_COLS=$(PATCH_COLS) \
+	    GEN_CONV_IN_CH=$(CONV_IN_CH) \
 	    GEN_PLIO_BEAT_SAMPLES=$(PLIO_BEAT_SAMPLES) \
 	    GEN_IFFT_COL_SHIFT=$(IFFT_COL_SHIFT) \
 	    GEN_IFFT_ROW_SHIFT=$(IFFT_ROW_SHIFT) \
@@ -1261,6 +1323,7 @@ x86sim_check: x86sim_graph gen_vectors
 	cd $(PROJECT_REPO) && env PYTHONHOME= PYTHONPATH= \
 	    GEN_PATCH_ROWS=$(PATCH_ROWS) \
 	    GEN_PATCH_COLS=$(PATCH_COLS) \
+	    GEN_CONV_IN_CH=$(CONV_IN_CH) \
 	    GEN_H_SHIFT=$(H_SHIFT) \
 	    uv run python3 scripts/check_kernel_bitexact.py \
 	        --kernel $(KUT) \
@@ -1294,10 +1357,13 @@ $(APP_FLAGS_STAMP): FLAGS_FOR_STAMP := $(GCC_FLAGS)
 $(BUILD_DIR)/$(APP_ELF): $(APP_FLAGS_STAMP)                 \
                          $(HOST_APP_SRC)/mosse_tracker.cpp  \
                          $(HOST_APP_SRC)/mosse_filter.cpp   \
-                         $(HOST_APP_SRC)/mosse_filter.h
+                         $(HOST_APP_SRC)/mosse_filter.h     \
+                         $(HOST_APP_SRC)/scene_colour.cpp   \
+                         $(HOST_APP_SRC)/scene_colour.h
 	mkdir -p $(BUILD_DIR)
 	$(CXX) $(GCC_FLAGS) $(GCC_INC) \
 	    $(HOST_APP_SRC)/mosse_tracker.cpp $(HOST_APP_SRC)/mosse_filter.cpp \
+	    $(HOST_APP_SRC)/scene_colour.cpp \
 	    $(GCC_LIBS) -o $@
 
 # -------------------------------------------------------
@@ -1312,6 +1378,24 @@ $(BUILD_DIR)/$(APP_ELF): $(APP_FLAGS_STAMP)                 \
 # The golden data is regenerated every run so the reference and the code cannot
 # drift apart the way the shift budget and the vector generator once did.
 TEST_HOST_DIR := $(HOST_APP_SRC)/test
+
+# scene_colour.{h,cpp} follows the same rule as mosse_filter: no XRT header, so
+# the luma -> interleaved-RGB pass is testable in seconds. It needs to be,
+# because BOTH of its failure modes are silent on hardware — a wrong interleave
+# or gain hands conv2d a plausible feature map, and a luma write that skipped
+# scene_touch() hands it the PREVIOUS frame's colour over one rect. Neither
+# shows up as anything but a slightly worse IoU.
+#
+# The missed-touch case is reproduced deliberately in the harness, so the
+# verifier is known to fire rather than assumed to.
+.PHONY: test_scene
+test_scene:
+	mkdir -p $(BUILD_DIR)
+	g++ -O2 -std=c++17 -Wall -Wextra -Werror -I$(HOST_APP_SRC) \
+	    $(HOST_APP_SRC)/scene_colour.cpp \
+	    $(TEST_HOST_DIR)/test_scene_colour.cpp \
+	    -o $(BUILD_DIR)/test_scene
+	$(BUILD_DIR)/test_scene
 
 .PHONY: test_host
 test_host:
@@ -1409,15 +1493,22 @@ $(BUILD_DIR)/scale_loop_sim: $(SCALE_SIM_STAMP)                \
 TEST_PL_DIR := $(PL_SRC_REPO)/test
 
 .PHONY: test_roi_crop
+# Runs BOTH arms. ROI_IN_CH is compile-time (it sizes the scratch buffer and the
+# interleave stride), so one binary cannot cover both; the golden directory holds
+# the cases for both and each binary runs the ones tagged for it. A build that
+# matches no case exits 2 rather than reporting a vacuous pass.
 test_roi_crop:
 	mkdir -p $(BUILD_DIR)
 	cd $(PROJECT_REPO) && env PYTHONHOME= PYTHONPATH= \
 	    uv run python3 scripts/gen_roi_crop_golden.py $(TEST_PL_DIR)/golden
-	g++ -O2 -std=c++17 -Wall -Wextra -Wno-comment -Wno-unknown-pragmas \
-	    -I$(XILINX_VITIS)/include -I$(PL_SRC_REPO)/roi_crop \
-	    $(PL_SRC_REPO)/roi_crop/roi_crop.cpp $(TEST_PL_DIR)/test_roi_crop.cpp \
-	    -o $(BUILD_DIR)/test_roi_crop
-	$(BUILD_DIR)/test_roi_crop $(TEST_PL_DIR)/golden
+	for ch in 1 3; do \
+	  g++ -O2 -std=c++17 -Wall -Wextra -Wno-comment -Wno-unknown-pragmas \
+	      -Wno-deprecated-copy -DROI_IN_CH=$$ch \
+	      -I$(XILINX_VITIS)/include -I$(PL_SRC_REPO)/roi_crop \
+	      $(PL_SRC_REPO)/roi_crop/roi_crop.cpp $(TEST_PL_DIR)/test_roi_crop.cpp \
+	      -o $(BUILD_DIR)/test_roi_crop_ch$$ch || exit 1; \
+	  $(BUILD_DIR)/test_roi_crop_ch$$ch $(TEST_PL_DIR)/golden || exit 1; \
+	done
 
 # -------------------------------------------------------
 # Package

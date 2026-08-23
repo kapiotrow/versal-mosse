@@ -39,6 +39,7 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 # graph was compiled with; a mismatch here would compare against a differently
 # shaped golden, so fail loudly rather than guess.
 import gen_aiesim_vectors as G
+import conv_weight_layout as CWL
 
 MAX_REPORT = 10
 
@@ -56,12 +57,16 @@ def load_patch_int8(scenario: str) -> np.ndarray:
     """
     path = os.path.join(scenario, 'patch_in.txt')
     words = np.loadtxt(path, dtype=np.int64)
-    need = G.N // 4
+    # SAMPLES, not pixels: at CONV_IN_CH=3 the stimulus is three times as long
+    # and pixel-interleaved. Reading only G.N of it would decode one third of the
+    # patch and silently compare against a model built from the whole thing.
+    need = G.N_SAMPLES // 4
     if words.size < need:
-        sys.exit(f"ERROR: {path} has {words.size} words, need at least {need}. "
-                 f"Wrong PATCH_ROWS/PATCH_COLS, or stale vectors — run `make gen_vectors`.")
+        sys.exit(f"ERROR: {path} has {words.size} words, need at least {need} "
+                 f"({G.N} px x {G.CONV_IN_CH} plane(s)). Wrong PATCH_ROWS/PATCH_COLS "
+                 f"or CONV_IN_CH, or stale vectors — run `make gen_vectors`.")
     words = words[:need].astype(np.uint32)
-    b = np.empty(G.N, dtype=np.uint8)
+    b = np.empty(G.N_SAMPLES, dtype=np.uint8)
     b[0::4] = (words) & 0xFF
     b[1::4] = (words >> 8) & 0xFF
     b[2::4] = (words >> 16) & 0xFF
@@ -114,17 +119,24 @@ def check_conv2d(scenario: str, actual_path: str, ch: int, relu: int) -> bool:
     wpath = os.path.join(scenario, f'weights_ch{ch}.bin')
     with open(wpath, 'rb') as f:
         weights = f.read()
-    if len(weights) < 22:
-        sys.exit(f"ERROR: {wpath} is {len(weights)} bytes, expected >= 22")
+    lay = CWL.Layout(G.CONV_IN_CH)
+    if len(weights) < lay.end:
+        sys.exit(f"ERROR: {wpath} is {len(weights)} bytes, expected >= {lay.end}")
+    tag = CWL.detect(weights[:CWL.BUF_BYTES])
+    if tag != G.CONV_IN_CH:
+        sys.exit(f"ERROR: {wpath} was exported for CONV_IN_CH={tag} but the check "
+                 f"is running at CONV_IN_CH={G.CONV_IN_CH}. Re-run "
+                 f"`make weights CONV_IN_CH={G.CONV_IN_CH}`.")
 
     # mean_prev lives at bytes [18:22] and the KERNEL reads it from there
     # (conv2d_kernel.cpp:135-139). Passing 0 instead would silently compare
     # against a Stage-B1-free golden. This layout is duplicated across four
     # files — see the preprocessing-coupling note in CLAUDE.md.
-    mean_prev = struct.unpack_from('<i', weights, 18)[0]
-    out_shift = weights[9]
-    bias_acc = struct.unpack_from('<i', weights, 10)[0]
-    print(f"  weights: out_shift={out_shift} bias_acc={bias_acc} mean_prev={mean_prev}")
+    mean_prev = struct.unpack_from('<i', weights, lay.mean)[0]
+    out_shift = weights[lay.shift]
+    bias_acc = struct.unpack_from('<i', weights, lay.bias)[0]
+    print(f"  weights: CONV_IN_CH={G.CONV_IN_CH} taps={lay.raw} out_shift={out_shift} "
+          f"bias_acc={bias_acc} mean_prev={mean_prev}")
 
     # relu is passed EXPLICITLY rather than inherited from G's GEN_CONV_RELU, so
     # this check states which datapath it is comparing against instead of

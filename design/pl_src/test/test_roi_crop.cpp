@@ -108,6 +108,10 @@ struct Case {
     int roi_row = 0, roi_col = 0, roi_h = 0, roi_w = 0;
     int patch_rows = 0, patch_cols = 0;
     int twice = 0;
+    // Planes this case is written for. The kernel's ROI_IN_CH is COMPILE-TIME,
+    // so one binary cannot run both arms; the harness runs the cases that match
+    // it and skips the rest. `make test_roi_crop` builds and runs it twice.
+    int in_ch = 1;
     long exp_mean = 0, exp_var = 0, exp_inv_q = 0, exp_beats = 0;
     long step_y = 0, step_x = 0, fy_nonzero = 0, fx_nonzero = 0;
 };
@@ -132,6 +136,7 @@ Case load_case(const std::string &name)
         else if (key == "patch_rows") c.patch_rows = (int)v;
         else if (key == "patch_cols") c.patch_cols = (int)v;
         else if (key == "twice")      c.twice      = (int)v;
+        else if (key == "in_ch")      c.in_ch      = (int)v;
         else if (key == "exp_mean")   c.exp_mean   = v;
         else if (key == "exp_var")    c.exp_var    = v;
         else if (key == "exp_inv_q")  c.exp_inv_q  = v;
@@ -178,14 +183,19 @@ void drain(hls::stream<ap_axiu<32, 0, 0, 0>> &s, std::vector<int8_t> &out,
     check_true(buf, bad_keep == 0, std::to_string(bad_keep) + " bad beats");
 }
 
-void run_case(const std::string &name)
+// Returns false if the case belongs to the other arm.
+bool run_case(const std::string &name)
 {
     const Case c = load_case(name);
+    if (c.in_ch != ROI_IN_CH) return false;
+
     const std::vector<uint8_t> frame = read_all(path(name + "_frame.bin"));
     const std::vector<uint8_t> exp_raw = read_all(path(name + "_patch.bin"));
 
-    const size_t n_frame = (size_t)c.frame_rows * c.frame_cols;
-    const size_t n_patch = (size_t)c.patch_rows * c.patch_cols;
+    // Both are in SAMPLES, not pixels: frame_buf is interleaved and so is the
+    // expected patch, which is exactly the AXIS wire order.
+    const size_t n_frame = (size_t)c.frame_rows * c.frame_cols * ROI_IN_CH;
+    const size_t n_patch = (size_t)c.patch_rows * c.patch_cols * ROI_IN_CH;
     if (frame.size() != n_frame || exp_raw.size() != n_patch) {
         fprintf(stderr, "FATAL: %s size mismatch (frame %zu/%zu, patch %zu/%zu)\n",
                 name.c_str(), frame.size(), n_frame, exp_raw.size(), n_patch);
@@ -193,9 +203,10 @@ void run_case(const std::string &name)
     }
     const int8_t *exp = reinterpret_cast<const int8_t *>(exp_raw.data());
 
-    printf("  %-18s roi %dx%d @(%d,%d) -> patch %dx%d  step %ld/%ld  fy nz %ld\n",
+    printf("  %-20s roi %dx%d @(%d,%d) -> patch %dx%dx%d  step %ld/%ld  fy nz %ld\n",
            c.name.c_str(), c.roi_h, c.roi_w, c.roi_row, c.roi_col,
-           c.patch_rows, c.patch_cols, c.step_y, c.step_x, c.fy_nonzero);
+           c.patch_rows, c.patch_cols, ROI_IN_CH, c.step_y, c.step_x,
+           c.fy_nonzero);
 
     std::vector<ap_uint<8>> fbuf(n_frame);
     for (size_t i = 0; i < n_frame; ++i) fbuf[i] = frame[i];
@@ -211,9 +222,11 @@ void run_case(const std::string &name)
     if (got.size() != n_patch) {
         check_true("patch size", false,
                    std::to_string(got.size()) + " vs " + std::to_string(n_patch));
-        return;
+        return true;
     }
-    check_i8("patch bit-exact", got.data(), exp, n_patch, c.patch_cols);
+    // Row width in SAMPLES, so a mismatch reports the right (r,c).
+    check_i8("patch bit-exact", got.data(), exp, n_patch,
+             c.patch_cols * ROI_IN_CH);
 
     if (c.twice) {
         // recompute=0 must re-stream the static buffer byte-identically. The
@@ -228,6 +241,7 @@ void run_case(const std::string &name)
                    got2.size() == got.size() &&
                    memcmp(got2.data(), got.data(), got.size()) == 0);
     }
+    return true;
 }
 
 }  // namespace
@@ -236,9 +250,11 @@ int main(int argc, char **argv)
 {
     g_dir = (argc > 1) ? argv[1] : "golden";
 
-    printf("\nroi_crop native harness — golden: %s\n", g_dir.c_str());
-    printf("NOTE: 11 of these cases execute the bilinear interpolator, which has\n"
-           "      never run in any build (roi_h == patch_rows makes fy == fx == 0).\n\n");
+    printf("\nroi_crop native harness — ROI_IN_CH=%d — golden: %s\n",
+           ROI_IN_CH, g_dir.c_str());
+    printf("NOTE: most of these cases execute the bilinear interpolator, which has\n"
+           "      never run in any build (roi_h == patch_rows makes fy == fx == 0).\n"
+           "      Cases written for the other ROI_IN_CH are skipped, not failed.\n\n");
 
     std::ifstream mf(path("manifest.txt"));
     if (!mf) { fprintf(stderr, "FATAL: no manifest.txt in %s\n", g_dir.c_str()); exit(2); }
@@ -252,10 +268,21 @@ int main(int argc, char **argv)
         exit(2);
     }
 
-    for (const std::string &name : names) run_case(name);
+    int ran = 0;
+    for (const std::string &name : names) ran += run_case(name) ? 1 : 0;
 
-    printf("\n  OVERALL: %s (%d failure%s over %d case%s)\n\n",
+    // A run that matched NOTHING is a broken invocation, not a pass. Without
+    // this an empty manifest, or a generator that stopped emitting in_ch, would
+    // report a confident green.
+    if (ran == 0) {
+        fprintf(stderr, "FATAL: no case in %s matches ROI_IN_CH=%d — "
+                        "regenerate the golden (make test_roi_crop)\n",
+                g_dir.c_str(), ROI_IN_CH);
+        return 2;
+    }
+
+    printf("\n  OVERALL: %s (%d failure%s over %d case%s run, %d skipped)\n\n",
            g_failures ? "FAIL" : "PASS", g_failures,
-           g_failures == 1 ? "" : "s", n, n == 1 ? "" : "s");
+           g_failures == 1 ? "" : "s", ran, ran == 1 ? "" : "s", n - ran);
     return g_failures ? 1 : 0;
 }

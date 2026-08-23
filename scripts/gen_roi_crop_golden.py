@@ -87,6 +87,26 @@ def _tex(rows: int, cols: int, seed: int, target=(64, 64), at=None) -> np.ndarra
                          noise=SF.HARNESS_NOISE, seed=seed)
 
 
+def _tex_rgb(rows: int, cols: int, seed: int, target=(64, 64), at=None) -> np.ndarray:
+    """Three GENUINELY DIFFERENT planes, returned planar [3, rows, cols].
+
+    Not three copies of one texture: with identical planes the joint reduction
+    is arithmetically indistinguishable from the per-plane one (mean and ex2 both
+    scale by 3), so every RGB case built that way would pass with a per-plane
+    kernel. The planes here are decorrelated by construction — a different seed
+    per plane, plus an inversion on B — so a kernel that normalizes per plane
+    fails these outright.
+
+    The one case that DOES use identical planes is rgb_gray_control, where the
+    equivalence is the property under test.
+    """
+    return np.stack([
+        _tex(rows, cols, seed, target=target, at=at),
+        _tex(rows, cols, seed + 100, target=target, at=at),
+        255 - _tex(rows, cols, seed + 200, target=target, at=at),
+    ])
+
+
 def _cap_frame(k: int) -> np.ndarray:
     """128x128 frame whose LOG_LUT mean is an exact integer — see the docstring."""
     p = np.full(128 * 128, 250, dtype=np.uint8)
@@ -100,9 +120,13 @@ def build_cases() -> list[dict]:
 
     def add(name, frame, roi_row, roi_col, roi_h, roi_w,
             patch_rows=128, patch_cols=128, twice=False, why=""):
+        # in_ch follows the frame's shape: 2-D is grayscale, [3,r,c] is RGB.
+        # The harness runs only the cases matching the ROI_IN_CH it was built
+        # with, so both arms share one golden directory and one manifest.
         C.append(dict(name=name, frame=frame, roi_row=roi_row, roi_col=roi_col,
                       roi_h=roi_h, roi_w=roi_w, patch_rows=patch_rows,
-                      patch_cols=patch_cols, twice=twice, why=why))
+                      patch_cols=patch_cols, twice=twice, why=why,
+                      in_ch=(3 if frame.ndim == 3 else 1)))
 
     add("identity_1to1", _tex(160, 160, 1, target=(40, 40)), 16, 16, 128, 128,
         why="the only geometry ever built; interpolator provably dead")
@@ -141,6 +165,32 @@ def build_cases() -> list[dict]:
     add("recompute_cached", _tex(FRAME_ROWS, FRAME_COLS, 4, target=(85, 85), at=(463, 763)),
         400, 700, 127, 127, twice=True,
         why="second call must re-stream the static buffer byte-identically")
+
+    # ---------------------------------------------------------------
+    # ROI_IN_CH=3. Run by the RGB build of the harness only.
+    # ---------------------------------------------------------------
+    add("rgb_identity_1to1", _tex_rgb(160, 160, 21, target=(40, 40)), 16, 16, 128, 128,
+        why="interleaved store + joint stats with the interpolator dead")
+    add("rgb_up_2x", _tex_rgb(200, 200, 22, target=(30, 30)), 30, 30, 64, 64,
+        why="interpolator active on all three planes, shared fy/fx")
+    add("rgb_clamp_topleft", _tex_rgb(400, 400, 23, target=(64, 64), at=(60, 40)),
+        -40, -60, 200, 200,
+        why="negative coords THROUGH the *3 interleave — the likeliest indexing bug")
+    add("rgb_aniso", _tex_rgb(400, 400, 24, target=(51, 51), at=(200, 200)),
+        150, 150, 127, 129,
+        why="step_y != step_x with 3 planes; catches an x/y or plane transposition")
+    add("rgb_nonsquare", _tex_rgb(400, 400, 25, target=(64, 32)),
+        100, 100, 192, 96, patch_rows=96, patch_cols=128,
+        why="row_bytes = 3*patch_cols stride, and patch_rows != patch_cols")
+    add("rgb_flat", np.stack([np.full((256, 256), 77, dtype=np.uint8)] * 3),
+        0, 0, 128, 128, why="var 0 across all planes -> inv_q 0 -> all zeros")
+    add("rgb_gray_control", np.stack([_tex(160, 160, 1, target=(40, 40))] * 3),
+        16, 16, 128, 128,
+        why="THE CONTROL: three identical planes must reproduce identity_1to1 "
+            "exactly, plane for plane — same frame, same ROI, same geometry")
+    add("rgb_recompute_cached", _tex_rgb(400, 400, 26, target=(85, 85), at=(200, 200)),
+        150, 150, 127, 127, twice=True,
+        why="the 48 KB static buffer must re-stream byte-identically")
     return C
 
 
@@ -159,10 +209,14 @@ def main(outdir: Path) -> int:
                              c["roi_h"], c["roi_w"],
                              c["patch_rows"], c["patch_cols"], with_diag=True)
 
-        c["frame"].tofile(outdir / f"{c['name']}_frame.bin")
+        # The kernel reads frame_buf INTERLEAVED, so planar [3,r,c] is written
+        # as [r,c,3]. stage_a() already returns the patch interleaved.
+        frame_out = (np.moveaxis(c["frame"], 0, -1).copy()
+                     if c["in_ch"] == 3 else c["frame"])
+        frame_out.tofile(outdir / f"{c['name']}_frame.bin")
         patch.tofile(outdir / f"{c['name']}_patch.bin")
 
-        fr, fc = (int(x) for x in c["frame"].shape)
+        fr, fc = (int(x) for x in c["frame"].shape[-2:])
         with open(outdir / f"{c['name']}.txt", "w") as f:
             f.write(f"name {c['name']}\n")
             f.write(f"frame_rows {fr}\nframe_cols {fc}\n")
@@ -170,11 +224,13 @@ def main(outdir: Path) -> int:
             f.write(f"roi_h {c['roi_h']}\nroi_w {c['roi_w']}\n")
             f.write(f"patch_rows {c['patch_rows']}\npatch_cols {c['patch_cols']}\n")
             f.write(f"twice {1 if c['twice'] else 0}\n")
+            f.write(f"in_ch {c['in_ch']}\n")
             # Diagnostics: not asserted end-to-end, but printed by the harness on
             # failure so a mismatch localises without a second run.
             f.write(f"exp_mean {d['mean']}\nexp_var {d['var']}\n")
             f.write(f"exp_inv_q {d['inv_q']}\n")
-            f.write(f"exp_beats {(c['patch_rows'] * c['patch_cols']) // 4}\n")
+            f.write(f"exp_beats "
+                    f"{(c['patch_rows'] * c['patch_cols'] * c['in_ch']) // 4}\n")
             f.write(f"step_y {d['step_y']}\nstep_x {d['step_x']}\n")
             f.write(f"fy_nonzero {d['fy_nonzero']}\nfx_nonzero {d['fx_nonzero']}\n")
             f.write(f"why {c['why']}\n")

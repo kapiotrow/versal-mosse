@@ -115,7 +115,7 @@ void roi_crop(
     int  patch_cols,
     int  recompute)
 {
-#pragma HLS INTERFACE m_axi     port=frame_buf  bundle=gmem0  depth=2073600
+#pragma HLS INTERFACE m_axi     port=frame_buf  bundle=gmem0  depth=ROI_FRAME_DEPTH
 #pragma HLS INTERFACE axis      port=patch_out
 #pragma HLS INTERFACE s_axilite port=frame_rows bundle=control
 #pragma HLS INTERFACE s_axilite port=frame_cols bundle=control
@@ -132,23 +132,32 @@ void roi_crop(
     // quantized int8 samples, rewritten in place by the normalize pass. Keeping
     // the quantized result here is what lets recompute=0 skip straight to the
     // stream-out pass. static → persists across the frame's channel calls.
-    static ap_uint<8> patch_buf[ROI_MAX_PATCH_ELEMS];
+    static ap_uint<8> patch_buf[ROI_MAX_PATCH_BYTES];
 #pragma HLS BIND_STORAGE variable=patch_buf type=ram_2p impl=bram
 
     ROI_ASSERT(patch_rows > 0 && patch_cols > 0,
                "patch dimensions must be positive (the step divisions below trap)");
     ROI_ASSERT((patch_cols & 3) == 0,
-               "patch_cols must be a multiple of 4: PASS2 packs 4 px/beat and "
-               "total_beats = n_elems>>2, so otherwise word.last never asserts");
-    ROI_ASSERT((long)patch_rows * (long)patch_cols <= (long)ROI_MAX_PATCH_ELEMS,
-               "patch exceeds ROI_MAX_PATCH_ELEMS — patch_buf would overrun");
+               "patch_cols must be a multiple of 4: PASS2 packs 4 bytes/beat and "
+               "total_beats = n_bytes>>2, so otherwise word.last never asserts");
+    ROI_ASSERT(((patch_cols * ROI_IN_CH) & 3) == 0,
+               "a patch ROW must be a whole number of AXIS beats, or PASS2 would "
+               "straddle rows; 3*patch_cols is fine whenever patch_cols is a "
+               "multiple of 4, since gcd(3,4) = 1");
+    ROI_ASSERT((long)patch_rows * (long)patch_cols * (long)ROI_IN_CH
+                   <= (long)ROI_MAX_PATCH_BYTES,
+               "patch exceeds ROI_MAX_PATCH_BYTES — patch_buf would overrun");
     ROI_ASSERT(roi_h > 0 && roi_w > 0,
                "roi extent must be positive: 0 collapses every row onto one "
                "source row, negative runs the sampler backwards");
     ROI_ASSERT(frame_rows > 0 && frame_cols > 0, "frame dimensions must be positive");
 
-    const int n_elems    = patch_rows * patch_cols;
-    const int total_beats = n_elems >> 2;
+    const int n_elems    = patch_rows * patch_cols;   // PIXELS
+    // SAMPLES: one per plane per pixel. Every reduction below is over n_samples,
+    // not n_elems — that is what makes the normalization joint across planes.
+    const int n_samples  = n_elems * ROI_IN_CH;
+    const int row_bytes  = patch_cols * ROI_IN_CH;
+    const int total_beats = n_samples >> 2;
 
     // Q8 source-coordinate step. Computed once, outside every pipeline, so no
     // divider lands in the datapath.
@@ -203,6 +212,9 @@ PASS1_ROW:
         y0 = (y0 < 0) ? 0 : ((y0 > max_y) ? max_y : y0);
         y1 = (y1 < 0) ? 0 : ((y1 > max_y) ? max_y : y1);
 
+        // PIXEL index of the two source rows, not a byte offset — the
+        // * ROI_IN_CH that converts to interleaved bytes is applied at the tap,
+        // so this stays common to all three planes. At 1 plane it vanishes.
         const int row0_base = y0 * frame_cols;
         const int row1_base = y1 * frame_cols;
 
@@ -216,35 +228,51 @@ PASS1_ROW:
             x0 = (x0 < 0) ? 0 : ((x0 > max_x) ? max_x : x0);
             x1 = (x1 < 0) ? 0 : ((x1 > max_x) ? max_x : x1);
 
-            const ap_uint<8> p00 = frame_buf[row0_base + x0];
-            const ap_uint<8> p01 = frame_buf[row0_base + x1];
-            const ap_uint<8> p10 = frame_buf[row1_base + x0];
-            const ap_uint<8> p11 = frame_buf[row1_base + x1];
+            // The four tap ADDRESSES are shared by every plane — same geometry,
+            // same fx/fy weights — so only the +p byte offset changes. Unrolled,
+            // so the three planes are 3 parallel datapaths against one m_axi
+            // port, and the 3 bytes of one source pixel are contiguous.
+        PASS1_PLANE:
+            for (int p = 0; p < ROI_IN_CH; ++p) {
+#pragma HLS UNROLL
+                const ap_uint<8> p00 = frame_buf[(row0_base + x0) * ROI_IN_CH + p];
+                const ap_uint<8> p01 = frame_buf[(row0_base + x1) * ROI_IN_CH + p];
+                const ap_uint<8> p10 = frame_buf[(row1_base + x0) * ROI_IN_CH + p];
+                const ap_uint<8> p11 = frame_buf[(row1_base + x1) * ROI_IN_CH + p];
 
-            // Q8 bilinear. top/bot ≤ 255·256 (17 bits); val ≤ 255·256·256
-            // (25 bits) before the >>16.
-            const ap_uint<18> top = p00 * (ROI_FRAC_ONE - fx) + p01 * fx;
-            const ap_uint<18> bot = p10 * (ROI_FRAC_ONE - fx) + p11 * fx;
-            const ap_uint<27> val = top * (ROI_FRAC_ONE - fy) + bot * fy;
-            const ap_uint<8>  pix = (ap_uint<8>)(val >> (2 * ROI_FRAC_BITS));
+                // Q8 bilinear. top/bot ≤ 255·256 (17 bits); val ≤ 255·256·256
+                // (25 bits) before the >>16.
+                const ap_uint<18> top = p00 * (ROI_FRAC_ONE - fx) + p01 * fx;
+                const ap_uint<18> bot = p10 * (ROI_FRAC_ONE - fx) + p11 * fx;
+                const ap_uint<27> val = top * (ROI_FRAC_ONE - fy) + bot * fy;
+                const ap_uint<8>  pix = (ap_uint<8>)(val >> (2 * ROI_FRAC_BITS));
 
-            patch_buf[r * patch_cols + c] = pix;
+                // INTERLEAVED in the scratch buffer, because that is what the
+                // AXIS wire carries and what conv2d unpacks. PASS2 then stays a
+                // linear byte read.
+                patch_buf[(r * patch_cols + c) * ROI_IN_CH + p] = pix;
 
-            const ap_uint<16> lv = LOG_LUT[pix];
-            sum_x  += lv;
-            sum_x2 += (ap_uint<32>)lv * (ap_uint<32>)lv;
+                // ONE pair of accumulators for all planes — the joint statistic.
+                const ap_uint<16> lv = LOG_LUT[pix];
+                sum_x  += lv;
+                sum_x2 += (ap_uint<32>)lv * (ap_uint<32>)lv;
+            }
         }
     }
 
     // ---------------------------------------------------------------------
     // Statistics: mean and 1/σ, once per patch
     // ---------------------------------------------------------------------
-    const ap_uint<32> mean = (ap_uint<32>)(sum_x / n_elems);
+    // sum_x  <= 3 * 16384 * 65535       = 3.22e9   (32 bits)
+    // sum_x2 <= 3 * 16384 * 65535^2      = 2.11e14  vs ap_uint<48> = 2.81e14.
+    // RGB fits with 33% headroom; a fourth plane would NOT, which is why the
+    // reference asserts the width rather than assuming it.
+    const ap_uint<32> mean = (ap_uint<32>)(sum_x / n_samples);
 
     // var = E[x²] - E[x]².  Both terms fit comfortably; the subtraction is
     // exact in integer arithmetic because sum_x2 and mean are exact.
     const ap_uint<48> mean_sq = (ap_uint<48>)mean * (ap_uint<48>)mean;
-    const ap_uint<48> ex2     = sum_x2 / n_elems;
+    const ap_uint<48> ex2     = sum_x2 / n_samples;
     const ap_uint<48> var     = (ex2 > mean_sq) ? (ap_uint<48>)(ex2 - mean_sq) : (ap_uint<48>)0;
 
     // inv_q = ROI_NORM_Q / σ in Q16.16.
@@ -265,8 +293,11 @@ PASS1_ROW:
     // pass below becomes a pure buffer read.
     //   q = clip(round((log(x) - mean) · inv_q >> 16), ±127)
     // ---------------------------------------------------------------------
+    // Every sample of every plane gets the SAME mean and inv_q — see the joint
+    // normalization note in roi_crop.h. The loop is over bytes, so it does not
+    // need to know the interleaving.
 NORM_LOOP:
-    for (int i = 0; i < n_elems; ++i) {
+    for (int i = 0; i < n_samples; ++i) {
 #pragma HLS PIPELINE II=1
         const ap_uint<8> pix = patch_buf[i];
         const ap_int<18> dev = (ap_int<18>)LOG_LUT[pix] - (ap_int<18>)mean;
@@ -306,7 +337,7 @@ NORM_LOOP:
 PASS2_ROW:
     for (int r = 0; r < patch_rows; ++r) {
     PASS2_COL:
-        for (int c = 0; c < patch_cols; c += 4) {
+        for (int c = 0; c < row_bytes; c += 4) {
 #pragma HLS PIPELINE II=1
             ap_axiu<32,0,0,0> word;
             word.keep = (ap_uint<4>)-1;
@@ -316,7 +347,7 @@ PASS2_ROW:
         PASS2_PACK:
             for (int i = 0; i < 4; ++i) {
 #pragma HLS UNROLL
-                word.data.range(8*i + 7, 8*i) = patch_buf[r * patch_cols + c + i];
+                word.data.range(8*i + 7, 8*i) = patch_buf[r * row_bytes + c + i];
             }
 
             patch_out.write(word);

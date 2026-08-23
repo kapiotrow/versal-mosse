@@ -1,0 +1,20 @@
+name rgb_aniso
+frame_rows 400
+frame_cols 400
+roi_row 150
+roi_col 150
+roi_h 127
+roi_w 129
+patch_rows 128
+patch_cols 128
+twice 0
+in_ch 3
+exp_mean 56676
+exp_var 8919692
+exp_inv_q 702
+exp_beats 12288
+step_y 254
+step_x 258
+fy_nonzero 127
+fx_nonzero 127
+why step_y != step_x with 3 planes; catches an x/y or plane transposition

@@ -11,16 +11,18 @@
  *         (real = Hanning-windowed feature value, imag = 0)
  *
  * Weights: 64-byte buffer loaded via gmio_weights before each invocation.
- *   [0 : 9]   int8  w[KSIZE=3][KSIZE=3]  — 3×3 grayscale conv weights (row-major)
- *   [9]       int8  out_shift             — right-shift: int32 acc → int16
- *   [10:14]   int32 bias_acc (LE)         — bias in accumulator domain
- *   [14:18]   float32 dequant_scale (LE)  — for host validation only, not used by kernel
- *   [18:22]   int32 mean_prev (LE)        — Stage B1: previous frame's per-channel
- *                                           post-ReLU feature mean (see below)
- *   [22:64]   zero padding
+ *   THE LAYOUT IS IN conv_weight_layout.h, derived from CONV_IN_CH — it is not
+ *   repeated here, because it used to be repeated in four places and RGB's 27
+ *   taps overrun every grayscale field. At CONV_IN_CH=1 it resolves to the
+ *   historical offsets: taps [0:9), out_shift 9, bias_acc 10, dequant_scale 14,
+ *   mean_prev 18. Byte 63 is a layout tag.
+ *
+ *   mean_prev is Stage B1's previous-frame per-channel feature mean, written by
+ *   the HOST every frame — see below.
  *
  * Weights are derived from the first conv layer of MobileNetV3-Small (pretrained
- * ImageNet) collapsed to grayscale via luminance coefficients.
+ * ImageNet), collapsed to grayscale via luminance coefficients at CONV_IN_CH=1
+ * or kept as three planes at CONV_IN_CH=3.
  * Generate with:  make weights  (runs scripts/export_weights.py)
  *
  * Input quantization contract:
@@ -69,17 +71,19 @@
 #include <adf.h>
 using namespace adf;
 
-// Single grayscale input channel
-#ifndef CONV_IN_CH
-#  define CONV_IN_CH  1
+// CONV_IN_CH (1 = luminance, 3 = RGB), CONV_KSIZE, CONV_WEIGHT_BYTES_RAW/_PAD
+// and every field offset. One definition, shared with the host, roi_crop and
+// (mirrored) scripts/conv_weight_layout.py.
+#include "conv_weight_layout.h"
+
+// AIE stack for conv2d, BYTES. Only applied at CONV_IN_CH=3 (see mosse_graph.h):
+// the 27-tap MAC chain needs 1344 where the default is 1024. Powers of two keep
+// the tile allocator's arithmetic simple; 2048 leaves ~700 bytes of headroom for
+// a future tap or post-chain change without another round trip through the
+// mapper.
+#ifndef CONV2D_STACK
+#  define CONV2D_STACK 2048
 #endif
-// Kernel size
-#ifndef CONV_KSIZE
-#  define CONV_KSIZE  3
-#endif
-// Weight array size for one output channel, padded to 64-byte GMIO alignment
-#define CONV_WEIGHT_BYTES_RAW  (CONV_IN_CH * CONV_KSIZE * CONV_KSIZE)   // 9
-#define CONV_WEIGHT_BYTES_PAD  64                                         // padded
 
 #ifndef FFT_ROW_WS
 #  define FFT_ROW_WS  2

@@ -1,4 +1,4 @@
-name flat
+name rgb_flat
 frame_rows 256
 frame_cols 256
 roi_row 0
@@ -8,13 +8,13 @@ roi_w 128
 patch_rows 128
 patch_cols 128
 twice 0
-in_ch 1
+in_ch 3
 exp_mean 51489
 exp_var 0
 exp_inv_q 0
-exp_beats 4096
+exp_beats 12288
 step_y 256
 step_x 256
 fy_nonzero 0
 fx_nonzero 0
-why legitimately uniform image -> var 0, distinct from the clamp path
+why var 0 across all planes -> inv_q 0 -> all zeros

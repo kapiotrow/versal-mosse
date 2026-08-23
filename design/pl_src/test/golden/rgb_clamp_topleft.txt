@@ -1,0 +1,20 @@
+name rgb_clamp_topleft
+frame_rows 400
+frame_cols 400
+roi_row -40
+roi_col -60
+roi_h 200
+roi_w 200
+patch_rows 128
+patch_cols 128
+twice 0
+in_ch 3
+exp_mean 56579
+exp_var 7725291
+exp_inv_q 754
+exp_beats 12288
+step_y 400
+step_x 400
+fy_nonzero 120
+fx_nonzero 120
+why negative coords THROUGH the *3 interleave — the likeliest indexing bug

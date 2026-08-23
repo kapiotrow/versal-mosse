@@ -8,6 +8,7 @@ roi_w 129
 patch_rows 128
 patch_cols 128
 twice 0
+in_ch 1
 exp_mean 55905
 exp_var 4019527
 exp_inv_q 1046

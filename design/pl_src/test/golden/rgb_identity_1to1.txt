@@ -1,4 +1,4 @@
-name identity_1to1
+name rgb_identity_1to1
 frame_rows 160
 frame_cols 160
 roi_row 16
@@ -8,13 +8,13 @@ roi_w 128
 patch_rows 128
 patch_cols 128
 twice 0
-in_ch 1
-exp_mean 55937
-exp_var 4097785
-exp_inv_q 1035
-exp_beats 4096
+in_ch 3
+exp_mean 56684
+exp_var 7518945
+exp_inv_q 764
+exp_beats 12288
 step_y 256
 step_x 256
 fy_nonzero 0
 fx_nonzero 0
-why the only geometry ever built; interpolator provably dead
+why interleaved store + joint stats with the interpolator dead

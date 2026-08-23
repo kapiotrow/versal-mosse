@@ -50,14 +50,18 @@ from pathlib import Path
 
 import numpy as np
 
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import conv_weight_layout as CWL
+
 N_OUT, KSIZE = 16, 3
 LUM = np.array([0.2989, 0.5870, 0.1140], dtype=np.float64)
 WEIGHTS_BIN = Path("design/aie_src/weights/layer0_weights.bin")
 # Q4 input: any scenario whose patch has been through Stage A. s0-s4 are raw
 # impulses/constants and are meaningless here; s6/s7 are preprocessed.
 SCENARIO = Path("design/aie_src/aiesim_data/s6")
-# Must match export_weights.py.
-ACC_MAX_THEORY = 1 * KSIZE * KSIZE * 127 * 127
+# Must match export_weights.py's acc_max_theory(): n_in * KSIZE^2 * 127 * 127.
+def acc_max_theory(n_in):
+    return n_in * KSIZE * KSIZE * 127 * 127
 
 
 # ---------------------------------------------------------------------------
@@ -65,16 +69,23 @@ ACC_MAX_THEORY = 1 * KSIZE * KSIZE * 127 * 127
 # ---------------------------------------------------------------------------
 
 def load_channels():
-    """Unpack layer0_weights.bin -> list of (w[3][3], out_shift, bias_acc)."""
+    """Unpack layer0_weights.bin -> (list of (w[n_in,3,3], out_shift, bias), n_in).
+
+    Goes through conv_weight_layout so the offsets cannot drift from the kernel's,
+    and so the layout tag decides n_in instead of this file assuming it. Reading
+    an RGB export with the grayscale offsets is the failure this guards: it does
+    not throw, it reports sixteen healthy channels built from R-plane taps with a
+    bias sliced out of the G plane.
+    """
     if not WEIGHTS_BIN.exists():
         raise SystemExit(f"{WEIGHTS_BIN} absent — run `make weights` first.")
-    b = WEIGHTS_BIN.read_bytes()
+    chans = CWL.load_bin(WEIGHTS_BIN)
+    n_in = chans[0][5].n_in
     out = []
-    for oc in range(len(b) // 64):
-        r = b[oc * 64:(oc + 1) * 64]
-        w = np.frombuffer(r[0:9], dtype=np.int8).astype(np.int32).reshape(3, 3)
-        out.append((w, int(r[9]), struct.unpack("<i", r[10:14])[0]))
-    return out
+    for taps, shift, bias, _dq, _mean, lay in chans:
+        w = np.array(taps, dtype=np.int32).reshape(lay.n_in, 3, 3)
+        out.append((w, shift, bias))
+    return out, n_in
 
 
 def q8(w):
@@ -156,8 +167,13 @@ def q1_lum_vs_sum():
 # Q2 — linear diversity of the shipped kernels
 # ---------------------------------------------------------------------------
 
-def q2_linear_diversity(chans):
-    hdr(2, "linear diversity of the shipped int8 kernels")
+def q2_linear_diversity(chans, n_in=1):
+    hdr(2, f"linear diversity of the shipped int8 kernels (CONV_IN_CH={n_in})")
+    if n_in == 1:
+        print("A 3x3 grayscale kernel lives in 9 dimensions, so 16 channels CANNOT")
+        print("be independent — the rank cap is structural, not a property of the")
+        print("pretrained weights. At CONV_IN_CH=3 the space is 27-dimensional and")
+        print("the cap lifts. See the RGB section of CLAUDE.md.")
     W = np.stack([w.astype(float).ravel() for w, _, _ in chans])
     Wn = W / np.linalg.norm(W, axis=1, keepdims=True)
     C = Wn @ Wn.T
@@ -179,9 +195,33 @@ def q2_linear_diversity(chans):
         seen |= g
         groups.append(sorted(g))
     ev = np.linalg.svd(Wn, compute_uv=False)
+    ambient = Wn.shape[1]                       # 9 for a 3x3 grayscale kernel
+    num_rank = int((ev > ev[0] * 1e-2).sum())
+    energy = ev**2 / (ev**2).sum()
+    pr = (ev**2).sum()**2 / (ev**4).sum()       # participation ratio
+    d95 = int(np.searchsorted(np.cumsum(energy), 0.95) + 1)
+
     print()
     print("singular values: " + "  ".join(f"{v:.3f}" for v in ev))
-    print(f"independent linear filters: {len(groups)} of {n} channels")
+    planes = ambient // (KSIZE * KSIZE)
+    print(f"ambient dimension: {ambient} (a {KSIZE}x{KSIZE} kernel over "
+          f"{planes} input plane{'s' if planes != 1 else ''}) — "
+          f"{n} channels CANNOT exceed it")
+    print(f"numerical rank (sv > 1% of max): {num_rank} of {n} channels")
+    print(f"effective rank (participation ratio): {pr:.2f}   "
+          f"directions for 95% of kernel energy: {d95}")
+    print(f"collinear GROUPS at |cos|>0.95: {len(groups)} "
+          f"({n - len(groups)} channel(s) absorbed into another group)")
+    print()
+    print("READ THE RANK, NOT THE GROUP COUNT. The group count only merges pairs")
+    print("that are nearly parallel; it said '14 of 16' here for a bank whose rank")
+    print("is capped at 9 by the collapse itself, and understated the problem for")
+    print("months. The luminance collapse projects 27-dim RGB kernels onto 9 dims,")
+    print("so redundancy is structural, not a property of the pretrained weights:")
+    print("in RGB the same kernels have rank 16 and participation ratio 7.43, and")
+    print("the three collinear channels here (0/9/14, within 2-6 degrees) are")
+    print("59-72 degrees apart. Measured by scripts/rgb_vs_gray_holdout.py.")
+    print()
     print("NOTE: this is the LINEAR picture only. Channels with the same kernel but")
     print("different bias/out_shift are different nonlinear readouts — see Q4.")
 
@@ -190,7 +230,24 @@ def q2_linear_diversity(chans):
 # Q3 — bias / out_shift sanity (input-independent)
 # ---------------------------------------------------------------------------
 
-def q3_bias_shift(chans):
+def exported_bias_scale():
+    """The --bias-scale the .bin was exported with, from layer0.h beside it.
+
+    Returns None if the header is missing or predates LAYER0_BIAS_SCALE, in
+    which case the export used the historical 127 by definition. This exists so
+    Q3 does not print a root-cause paragraph about a defect that a corrected
+    export has already fixed.
+    """
+    h = WEIGHTS_BIN.parent / "layer0.h"
+    if not h.exists():
+        return None
+    for line in h.read_text().splitlines():
+        if line.startswith("#define LAYER0_BIAS_SCALE"):
+            return float(line.split()[2].rstrip('f'))
+    return None
+
+
+def q3_bias_shift(chans, n_in=1):
     hdr(3, "bias / out_shift sanity — INPUT-INDEPENDENT")
     print(" ch  shift    bias_acc     maxAC   verdict                       bits/15")
     print(" " + "-" * 74)
@@ -218,12 +275,20 @@ def q3_bias_shift(chans):
           f"of 15 available (spread {bits.max()-bits.min():.1f} bits)")
     print()
     print("WHY the low end is low: out_shift comes from |bias_acc| + ACC_MAX_THEORY")
-    print(f"(={ACC_MAX_THEORY}), so a large bias shifts the SIGNAL down to make room for a")
+    print(f"(={acc_max_theory(n_in)}), so a large bias shifts the SIGNAL down to make room for a")
     print("DC pedestal that Stage B1 subtracts away downstream. Pure loss.")
-    print("Suspected root cause: export_weights.py derives bias_acc as b_fold*127/scale,")
-    print("i.e. for an input scale of 127 = 1.0, but roi_crop emits ROI_NORM_Q = 32 per")
-    print("sigma. The bias is ~4x oversized relative to the activations it meets, and it")
-    print("sits BEFORE ReLU, so it also decides which activations survive at all.")
+    bs = exported_bias_scale()
+    if bs is None or abs(bs - 127.0) < 1e-6:
+        print("Root cause: export_weights.py derived bias_acc as b_fold*127/scale, i.e.")
+        print("for an input scale of 127 = 1.0, but roi_crop emits ROI_NORM_Q = 32 per")
+        print("sigma. The bias is ~4x oversized relative to the activations it meets, and")
+        print("it sits BEFORE ReLU, so it also decides which activations survive at all.")
+        print("Fix: make weights BIAS_SCALE=roi — but ONLY with CONV_RELU=0, and it")
+        print("obliges a shift-budget re-sweep. See export_weights.py's --bias-scale.")
+    else:
+        print(f"bias_acc was exported at scale {bs:g} (the ROI_NORM_Q correction), so")
+        print("the classic ~4x-oversized-bias loss does NOT apply to this file. Any")
+        print("remaining spread is the tap count and the per-channel weight scales.")
 
 
 # ---------------------------------------------------------------------------
@@ -254,8 +319,14 @@ def load_patch(scenario):
     return px[:N * N].astype(np.int32).reshape(N, N), N
 
 
-def q4_post_relu(chans, scenario=SCENARIO):
+def q4_post_relu(chans, scenario=SCENARIO, n_in=1):
     hdr(4, f"post-ReLU feature maps on a real patch ({scenario})")
+    if n_in != 1:
+        print(f"CONV_IN_CH={n_in}: skipped. This check runs the kernel's integer")
+        print("datapath over a single-plane Stage-A patch, and the scenario data")
+        print("is grayscale. An RGB verdict needs 3-plane vectors from")
+        print("gen_aiesim_vectors.py, which do not exist yet.")
+        return
     patch, N = load_patch(scenario)
     if patch is None:
         print(f"no usable preprocessed patch in {scenario} — skipped.")
@@ -272,7 +343,7 @@ def q4_post_relu(chans, scenario=SCENARIO):
         acc = np.zeros((N, N), dtype=np.int64) + bias
         for kr in range(3):
             for kc in range(3):
-                acc += int(w[kr, kc]) * pad[kr:kr + N, kc:kc + N]
+                acc += int(w[0, kr, kc]) * pad[kr:kr + N, kc:kc + N]
         maps.append(np.clip(acc >> shift, 0, 32767).astype(np.float64))
     maps = np.stack(maps)
 
@@ -313,9 +384,11 @@ def q4_post_relu(chans, scenario=SCENARIO):
 
 
 if __name__ == "__main__":
-    chans = load_channels()
+    chans, n_in = load_channels()
+    print(f"layer0_weights.bin: {len(chans)} channels, CONV_IN_CH={n_in} "
+          f"({'RGB' if n_in == 3 else 'grayscale'}), {chans[0][0].size} taps/channel")
     if "--skip-torch" not in sys.argv:
         q1_lum_vs_sum()
-    q2_linear_diversity(chans)
-    q3_bias_shift(chans)
-    q4_post_relu(chans)
+    q2_linear_diversity(chans, n_in)
+    q3_bias_shift(chans, n_in)
+    q4_post_relu(chans, n_in=n_in)

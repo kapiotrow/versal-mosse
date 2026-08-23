@@ -142,6 +142,200 @@ void conv2d_kernel(
         out[4 * i + 3].real = (int8_t)((w >> 24) & 0xFF);  out[4 * i + 3].imag = 0;
     }
     return;
+
+// ====================================================================
+// RGB PATH — CONV_IN_CH == 3. Present to MEASURE, not yet to ship: nothing
+// else in the design (roi_crop, export_weights.py, the host) produces or
+// consumes 3-plane data, so this compiles and schedules but is not wired up.
+// Its purpose is to replace the estimated "conv2d 4.1 -> ~9.0 ms/frame" in
+// CLAUDE.md with the compiler's own scheduled cycle count, via
+//     make graph TARGET=hw_emu CONV_IN_CH=3
+// and reading "Total number of cycles" for node 14_0-main_ in aiecompiler.log.
+// TARGET=hw_emu is a SANDBOX: AIE_FLAGS is --target=hw regardless, so this
+// compiles the identical graph without overwriting build/hw's libadf.a or the
+// aiecompiler.log that documents what actually ran on the board.
+//
+// Two design choices this encodes, both from the RGB section of CLAUDE.md:
+//   * INTERLEAVED ON THE WIRE, PLANAR IN THE LINE BUFFER. roi_crop must send
+//     interleaved (planar would need whole planes resident); the read loop
+//     de-interleaves into three 3-row plane buffers as it unpacks, which it was
+//     already doing byte by byte. 3 int32 words carry exactly 4 RGB pixels, so
+//     the scatter pattern repeats every 4 columns instead of rotating.
+//   * PLANAR WEIGHT ORDER: [0:9] R, [9:18] G, [18:27] B. The remaining fields
+//     follow the tap block exactly as they do at CONV_IN_CH=1, and their
+//     offsets come from conv_weight_layout.h rather than from literals here:
+//     out_shift 27, bias_acc 28, dequant_scale 32, mean_prev 36. The grayscale
+//     layout has 27 taps overrunning ALL FOUR of those fields, which is why the
+//     offsets stopped being hand-written in four files.
+// ====================================================================
+#elif CONV_IN_CH == 3
+
+    const int8_t *wb = weights.data();
+    const int8_t *wR = wb + CONV_W_OFF_PLANE(0);
+    const int8_t *wG = wb + CONV_W_OFF_PLANE(1);
+    const int8_t *wB = wb + CONV_W_OFF_PLANE(2);
+    const int8_t wR00 = wR[0], wR01 = wR[1], wR02 = wR[2];
+    const int8_t wR10 = wR[3], wR11 = wR[4], wR12 = wR[5];
+    const int8_t wR20 = wR[6], wR21 = wR[7], wR22 = wR[8];
+    const int8_t wG00 = wG[0], wG01 = wG[1], wG02 = wG[2];
+    const int8_t wG10 = wG[3], wG11 = wG[4], wG12 = wG[5];
+    const int8_t wG20 = wG[6], wG21 = wG[7], wG22 = wG[8];
+    const int8_t wB00 = wB[0], wB01 = wB[1], wB02 = wB[2];
+    const int8_t wB10 = wB[3], wB11 = wB[4], wB12 = wB[5];
+    const int8_t wB20 = wB[6], wB21 = wB[7], wB22 = wB[8];
+    const int out_shift = (int)(uint8_t)wb[CONV_W_OFF_SHIFT];
+
+    int32_t bias;
+    bias  = (int32_t)(uint8_t)wb[CONV_W_OFF_BIAS + 0];
+    bias |= (int32_t)(uint8_t)wb[CONV_W_OFF_BIAS + 1] << 8;
+    bias |= (int32_t)(uint8_t)wb[CONV_W_OFF_BIAS + 2] << 16;
+    bias |= (int32_t)(uint8_t)wb[CONV_W_OFF_BIAS + 3] << 24;
+
+    int32_t mean_prev;
+    mean_prev  = (int32_t)(uint8_t)wb[CONV_W_OFF_MEAN + 0];
+    mean_prev |= (int32_t)(uint8_t)wb[CONV_W_OFF_MEAN + 1] << 8;
+    mean_prev |= (int32_t)(uint8_t)wb[CONV_W_OFF_MEAN + 2] << 16;
+    mean_prev |= (int32_t)(uint8_t)wb[CONV_W_OFF_MEAN + 3] << 24;
+
+    constexpr int ROWS_PER_INV = CONV_OUT_CHUNK / PATCH_COLS;
+    static_assert(PATCH_COLS % 4 == 0, "RGB read loop consumes 4 pixels per 3 words");
+
+    // 3 planes x 3 rows, each with the 1-sample zero pad on both sides.
+    static int8_t buf[3][3][PATCH_COLS + 2];
+    static int8_t zrow[PATCH_COLS + 2];
+    static int    rows_read = 0;
+    static int    rows_out  = 0;
+
+    if (rows_out == 0) {
+        memset(buf,  0, sizeof(buf));
+        memset(zrow, 0, sizeof(zrow));
+        rows_read = 0;
+    }
+
+    cint16_t *out = feature_out.data();
+    int o = 0;
+
+    for (int k = 0; k < ROWS_PER_INV; ++k) {
+
+        const int out_r = rows_out;
+
+        while (rows_read <= out_r + 1 && rows_read < PATCH_ROWS) {
+            int8_t *dR = buf[0][rows_read % 3];
+            int8_t *dG = buf[1][rows_read % 3];
+            int8_t *dB = buf[2][rows_read % 3];
+            dR[0] = dG[0] = dB[0] = 0;                  // left zero pad
+            for (int c = 0; c < PATCH_COLS; c += 4)
+            chess_prepare_for_pipelining
+            chess_loop_range(PATCH_COLS / 4, PATCH_COLS / 4)
+            {
+                // 12 bytes = 4 RGB pixels: R0 G0 B0 R1 | G1 B1 R2 G2 | B2 R3 G3 B3
+                const int32_t w0 = readincr(patch_in);
+                const int32_t w1 = readincr(patch_in);
+                const int32_t w2 = readincr(patch_in);
+                dR[c + 1] = (int8_t)( w0        & 0xFF);
+                dG[c + 1] = (int8_t)((w0 >>  8) & 0xFF);
+                dB[c + 1] = (int8_t)((w0 >> 16) & 0xFF);
+                dR[c + 2] = (int8_t)((w0 >> 24) & 0xFF);
+                dG[c + 2] = (int8_t)( w1        & 0xFF);
+                dB[c + 2] = (int8_t)((w1 >>  8) & 0xFF);
+                dR[c + 3] = (int8_t)((w1 >> 16) & 0xFF);
+                dG[c + 3] = (int8_t)((w1 >> 24) & 0xFF);
+                dB[c + 3] = (int8_t)( w2        & 0xFF);
+                dR[c + 4] = (int8_t)((w2 >>  8) & 0xFF);
+                dG[c + 4] = (int8_t)((w2 >> 16) & 0xFF);
+                dB[c + 4] = (int8_t)((w2 >> 24) & 0xFF);
+            }
+            dR[PATCH_COLS + 1] = dG[PATCH_COLS + 1] = dB[PATCH_COLS + 1] = 0;
+            ++rows_read;
+        }
+
+        const int8_t *rR_top = (out_r >= 1) ? buf[0][(out_r - 1) % 3] : zrow;
+        const int8_t *rG_top = (out_r >= 1) ? buf[1][(out_r - 1) % 3] : zrow;
+        const int8_t *rB_top = (out_r >= 1) ? buf[2][(out_r - 1) % 3] : zrow;
+        const int8_t *rR_mid = buf[0][out_r % 3];
+        const int8_t *rG_mid = buf[1][out_r % 3];
+        const int8_t *rB_mid = buf[2][out_r % 3];
+        const int8_t *rR_bot = (out_r + 1 < PATCH_ROWS) ? buf[0][(out_r + 1) % 3] : zrow;
+        const int8_t *rG_bot = (out_r + 1 < PATCH_ROWS) ? buf[1][(out_r + 1) % 3] : zrow;
+        const int8_t *rB_bot = (out_r + 1 < PATCH_ROWS) ? buf[2][(out_r + 1) % 3] : zrow;
+
+        const int16_t h_r = HTAB[out_r];
+
+        for (int c = 0; c < PATCH_COLS; c += CONV_VEC)
+        chess_prepare_for_pipelining
+        chess_loop_range(PATCH_COLS / CONV_VEC, PATCH_COLS / CONV_VEC)
+        {
+            aie::accum<acc32, CONV_VEC> a;
+            a.from_vector(aie::broadcast<int32_t, CONV_VEC>(bias), 0);
+
+            a = aie::mac(a, aie::load_unaligned_v<CONV_VEC>(rR_top + c), wR00);
+            a = aie::mac(a, aie::load_unaligned_v<CONV_VEC>(rR_top + c + 1), wR01);
+            a = aie::mac(a, aie::load_unaligned_v<CONV_VEC>(rR_top + c + 2), wR02);
+            a = aie::mac(a, aie::load_unaligned_v<CONV_VEC>(rR_mid + c), wR10);
+            a = aie::mac(a, aie::load_unaligned_v<CONV_VEC>(rR_mid + c + 1), wR11);
+            a = aie::mac(a, aie::load_unaligned_v<CONV_VEC>(rR_mid + c + 2), wR12);
+            a = aie::mac(a, aie::load_unaligned_v<CONV_VEC>(rR_bot + c), wR20);
+            a = aie::mac(a, aie::load_unaligned_v<CONV_VEC>(rR_bot + c + 1), wR21);
+            a = aie::mac(a, aie::load_unaligned_v<CONV_VEC>(rR_bot + c + 2), wR22);
+            a = aie::mac(a, aie::load_unaligned_v<CONV_VEC>(rG_top + c), wG00);
+            a = aie::mac(a, aie::load_unaligned_v<CONV_VEC>(rG_top + c + 1), wG01);
+            a = aie::mac(a, aie::load_unaligned_v<CONV_VEC>(rG_top + c + 2), wG02);
+            a = aie::mac(a, aie::load_unaligned_v<CONV_VEC>(rG_mid + c), wG10);
+            a = aie::mac(a, aie::load_unaligned_v<CONV_VEC>(rG_mid + c + 1), wG11);
+            a = aie::mac(a, aie::load_unaligned_v<CONV_VEC>(rG_mid + c + 2), wG12);
+            a = aie::mac(a, aie::load_unaligned_v<CONV_VEC>(rG_bot + c), wG20);
+            a = aie::mac(a, aie::load_unaligned_v<CONV_VEC>(rG_bot + c + 1), wG21);
+            a = aie::mac(a, aie::load_unaligned_v<CONV_VEC>(rG_bot + c + 2), wG22);
+            a = aie::mac(a, aie::load_unaligned_v<CONV_VEC>(rB_top + c), wB00);
+            a = aie::mac(a, aie::load_unaligned_v<CONV_VEC>(rB_top + c + 1), wB01);
+            a = aie::mac(a, aie::load_unaligned_v<CONV_VEC>(rB_top + c + 2), wB02);
+            a = aie::mac(a, aie::load_unaligned_v<CONV_VEC>(rB_mid + c), wB10);
+            a = aie::mac(a, aie::load_unaligned_v<CONV_VEC>(rB_mid + c + 1), wB11);
+            a = aie::mac(a, aie::load_unaligned_v<CONV_VEC>(rB_mid + c + 2), wB12);
+            a = aie::mac(a, aie::load_unaligned_v<CONV_VEC>(rB_bot + c), wB20);
+            a = aie::mac(a, aie::load_unaligned_v<CONV_VEC>(rB_bot + c + 1), wB21);
+            a = aie::mac(a, aie::load_unaligned_v<CONV_VEC>(rB_bot + c + 2), wB22);
+
+            // Post-chain IDENTICAL to the grayscale path — it is fixed cost and
+            // does not scale with the input channel count, which is exactly what
+            // the cycle measurement is meant to show.
+            aie::vector<int32_t, CONV_VEC> sh =
+                aie::downshift(a.to_vector<int32_t>(0), out_shift);
+#if CONV_RELU
+            aie::vector<int32_t, CONV_VEC> r = aie::min(aie::max(sh, 0), 32767);
+#else
+            aie::vector<int32_t, CONV_VEC> r = aie::min(aie::max(sh, -32768), 32767);
+#endif
+            aie::vector<int32_t, CONV_VEC> cen =
+                aie::sub(r, aie::broadcast<int32_t, CONV_VEC>(mean_prev));
+            cen = aie::min(aie::max(cen, -32768), 32767);
+
+            aie::vector<int32_t, CONV_VEC> w1v =
+                aie::downshift(aie::mul(cen, (int32_t)h_r).template to_vector<int32_t>(0), 15);
+            aie::vector<int32_t, CONV_VEC> hc =
+                aie::unpack(aie::load_unaligned_v<CONV_VEC>((const int16_t *)HTAB + c));
+            aie::vector<int32_t, CONV_VEC> w2v =
+                aie::downshift(aie::mul(w1v, hc).template to_vector<int32_t>(0), 15);
+            w2v = aie::min(aie::max(w2v, -32768), 32767);
+
+            aie::accum<acc32, CONV_VEC> t;
+            t.from_vector(w2v, 0);
+            const aie::vector<int16_t, CONV_VEC> re16 = t.template to_vector<int16_t>(0);
+            const aie::vector<int16_t, CONV_VEC> zero =
+                aie::zeros<int16_t, CONV_VEC>();
+            const auto zp = aie::interleave_zip(re16, zero, 1);
+
+            int16_t *dst = (int16_t *)(out + o);
+            aie::store_unaligned_v(dst,            zp.first);
+            aie::store_unaligned_v(dst + CONV_VEC, zp.second);
+            o += CONV_VEC;
+        }
+
+        ++rows_out;
+        if (rows_out == PATCH_ROWS) rows_out = 0;
+    }
+    return;
+
 #else
     // ----------------------------------------------------------------
     // Load per-channel kernel parameters from the 64-byte weight buffer.
@@ -157,24 +351,27 @@ void conv2d_kernel(
     const int8_t w00 = wb[0], w01 = wb[1], w02 = wb[2];
     const int8_t w10 = wb[3], w11 = wb[4], w12 = wb[5];
     const int8_t w20 = wb[6], w21 = wb[7], w22 = wb[8];
+    // Offsets below come from conv_weight_layout.h. At CONV_IN_CH=1 they are
+    // the historical 9/10/14/18 — verified by the shipped .bin round-tripping
+    // byte-for-byte through the shared packer.
 
-    const int out_shift = (int)(uint8_t)wb[9];
+    const int out_shift = (int)(uint8_t)wb[CONV_W_OFF_SHIFT];
 
     int32_t bias;
     // Byte-by-byte copy avoids alignment UB when wb is not 4-byte aligned.
-    bias  = (int32_t)(uint8_t)wb[10];
-    bias |= (int32_t)(uint8_t)wb[11] << 8;
-    bias |= (int32_t)(uint8_t)wb[12] << 16;
-    bias |= (int32_t)(uint8_t)wb[13] << 24;
+    bias  = (int32_t)(uint8_t)wb[CONV_W_OFF_BIAS + 0];
+    bias |= (int32_t)(uint8_t)wb[CONV_W_OFF_BIAS + 1] << 8;
+    bias |= (int32_t)(uint8_t)wb[CONV_W_OFF_BIAS + 2] << 16;
+    bias |= (int32_t)(uint8_t)wb[CONV_W_OFF_BIAS + 3] << 24;
 
     // Stage B1: previous frame's post-ReLU feature mean for this channel.
     // Subtracted after the ReLU and before the window. Zero on the first frame,
     // which simply degrades to the old behaviour for that one frame.
     int32_t mean_prev;
-    mean_prev  = (int32_t)(uint8_t)wb[18];
-    mean_prev |= (int32_t)(uint8_t)wb[19] << 8;
-    mean_prev |= (int32_t)(uint8_t)wb[20] << 16;
-    mean_prev |= (int32_t)(uint8_t)wb[21] << 24;
+    mean_prev  = (int32_t)(uint8_t)wb[CONV_W_OFF_MEAN + 0];
+    mean_prev |= (int32_t)(uint8_t)wb[CONV_W_OFF_MEAN + 1] << 8;
+    mean_prev |= (int32_t)(uint8_t)wb[CONV_W_OFF_MEAN + 2] << 16;
+    mean_prev |= (int32_t)(uint8_t)wb[CONV_W_OFF_MEAN + 3] << 24;
 
     // ----------------------------------------------------------------
     // STATEFUL ACROSS INVOCATIONS.

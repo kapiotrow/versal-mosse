@@ -109,6 +109,14 @@ def out_shift_for(max_val):
 
 def load_channels():
     b = WEIGHTS_BIN.read_bytes()
+    # Grayscale-only: the offline model convolves a single-plane Stage-A patch.
+    # The layout tag turns a CONV_IN_CH=3 export into an error instead of a
+    # plausible-looking model built from R-plane taps.
+    sys.path.insert(0, str(Path(__file__).resolve().parent))
+    import conv_weight_layout as CWL
+    if CWL.detect(b[:CWL.BUF_BYTES]) != 1:
+        raise SystemExit(f"{WEIGHTS_BIN} is an RGB export; phase1_sweep is "
+                         f"grayscale-only. Re-run: make weights CONV_IN_CH=1")
     chans = []
     for oc in range(len(b) // 64):
         r = b[oc * 64:(oc + 1) * 64]

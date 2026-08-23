@@ -1,0 +1,20 @@
+name rgb_nonsquare
+frame_rows 400
+frame_cols 400
+roi_row 100
+roi_col 100
+roi_h 192
+roi_w 96
+patch_rows 96
+patch_cols 128
+twice 0
+in_ch 3
+exp_mean 56837
+exp_var 4048112
+exp_inv_q 1042
+exp_beats 9216
+step_y 512
+step_x 192
+fy_nonzero 0
+fx_nonzero 96
+why row_bytes = 3*patch_cols stride, and patch_rows != patch_cols

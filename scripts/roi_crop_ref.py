@@ -371,15 +371,40 @@ def stage_a(
 ):
     """Full Stage A. Returns the int8 patch PatchIn actually carries.
 
+    `frame` is either 2-D [rows, cols] (grayscale, ROI_IN_CH=1) or 3-D
+    [3, rows, cols] PLANAR (RGB, ROI_IN_CH=3). The return follows: [pr, pc] for
+    grayscale, [pr, pc, 3] PIXEL-INTERLEAVED for RGB — so `.tofile()` on the
+    result is byte-for-byte the AXIS wire order the kernel emits and conv2d
+    unpacks. Planar in, interleaved out, deliberately: the planes are what the
+    resampler and the host think in, the interleave is what the wire carries.
+
+    NORMALIZATION IS JOINT ACROSS PLANES. One mean and one inv_q over all
+    3*pr*pc samples, applied to all three. Per-plane statistics would equalize
+    the planes and delete the chromatic contrast RGB exists for — the failure is
+    silent, since the output looks entirely reasonable. `stats_q` is
+    shape-agnostic (it reduces over `.size`), so the joint statistic is what you
+    get by handing it the stacked array and nothing else changes.
+
     With `with_diag`, returns (patch_i8, diag) where diag carries what the sweep
     needs to tell a bad (target, padding) apart from a good one — see the fields
     below, each of which surfaces a failure mode no PSR number reveals.
     """
-    resampled = resample_q8(
-        frame, roi_row, roi_col, roi_h, roi_w, patch_rows, patch_cols
-    )
-    mean, var, inv_q = stats_q(resampled)
-    patch = normalize_q(resampled, mean, inv_q)
+    planar = frame.ndim == 3
+    planes = frame if planar else frame[None]
+    if planes.shape[0] not in (1, 3):
+        raise ValueError(f"expected 1 or 3 planes, got {planes.shape[0]}")
+
+    resampled = np.stack([
+        resample_q8(pl, roi_row, roi_col, roi_h, roi_w, patch_rows, patch_cols)
+        for pl in planes
+    ])                                            # [P, pr, pc]
+
+    mean, var, inv_q = stats_q(resampled)         # JOINT over all P*pr*pc
+
+    q = np.stack([normalize_q(resampled[i], mean, inv_q)
+                  for i in range(planes.shape[0])])
+    # [P, pr, pc] -> [pr, pc, P], i.e. R0 G0 B0 R1 G1 B1 ... in memory order.
+    patch = q[0] if not planar else np.moveaxis(q, 0, -1).copy()
     if not with_diag:
         return patch
 
@@ -410,11 +435,14 @@ def stage_a(
         "centring_bias_y": centring_bias_px(roi_h, patch_rows),
         "centring_bias_x": centring_bias_px(roi_w, patch_cols),
         "step_exact": step_is_exact(roi_h, patch_rows) and step_is_exact(roi_w, patch_cols),
+        "in_ch": int(planes.shape[0]),
         "mean": mean,
         "var": var,
         "inv_q": inv_q,
         "inv_q_capped": inv_q == ROI_INV_Q_MAX,
         "clipped": int(np.count_nonzero(np.abs(patch.astype(np.int64)) == 127)),
+        # n_elems counts SAMPLES (all planes), which is what the kernel reduces
+        # over and what decides mean/var. Not pixels.
         "n_elems": int(patch.size),
         "patch_std": float(patch.astype(np.float64).std()),
     }
@@ -424,6 +452,20 @@ def stage_a(
 # --------------------------------------------------------------------------
 # AXIS packing — the convention asserted in three places and checked in none
 # --------------------------------------------------------------------------
+def stage_a_rgb(planes_u8, roi_row, roi_col, roi_h, roi_w,
+                patch_rows, patch_cols, with_diag=False):
+    """Explicit RGB entry point. `planes_u8` is [3, rows, cols] planar.
+
+    Thin alias for stage_a — the 3-plane path is not a separate implementation,
+    which is the whole point of this module having one model.
+    """
+    planes = np.asarray(planes_u8)
+    if planes.ndim != 3 or planes.shape[0] != 3:
+        raise ValueError(f"expected [3, rows, cols], got {planes.shape}")
+    return stage_a(planes, roi_row, roi_col, roi_h, roi_w,
+                   patch_rows, patch_cols, with_diag)
+
+
 def pack_axis_words(patch_i8: np.ndarray) -> np.ndarray:
     """Pack the int8 patch into 32-bit AXIS beats, 4 pixels per beat, LSB first.
 
@@ -515,6 +557,53 @@ def _self_check() -> int:
     # Centring bias, the hazard that does not cancel in a closed loop.
     check("centring bias 0.5 px at 1:1", centring_bias_px(128, 128) == 0.5)
     check("centring bias grows with ratio", centring_bias_px(256, 128) == 1.0)
+
+    # ---------------------------------------------------------------
+    # RGB (ROI_IN_CH=3)
+    # ---------------------------------------------------------------
+    lum = rng.integers(0, 256, size=(160, 160), dtype=np.uint8)
+
+    # THE CONTROL, and the strongest statement available here: three IDENTICAL
+    # planes must reproduce the grayscale result exactly, plane for plane.
+    # It holds by construction — with P copies, sum_x and n both scale by P, so
+    # mean is unchanged, and likewise ex2 — which is what makes it a real test of
+    # the JOINT reduction rather than a tautology: a per-plane or mis-weighted
+    # reduction would still pass a "looks reasonable" eyeball and fail this.
+    g_out = stage_a(lum, 12, 20, 100, 100, 128, 128)
+    rgb_same = stage_a_rgb(np.stack([lum] * 3), 12, 20, 100, 100, 128, 128)
+    check("RGB shape is interleaved", rgb_same.shape == (128, 128, 3),
+          str(rgb_same.shape))
+    check("3 identical planes reproduce gray",
+          all(np.array_equal(rgb_same[:, :, k], g_out) for k in range(3)))
+
+    # ...and the discriminator: with DIFFERENT planes, the joint statistic must
+    # NOT equal what per-plane normalization would give. If these ever agree the
+    # test frame has become degenerate and the check above proves nothing.
+    planes = np.stack([lum,
+                       np.clip(lum.astype(np.int16) // 2 + 40, 0, 255).astype(np.uint8),
+                       (255 - lum).astype(np.uint8)])
+    joint = stage_a_rgb(planes, 12, 20, 100, 100, 128, 128)
+    per_plane = np.stack([stage_a(pl, 12, 20, 100, 100, 128, 128)
+                          for pl in planes], axis=-1)
+    check("joint != per-plane on real colour",
+          not np.array_equal(joint, per_plane),
+          f"{int(np.count_nonzero(joint != per_plane))} of {joint.size} samples differ")
+
+    # The per-plane MEANS must survive. Under per-plane normalization every
+    # plane is centred on 0 by construction; under joint they are not, and that
+    # offset IS the chromatic information.
+    pm = [float(joint[:, :, k].mean()) for k in range(3)]
+    check("joint preserves inter-plane offsets",
+          max(abs(m) for m in pm) > 1.0,
+          "plane means " + ", ".join(f"{m:+.1f}" for m in pm))
+
+    # ap_uint<48> headroom on sum_x2 at 3 planes — the kernel's widest reduction.
+    worst = 3 * 128 * 128 * 65535 * 65535
+    check("sum_x2 fits ap_uint<48> at 3 planes", worst < (1 << 48),
+          f"{worst:.3e} vs {float(1 << 48):.3e} ({100.0 * worst / (1 << 48):.0f}%)")
+
+    # A row must be a whole number of AXIS beats at 3 bytes per pixel.
+    check("RGB row is beat-aligned", (128 * 3) % 4 == 0, "384 bytes = 96 beats")
 
     # AXIS packing round-trip.
     words = pack_axis_words(p_bi)

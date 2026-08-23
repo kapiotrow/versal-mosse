@@ -11,12 +11,59 @@ Layer:  features[0] = Conv2dNormActivation(Conv2d(3→16, 3×3), BN, Hardswish)
 Processing steps
 ----------------
 1. Fold BatchNorm into conv weights/bias.
-2. Collapse RGB (3 input channels) → grayscale (1 channel) via ITU-R BT.601
-   luminance coefficients: LUM = [0.2989, 0.5870, 0.1140].
-3. Per-output-channel symmetric INT8 weight quantization.
+2. --in-ch 1 (default): collapse RGB (3 input channels) → grayscale (1 channel)
+   via ITU-R BT.601 luminance coefficients LUM = [0.2989, 0.5870, 0.1140].
+   --in-ch 3: no collapse — export all 27 taps for the RGB conv2d path.
+3. Per-output-channel symmetric INT8 weight quantization (over ALL taps of the
+   channel, so the three planes share one scale — see --in-ch below).
 4. Compute per-channel integer bias and output right-shift for the AIE accumulator.
 5. Pack into 64-byte buffers and write outputs.
 6. Write hanning_128.h into design/aie_src/ (precomputed Q1.15 window table).
+
+--in-ch 3 — the RGB export
+--------------------------
+RGB is a ROBUSTNESS change, not an accuracy one: measured offline over 16 VOT
+sequences it takes supervised failures 51 → 42 (−18%) with accuracy moving only
++0.016, and a colour-free control (the same 27 taps fed three identical
+luminance planes) reproduces the grayscale arm, so the win is colour and not
+bookkeeping. See the RGB section of CLAUDE.md for the full table and costs.
+
+The quantization scale is per OUTPUT channel, taken over all 27 taps at once —
+NOT per plane. A per-plane scale would renormalize the three planes against each
+other and destroy the chromatic contrast the export exists to preserve, which is
+the same trap Stage A's normalization has to avoid in roi_crop.
+
+ACC_MAX_THEORY triples with the tap count, so out_shift rises by ~0.6 bits on
+average and RGB carries slightly fewer signal bits per channel. That is real but
+it is NOT the reason RGB underperformed in one offline arm: forcing gray's
+shifts onto RGB made it worse (42 → 53 failures) at 0.0000% saturation. Do not
+"fix" the shift.
+
+--bias-scale — a KNOWN DEFECT, kept as the default on purpose
+------------------------------------------------------------
+bias_acc converts the folded float bias into accumulator units, and that needs
+the scale of the activations the bias actually meets. This script has always
+used 127 (i.e. "int8 full scale ≙ 1.0"), but roi_crop emits a z-score at
+ROI_NORM_Q = 32 per sigma, so the bias is ~4x oversized relative to the
+activations — and since out_shift is derived from |bias_acc| + ACC_MAX_THEORY,
+an oversized bias shifts the SIGNAL down to make room for it. Measured cost:
+7.6–13.0 of 15 bits of signal resolution (scripts/check_collapse.py Q3).
+
+  --bias-scale 127   (default)  what has shipped and what every hardware
+                                measurement in CLAUDE.md was taken with
+  --bias-scale roi              b_fold * ROI_NORM_Q / scale, the corrected form
+
+The correction is NOT a free win and must not be applied alone: held-out
+peak/max-sidelobe is 12.82 for base(ReLU), 3.92 for bias-corrected(ReLU) and
+16.25 for bias-corrected(no ReLU). It only pays with CONV_RELU=0, which is the
+shipping configuration. The offline RGB harness (scripts/rgb_vs_gray_*.py) uses
+the CORRECTED bias, so a board run meant to reproduce those numbers wants
+--bias-scale roi on BOTH arms; a board run meant to be compared against the
+existing hardware baseline wants the default on both. Do not mix the two across
+arms — that is two magnitudes moving at once.
+
+Changing the bias scale changes the effective input scale, so it obliges a
+shift-budget re-sweep over >= 20 hardware frames. See CLAUDE.md.
 
 The Hardswish activation is omitted.  The MOSSE correlation filter is linear in
 feature space — no activation is needed at this stage; H_ch* adapts to any scale.
@@ -98,13 +145,21 @@ Float reconstruction (for validation):
 
 where  dequant_scale = scale / 127  and  scale = max(|w_gray[oc]|) / 127.
 
-64-byte weight buffer layout (CONV_WEIGHT_BYTES_PAD in conv2d_kernel.h)
-------------------------------------------------------------------------
-  [ 0:  9]  int8[3][3]   grayscale conv weights w[kr][kc] (row-major)
-  [ 9]      int8         out_shift   (right-shift: int32 → int16)
-  [10: 14]  int32 LE     bias_acc    = round(b_fold * 127 / scale)
-  [14: 18]  float32 LE   dequant_scale = scale / 127   (host validation only)
-  [18: 64]  zero padding
+64-byte weight buffer layout
+----------------------------
+NOT defined here. The layout lives in design/aie_src/conv_weight_layout.h and is
+mirrored, formula for formula, in scripts/conv_weight_layout.py, which this
+script packs through. It is derived from the tap count, so:
+
+  gray (9 taps)   taps [0:9)   shift 9   bias 10  dequant 14  mean_prev 18
+  RGB  (27 taps)  taps [0:27)  shift 27  bias 28  dequant 32  mean_prev 36
+
+and byte 63 carries the layout tag (= CONV_IN_CH) so a reader can assert rather
+than guess. RGB's 27 taps overrun ALL FOUR grayscale fields, silently, which is
+why the offsets stopped being hardcoded.
+
+mean_prev is written by the HOST, not here: it is seeded from
+bias_acc >> out_shift before frame 0 and rewritten every frame after.
 
 Outputs (under design/aie_src/weights/ by default)
 -----------------------------------------------------
@@ -124,11 +179,14 @@ Dependencies (install once):
   or:  pip install torch torchvision
 """
 
+import argparse
 import sys
 import math
-import struct
 import numpy as np
 from pathlib import Path
+
+sys.path.insert(0, str(Path(__file__).resolve().parent))
+import conv_weight_layout as CWL          # noqa: E402
 
 try:
     import torch
@@ -145,10 +203,13 @@ except ImportError:
 # ---------------------------------------------------------------------------
 N_OUT       = 16
 N_IN        = 3        # RGB channels in the pretrained model
-N_IN_GRAY   = 1        # grayscale: what the AIE kernel uses (CONV_IN_CH=1)
-KSIZE       = 3
-BUF_BYTES   = 64       # CONV_WEIGHT_BYTES_PAD
+KSIZE       = CWL.KSIZE
+BUF_BYTES   = CWL.BUF_BYTES    # CONV_WEIGHT_BYTES_PAD
 PATCH_SIZE  = 128      # PATCH_ROWS = PATCH_COLS (for hanning_128.h generation)
+
+# roi_crop emits (x-µ)/σ scaled by this — design/pl_src/roi_crop/roi_crop.h.
+# Duplicated here rather than parsed: one number, and --bias-scale prints it.
+ROI_NORM_Q  = 32
 
 # ImageNet normalization used during MobileNetV3-Small pretraining
 IMAGENET_MEAN = np.array([0.485, 0.456, 0.406], dtype=np.float64)
@@ -157,9 +218,14 @@ IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float64)
 # Luminance coefficients for RGB → grayscale weight collapse (ITU-R BT.601)
 LUM = np.array([0.2989, 0.5870, 0.1140], dtype=np.float64)
 
-# Theoretical worst-case int32 accumulator magnitude before bias:
-#   N_IN_GRAY * KSIZE^2 * 127 * 127  = 9 * 127 * 127 = 144 963
-ACC_MAX_THEORY = N_IN_GRAY * KSIZE * KSIZE * 127 * 127
+def acc_max_theory(n_in: int) -> int:
+    """Worst-case |acc| before bias:  n_in * KSIZE^2 * 127 * 127.
+
+    145 161 at 9 taps, 435 483 at 27. out_shift is sized against this plus
+    |bias_acc|, so the tap count costs ~log2(3) = 1.6 bits of headroom, of which
+    ~0.6 shows up in the mean shift once the bias term is included.
+    """
+    return n_in * KSIZE * KSIZE * 127 * 127
 
 
 # ---------------------------------------------------------------------------
@@ -167,42 +233,52 @@ ACC_MAX_THEORY = N_IN_GRAY * KSIZE * KSIZE * 127 * 127
 # ---------------------------------------------------------------------------
 
 def fold_bn(conv_w: np.ndarray, conv_b, gamma, beta, mu, var, eps: float):
-    """Fold BatchNorm into conv weights/bias, then collapse RGB → grayscale.
+    """Fold BatchNorm into conv weights/bias. NO collapse — 3 input planes.
 
     Returns:
-        w_gray  [N_OUT, 1, KSIZE, KSIZE]  grayscale conv weights (float64)
+        w_fold  [N_OUT, 3, KSIZE, KSIZE]  BN-folded RGB conv weights (float64)
         b_fold  [N_OUT]                   folded bias (float64)
     """
     s      = gamma / np.sqrt(var + eps)                      # [N_OUT]
     w_fold = conv_w * s[:, None, None, None]                  # [N_OUT, 3, K, K]
     b_in   = conv_b if conv_b is not None else np.zeros(N_OUT, dtype=np.float64)
     b_fold = s * (b_in - mu) + beta                          # [N_OUT]
+    return w_fold, b_fold
 
-    # Collapse RGB input channels → single grayscale channel via luminance weights.
-    # w_gray[oc, 0, kr, kc] = Σ_ic LUM[ic] * w_fold[oc, ic, kr, kc]
-    w_gray = np.sum(w_fold * LUM[None, :, None, None], axis=1, keepdims=True)
-    # w_gray: [N_OUT, 1, K, K]
-    return w_gray, b_fold
+
+def collapse_lum(w_fold: np.ndarray) -> np.ndarray:
+    """RGB → grayscale via ITU-R BT.601 luminance. [N_OUT,3,K,K] → [N_OUT,1,K,K].
+
+        w_gray[oc, 0, kr, kc] = Σ_ic LUM[ic] * w_fold[oc, ic, kr, kc]
+
+    Deliberately NOT Danelljan's unweighted sum — see the long note above.
+    """
+    return np.sum(w_fold * LUM[None, :, None, None], axis=1, keepdims=True)
 
 
 # ---------------------------------------------------------------------------
 # Step 2 — per-channel symmetric INT8 quantization
 # ---------------------------------------------------------------------------
 
-def quantize_weights(w_gray: np.ndarray):
+def quantize_weights(w: np.ndarray):
     """Symmetric per-output-channel INT8 quantization.
 
-    w_gray shape: [N_OUT, 1, KSIZE, KSIZE]
+    w shape: [N_OUT, n_in, KSIZE, KSIZE]   (n_in = 1 gray, 3 RGB)
 
-    scale[oc]  = max(|w_gray[oc]|) / 127
-    w_int8[oc] = clip(round(w_gray[oc] / scale[oc]), -127, 127)
+    scale[oc]  = max(|w[oc]|) / 127          — over ALL taps of the channel
+    w_int8[oc] = clip(round(w[oc] / scale[oc]), -127, 127)
+
+    ONE SCALE PER OUTPUT CHANNEL, NOT PER INPUT PLANE. At n_in=3 a per-plane
+    scale would equalize the three planes against each other and delete the
+    chromatic contrast that is the entire point of the RGB export — the same
+    failure mode as normalizing the three planes independently in Stage A.
 
     Returns w_int8 (int8) and scales (float64), both indexed by output channel.
     """
-    flat   = w_gray.reshape(N_OUT, -1)                           # [N_OUT, 9]
+    flat   = w.reshape(N_OUT, -1)                           # [N_OUT, 9 or 27]
     maxabs = np.abs(flat).max(axis=1).clip(min=1e-12)
     scales = maxabs / 127.0
-    w_q    = np.clip(np.round(w_gray / scales[:, None, None, None]), -127, 127)
+    w_q    = np.clip(np.round(w / scales[:, None, None, None]), -127, 127)
     return w_q.astype(np.int8), scales
 
 
@@ -210,23 +286,29 @@ def quantize_weights(w_gray: np.ndarray):
 # Step 3 — integer bias and per-channel output shift
 # ---------------------------------------------------------------------------
 
-def compute_acc_params(b_fold: np.ndarray, scales: np.ndarray):
+def compute_acc_params(b_fold: np.ndarray, scales: np.ndarray,
+                       n_in: int, bias_input_scale: float):
     """Derive per-channel bias_acc and out_shift for the AIE kernel.
 
-    The accumulator holds  acc ≈ (y_float - b_fold) * 127 / scale.
-    Adding  bias_acc = round(b_fold * 127 / scale)  gives:
-        full_acc ≈ y_float * 127 / scale
+    The accumulator holds  acc ≈ (y_float - b_fold) * q / scale, where q is the
+    scale of the int8 activations the kernel actually receives. Adding
+    bias_acc = round(b_fold * q / scale) gives full_acc ≈ y_float * q / scale.
 
-    out_shift is chosen so that |full_acc| >> out_shift fits in int16 [-32767,32767].
+    `bias_input_scale` IS that q, and it is the whole --bias-scale question:
+    127 assumes int8 full scale ≙ 1.0, ROI_NORM_Q (32) matches what roi_crop
+    emits. See the --bias-scale section of the module docstring.
+
+    out_shift is chosen so |full_acc| >> out_shift fits in int16 [-32767, 32767],
+    sized against the worst case |bias_acc| + acc_max_theory(n_in).
 
     Returns:
         bias_acc  int32[N_OUT]
         shifts    int8[N_OUT]    (out_shift per channel)
     """
-    bias_acc_f = b_fold * 127.0 / scales
+    bias_acc_f = b_fold * float(bias_input_scale) / scales
     bias_acc   = np.clip(np.round(bias_acc_f), -(2**31), 2**31 - 1).astype(np.int32)
 
-    max_full   = np.abs(bias_acc).astype(np.float64) + ACC_MAX_THEORY
+    max_full   = np.abs(bias_acc).astype(np.float64) + acc_max_theory(n_in)
     log2_over  = np.log2(np.maximum(max_full / 32767.0, 1.0))
     shifts     = np.ceil(log2_over).astype(np.int8).clip(0, 30)
 
@@ -237,22 +319,16 @@ def compute_acc_params(b_fold: np.ndarray, scales: np.ndarray):
 # Step 4 — pack into 64-byte buffer
 # ---------------------------------------------------------------------------
 
-def pack_channel(w_int8_oc: np.ndarray, shift: int, bias_acc: int, scale: float) -> bytes:
+def pack_channel(lay: CWL.Layout, w_int8_oc: np.ndarray, shift: int,
+                 bias_acc: int, scale: float) -> bytes:
     """Pack one output channel into BUF_BYTES bytes.
 
-    Layout (must match conv2d_kernel.h):
-      [ 0: 9]  int8[3][3]   grayscale weights w[kr][kc] row-major
-      [ 9]     int8         out_shift
-      [10:14]  int32 LE     bias_acc
-      [14:18]  float32 LE   dequant_scale = scale / 127
-      [18:64]  zero padding
+    The layout comes from conv_weight_layout, which mirrors
+    design/aie_src/conv_weight_layout.h. Taps are flattened [n_in][kr][kc], so
+    RGB lands PLANAR: [0:9] R, [9:18] G, [18:27] B.
     """
-    buf      = bytearray(BUF_BYTES)
-    buf[0:9] = w_int8_oc.flatten().tobytes()           # 9 bytes
-    buf[9]   = int(shift) & 0xFF
-    struct.pack_into('<i', buf, 10, int(bias_acc))
-    struct.pack_into('<f', buf, 14, float(scale / 127.0))
-    return bytes(buf)
+    return CWL.pack(lay, w_int8_oc.flatten().tolist(), shift, bias_acc,
+                    scale / 127.0)
 
 
 # ---------------------------------------------------------------------------
@@ -326,34 +402,42 @@ def _gen_hanning_h(out_path: Path, n: int) -> None:
 # Validation helpers
 # ---------------------------------------------------------------------------
 
-def _run_float(w_gray: np.ndarray, b_fold: np.ndarray, x_gray_int8: np.ndarray) -> np.ndarray:
-    """Float-exact reference: grayscale BN-folded conv on a 1×3×3 patch."""
-    x_f = x_gray_int8.astype(np.float64) / 127.0   # [1, K, K]
+def _run_float(w: np.ndarray, b_fold: np.ndarray, x_int8: np.ndarray) -> np.ndarray:
+    """Float-exact reference: BN-folded conv on one n_in×3×3 patch."""
+    x_f = x_int8.astype(np.float64) / 127.0   # [n_in, K, K]
     return np.array(
-        [float(np.sum(w_gray[oc] * x_f)) + b_fold[oc] for oc in range(N_OUT)]
+        [float(np.sum(w[oc] * x_f)) + b_fold[oc] for oc in range(N_OUT)]
     )
 
 
-def validate(w_gray, b_fold, w_int8, scales, bias_acc, shifts, seed=42):
+def validate(w, b_fold, w_int8, scales, bias_acc, shifts, n_in, seed=42):
     """Compare quantized integer simulation against float reference.
 
-    PyTorch comparison is intentionally omitted: after the grayscale collapse
-    the kernel no longer computes the same function as the 3-channel model,
-    so a direct numerical comparison would not be meaningful.
+    PyTorch comparison is intentionally omitted: at --in-ch 1 the grayscale
+    collapse means the kernel no longer computes the same function as the
+    3-channel model, so a direct numerical comparison would not be meaningful.
+
+    NOTE this validates the QUANTIZATION only — it feeds a patch at int8 full
+    scale (127 ≙ 1.0), which is the assumption --bias-scale 127 encodes. Under
+    --bias-scale roi the reconstruction error here will be LARGER by design,
+    because the bias is then sized for activations at ROI_NORM_Q. That is not a
+    regression; the arbiter for the corrected bias is roi_crop's real output,
+    not this synthetic patch.
     """
-    rng         = np.random.default_rng(seed)
-    x_gray_int8 = rng.integers(-127, 127, (N_IN_GRAY, KSIZE, KSIZE), dtype=np.int8)
+    rng    = np.random.default_rng(seed)
+    x_int8 = rng.integers(-127, 127, (n_in, KSIZE, KSIZE), dtype=np.int8)
 
-    y_float = _run_float(w_gray, b_fold, x_gray_int8)
+    y_float = _run_float(w, b_fold, x_int8)
 
-    print(f"\n--- Kernel simulation vs float reference (random 1×{KSIZE}×{KSIZE} grayscale patch) ---")
+    print(f"\n--- Kernel simulation vs float reference "
+          f"(random {n_in}×{KSIZE}×{KSIZE} patch, int8 full scale) ---")
     print(f"\n  {'ch':>4}  {'float_ref':>10}  {'int_acc':>10}  "
           f"{'>>shft':>8}  {'recon':>10}  {'abs_err':>9}")
     print(f"  {'-'*66}")
 
     max_err = 0.0
     for oc in range(N_OUT):
-        acc  = int(np.sum(w_int8[oc].astype(np.int32) * x_gray_int8.astype(np.int32)))
+        acc  = int(np.sum(w_int8[oc].astype(np.int32) * x_int8.astype(np.int32)))
         full = acc + int(bias_acc[oc])
         sh   = int(shifts[oc])
         out16 = max(-32768, min(32767, full >> sh))
@@ -383,12 +467,36 @@ def main():
     repo_root   = script_dir.parent
     default_out = repo_root / "design" / "aie_src" / "weights"
 
-    out_dir = Path(sys.argv[1]) if len(sys.argv) > 1 else default_out
-    out_dir.mkdir(parents=True, exist_ok=True)
+    # The two positionals are the historical `make weights` interface
+    # (out_dir, then PATCH_COLS) and must keep working unchanged.
+    ap = argparse.ArgumentParser(
+        description="Export MobileNetV3-Small conv1 as INT8 weights for conv2d_kernel.")
+    ap.add_argument('out_dir', nargs='?', default=str(default_out))
+    ap.add_argument('patch_size', nargs='?', type=int, default=PATCH_SIZE,
+                    help="Hanning table length (= PATCH_COLS)")
+    ap.add_argument('--in-ch', type=int, default=1, choices=(1, 3),
+                    help="1 = BT.601 luminance collapse (default, what ships); "
+                         "3 = RGB, all 27 taps")
+    ap.add_argument('--bias-scale', default='127', choices=('127', 'roi'),
+                    help="activation scale bias_acc is derived against. "
+                         "127 = int8 full scale (default, what every hardware "
+                         "measurement used); roi = ROI_NORM_Q, what roi_crop "
+                         "actually emits. See the module docstring.")
+    args = ap.parse_args()
 
-    # Patch size for the Hanning table (square patch: PATCH_ROWS == PATCH_COLS).
-    # Passed as argv[2] by `make weights` (= $(PATCH_COLS)); defaults to 128.
-    patch_size = int(sys.argv[2]) if len(sys.argv) > 2 else PATCH_SIZE
+    out_dir = Path(args.out_dir)
+    out_dir.mkdir(parents=True, exist_ok=True)
+    patch_size = args.patch_size
+
+    n_in = args.in_ch
+    lay  = CWL.Layout(n_in)
+    bias_input_scale = 127.0 if args.bias_scale == '127' else float(ROI_NORM_Q)
+
+    print(f"CONV_IN_CH = {n_in}  ({'RGB, 27 taps' if n_in == 3 else 'grayscale, 9 taps'})")
+    print(f"  {lay}")
+    print(f"  bias_acc scale: {bias_input_scale:g} "
+          f"({'int8 full scale — the shipped default' if args.bias_scale == '127' else 'ROI_NORM_Q — corrected; needs CONV_RELU=0 and a shift-budget re-sweep'})")
+    print(f"  acc_max_theory: {acc_max_theory(n_in)}")
 
     # ------------------------------------------------------------------
     # 1. Load pretrained model
@@ -424,19 +532,24 @@ def main():
     # ------------------------------------------------------------------
     # 3. Fold BN + grayscale collapse
     # ------------------------------------------------------------------
-    print("Folding BatchNorm + collapsing RGB → grayscale (ITU-R BT.601)...")
-    w_gray, b_fold = fold_bn(conv_w, conv_b, gamma, beta, mu, var_, eps)
-    print(f"  w_gray  shape: {w_gray.shape}  "
-          f"range: [{w_gray.min():.5f}, {w_gray.max():.5f}]")
+    w_fold, b_fold = fold_bn(conv_w, conv_b, gamma, beta, mu, var_, eps)
+    if n_in == 1:
+        print("Folding BatchNorm + collapsing RGB → grayscale (ITU-R BT.601)...")
+        w_taps = collapse_lum(w_fold)
+    else:
+        print("Folding BatchNorm, keeping all three input planes (RGB)...")
+        w_taps = w_fold
+    print(f"  w_taps  shape: {w_taps.shape}  "
+          f"range: [{w_taps.min():.5f}, {w_taps.max():.5f}]")
     print(f"  b_fold  range: [{b_fold.min():.5f}, {b_fold.max():.5f}]")
 
     # ------------------------------------------------------------------
     # 4. Quantize weights
     # ------------------------------------------------------------------
     print("Quantizing weights (symmetric per-output-channel INT8)...")
-    w_int8, scales = quantize_weights(w_gray)
+    w_int8, scales = quantize_weights(w_taps)
     w_dq    = w_int8.astype(np.float64) * scales[:, None, None, None]
-    quant_err = np.abs(w_gray - w_dq)
+    quant_err = np.abs(w_taps - w_dq)
     print(f"  Weight quant error — max: {quant_err.max():.2e}  mean: {quant_err.mean():.2e}")
     print(f"  Scale range: [{scales.min():.4e}, {scales.max():.4e}]")
 
@@ -444,30 +557,48 @@ def main():
     # 5. Bias and output shift
     # ------------------------------------------------------------------
     print("Computing integer bias and per-channel output shift...")
-    bias_acc, shifts = compute_acc_params(b_fold, scales)
+    bias_acc, shifts = compute_acc_params(b_fold, scales, n_in, bias_input_scale)
     print(f"  out_shifts:  {shifts.tolist()}")
     print(f"  bias_acc range: [{bias_acc.min()}, {bias_acc.max()}]")
 
     # ------------------------------------------------------------------
     # 6. Validation
     # ------------------------------------------------------------------
-    max_err = validate(w_gray, b_fold, w_int8, scales, bias_acc, shifts)
+    max_err = validate(w_taps, b_fold, w_int8, scales, bias_acc, shifts, n_in)
 
     # ------------------------------------------------------------------
     # 7. Pack and write outputs
     # ------------------------------------------------------------------
     flat = bytearray()
     for oc in range(N_OUT):
-        flat += pack_channel(w_int8[oc], shifts[oc], bias_acc[oc], scales[oc])
+        flat += pack_channel(lay, w_int8[oc], shifts[oc], bias_acc[oc], scales[oc])
 
     bin_path = out_dir / "layer0_weights.bin"
     bin_path.write_bytes(flat)
-    print(f"\nWrote {bin_path}  ({len(flat)} bytes = {N_OUT}×{BUF_BYTES})")
+    print(f"\nWrote {bin_path}  ({len(flat)} bytes = {N_OUT}×{BUF_BYTES}, "
+          f"layout tag {n_in})")
+
+    # Read it straight back through the SHARED unpacker. This is cheap and it
+    # closes the loop the tag byte exists for: if the header and the Python
+    # mirror ever disagree about an offset, the exporter itself says so instead
+    # of shipping a file the kernel will misread.
+    for oc, (taps, sh, ba, dq, mp, _l) in enumerate(CWL.load_bin(bin_path, n_in)):
+        assert taps == w_int8[oc].flatten().tolist(), f"tap round-trip failed on ch{oc}"
+        assert sh == int(shifts[oc]) and ba == int(bias_acc[oc]), \
+            f"shift/bias round-trip failed on ch{oc}"
+        assert mp == 0, f"mean_prev must ship as 0 (the host seeds it), ch{oc}"
+    print(f"  round-trip through conv_weight_layout: OK ({N_OUT} channels)")
 
     # Numpy archive (for debugging / aiesim scenarios)
     npz_path = out_dir / "layer0_meta.npz"
     np.savez(str(npz_path),
-             w_gray=w_gray.astype(np.float32),
+             w_taps=w_taps.astype(np.float32),
+             # w_gray kept for readers that predate --in-ch; at --in-ch 3 it is
+             # the luminance collapse of the SAME folded weights, i.e. what the
+             # grayscale export would have produced, not what was shipped.
+             w_gray=collapse_lum(w_fold).astype(np.float32),
+             n_in=np.int32(n_in),
+             bias_input_scale=np.float32(bias_input_scale),
              w_int8=w_int8,
              b_float=b_fold.astype(np.float32),
              bias_acc=bias_acc,
@@ -488,6 +619,23 @@ def main():
         f.write(f"#define LAYER0_N_OUT_CH      {N_OUT}\n")
         f.write(f"#define LAYER0_BUF_BYTES     {BUF_BYTES}\n")
         f.write(f"#define LAYER0_TOTAL_BYTES   {N_OUT * BUF_BYTES}\n\n")
+        f.write("/* What this file was exported as. The BUILD must agree:\n"
+                " * a CONV_IN_CH=1 graph fed a CONV_IN_CH=3 weights file reads\n"
+                " * taps [0:9] as a 3x3 kernel and slices out_shift out of the\n"
+                " * G plane. Byte 63 of every channel buffer carries the same\n"
+                " * number so a reader can assert at runtime. */\n")
+        f.write(f"#define LAYER0_IN_CH         {n_in}\n")
+        f.write(f"#define LAYER0_N_TAPS        {lay.raw}\n")
+        f.write(f"#define LAYER0_BIAS_SCALE    {bias_input_scale:.1f}f\n\n")
+        # Bare include, not "../conv_weight_layout.h": design/aie_src is already on
+        # the include path for both toolchains (GCC_INC and the aiecompiler
+        # --include list), and a relative path breaks the moment layer0.h is
+        # generated anywhere but its usual directory.
+        f.write("#include \"conv_weight_layout.h\"\n")
+        f.write("#if LAYER0_IN_CH != CONV_IN_CH\n"
+                "#  error \"layer0_weights.bin was exported for a different "
+                "CONV_IN_CH. Re-run: make weights CONV_IN_CH=<n>\"\n"
+                "#endif\n\n")
         f.write("/* Per-channel dequantization scale: y_float ≈ out_int16 * scale * (1<<shift) */\n")
         f.write(f"static const float layer0_dequant_scales[{N_OUT}] = {{\n")
         for s in scales:

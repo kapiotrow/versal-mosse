@@ -1,4 +1,4 @@
-17
+25
 identity_1to1
 down_2x
 up_2x
@@ -16,3 +16,11 @@ cap_miss
 var_floor_zero
 nonsquare
 recompute_cached
+rgb_identity_1to1
+rgb_up_2x
+rgb_clamp_topleft
+rgb_aniso
+rgb_nonsquare
+rgb_flat
+rgb_gray_control
+rgb_recompute_cached

@@ -7,14 +7,19 @@
  *   1. bilinear resample  — arbitrary roi_h × roi_w → fixed patch_rows × patch_cols
  *                           (source coordinates clamped to the frame, so a target
  *                            near an edge replicates the border instead of reading
- *                            out of bounds)
+ *                            out of bounds). At ROI_IN_CH=3 all three planes are
+ *                            resampled with the SAME geometry and weights.
  *   2. log transform      — LOG_LUT[v] ≈ log(1+v), "helps with low contrast
- *                           lighting situations"
+ *                           lighting situations". Per sample, per plane.
  *   3. zero mean          — subtract the patch mean
  *   4. unit L2 norm       — divide by the patch standard deviation, then rescale
  *                           by ROI_NORM_Q so the int8 grid is actually used
  *                           (see the note on ROI_NORM_Q below)
  *   5. int8 quantize      — clip to [-127, 127], SIGNED
+ *
+ * Steps 3-4 are JOINT ACROSS THE PLANES at ROI_IN_CH=3 — one mean and one
+ * 1/sigma over all 3·patch_rows·patch_cols samples, applied to all three. See
+ * the ROI_IN_CH note below; getting this wrong is silent and self-defeating.
  *
  * Steps 3-4 are global reductions: nothing can be emitted until every pixel has
  * been seen. The kernel therefore buffers the resampled patch in BRAM and runs
@@ -27,6 +32,12 @@
  *   word.data[23:16] = sample 2
  *   word.data[31:24] = sample 3
  *
+ * At ROI_IN_CH=3 the SAMPLES are pixel-interleaved, so a row is 3·patch_cols
+ * bytes and three words carry exactly four RGB pixels:
+ *   R0 G0 B0 R1 | G1 B1 R2 G2 | B2 R3 G3 B3
+ * which is byte-for-byte what conv2d_kernel.cpp's RGB read loop unpacks. A row
+ * stays word-aligned because patch_cols is a multiple of 4 and 3·4 = 12.
+ *
  * The final beat has word.last = 1.
  * Called once per channel per frame (APU loops N_CHANNELS times).
  */
@@ -37,11 +48,45 @@
 #include "hls_stream.h"
 #include "ap_axi_sdata.h"
 
+// Input planes. 1 = grayscale (what ships), 3 = interleaved RGB.
+//
+// DRIVEN FROM THE SAME MAKEFILE VARIABLE AS CONV_IN_CH. The two MUST agree:
+// this kernel decides what the AXIS wire carries and conv2d decides how to
+// unpack it, and a disagreement is not a compile error at either end — it is a
+// graph that runs and produces a plausible, wrong feature map. The Makefile
+// passes -DROI_IN_CH=$(CONV_IN_CH) so there is one knob, per CLAUDE.md's rule
+// about constants both engines derive from.
+//
+// WHY NORMALIZATION MUST BE JOINT ACROSS PLANES. Normalizing each plane on its
+// own mean and sigma equalizes the three and deletes exactly the chromatic
+// contrast RGB is for: a red patch and a grey patch of the same luminance
+// structure would come out identical. So Stage A takes ONE mean and ONE inv_q
+// over all 3N samples. This matches scripts/rgb_vs_gray_holdout.py's
+// stage_a_rgb(), which is the model the offline 51 -> 42 failure result was
+// measured with, so the board reproduces that arm rather than a variant of it.
+//
+// FRAME LAYOUT AT ROI_IN_CH=3 IS PIXEL-INTERLEAVED: frame_buf holds
+// frame_rows x frame_cols x 3 bytes as R0 G0 B0 R1 G1 B1 ... per row.
+// Interleaved, not planar, for two reasons: it is what a camera delivers, and
+// the three taps for one source pixel are then CONTIGUOUS, so the 12 scattered
+// reads per output pixel are 4 bursts of 3 bytes rather than 12 unrelated
+// addresses. At ROI_IN_CH=1 the indexing collapses to the historical
+// frame_buf[y * frame_cols + x] exactly.
+#ifndef ROI_IN_CH
+#  define ROI_IN_CH 1
+#endif
+
 // Largest patch the BRAM scratch buffer supports. PATCH_ROWS/PATCH_COLS come
 // from the Makefile and must not exceed this.
 #define ROI_MAX_PATCH_ROWS 128
 #define ROI_MAX_PATCH_COLS 128
 #define ROI_MAX_PATCH_ELEMS (ROI_MAX_PATCH_ROWS * ROI_MAX_PATCH_COLS)
+// Scratch buffer bytes: one byte per sample per plane. 16 KB gray, 48 KB RGB.
+#define ROI_MAX_PATCH_BYTES (ROI_MAX_PATCH_ELEMS * ROI_IN_CH)
+
+// m_axi depth for frame_buf, in BYTES. Cosim/interface sizing only — it must
+// cover the largest frame the host will pass. 1920*1080 per plane.
+#define ROI_FRAME_DEPTH (1920 * 1080 * ROI_IN_CH)
 
 // Fractional bits used for bilinear interpolation weights and for the source
 // coordinate step. Q8 is ample for 8-bit pixels.

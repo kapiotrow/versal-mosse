@@ -1,4 +1,4 @@
-name identity_1to1
+name rgb_gray_control
 frame_rows 160
 frame_cols 160
 roi_row 16
@@ -8,13 +8,13 @@ roi_w 128
 patch_rows 128
 patch_cols 128
 twice 0
-in_ch 1
+in_ch 3
 exp_mean 55937
 exp_var 4097785
 exp_inv_q 1035
-exp_beats 4096
+exp_beats 12288
 step_y 256
 step_x 256
 fy_nonzero 0
 fx_nonzero 0
-why the only geometry ever built; interpolator provably dead
+why THE CONTROL: three identical planes must reproduce identity_1to1 exactly, plane for plane — same frame, same ROI, same geometry

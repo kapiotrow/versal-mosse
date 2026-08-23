@@ -15,6 +15,7 @@
 .lock
 
 .bin
+*.bin
 .pdi
 .vitisWorkspace.json
 

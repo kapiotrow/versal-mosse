@@ -7,6 +7,20 @@
 #define LAYER0_BUF_BYTES     64
 #define LAYER0_TOTAL_BYTES   1024
 
+/* What this file was exported as. The BUILD must agree:
+ * a CONV_IN_CH=1 graph fed a CONV_IN_CH=3 weights file reads
+ * taps [0:9] as a 3x3 kernel and slices out_shift out of the
+ * G plane. Byte 63 of every channel buffer carries the same
+ * number so a reader can assert at runtime. */
+#define LAYER0_IN_CH         1
+#define LAYER0_N_TAPS        9
+#define LAYER0_BIAS_SCALE    32.0f
+
+#include "conv_weight_layout.h"
+#if LAYER0_IN_CH != CONV_IN_CH
+#  error "layer0_weights.bin was exported for a different CONV_IN_CH. Re-run: make weights CONV_IN_CH=<n>"
+#endif
+
 /* Per-channel dequantization scale: y_float ≈ out_int16 * scale * (1<<shift) */
 static const float layer0_dequant_scales[16] = {
     1.4484671646e-06f,
@@ -28,4 +42,4 @@ static const float layer0_dequant_scales[16] = {
 };
 
 /* Per-channel output right-shift stored at byte 9 of each 64-byte buffer */
-static const int layer0_out_shifts[16] = { 7, 3, 5, 3, 4, 3, 4, 3, 4, 5, 8, 3, 5, 6, 7, 3 };
+static const int layer0_out_shifts[16] = { 5, 3, 4, 3, 3, 3, 3, 3, 3, 4, 6, 3, 4, 4, 5, 3 };

@@ -47,6 +47,17 @@ import numpy as np
 PATCH_ROWS = int(os.environ.get('GEN_PATCH_ROWS', 128))
 PATCH_COLS = int(os.environ.get('GEN_PATCH_COLS', 128))
 N = PATCH_ROWS * PATCH_COLS
+# conv2d input planes: 1 = luminance, 3 = interleaved RGB. Fed from the Makefile's
+# CONV_IN_CH so the vectors and the graph cannot disagree about what the PLIO
+# carries — a 3-plane stimulus into a 1-plane graph reads 3x the beats it should
+# and desynchronises the whole stream.
+#
+# N stays PIXELS. N_SAMPLES is what the PLIO actually carries.
+CONV_IN_CH = int(os.environ.get('GEN_CONV_IN_CH', 1))
+N_SAMPLES  = N * CONV_IN_CH
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import conv_weight_layout as CWL   # noqa: E402
 # MUST match ifft_graph.h FFT_2D_TP_IFFT_COL_SHIFT. The Makefile feeds both from
 # the single IFFT_COL_SHIFT variable — never set them independently, because every
 # expected response peak scales by 2^(REF-shift) and a mismatch silently invalidates
@@ -193,17 +204,29 @@ def conv2d_relu_map(patch_int8: np.ndarray, weights_64b: bytes,
     """
     if relu is None:
         relu = bool(CONV_RELU)
-    w     = np.frombuffer(weights_64b[0:9], dtype=np.int8).reshape(3, 3).astype(np.int64)
-    shift = int(weights_64b[9])
-    bias  = struct.unpack_from('<i', weights_64b, 10)[0]
 
-    x  = patch_int8.reshape(PATCH_ROWS, PATCH_COLS).astype(np.int64)
-    xp = np.pad(x, 1, mode='constant')     # zero-padding = conv padding=1
+    # Offsets from the SHARED layout, never literals: at CONV_IN_CH=3 the 27 taps
+    # overrun the grayscale out_shift/bias/dequant/mean fields, so a hardcoded
+    # weights_64b[9] would slice out_shift out of the G plane and produce a
+    # model that is wrong in a way no assertion here could see.
+    _lay  = CWL.Layout(CONV_IN_CH)
+    w     = (np.frombuffer(weights_64b[0:_lay.raw], dtype=np.int8)
+             .reshape(CONV_IN_CH, 3, 3).astype(np.int64))
+    shift = int(weights_64b[_lay.shift])
+    bias  = struct.unpack_from('<i', weights_64b, _lay.bias)[0]
+
+    # The stimulus is PIXEL-INTERLEAVED on the wire (R0 G0 B0 R1 ...), which is
+    # what roi_crop emits and what conv2d de-interleaves into three planar row
+    # buffers. Undo that here so the convolution is per plane.
+    x  = (patch_int8.reshape(PATCH_ROWS, PATCH_COLS, CONV_IN_CH)
+          .astype(np.int64).transpose(2, 0, 1))          # [P, R, C]
+    xp = np.pad(x, ((0, 0), (1, 1), (1, 1)), mode='constant')
 
     acc = np.full((PATCH_ROWS, PATCH_COLS), bias, dtype=np.int64)
-    for kr in range(3):
-        for kc in range(3):
-            acc += w[kr, kc] * xp[kr:kr + PATCH_ROWS, kc:kc + PATCH_COLS]
+    for p in range(CONV_IN_CH):
+        for kr in range(3):
+            for kc in range(3):
+                acc += w[p, kr, kc] * xp[p, kr:kr + PATCH_ROWS, kc:kc + PATCH_COLS]
 
     shifted = acc >> shift
     # ReLU + saturate, matching conv2d_kernel.cpp's `#if CONV_RELU` branch
@@ -310,8 +333,12 @@ def write_plio_txt(path: str, samples: np.ndarray) -> None:
     Set GEN_PLIO_PACK_INT32=0 for the older plio_128_bits + int8-stream build,
     which took raw int8 values, PLIO_BEAT_SAMPLES per line.
     """
-    assert samples.dtype == np.int8 and len(samples) == N
-    padding = np.zeros(N * PLIO_PADDING_FRAMES, dtype=np.int8)
+    assert samples.dtype == np.int8, f"PLIO stimulus must be int8, got {samples.dtype}"
+    assert len(samples) == N_SAMPLES, (
+        f"PLIO stimulus is {len(samples)} samples, expected {N_SAMPLES} "
+        f"({N} px x {CONV_IN_CH} plane(s)). A 3-plane stimulus fed to a 1-plane "
+        f"graph desynchronises the stream rather than failing.")
+    padding = np.zeros(N_SAMPLES * PLIO_PADDING_FRAMES, dtype=np.int8)
     all_samples = np.concatenate([samples, padding])
 
     with open(path, 'w') as f:
@@ -560,10 +587,19 @@ def generate_scenario(out_dir: str, name: str, patch_int8: np.ndarray,
     fco = np.fft.fft(fci, axis=1).flatten() / float(1 << (2 * FFT_SHIFT))
     write_cint16_bin(os.path.join(sdir, 'fft_col_out.bin'), fco.real, fco.imag)
     # Single-channel weight buffer: mosse_graph.cpp loads this instead of zeroing.
-    # Stage B1's mean_prev lives in bytes [18:22] — see conv2d_kernel.h.
+    #
+    # mean_prev's offset COMES FROM THE SHARED LAYOUT. It used to be a literal 18,
+    # which is right for 9 taps and lands INSIDE THE B PLANE at 27: writing an
+    # int32 there overwrote taps [18:22] and left the real mean_prev field at 0,
+    # so Stage B1 was silently disabled and three of the 27 taps were corrupted.
+    # The bit-exactness check still PASSED, because the kernel and the model read
+    # the same corrupted file — self-consistent and testing the wrong weights.
+    # Caught only because mean_prev printed as 0 where the generator had computed
+    # 4842. This is why the offsets live in exactly one place.
+    _lay = CWL.Layout(CONV_IN_CH)
     if weights_64b is not None:
         wb = bytearray(weights_64b)
-        struct.pack_into('<i', wb, 18, int(mean_prev))
+        struct.pack_into('<i', wb, _lay.mean, int(mean_prev))
         with open(os.path.join(sdir, 'weights_ch0.bin'), 'wb') as f:
             f.write(bytes(wb))
 
@@ -586,7 +622,7 @@ def generate_scenario(out_dir: str, name: str, patch_int8: np.ndarray,
                 relu = conv2d_relu_map(patch_int8, w64)
                 mp = int(round(float((w2d * relu).sum()) / float(w2d.sum())))
                 wbn = bytearray(w64)
-                struct.pack_into('<i', wbn, 18, mp)
+                struct.pack_into('<i', wbn, _lay.mean, mp)
                 with open(os.path.join(sdir, f'weights_ch{oc}.bin'), 'wb') as f:
                     f.write(bytes(wbn))
     desc = kwargs.get('description', '')
@@ -613,6 +649,22 @@ def simulate_roundtrip(patch_int8: np.ndarray) -> np.ndarray:
 # Main
 # ---------------------------------------------------------------------------
 
+def _require_layout(path: str, data: bytes) -> None:
+    """The weights file must have been exported for the plane count we generate.
+
+    Reading a CONV_IN_CH=3 export with grayscale offsets does not throw: it
+    slices out_shift out of the G plane and bias_acc out of G/B taps, and
+    produces vectors that look entirely plausible and match nothing the kernel
+    computes. The layout tag turns that into an error.
+    """
+    n_in = CWL.detect(data[:CWL.BUF_BYTES])
+    if n_in != CONV_IN_CH:
+        raise SystemExit(
+            f"{path} was exported with CONV_IN_CH={n_in}, but the vectors are "
+            f"being generated for CONV_IN_CH={CONV_IN_CH}.\n"
+            f"  Re-run: make weights CONV_IN_CH={CONV_IN_CH}")
+
+
 def _load_all_weights(repo_root: str):
     """Every 64-byte channel buffer from layer0_weights.bin, or [] if absent.
 
@@ -624,6 +676,7 @@ def _load_all_weights(repo_root: str):
         return []
     with open(path, 'rb') as f:
         data = f.read()
+    _require_layout(path, data)
     return [data[i * 64:(i + 1) * 64] for i in range(len(data) // 64)]
 
 
@@ -642,9 +695,98 @@ def _load_ch0_weights(repo_root: str) -> bytes:
     if len(data) < 64:
         print(f"  WARNING: {path} too short — using zero weights")
         return bytes(64)
+    _require_layout(path, data)
     print(f"  Loaded channel-0 weights from {path}")
     return data
 
+
+
+def write_s6rgb(out_dir: str, weights_ch0: bytes) -> None:
+    """s6's scene in colour: 3-plane Stage A -> the RGB conv2d path.
+
+    WHAT THIS IS FOR. The RGB conv2d branch had no test of any kind — it was
+    written to read a schedule out of the compiler and never checked against a
+    model. This scenario is what makes
+        make x86sim_check KUT=conv2d SCENARIO=s6rgb CONV_IN_CH=3
+    a bit-exact diff of the real kernel against simulate_conv2d, in seconds
+    rather than the hours an aiesim run costs.
+
+    THE PATCH COMES FROM roi_crop_ref, NOT FROM A FLOAT SHORTCUT. s6 (grayscale)
+    reproduces Stage A in float and is documented as differing from the kernel on
+    40.9% of samples. There is no reason to inherit that here: roi_crop_ref
+    already implements the exact integer Stage A including the JOINT
+    normalisation, and `make test_roi_crop` proves the PL kernel matches it on 8
+    RGB cases. So this patch is what roi_crop would really emit.
+
+    THE THREE PLANES MUST BE DECORRELATED. Replicating one luma plane three times
+    makes the joint reduction arithmetically indistinguishable from a per-plane
+    one, and makes a dropped plane index a no-op — the same trap the roi_crop RGB
+    cases document. The channel offsets below are what prevent that.
+    """
+    import roi_crop_ref as RC
+
+    rng = np.random.default_rng(20260823)
+    rr = np.arange(2 * PATCH_ROWS, dtype=np.float64).reshape(-1, 1)
+    cc = np.arange(2 * PATCH_COLS, dtype=np.float64).reshape(1, -1)
+    r0 = int(round(0.35 * 2 * PATCH_ROWS))
+    c0 = int(round(0.60 * 2 * PATCH_COLS))
+    sig = 2 * PATCH_COLS / 9.0
+    blob = np.exp(-(((rr - r0) ** 2 + (cc - c0) ** 2) / (2.0 * sig ** 2)))
+
+    # Per-plane amplitude and gradient, so R, G and B carry different structure
+    # rather than one image scaled three ways.
+    planes = []
+    for k, (amp, gx, gy, base) in enumerate([(180.0, 0.12, 0.06, 30.0),
+                                             (120.0, -0.05, 0.10, 60.0),
+                                             (200.0, 0.03, -0.04, 20.0)]):
+        img = (amp * blob + gx * cc + gy * rr + base
+               + 5.0 * rng.standard_normal((2 * PATCH_ROWS, 2 * PATCH_COLS)))
+        planes.append(np.clip(np.round(img), 0, 255).astype(np.uint8))
+    frame = np.stack(planes)                      # [3, 2R, 2C] planar
+
+    # Crop the middle at 1:1 so the interpolator is not the thing under test
+    # here — roi_crop's own suite covers that, and mixing the two would make a
+    # conv2d failure ambiguous.
+    patch = RC.stage_a_rgb(frame, PATCH_ROWS // 2, PATCH_COLS // 2,
+                           PATCH_ROWS, PATCH_COLS, PATCH_ROWS, PATCH_COLS)
+    patch_i8 = patch.reshape(-1).astype(np.int8)   # already interleaved R G B
+    assert patch_i8.size == N_SAMPLES
+    assert int(np.abs(patch_i8).max()) <= 127, "s6rgb patch violates the int8 contract"
+
+    relu_map = conv2d_relu_map(patch_i8, weights_ch0)
+    w2d = np.outer(HANNING, HANNING).astype(np.float64)
+    mean_prev = int(round(float((w2d * relu_map).sum()) / float(w2d.sum())))
+
+    feat = simulate_conv2d(patch_i8, weights_ch0, mean_prev)
+    peak_idx = int(np.argmax(np.abs(feat)))
+    peak_neg = bool(feat.flatten()[peak_idx] < 0)
+    re_lo, re_hi = (-32767, -1) if peak_neg else (1, 32767)
+
+    ones_re  = np.full(N, float(H_UNITY), dtype=np.float64)
+    zeros_re = np.zeros(N, dtype=np.float64)
+
+    generate_scenario(
+        out_dir, "s6rgb",
+        patch_i8,
+        H_re=ones_re,    H_im=zeros_re,
+        acc_re=zeros_re, acc_im=zeros_re,
+        weights_64b=weights_ch0,
+        use_conv2d=True,
+        mean_prev=mean_prev,
+        peak_idx=peak_idx,
+        peak_re_lo=re_lo, peak_re_hi=re_hi,
+        peak_im_lo=-32767, peak_im_hi=32767,
+        max_noise=0, skip_snr=True,
+        check_accum0=False,
+        description="RGB Stage-A patch (joint normalisation) through the REAL "
+                    "27-tap conv2d path, H=unity",
+    )
+    print(f"\n  s6rgb: {N_SAMPLES} samples ({N} px x 3), mean_prev={mean_prev}, "
+          f"peak_idx={peak_idx} ({'negative' if peak_neg else 'positive'})")
+    per_plane = patch.reshape(PATCH_ROWS, PATCH_COLS, 3)
+    print("  plane means (JOINT normalisation leaves these OFFSET, which is the "
+          "chromatic signal): " +
+          ", ".join(f"{per_plane[:, :, k].mean():+.2f}" for k in range(3)))
 
 
 def main():
@@ -658,6 +800,24 @@ def main():
     # Load channel-0 weights for conv2d simulation
     # ------------------------------------------------------------------
     weights_ch0 = _load_ch0_weights(repo_root)
+
+    # ------------------------------------------------------------------
+    # CONV_IN_CH=3: generate ONLY the scenario that means anything for RGB.
+    # ------------------------------------------------------------------
+    # RGB changes conv2d and NOTHING downstream of it — N_CHANNELS is conv2d's
+    # OUTPUT count, so the FFT -> cmul -> IFFT chain, H_SHIFT and the filter
+    # state are bit-for-bit the same as in the grayscale build. s0-s4 bypass
+    # conv2d entirely (they drive fft_col_in.bin directly), so an "RGB" version
+    # of them would test the same arithmetic with three times the stimulus and
+    # re-derived bounds that assert nothing new.
+    #
+    # So the RGB set is one scenario, s6rgb, aimed squarely at the only thing
+    # that changed. It writes to its OWN directory: overwriting s6 would silently
+    # feed RGB vectors to a grayscale x86sim_check, and the two are
+    # indistinguishable from the outside.
+    if CONV_IN_CH == 3:
+        write_s6rgb(out_dir, weights_ch0)
+        return
 
     # ------------------------------------------------------------------
     # Legacy top-level files (backward compat with old make aiesim)

@@ -179,6 +179,29 @@ public:
         runtime<ratio>(conv2d) = 0.9;
         runtime<ratio>(cmul)   = 0.9;
 
+#if CONV_IN_CH == 3
+        // RGB conv2d NEEDS MORE THAN THE 1024-BYTE DEFAULT STACK.
+        //
+        // Measured, not guessed: without this the mapper stops with
+        //   "Stack size requirement of total (1344 + 0) bytes for 15_0 exceeds
+        //    the allotted stack size of 1024 bytes"
+        // and NO libadf.a is produced. The per-kernel compile succeeds either
+        // way, which is why the RGB cycle schedules in CLAUDE.md were readable
+        // from a build that never linked.
+        //
+        // The cause is the 27-tap MAC chain: three planes' worth of live
+        // vectors and the fixed post chain (downshift / clip / B1 / two Hann
+        // multiplies, each an int32 x CONV_VEC vector) spill where nine taps did
+        // not. Confirmed pre-existing by counterfactual — the same 1344 bytes
+        // with the branch's original literal weight offsets, so it is not an
+        // artifact of the conv_weight_layout refactor.
+        //
+        // Set ONLY for CONV_IN_CH=3. The grayscale build keeps the default, so
+        // its mapping and its 38 FPS measurement are not perturbed by a change
+        // made for the other arm.
+        stack_size(conv2d) = CONV2D_STACK;
+#endif
+
         // --- Wiring ---
 
         // PatchIn → conv2d: stream (PLIO produces a stream of int8 samples)
