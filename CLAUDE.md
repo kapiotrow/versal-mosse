@@ -2059,23 +2059,6 @@ Two principles that have repeatedly earned their keep: **instruments before chan
   The startup banner now prints `ITER_CNT`, `VERBOSITY`, `DUMP_BUFFERS` and the shift budget, so
   new logs are self-describing; the shifts reach the host as report-only `*_CFG` defines from the
   same Makefile variables the graph gets.
-- **VERIFY THE CARD, NOT THE IMAGE. Three consecutive board runs executed a stale ELF.** The
-  multi-slot USB reader keeps its device node whether or not a card is inserted: with a card it
-  is 59.5 G, without one the empty slot reports a **phantom 2 TB**, same model string
-  (`STORAGE DEVICE`), same `removable=1`, same `/dev/sdb`. So `dd of=/dev/sdb` looks correct at
-  the prompt either way and silently writes to nothing. **Size is the only discriminator.**
-  After flashing, verify the *card*:
-  ```bash
-  sudo cmp -n $(stat -c %s "$IMG") "$IMG" /dev/sdX && echo "CARD MATCHES IMAGE"
-  ls -1 /media/karolina/*/ | wc -l     # 10 on a fresh image; more means it was never written
-  strings -a /media/karolina/*/mosse_tracker.elf | grep -c '<a string only the new build has>'
-  ```
-  A freshly `dd`'d card holds exactly 10 files (9 before `xrt.ini` was added to
-  `make package` on 2026-08-18). If it holds hundreds of `*.bin`, those were
-  written by a running board and the flash did not land. There are also **two physical SD
-  cards** in circulation — label them; "I reflashed it" and "the board booted it" are different
-  claims. Cheapest in-run check: put a unique string in every build and grep the boot log for it
-  before waiting on results.
 - **hw_emu packaging stalls on `udevadm settle` when the reader is plugged in.** Repeated
   "Timed out for waiting the udev queue being empty", ~120 s each, turning a 45 s package into
   10 min. Not a failure — v++ completes and the image is correct. Unplug the reader.
@@ -2202,21 +2185,7 @@ Two principles that have repeatedly earned their keep: **instruments before chan
   filled `g_background`, and `g_background` was read in exactly one place — `scene_restore()`,
   which copies only the *previous* frame's dirty rect. `g_dirty` starts empty, nothing ever
   copied the whole thing in, and the `camera_capture` zero-fill that used to initialise the
-  buffer is commented out. So the frame the pipeline read was the BO as allocated, plus a
-  target, plus whatever narrow rect a previous frame dirtied. Measured by replaying the host's
-  own scene functions, fraction of the ROI never written: **frame 0 88.53%** (the frame the
-  filter trains on), frames 2+ **6.92%** at `TRAJECTORY=0` / 3.1-4.7% at `TRAJECTORY=1`, and
-  **55.68%** without `FRAME_NOISE` — that last being the configuration of
-  `run_0_17-08-2026.txt`, whose frames 307-313 report `ratio 1.08x`, peak 7989 against max
-  sidelobe 7379, identical to ±3 every frame, and 302 px error. **The cost was dynamic range,
-  not false correlation.** The never-written band saturates the int8 rail (clipped count ==
-  band count exactly), inflating Stage A's σ ~4.3× and dividing the real content by the same:
-  signal std into conv2d 7.0-7.6 instead of 32.2-32.4, i.e. 77% lost normally and 88.7% on
-  frame 0. **The tempting explanation — a patch-stationary band that locks the response to
-  (0,0) — is WRONG and was tested:** the band sits at patch rows 123-127, where the Hann
-  window is 177 against 32767, and those rows carry **7.3e-6** of the windowed patch energy.
-  It cannot correlate with anything. This is a different defect from the entry below, which is
-  real and separate. Fix is one 2 MB `memcpy` at startup, and it **must** come after
+  buffer is commented out. Fix is one 2 MB `memcpy` at startup, and it **must** come after
   `rc_control_cu_probe()` (which zero-fills `frame_bo` by design) — putting it next to
   `scene_init()`, where it naturally belongs, lets the probe erase it.
   **CORRECTION 2026-08-20, and it is the interesting part of this entry.** The measured
