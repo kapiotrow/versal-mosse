@@ -76,3 +76,9 @@ echo "COMMON_IMAGE_VERSAL: $COMMON_IMAGE_VERSAL"
 echo "SDKTARGETSYSROOT: $SDKTARGETSYSROOT"
 echo "CXX: $CXX"
 echo ""
+
+# VOT-STb2022 evaluation. Deliberately an explicit absolute path with no
+# in-repo fallback: an unset or silently-defaulted VOT_ROOT is exactly what
+# makes a data/build mismatch invisible. The 10 GB of converted blobs live
+# here and are NOT in git; scripts/vot_prepare.py regenerates them.
+export VOT_ROOT=$HOME/vot

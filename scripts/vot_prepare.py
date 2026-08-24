@@ -105,17 +105,41 @@ def frame_bytes(rgb_hw3, channels):
     return np.ascontiguousarray(rgb_hw3).tobytes()
 
 
-def reduce_box(poly):
-    """VOT rotated polygon -> axis-aligned (row, col, h, w), min-max convention.
+def reduce_box(vals):
+    """One groundtruth line -> axis-aligned (row, col, h, w).
 
-    Identical to rgb_vs_gray_vot.load_gt. Doing this ONCE here, on the PC, is
-    what keeps the board and the offline harness agreeing about what the ground
-    truth box is, rather than having two copies of the rule drift apart.
+    VOT USES TWO GROUNDTRUTH FORMATS AND THIS DISPATCHES ON WHICH.
+
+      4 values  ->  x, y, w, h    axis-aligned rectangle. ALL of stb2022.
+      2n values ->  polygon       rotated quad. The VOT2015-era sequences in
+                                  test-sequences/, and nothing in stb2022.
+
+    Getting this wrong is silent and total: reading a 4-value rectangle with the
+    polygon rule gives x=[x,w], y=[y,h], so `fernando` frame 291
+    (440,229,198,230) reduces to a 1.0 x 242.0 sliver instead of 230 x 198. It
+    produced 62 plausible manifests and every box in them was wrong.
+
+    It went unnoticed because rgb_vs_gray_vot.load_gt makes the SAME polygon-only
+    assumption, so cross-checking against it agreed -- two implementations of one
+    wrong rule. On test-sequences/ the rule is correct, which is why every
+    Phase 0c check passed. verify() now cross-checks against the toolkit's own
+    parse_region(), which is a genuinely independent parser.
     """
-    v = np.asarray(poly, dtype=np.float64)
-    x, y = v[0::2], v[1::2]
-    return (0.5 * (y.min() + y.max()), 0.5 * (x.min() + x.max()),
-            y.max() - y.min(), x.max() - x.min())
+    v = np.asarray(vals, dtype=np.float64)
+    if v.size == 4:
+        x, y, w, h = v
+        return (y + h / 2.0, x + w / 2.0, h, w)
+    if v.size >= 6 and v.size % 2 == 0:
+        x, y = v[0::2], v[1::2]
+        return (0.5 * (y.min() + y.max()), 0.5 * (x.min() + x.max()),
+                y.max() - y.min(), x.max() - x.min())
+    raise SystemExit(f"groundtruth line with {v.size} values: "
+                     f"expected 4 (rectangle) or an even count >= 6 (polygon)")
+
+
+def gt_format(path):
+    n = len(path.read_text().split()[0].split(','))
+    return "rectangle" if n == 4 else f"polygon{n}"
 
 
 def load_gt(path):
@@ -153,6 +177,46 @@ def discover(root):
     return seqs
 
 
+def discover_vot(root):
+    """Toolkit workspace layout: <root>/<seq>/{sequence, groundtruth.txt,
+    anchor.value, color/%08d.jpg}. Distinct from the test-sequences layout,
+    which keeps annotations in a sibling directory with an inconsistent name.
+    """
+    root = Path(root)
+    seqs = {}
+    for d in sorted(root.iterdir()):
+        if not d.is_dir() or not (d / "sequence").is_file():
+            continue
+        frames = sorted((d / "color").glob("*.jpg"))
+        gt = d / "groundtruth.txt"
+        if frames and gt.exists():
+            seqs[d.name] = (frames, gt)
+        else:
+            print(f"  [skip] {d.name}: no frames or groundtruth")
+    return seqs
+
+
+def autodiscover(root):
+    """Pick the layout by looking, not by a flag. Returns (seqs, kind)."""
+    root = Path(root)
+    if any((d / "sequence").is_file() for d in root.iterdir() if d.is_dir()):
+        return discover_vot(root), "vot"
+    return discover(root), "local"
+
+
+def read_anchors(gtf, length):
+    """<seq>/anchor.value if present. Every frame carries a number -- the
+    toolkit's reader does an unconditional float(line), so 0 means 'not an
+    anchor' and a blank line is an error, not an absence."""
+    p = gtf.parent / "anchor.value"
+    if not p.exists():
+        return None
+    v = [float(x.strip()) for x in p.read_text().split()]
+    if len(v) != length:
+        raise SystemExit(f"{p}: {len(v)} values for {length} frames")
+    return v
+
+
 def check_frame_order(frames):
     """Assert files are exactly 00000001.jpg .. %08d.jpg with no gaps.
 
@@ -170,6 +234,29 @@ def check_frame_order(frames):
 # ---------------------------------------------------------------------------
 # job list
 # ---------------------------------------------------------------------------
+
+def make_jobs_from_anchors(gt, values):
+    """The DATASET's anchors: one run per anchor, direction from the SIGN.
+
+    `find_anchors()` in the toolkit splits a per-frame `anchor` value into a
+    forward list (value > 0) and a backward list (value < 0); the lists are
+    disjoint and each anchor is run exactly once. A forward anchor at i covers
+    [i .. end], a backward anchor covers [i .. 0]. Reproduced here so the board
+    runs precisely the jobs the analysis will look for -- a job the toolkit does
+    not expect is wasted board time, and a job it expects but does not find is a
+    "Missing results" failure at analysis time, hours later.
+    """
+    n = len(gt)
+    jobs = []
+    for i, v in enumerate(values):
+        if v > 0:
+            jobs.append({"anchor": i, "direction": "forward",
+                         "init_box": list(gt[i]), "length": n - i})
+        elif v < 0:
+            jobs.append({"anchor": i, "direction": "backward",
+                         "init_box": list(gt[i]), "length": i + 1})
+    return jobs
+
 
 def make_jobs(gt, spacing):
     """Synthetic multi-start anchors at a fixed spacing.
@@ -217,6 +304,20 @@ def convert_sequence(name, frames, gtf, out, channels, spacing, mutate=None):
     if h > MAX_ROWS or w > MAX_COLS:
         raise SystemExit(f"{name}: {h}x{w} exceeds the {MAX_ROWS}x{MAX_COLS} "
                          f"frame buffer")
+
+    if mutate == 'polyonly':
+        # THE bug this cross-check exists for, reproduced exactly: apply the
+        # polygon min-max rule to every line regardless of its length. On a
+        # 4-value rectangle that reads x=[x,w], y=[y,h]. Inert on genuinely
+        # polygonal groundtruth, so run this mutant against stb2022, not
+        # test-sequences.
+        def _polyonly(vals):
+            v = np.asarray(vals, dtype=np.float64)
+            x, y = v[0::2], v[1::2]
+            return (0.5 * (y.min() + y.max()), 0.5 * (x.min() + x.max()),
+                    y.max() - y.min(), x.max() - x.min())
+        gt = [_polyonly([float(t) for t in line.split(',')])
+              for line in gtf.read_text().split()]
 
     order = list(range(len(frames)))
     if mutate == 'offbyone':
@@ -266,10 +367,16 @@ def convert_sequence(name, frames, gtf, out, channels, spacing, mutate=None):
                 lm.update(b)
         luma_md5 = lm.hexdigest()
 
+    anchors = read_anchors(gtf, len(gt))
     sides = [min(b[2], b[3]) for b in gt]
     over = sum(1 for b in gt
                if b[2] * TARGET_PADDING > h or b[3] * TARGET_PADDING > w)
-    jobs = make_jobs(gt, spacing)
+    if anchors is not None:
+        jobs = make_jobs_from_anchors(gt, anchors)
+        src = "dataset"
+    else:
+        jobs = make_jobs(gt, spacing)
+        src = f"synthetic:spacing={spacing}"
 
     man = {
         "schema": SCHEMA_VERSION,
@@ -288,10 +395,12 @@ def convert_sequence(name, frames, gtf, out, channels, spacing, mutate=None):
         "luma_convention": ("BT.601 clip(round(0.2989R+0.5870G+0.1140B)) -- "
                             "matches rgb_vs_gray_holdout.to_luma, NOT "
                             "PIL Image.convert('L')"),
-        "gt_convention": ("axis-aligned min-max of the rotated polygon "
-                          "-> (row, col, h, w)"),
+        "gt_format": gt_format(gtf),
+        "gt_convention": ("4-value x,y,w,h -> centre; polygon -> axis-aligned "
+                          "min-max. Both give (row, col, h, w)"),
+        "empty_boxes": int(sum(1 for b in gt if b[2] <= 0 or b[3] <= 0)),
         "groundtruth": [list(b) for b in gt],
-        "anchors_source": f"synthetic:spacing={spacing}",
+        "anchors_source": src,
         "jobs": jobs,
         "tracked_frames": sum(j["length"] for j in jobs),
         "min_box_side": float(min(sides)),
@@ -363,6 +472,30 @@ def verify_sequence(name, frames, gtf, out, check_gt, limit=None):
                 break                      # one report per sequence is enough
 
     if check_gt:
+        # INDEPENDENT PARSER. parse_region() dispatches rectangle vs polygon on
+        # its own and bounds() returns (l, t, r, b) ROUNDED TO INTEGERS, so
+        # compare with a 1 px tolerance -- enough to catch a format error (which
+        # is off by tens of px) without demanding the toolkit's rounding.
+        try:
+            from vot.region.io import parse_region
+        except ImportError:
+            parse_region = None
+        if parse_region is not None:
+            worst, where = 0.0, None
+            for k, line in enumerate(gtf.read_text().split()):
+                r = parse_region(line)
+                if r.is_empty():
+                    continue
+                l, t, rr, b = r.bounds()
+                ref = ((t + b) / 2.0, (l + rr) / 2.0, b - t, rr - l)
+                got = man["groundtruth"][k]
+                d = max(abs(a - c) for a, c in zip(ref, got))
+                if d > worst:
+                    worst, where = d, k
+            if worst > 1.0:
+                fails.append(f"{name}: gt disagrees with toolkit parse_region "
+                             f"by {worst:.2f} px at frame {where+1}")
+
         want_gt = load_gt(gtf)
         got_gt = man["groundtruth"]
         if len(want_gt) != len(got_gt):
@@ -380,7 +513,8 @@ def verify_sequence(name, frames, gtf, out, check_gt, limit=None):
 # CLI
 # ---------------------------------------------------------------------------
 
-MUTANTS = ['offbyone', 'dropframe', 'reverse', 'transpose', 'pilluma']
+MUTANTS = ['offbyone', 'dropframe', 'reverse', 'transpose', 'pilluma',
+           'polyonly']
 
 
 def resolve_out(args):
@@ -416,7 +550,8 @@ def main():
     args = ap.parse_args()
 
     out = resolve_out(args)
-    seqs = discover(args.root)
+    seqs, kind = autodiscover(args.root)
+    print(f"layout: {kind}  root: {args.root}")
     if args.sequences:
         seqs = {k: v for k, v in seqs.items() if k in args.sequences}
     if not seqs:
@@ -427,12 +562,30 @@ def main():
         print(f"converting {len(seqs)} sequences -> {out} "
               f"(channels={args.channels})")
         tot = tracked = 0
+        mans = []
         for name, (frames, gtf) in seqs.items():
             m = convert_sequence(name, frames, gtf, out, args.channels,
                                  args.spacing)
+            mans.append(m)
             tot += m["frames"]; tracked += m["tracked_frames"]
+        # trackers.ini is generated HERE so the out-of-repo workspace and the
+        # in-repo shim cross-reference through one source, not two.
+        ini = out / "trackers.ini"
+        ini.write_text("[MOSSE]\nlabel = MOSSE-VEK280\n"
+                       "protocol = traxpython\ncommand = noop\n")
+        srcs = sorted({m["anchors_source"] for m in mans})
         print(f"\n{len(seqs)} sequences, {tot} frames, "
-              f"{tracked} tracked frames across all jobs")
+              f"{tracked} tracked frames across {sum(len(m['jobs']) for m in mans)} runs")
+        print(f"anchors: {', '.join(srcs)}")
+        for ms, lbl in ((26.29, "gray"), (28.58, "RGB")):
+            print(f"  at {ms} ms/frame ({lbl}): "
+                  f"{tracked*ms/1000/60:.1f} min")
+        blob = sum(m["frames"] * m["frame_bytes"] for m in mans)
+        print(f"blobs {blob/1e9:.2f} GB -> {blob/117.2e6/60:.1f} min staging "
+              f"at the Phase 0a rate (117.2 MB/s)")
+        print(f"largest single blob {max(m['frames']*m['frame_bytes'] for m in mans)/1e6:.0f} MB "
+              f"= peak board heap")
+        print(f"wrote {ini}")
         return
 
     if args.mode == 'verify' and not args.mutate:
@@ -463,8 +616,18 @@ def main():
     frames, gtf = seqs[name]
     mout = out / "_mutants"
     mout.mkdir(parents=True, exist_ok=True)
-    lim = args.limit or 40
-    print(f"mutation test on '{name}' (first {lim} frames verified)\n")
+    # DEFAULT TO ALL FRAMES. An earlier default of 40 made `dropframe` report
+    # SURVIVED on a 292-frame sequence purely because the mutation lands at the
+    # midpoint and the check stopped at frame 40 -- a harness artifact that
+    # reads exactly like a verifier gap. --limit is a speed knob, and it warns
+    # when it is too small to reach the mutation.
+    lim = args.limit
+    print(f"mutation test on '{name}' "
+          f"({'first %d frames' % lim if lim else 'ALL frames'} verified)")
+    if lim and lim <= len(frames) // 2:
+        print(f"  WARNING: --limit {lim} does not reach the dropframe mutation "
+              f"at frame {len(frames)//2}")
+    print()
     caught = 0
     for m in muts:
         if m == 'pilluma' and args.channels != 1:

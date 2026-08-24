@@ -11,3 +11,6 @@ weights = [
     "torch",
     "torchvision",
 ]
+vot = [
+    "vot-toolkit",
+]
