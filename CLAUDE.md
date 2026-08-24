@@ -62,9 +62,9 @@ the `dsp` subdirectory (the Makefile appends `/dsp`).
 | `FRAME_TEXTURE` | — | Band-limited background instead of a flat fill |
 | `FRAME_NOISE` | `2` | Per-frame sensor noise, PEAK amplitude in LSB, over the ROI. Does **not** fix background lock |
 | `BG_PAN` / `BG_PAN_R` / `BG_PAN_C` | `1` / `31` / `47` | Camera pan over the cached background, px/frame. Decorrelates the background 6.6× (swept with `scripts/bg_pan_sweep.py`) but **did not fix tracking** — see the training-target trap. Host-only |
-| `VERBOSITY` | `1` | **A frame-rate parameter** — `0` = one compact line/frame (~45 B), use for long runs; `1` = per-frame block, roi_crop/DMA tables on first+last frame only; `2` = everything. Anomalies print at every level. Host-only |
+| `VERBOSITY` | `1` | `0` = one compact line/frame (~45 B); `1` = per-frame block, roi_crop/DMA tables on first+last frame only; `2` = everything. Anomalies print at every level. **No longer a diagnostics trade-off** — since 2026-08-24 `track.csv` carries `rails`/`accum_max`, so a `VERBOSITY=0` run is a full budget verdict AND an FPS measurement. Host-only |
 | `DUMP_BUFFERS` | `1` | Per-frame binary dumps. **1216 KB/frame, ~2 s/frame**. Set `0` for any run measuring tracking or FPS |
-| `CSV_LOG` | `1` | One row/frame to `track.csv` — gate verdict, both PSRs, peak, displacement, `resp00_over_peak`, both boxes, IoU, centre error, `scale_idx`/`scale_conf`/`scale_reason`. ~40 B/frame |
+| `CSV_LOG` | `1` | One row/frame to `track.csv` — gate verdict, both PSRs, peak, displacement, `resp00_over_peak`, both boxes, IoU, centre error, scale fields, and (2026-08-24+) `rails,accum_max,fch0_max,h_max`. ~60 B/frame |
 
 Artifacts land in `build/$(TARGET)/$(PATCH_ROWS)x$(PATCH_COLS)/ch$(N_CHANNELS)/`.
 
@@ -270,8 +270,10 @@ both. All at 128×128 ch16, `BIAS_SCALE=roi`, 4-4-4, `TRAJECTORY=1 SCALE_TRAJ=1`
 | `run_0824_1432` | RGB tint | 11 | 0 | 0.9173 | **42.65 / 100.44** | colour arm |
 | `run_0824_1442` | RGB luma | 11 | 0 | 0.9188 | 25.69 / 84.83 | colour-free control |
 
-Neither gray run is an FPS measurement — `VERBOSITY=1` costs ~36 ms/frame of console (62.3 vs
-26.29). **RGB's frame rate has not been measured**; offline predicts ~30 FPS, bracket 27-34.
+Those five are `VERBOSITY=1`, so their frame times are console-bound (62.3 ms). **RGB's frame
+rate is 28.58 ms = 34.99 FPS** (`runs/run_0824_1457.log`, `VERBOSITY=0`) against gray's 38.04 —
+**a 8.0% cost for colour, not the 21% the offline model predicted.** See "RGB costs what the
+HOST pays" below.
 
 The full chain runs on real hardware at 128×128 ch16 on the real conv path: roi_crop → PatchIn →
 conv2d → B1 → row FFT → transpose → col FFT → cmul(H_SHIFT) → B2 → IFFT rows → transpose →
@@ -294,57 +296,60 @@ IFFT cols → response → PSR gate → filter update → scale update.
 | 08-21 | `CMUL_SPLIT_ACCUM` | 29.61 | 33.77 | `run_0821_1452` |
 | 08-21 | blocked `unpack_spectrum` | 28.64 | 34.92 | `run_0821_1635` |
 | 08-21 | tail split onto core 1 (`TAIL_PARALLEL`) | **26.23** | **38.15** | `run_0821_1712` |
+| 08-24 | RGB (`CONV_IN_CH=3`) — cost is host memory, not conv2d | 28.58 | 34.99 | `run_0824_1457` |
 
 **Every one of these was accepted on a bit-identical-tracking test**, and that criterion has now
 caught two bugs it was not designed for (the `g_target_shift` race, the `FFT_COL_WS` datapath
 check). A tolerance-based check would have shrugged at IoU 0.48.
 
-### Where the frame goes now (`run_0821_1725`, 26.29 ms)
+### Where the frame goes — gray 26.29 ms, RGB 28.58 ms
 
 ```
-APU subtotal      15.639    <- comparable to every pre-threading run
-of which OVERLAP  -2.762    <- ran CONCURRENTLY on core 1
-APU wall          12.876    <- what the frame actually spent
-GMIO              11.14     (async 6.61 / wait 4.51)
-roi_crop launch    1.02     (= channel 0's Stage A, structurally exposed)
-UNATTRIBUTED      +1.261
+                  gray    RGB      (VERBOSITY=0, run_0821_1725 / run_0824_1457)
+APU subtotal    15.639  17.442
+of which OVERLAP -2.762  -2.746   <- ran CONCURRENTLY on core 1
+APU wall        12.876  14.696    <- what the frame actually spent
+GMIO            11.134  11.133    (async 6.6 / wait 4.5 — UNCHANGED by RGB)
+roi_crop launch  1.013   1.471    (= channel 0's Stage A, structurally exposed)
+UNATTRIBUTED    +1.261  +1.284
 ```
 
-**The frame is 84% CPU-BOUND**, not wait-bound: host CPU = APU 15.4 + GMIO async 6.6 +
-roi_crop 1.0 + unattributed 1.2 = 24.2 ms of a 28.7 ms frame (measured pre-threading). Only 41%
-of GMIO is blocking. **The second core's value is splitting 24 ms of work, not filling 4.5 ms of
-gaps**; perfect two-core use floors at ≈12-15 ms, 65-80 FPS.
+**The frame is 84% CPU-BOUND**, not wait-bound: host CPU = APU 15.4 + GMIO async 6.6 + roi_crop
+1.0 + unattributed 1.2 = 24.2 ms of a 28.7 ms frame (measured pre-threading). Only 41% of GMIO
+blocks. **The second core's value is splitting 24 ms of work, not filling 4.5 ms of gaps**;
+perfect two-core use floors at ≈12-15 ms, 65-80 FPS. That slack is also why RGB is nearly free
+(see "RGB costs what the HOST pays").
 
-**Overlap accounting is measured, not estimated.** Let H be the helper's own elapsed time and W
-the time the main thread spends blocked in `join()`. The region's WALL cost is (main's own work
-+ W); the slots credit (main's own work + H). The double-count is exactly **H − W** =
-`min(helper, main)` however the two line up. It validated itself: overlap 2.762 against a
-predicted `min(4.80, 2.89)` = 2.9 (95.6% of the maximum), and the residual returned to +1.261
-against +1.17 before threading — a correction tuned merely to erase a negative number would
-have had no reason to land there.
+**Overlap accounting is measured, not estimated.** With H the helper's elapsed time and W the
+main thread's time blocked in `join()`, the region's WALL cost is (main's own work + W) while the
+slots credit (main's own work + H), so the double-count is exactly **H − W**. It validated
+itself: overlap 2.762 against a predicted `min(4.80, 2.89)` = 2.9, and the residual returned to
++1.261 against +1.17 before threading — a correction tuned merely to erase a negative number
+would have had no reason to land there.
 
 ### Next, in order
 
-The APU is a **flat tail** — biggest single item 4.8 ms — so the remaining wins are structural.
+The APU is a **flat tail** — biggest single item 5.2 ms — so the remaining wins are structural.
 
 1. **Software-pipeline the CHANNEL loop.** The `fft_col_out` + `accum_out` pair (~8.7 ms) is the
-   col-FFT + cmul production time for 16 channels, proven immune to transaction count. Overlap
-   it with the host's ~0.4 ms/channel of APU work, exactly as `roi_crop` was pipelined
+   col-FFT + cmul production time for 16 channels, proven immune to transaction count. Overlap it
+   with the host's ~0.4 ms/channel of APU work, exactly as `roi_crop` was pipelined
    (5.196 → 1.020 ms). The graph already permits one channel of lookahead; the host serialises.
 2. **More of the second core.** Parallel-for over channels inside `filter_update_quantize` —
-   expect well under 2×, it is memory-bound and the two cores share a controller (both halves
-   of the tail split got ~4% slower from contention). **See the abandoned attempt below before
-   trying.** Then re-enable `CMUL_ACCUM_MEMTILE`, which only pays once a helper exists to absorb
-   the resulting wait (alone it loses 0.36 ms; paired, worth ~2.7 ms of freed CPU).
-3. **NEON-vectorise the int16→float conversion in `unpack_spectrum`** (`SSHLL` + `SCVTF`) —
-   maybe 1 ms, and the only remaining idea for that slot.
-4. **6.6 ms/frame of XRT descriptor cost (23% of the frame)** — the two 256-tx ports cost 11.0 µs
-   of host CPU per `async()`. The only lever is fewer, larger transactions, i.e. item 2's memtile.
+   expect well under 2×, it is memory-bound and the two cores share a controller. **See the
+   abandoned attempt below before trying.** Then re-enable `CMUL_ACCUM_MEMTILE`, which only pays
+   once a helper exists to absorb the wait (alone it loses 0.36 ms; paired, ~2.7 ms of freed CPU).
+3. **NEON-vectorise the int16→float conversion in `unpack_spectrum`** (`SSHLL` + `SCVTF`) — maybe
+   1 ms, and the only remaining idea for that slot.
+4. **6.6 ms/frame of XRT descriptor cost** — the two 256-tx ports cost 11.0 µs of host CPU per
+   `async()`. The only lever is fewer, larger transactions, i.e. item 2's memtile.
+5. **At `CONV_IN_CH=3` only: `frame push` 1.385 ms.** The 6 MB `frame_bo` is now the single
+   biggest RGB-specific cost — bigger than everything conv2d added to the frame.
 
-**Retired, do not reopen:** `FFT_COL_WS` 8→32 (a 9.57 ms loss), `CMUL_ACCUM_MEMTILE` alone (a
-0.36 ms loss), Hermitian symmetry in the host filter (premise refuted in fixed point), the
-accumulator as a `shared_buffer`, parallel-for inside `filter_update_quantize` as attempted.
-Each has an entry below.
+**Retired, do not reopen:** `FFT_COL_WS` 8→32 (a 9.57 ms loss), `CMUL_ACCUM_MEMTILE` alone (0.36
+ms), Hermitian symmetry in the host filter (premise refuted in fixed point), the accumulator as a
+`shared_buffer`, parallel-for inside `filter_update_quantize` as attempted. Each has an entry
+below.
 
 ### Parallel-for inside `filter_update_quantize` — ATTEMPTED AND ABANDONED (2026-08-21)
 
@@ -372,44 +377,37 @@ arithmetic.
 ### Scale filter — root-caused offline, confirmed on hardware (2026-08-20)
 
 `design/host_app_src/test/scale_loop_sim.cpp` (`make scale_sim`) drives the REAL
-`scale_extract`/`scale_detect`/`scale_gate`/`scale_update` in a closed loop with the position
-held. Native g++, seconds per arm. It **reproduces the board**: the `moving` arm parks for 42
-frames starting at f131; hardware froze at f130. The program refuses to report a verdict when
-the premise arm fails to reproduce.
+`scale_extract`/`scale_detect`/`scale_gate`/`scale_update` in a closed loop with position held.
+Native g++, seconds per arm. It **reproduces the board** (the `moving` arm parks for 42 frames
+from f131; hardware froze at f130) and refuses to report a verdict when the premise arm fails to
+reproduce.
 
 **`SCALE_STEP=1.04` confirmed on hardware** (`runs/run_0820_1513.log`, otherwise identical to
-`run_0820_1418`):
-
-| | a=1.02 | a=1.04 |
-|---|---|---|
-| mean / worst IoU | 0.807 / 0.579 | **0.917 / 0.833** |
-| max box error | 31.4% | **9.6%** |
-| mean / worst centre error | 2.47 / 11.07 px | **1.30 / 3.52 px** |
-
-**Centre error fell 3.2× from a size-only change** — independent confirmation that position error
-was downstream of the scale error, not a separate defect.
+`run_0820_1418`): mean/worst IoU 0.807/0.579 → **0.917/0.833**, max box error 31.4% → **9.6%**,
+mean/worst centre error 2.47/11.07 px → **1.30/3.52**. **Centre error fell 3.2× from a size-only
+change** — independent confirmation that position error was downstream of the scale error.
 
 **The detector proposed only −1, 0 or +1 over 199 frames** (174/13/12) — never ±2, at either step
-size. The decisions overlap heavily in error (idx 0 spans −5.3%..+9.6%, idx −1 spans
-−1.5%..+7.6%), so near zero it is a noisy estimator, not a dead zone with a clean threshold.
+size, and still true on both RGB arms. The decisions overlap heavily in error (idx 0 spans
+−5.3%..+9.6%), so near zero it is a noisy estimator, not a dead zone with a clean threshold.
 
 **`SCALE_CONF_MIN` blocks legitimate large corrections.** On the sim's `step` arm the detector
-proposes the correct `idx=-14` on the first frame after a jump and the gate vetoes it as
-`LOW_CONF` for four frames; after that it only ever proposes ±1 and the box walks at 2%/frame
-with a 37% peak. Bypassing the gate corrects the same step in ONE frame. **`conf` cannot
-distinguish "wrong proposal" from "big correct correction"** — both match the model poorly, for
-the same reason. Exonerated for the smooth `moving` envelope, but it will bite on any abrupt
-scale change.
+proposes the correct `idx=-14` after a jump and the gate vetoes it as `LOW_CONF` for four frames;
+the box then walks at 2%/frame with a 37% peak, where bypassing the gate corrects it in ONE
+frame. **`conf` cannot distinguish "wrong proposal" from "big correct correction"** — both match
+the model poorly, for the same reason. Exonerated for smooth envelopes; it will bite on any
+abrupt scale change.
 
-**Where it stops.** `SCALE_ETA` does not help now (sim at a=1.04: 8.6/10.3/9.2% at
-0.025/0.05/0.1). `SCALE_N=65` gives 7.0% against 8.6% for **3.9× the scale-filter cost**.
-~8-10% box error is this filter's practical floor; the next gain would be a different estimator.
+**Where it stops.** `SCALE_ETA` does not help (sim at a=1.04: 8.6/10.3/9.2% at 0.025/0.05/0.1);
+`SCALE_N=65` gives 7.0% against 8.6% for **3.9× the cost**. ~8-10% box error is this filter's
+practical floor — and it is what the worst IoU frames on EVERY 2026-08-24 run are: f125 box
+54.71 vs truth 50.00 with centre error 0.06 px. The next gain needs a different estimator, not a
+tuning change.
 
 **Calibration honesty: the sim predicted a=1.04 well and a=1.02 badly** (12.6% → 8.6% predicted;
-31.4% → 9.6% measured). It also peaks at 12.6% where hardware peaked at +31%, and recovers when
-the envelope turns where hardware never did — **unexplained**; position error and background pan
-were both tested and ruled out. **Trust the ORDERING; do not quote the sim's absolute magnitudes
-as the board's.**
+31.4% → 9.6% measured), and it recovers when the envelope turns where hardware never did —
+**unexplained**; position error and background pan were both tested and ruled out. **Trust the
+ORDERING; do not quote the sim's absolute magnitudes as the board's.**
 
 **The truth rate matters and the test bench chose it.** `SCALE_TRAJ_AMP=0.30` over
 `SCALE_TRAJ_PERIOD=200` shrinks the target at ~0.94%/frame — under half of one 2% scale level —
@@ -892,16 +890,23 @@ Two principles that have repeatedly earned their keep: **instruments before chan
   template capped at 512 px. A single application under-corrects (+3 where +5 is exact) because
   the response is a discrete peak smoothed by a σ=S/16 target — the property to assert is that
   **repeated** application converges monotonically, which it does to 0.5%.
-- **Console gating (`VERBOSITY`) details that mattered.** (1) It is a compile-time constant and
-  the `VP1`/`VP2` macros are `if (VERBOSITY >= n)`, so format strings are **dead-code-eliminated,
-  not merely skipped** — verified statically with `strings` on the ELF at each level, a stronger
-  check than reading a log. (2) `dma_accumulate_frame()` had to be split out of
-  `dma_report_frame()`; the printer was also the accumulator, so gating the print would have
-  silently turned the CUMULATIVE report into a two-frame report. (3) **Anomalies print at every
-  level** — a railed bin (`rails` is the one number `track.csv` does not carry), a PSR or scale
-  HOLD, a peak-definition disagreement, a negative peak. Silencing those is how a shift-budget
-  hunt goes wrong. (4) `VERBOSITY=0` still prints one line per frame deliberately: gating to
-  nothing would delete the instrument `picocom | ts` needs.
+- **Console gating (`VERBOSITY`) details that mattered.** (1) The `VP1`/`VP2` macros are
+  `if (VERBOSITY >= n)` on a compile-time constant, so format strings are **dead-code-eliminated,
+  not merely skipped** — verify with `strings` on the ELF, a stronger check than reading a log.
+  (2) `dma_accumulate_frame()` had to be split out of `dma_report_frame()`; the printer was also
+  the accumulator, so gating the print would have silently turned the CUMULATIVE report into a
+  two-frame report. (3) **Anomalies print at every level** — a railed bin, a PSR or scale HOLD, a
+  peak-definition disagreement, a negative peak. (4) `VERBOSITY=0` still prints one line per
+  frame deliberately: gating to nothing would delete the instrument `picocom | ts` needs.
+- **`track.csv` carries `rails,accum_max,fch0_max,h_max` since 2026-08-24, and that retired the
+  "`VERBOSITY=1` is load-bearing" rule.** The scan always ran — `report_cint16` gates the PRINT,
+  not `scan_cint16` — so the numbers were computed and discarded, and a healthy `VERBOSITY=0` run
+  yielded no amplitude data at all. **Validated by reproducing a known answer**: the
+  `VERBOSITY=0` run's CSV gives `F_ch`/`accum`/`response`/`H(q15)` digit-for-digit identical to
+  the `VERBOSITY=1` run's console, at 28.58 ms/frame instead of 62.67. `calib_report.py` falls
+  back to the CSV when a log has no `[diag]` lines and says which source it used; it distinguishes
+  "0 rails" from "no rails column", because those must never print the same word.
+  `fch0_max` is named for ch0 because `F_ch` is scanned under `if (ch == 0)` — not a bank max.
 - **DMA 4258 → 1090 tx/frame** via `FFT_ROW_WS`/`FFT_COL_WS` 2→8; 96% of the traffic was the four
   per-invocation-chunked ports. **DMA is not a bottleneck and the fabric is at spec**: 80 µs/tx is
   per-transaction *overhead*, not bandwidth — 64 B costs 14.4 µs and 128 KB costs 22.8 µs
@@ -1158,9 +1163,26 @@ copies agree.
 - **Caching the patch in conv2d's tile does not fit.** At `FFT_ROW_WS=64` the output window is
   32 KB and its ping-pong is 64 KB — the whole tile. A 48 KB RGB patch cache would force
   `FFT_ROW_WS` down, and 64→32 cost 10.2 ms/frame on hardware. Net loss.
-- **RGB's FRAME RATE IS STILL UNMEASURED.** Every RGB run so far is `VERBOSITY=1`, which costs
-  ~36 ms/frame of console. Offline predicts ~30 FPS (bracket 27–34). A `VERBOSITY=0` repackage
-  would settle it in minutes.
+- **RGB COSTS WHAT THE HOST PAYS, NOT WHAT conv2d COSTS.** Measured `run_0824_1457` (RGB,
+  `VERBOSITY=0`) against `run_0821_1725` (gray): **28.58 ms = 34.99 FPS vs 26.29 = 38.04**, so
+  +2.29 ms. conv2d's +4.59 ms of AIE compute **does not appear in the frame at all** — `GMIO`
+  total is unchanged (11.133 vs 11.134) and the host's blocking `wait()` is unchanged (4.55 vs
+  4.51 ms). The whole +2.29 is host-side and adds up:
+
+  | stage | gray | RGB | delta |
+  |---|---|---|---|
+  | frame push (`frame_bo` 2 → 6 MB) | 0.472 | 1.385 | **+0.91** |
+  | roi_crop launch (3× bilinear taps) | 1.013 | 1.471 | +0.46 |
+  | colourise RGB (new pass) | — | 0.338 | +0.34 |
+  | `frame_bo.sync` | 0.116 | 0.304 | +0.19 |
+  | filter upd+quant | 4.806 | 5.215 | +0.41 |
+  | **frame** | **26.29** | **28.58** | **+2.29** |
+
+  **The offline "~30 FPS, bracket 27-34" was arithmetically fine and its PREMISE was wrong** — it
+  costed conv2d as if AIE time were frame time. It is not: the frame is 84% CPU-bound, so the AIE
+  had slack and absorbed the doubling. Third time a self-consistent offline model has been
+  overturned by its premise on this project. **The lever for RGB speed is host memory traffic
+  (`frame push`, `colourise`), not the 27 taps.**
 - **No alignment obstacle** — the old "does not divide evenly into 16-byte beats" was false twice
   over: the PLIO is 32-bit, and 128·128·3 = 49152 B divides exactly.
   See [[verify-stated-blockers-arithmetically]].
