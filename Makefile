@@ -257,14 +257,35 @@ IFFT_COL_SHIFT      ?= 4
 #   H_SHIFT   accum(ch1)  accum(ch16)  rowIFFT  response
 #      15          15          240        173        21   response at the floor
 #      12         120         1920       1384       168   response at the floor
-#      10         480         7680       5536       672   <-- 4x margin everywhere
+#      10         480         7680       5536       672   4x margin at BIAS_SCALE=127
 #       8        1920        30719      22143      2688   accum ~94% of rail at ch16
 # The ch16 column at H_SHIFT=10 (7680) lands on the 7728 already recorded as the
 # validated 16-channel accumulator, which is a useful independent check.
 #
+# RAISED 10 -> 11 on 2026-08-24, because BIAS_SCALE=roi returned ~2.5x of signal
+# and consumed that margin. At 10 the corrected build railed (runs/run_calib.log:
+# accum 33952 = 104% of int16 on f173, response 32153 = 98% on f187, and the
+# response was STILL GROWING at f200). H_SHIFT is the only knob upstream of BOTH
+# the accumulator and the response — IFFT_* reaches only the response, and
+# FFT_SHIFT moves it two bits at once because it applies to the row AND the
+# column pass — and both needed exactly one bit.
+#
+# Validated on hardware over 200 frames (runs/run_0824_1354.log, gray /
+# BIAS_SCALE=roi / 4-4-4 / TRAJECTORY=1 SCALE_TRAJ=1):
+#   rails 0 on every frame; accum max 52.1%, response max 49.0% of int16
+#   TRACKING BIT-IDENTICAL to the H_SHIFT=10 run on all 199 evaluated frames
+#   (every IoU, centre error and box string), mean IoU 0.9188, worst 0.8353
+#   PSR 25.92 / 84.06 / 127.36 against 25.92 / 84.08 / 127.41 at H_SHIFT=10
+# That PSR agreement is the load-bearing check, not a nicety: the response now
+# sits at ~28% of int16 typically, BELOW the 49-64% band the 4-4-4 budget was
+# validated in, and PSR is the metric that would show a quantization floor. It
+# did not move. The band was measured on a distribution with a 1.30x spread; the
+# corrected build spreads 2.07x, so centring the TYPICAL frame in the band puts
+# the TAIL on the rail. Size against the tail.
+#
 # SINGLE SOURCE OF TRUTH — reaches the AIE kernel, the host app and the vector
 # generator from this one line.
-H_SHIFT             ?= 10
+H_SHIFT             ?= 11
 
 # =========================================================
 # Paths
@@ -598,6 +619,22 @@ GCC_FLAGS  += -DFRAME_COLS=1920
 # CONV_IN_CH=1, and irrelevant once a real frame source supplies its own colour.
 FRAME_RGB_MODE ?= 1
 GCC_FLAGS  += -DFRAME_RGB_MODE=$(FRAME_RGB_MODE)
+# Re-colourise the WHOLE frame each push and abort on a mismatch, with
+# coordinates. The incremental colourise is correct only if every luma write
+# reached scene_touch(); miss one and the device reads last frame's colour
+# there, which looks like a slightly worse tracking result rather than a bug.
+# O(frame)/frame, so it is opt-in: run it for a handful of frames after any
+# change to a scene function, then turn it off. Inert at CONV_IN_CH=1.
+#
+# PLUMBED 2026-08-24. It was a bare `#ifndef SCENE_VERIFY` default in
+# mosse_tracker.cpp and nothing passed it, so `make sd_card SCENE_VERIFY=1`
+# silently built the instrument DISABLED — the "a #ifndef default in the host is
+# not a safety net, it is what makes the mismatch silent" trap, on the one
+# instrument written for the colour path. Verify it took with:
+#   strings $(BUILD_DIR)/mosse_tracker.elf | grep 'incremental colourise'
+# which is present only when the check is compiled in.
+SCENE_VERIFY ?= 0
+GCC_FLAGS  += -DSCENE_VERIFY=$(SCENE_VERIFY)
 # The host builds H in Q1.15 to match the shift cmul_accum applies to the product.
 # Same value as the AIE_FLAGS line above — see the H_SHIFT comment block.
 GCC_FLAGS  += -DCMUL_H_SHIFT=$(H_SHIFT)

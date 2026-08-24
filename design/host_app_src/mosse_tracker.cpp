@@ -1482,6 +1482,12 @@ static void dump_buffer(const char *tag, int frame, const void *p, size_t bytes)
 
 static FILE *g_csv = nullptr;
 
+struct FrameDiag {
+    double fch = 0.0, accum = 0.0, resp = 0.0, h = 0.0;
+    int    rails = 0;
+};
+static FrameDiag g_fdiag;
+
 static void csv_open(void)
 {
 #if CSV_LOG
@@ -1502,7 +1508,13 @@ static void csv_open(void)
             // logged only est_h, so the level the detector actually PROPOSED had
             // to be reverse-engineered from log(est_h/64)/log(a) — which is how
             // "the detector only ever proposes +-1" was found, slowly. Log it.
-            "scale_idx,scale_conf,scale_reason\n");
+            "scale_idx,scale_conf,scale_reason,"
+            // Added 2026-08-24. rails was THE number track.csv did not carry,
+            // so a budget verdict needed the console and therefore VERBOSITY=1.
+            // accum_max/h_max are the other two the console alone had; fch0_max
+            // is ch0 ONLY (see diag_record) — not a bank maximum. `response` is
+            // deliberately absent: `peak` above already is it.
+            "rails,accum_max,fch0_max,h_max\n");
     fflush(g_csv);
     printf("[csv] per-frame log -> %s\n", path);
 #endif
@@ -1521,7 +1533,7 @@ static void csv_row(int frame, bool occluded, bool evaluated,
     fprintf(g_csv,
             "%d,%d,%d,%d,%s,%.4f,%.4f,%ld,%d,%d,%.4f,"
             "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.4f,%.2f,%d,"
-            "%d,%.4f,%s\n",
+            "%d,%.4f,%s,%d,%.0f,%.0f,%.0f\n",
             frame, occluded ? 1 : 0, evaluated ? 1 : 0, gate.accept ? 1 : 0,
             mosse::gate_reason_tag(gate.reason),
             p.psr, p.ratio, p.peak, p.dr, p.dc, resp00_over_peak,
@@ -1534,7 +1546,8 @@ static void csv_row(int frame, bool occluded, bool evaluated,
             // settled scale — the exact confusion this column exists to remove.
             scale_evaluated ? scale_idx : 0,
             scale_evaluated ? sd.conf : 0.0,
-            scale_evaluated ? mosse::scale_veto_tag(sd.reason) : "NOT_RUN");
+            scale_evaluated ? mosse::scale_veto_tag(sd.reason) : "NOT_RUN",
+            g_fdiag.rails, g_fdiag.accum, g_fdiag.fch, g_fdiag.h);
     // Per ROW, not per run: the whole point is surviving a power cut. A 500-frame
     // run writes 500 flushes of ~40 B, which is nothing against 1216 KB/frame of
     // binaries or 8.3 KB/frame of console.
@@ -1599,9 +1612,36 @@ static Cint16Scan scan_cint16(const int16_t *b, int n)
 // shift-budget instrument and it is the one number here that track.csv does not
 // carry, so a quiet run must still shout when a bin saturates — silencing an
 // anomaly to save console is how a budget hunt goes wrong.
+// Per-frame diagnostic maxima, kept for track.csv.
+//
+// WHY THIS EXISTS: at VERBOSITY=0 the [diag] lines print only when something
+// rails, so a healthy run yields NO amplitude data at all — which is why every
+// calibration run so far had to pay VERBOSITY=1's console cost (62 ms/frame
+// against 26) and therefore could not also be an FPS measurement. The scan
+// itself ALREADY RUNS at every verbosity (report_cint16 gates the print, not
+// scan_cint16), so these four numbers were being computed and thrown away.
+// Recording them makes a VERBOSITY=0 run fully diagnosable.
+//
+// Single-threaded by construction: with TAIL_PARALLEL all four scans and
+// csv_row() run on the main thread AFTER g_filter_thr.join(), so no lock.
+// `fch` is CHANNEL 0 ONLY — report_cint16_scan("F_ch", ...) is called under
+// `if (ch == 0)`. The column is named fch0_max so the CSV cannot be misread as
+// a bank maximum; at CONV_IN_CH=3 ch0 is a colour-opponent channel and its
+// amplitude is the cheap on-board test that colour reaches conv2d.
+static void diag_record(const char *tag, const Cint16Scan &s)
+{
+    const double m = (s.max_m2 > 0) ? sqrt((double)s.max_m2) : 0.0;
+    if      (!strcmp(tag, "F_ch"))     g_fdiag.fch   = m;
+    else if (!strcmp(tag, "accum"))    g_fdiag.accum = m;
+    else if (!strcmp(tag, "response")) g_fdiag.resp  = m;
+    else if (!strcmp(tag, "H(q15)"))   g_fdiag.h     = m;
+    g_fdiag.rails += s.rails;
+}
+
 static void report_cint16_scan(const char *tag, const Cint16Scan &s, int cols,
                                const char *layout)
 {
+    diag_record(tag, s);
     if (VERBOSITY >= 1 || s.rails > 0)
         printf("  [diag] %-9s max|.|=%7.0f at %s idx %d (%d,%d)  rails=%d%s\n",
                tag, sqrt((double)s.max_m2), layout, s.max_i,
@@ -3374,6 +3414,7 @@ int main(int argc, char **argv)
         dma_reset_frame();
         rc_reset_frame();
         ap_reset_frame();      // zeroes the slots AND starts the frame-body clock
+        g_fdiag = FrameDiag{};  // rails must be per-frame, not cumulative
 
         // Recomputed every frame: the scale filter moves box.h/box.w, so the
         // ROI is no longer a constant of the run.

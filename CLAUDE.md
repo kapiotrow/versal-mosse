@@ -26,7 +26,7 @@ the `dsp` subdirectory (the Makefile appends `/dsp`).
 | `FFT_2D_DT` | `0` | 0=cint16, 1=cfloat |
 | `ITER_CNT` | `1` | Frames. **Needs ≥2** — frame 0 initialises the filter |
 | `PL_FREQ` | `312.5` | MHz. Platform also offers 625 / 156.25 / 100 / 78.125 |
-| `H_SHIFT` | `10` | cmul_accum filter-product shift; H is Q1.15. Independent of the FFT budget |
+| `H_SHIFT` | `11` | cmul_accum filter-product shift; H is Q1.15. Independent of the FFT budget — and that independence is what fixed the 2026-08-24 rail. Was 10 until then |
 | `FFT_SHIFT` / `IFFT_ROW_SHIFT` / `IFFT_COL_SHIFT` | `4` / `4` / `4` | See "Shift budget" — validated on hardware, do not change without a ≥20-frame hw run |
 | `FFT_ROW_WS` | `64` | Rows per FFT invocation — the DMA transaction-count knob. Exhausted, see history |
 | `FFT_COL_WS` | `8` | Cols per FFT invocation. **32 is a 9.6 ms LOSS — do not raise** |
@@ -43,8 +43,8 @@ the `dsp` subdirectory (the Makefile appends `/dsp`).
 | `CONV_IN_CH` | `1` | conv2d input planes. 1 = BT.601 luminance, 3 = RGB. Picks the **weight-buffer layout**, so it drives `AIE_FLAGS`, `GCC_FLAGS` and `ROI_IN_CH` from this one variable. Both arms build and link; see the RGB section |
 | `CONV2D_STACK` | `2048` | conv2d's AIE stack, bytes. Applied **only at `CONV_IN_CH=3`**, where the 27-tap chain needs 1344 against the 1024 default and the mapper otherwise refuses to emit a `libadf.a` |
 | `BIAS_SCALE` | `roi` | `bias_acc` input scale for `make weights`. **Default changed 2026-08-23**; `127` restores the pre-correction weights. See "The bias_acc correction" |
-| `FRAME_RGB_MODE` | `1` | Synthetic scene colour at `CONV_IN_CH=3`. 1 = per-plane tint, warmer target; 0 = replicate luma (the hardware analogue of the offline `rgb-lum` control). Inert at `CONV_IN_CH=1`; a real frame source ignores it |
-| `SCENE_VERIFY` | `0` | Re-colourise the whole frame each push and abort on a mismatch. O(frame)/frame — a debugging instrument for scene changes, not a per-run cost. Host-only |
+| `FRAME_RGB_MODE` | `1` | Synthetic scene colour at `CONV_IN_CH=3`. 1 = per-plane tint; 0 = replicate luma — the COLOUR-FREE CONTROL, run on hardware 2026-08-24 (`run_0824_1442`) where it reproduced grayscale bit-for-bit. Inert at `CONV_IN_CH=1`; a real frame source ignores it. Host-only |
+| `SCENE_VERIFY` | `0` | Re-colourise the whole frame each push and abort with coordinates on a mismatch. O(frame)/frame — for a short `MODE=bringup` run, never a 200-frame one (`calib_build.sh` refuses that combination). Plumbed 2026-08-24; it was a bare `#ifndef` before, so `SCENE_VERIFY=1` silently built it DISABLED. Host-only |
 | `B2_NULL_BINS` | `1` | 1 = null the 9 low-frequency bins, 0 = subtract µ·W |
 | `PSR_GATE_MIN` | `7.0` | Bolme §3.5. Below it the host HOLDS position and skips `filter_update` + `publish_filter`. `0` disables the threshold test only (structural vetoes remain). Host-only |
 | `TARGET_H` / `TARGET_W` | `64` | Target box size, frame px. Host-only |
@@ -68,37 +68,51 @@ the `dsp` subdirectory (the Makefile appends `/dsp`).
 
 Artifacts land in `build/$(TARGET)/$(PATCH_ROWS)x$(PATCH_COLS)/ch$(N_CHANNELS)/`.
 
-### Shift budget — SETTLED AT 4-4-4, BUT RE-OPENED BY `BIAS_SCALE=roi`
+### Shift budget — SETTLED: 4-4-4 at `H_SHIFT=11`, validated for BOTH arms
 
-**Every number below was measured at `BIAS_SCALE=127`.** The 2026-08-23 bias correction moves
-the effective input scale, so 4-4-4 is no longer validated for a freshly exported weights file.
-The budget itself is unchanged and is still the right starting point; what is missing is a
-≥20-frame hardware run confirming `rails=0` under the new bias. Rule 3 below applies verbatim —
-do not size anything against railing until that run exists.
+**Closed 2026-08-24.** gray `run_0824_1354`: `rails=0`, `accum` max 52.1%, `response` max 49.0%,
+mean IoU 0.9188. RGB `run_0824_1432`: `rails=0`, response max 38.5%. Both 200 frames,
+`BIAS_SCALE=roi`, `TRAJECTORY=1 SCALE_TRAJ=1`. **The FFT budget never moved — the fix was
+`H_SHIFT` 10 → 11.** The bias correction returned ~2.5× of signal and spent the margin
+`H_SHIFT=10` had: at 10 the corrected build railed (`run_calib.log`, `accum` 104% on f173,
+response 98% on f187, still growing at f200). `H_SHIFT` is the only knob upstream of **both** the
+accumulator and the response — `IFFT_*` reaches only the response, `FFT_SHIFT` moves it two bits
+at once — and both needed exactly one bit.
 
-Validated on hardware 2026-08-20 over 200 frames at ch16 (`runs/run_0820_1418.log`,
-`TRAJECTORY=1 SCALE_TRAJ=1`): **`rails=0` on every frame**, response peak 16157-20994 =
-**49-64% of int16 range** at the converged end.
+**What made it a validation and not just a passing run:** tracking came back BIT-IDENTICAL on all
+199 frames (a uniform rescale cannot move an argmax, so that was the prediction); PSR did not
+move (25.92 / 84.06 / 127.36 vs 25.92 / 84.08 / 127.41), which was written down as the falsifier
+BEFORE the run because PSR is where a quantization floor would show; and `F_ch` / `H(q15)` are
+digit-for-digit unchanged, as they must be — both are upstream of `H_SHIFT`.
 
-The invariant `2·FFT_SHIFT + IFFT_ROW_SHIFT + IFFT_COL_SHIFT` fixes the response scale, so
-weight moves freely between passes (holds to 1.3% across splits). `FFT_SHIFT` stays 4 rather
-than 5 because that leaves the accumulator at ~1400 instead of ~330 for the same response.
+**Do not re-centre the response in the 49-64% band.** That band came from a distribution with a
+1.30× spread; the corrected build spreads 2.07× at the converged end, so centring the TYPICAL
+frame puts the TAIL on the rail — exactly how f187 reached 98%. Size against the tail. The
+response now sits at ~28% (gray) / 22% (RGB) typically, and `calib_report.py` will call that
+UNDERSHOOT; it is advisory, and PSR is the arbiter.
 
-Retired points: 4-5-5 (total 16) undershot 6-11× — response 1.1-4.5% of range. 5-3-4 (total 17)
-gave 0.4%. 4-2-2 (total 12) peaks at 56% on frame 1, then rails from frame 15 and sign-flips to
-−32768, holding forever on `NEGATIVE_PEAK`. 4-2-1 was never validated past frame 1.
-`IFFT_ROW_SHIFT=0` is unsafe at 16 channels.
+The invariant `2·FFT_SHIFT + IFFT_ROW_SHIFT + IFFT_COL_SHIFT` fixes the response scale, so weight
+moves freely between passes (holds to 1.3% across splits). `FFT_SHIFT` stays 4 rather than 5
+because that leaves the accumulator at ~1400 instead of ~330 for the same response.
 
-**Three rules this budget cost real time to learn:**
+Retired points: 4-5-5 (total 16) undershot 6-11×. 5-3-4 (total 17) gave 0.4%. 4-2-2 (total 12)
+peaks at 56% on frame 1, then rails from frame 15 and sign-flips to −32768, holding forever on
+`NEGATIVE_PEAK`. 4-2-1 was never validated past frame 1. `IFFT_ROW_SHIFT=0` is unsafe at ch16.
+
+**Four rules this budget cost real time to learn:**
 1. **The response GROWS as the filter converges** — a budget validated at `ITER_CNT=2` is not
-   validated. Size it from frames 1-20.
+   validated. The 08-24 rail appeared at f173 and the 98% peak at f187, so for `H_SHIFT` even
+   "≥20 frames" is not enough: use the full 200.
 2. **Twice an offline model set this budget and hardware overturned it.** Both times the model
    was self-consistent and its *premise* was wrong (see the frame-buffer-seeding entry under
-   Correctness traps). Size from a hardware run of ≥20 frames, or don't change it.
+   Correctness traps).
 3. **Never size this budget against railing before checking `mean_prev` is seeded** — two budget
    hunts chased a frame-0 DC pedestal, not a scaling problem.
+4. **Do not size from early frames.** RGB's response reads ~1.03× of gray at f1-4 and 0.785× once
+   converged; the weights-derived estimate (0.685–0.790×) was right and the 4-frame read was not.
 
-`runs/.last_cfg` is **stale and not authoritative**; `build/hw/.../aie.flagstamp` is.
+`runs/.last_cfg` is **stale and not authoritative**; `build/hw/.../aie.flagstamp` is, and
+`scripts/calib_build.sh` checks it for you.
 
 ## Architecture overview
 
@@ -239,32 +253,25 @@ orchestration, never core count. **`runtime<ratio>` is not utilization**: the ma
 These are the compiler's scheduled cycles — real cycles on an in-order VLIW core absent memory
 stalls, trustworthy for sizing but not a profile.
 
-## Current status (2026-08-23)
+## Current status (2026-08-24)
 
-**Best hardware: `runs/run_0821_1725.log`, 26.29 ms/frame = 38.04 FPS** —
-`MEMTILE_TRANSPOSE=1 ROI_CROP_PIPELINE=1 CMUL_SPLIT_ACCUM=1 TAIL_PARALLEL=1`.
-Tracking unchanged since the training-target fix: mean IoU 0.9188, worst 0.8353, centre
-1.37/3.52 px, PSR 25.75/83.75/127.08, rails 0, no gate or scale holds.
+**Best hardware FPS: `runs/run_0821_1725.log`, 26.29 ms/frame = 38.04 FPS** —
+`MEMTILE_TRANSPOSE=1 ROI_CROP_PIPELINE=1 CMUL_SPLIT_ACCUM=1 TAIL_PARALLEL=1`. That run predates
+the `bias_acc` correction, so quote it for SPEED only; the tracking numbers below supersede it.
 
-**THAT RUN PREDATES THE 2026-08-23 `bias_acc` CORRECTION.** `make weights` now defaults to
-`BIAS_SCALE=roi`, so a freshly exported `layer0_weights.bin` is NOT the one those numbers were
-measured with. Nothing about it is expected to hurt tracking — the offline evidence says the
-opposite — but it is uncalibrated on hardware: **re-measure `rails` and IoU before quoting
-0.9188 for a current build.** `make weights BIAS_SCALE=127` reproduces the old file exactly
-(apart from the layout tag byte) if you need the comparator.
+**CALIBRATION CLOSED, AND RGB RUNS ON HARDWARE.** Five 200-frame runs on 2026-08-24 settled
+both. All at 128×128 ch16, `BIAS_SCALE=roi`, 4-4-4, `TRAJECTORY=1 SCALE_TRAJ=1`, `VERBOSITY=1`:
 
-**A calibration SD card is built and verified, and has not been run.**
-`scripts/calib_build.sh` produced `build/hw/128x128/ch16/package/sd_card.img` at gray /
-`BIAS_SCALE=roi` / 4-4-4 / 200 frames / `TRAJECTORY=1 SCALE_TRAJ=1` / `VERBOSITY=1` /
-`DUMP_BUFFERS=0` — the same shape as `run_0821_1725`, so it is an A/B against a known-good
-comparator with ONE variable moved. Both flagstamps were checked against the intended
-configuration after the build, and the packaged `layer0_weights.bin` was extracted from the
-image and md5-matched against the repo. `calib_cfg.txt` next to the artifacts records all of it.
-Capture with `picocom … | ts | tee` and run `scripts/calib_report.py <log> track.csv`, which
-prints the verdict: rails, amplitude for frames 1-20 and 21+ separately, IoU against 0.9188.
-**`VERBOSITY=1` is load-bearing here** — at 0 the `[diag]` lines appear only when something
-rails, so a healthy run yields no amplitude data at all (`run_0821_1725.log` has none). This
-run's frame time is therefore NOT comparable to 38.04 FPS.
+| run | arm | `H_SHIFT` | rails | mean IoU | PSR min/mean | note |
+|---|---|---|---|---|---|---|
+| `run_calib` | gray | 10 | **1** (f173) | 0.9188 | 25.92 / 84.08 | `accum` 104%, response 98% |
+| `run_0824_1354` | gray | **11** | 0 | 0.9188 | 25.92 / 84.06 | **the comparator** |
+| `run_0824_1426` | RGB | 11 | 0 | — | — | 5-frame bring-up, `SCENE_VERIFY=1` |
+| `run_0824_1432` | RGB tint | 11 | 0 | 0.9173 | **42.65 / 100.44** | colour arm |
+| `run_0824_1442` | RGB luma | 11 | 0 | 0.9188 | 25.69 / 84.83 | colour-free control |
+
+Neither gray run is an FPS measurement — `VERBOSITY=1` costs ~36 ms/frame of console (62.3 vs
+26.29). **RGB's frame rate has not been measured**; offline predicts ~30 FPS, bracket 27-34.
 
 The full chain runs on real hardware at 128×128 ch16 on the real conv path: roi_crop → PatchIn →
 conv2d → B1 → row FFT → transpose → col FFT → cmul(H_SHIFT) → B2 → IFFT rows → transpose →
@@ -341,38 +348,26 @@ Each has an entry below.
 
 ### Parallel-for inside `filter_update_quantize` — ATTEMPTED AND ABANDONED (2026-08-21)
 
-**~0.96 ms (3.6%) was not worth what every formulation cost in bit-exactness**, and the reason
-generalises. The gain was bounded before it started: the tail is
-`max(scale 2.89, filter 4.80) + publish 1.91 = 6.71 ms`, and **`publish` cannot move to the
-other core** (it consumes `filter_scratch`/`q15_scale`, so filter→publish is a serial
-dependency). Splitting the filter internally only helps after the scale filter frees core 0 at
-t = 2.89, i.e. on its last 1.91 ms.
+**~0.96 ms (3.6%) was not worth what every formulation cost in bit-exactness.** The gain was
+bounded before it started: the tail is `max(scale 2.89, filter 4.80) + publish 1.91 = 6.71 ms`,
+and **`publish` cannot move to the other core** (it consumes `filter_scratch`/`q15_scale`), so
+splitting the filter internally only helps on its last 1.91 ms.
 
-**Three formulations, each bit-exact under `-O2` and each 1 ulp off under `-ffp-contract=fast`** —
-always the same 82/1024 elements of **A** at 1.49e-08, with B, H(q15), scale and max|H| all
-bitwise identical:
+Three formulations — split by element range, split by channel, and a `noinline` wrapper — were
+each bit-exact under `-O2` and each 1 ulp off under `-ffp-contract=fast`, always the same
+82/1024 elements of **A** at 1.49e-08. **Root cause: GCC's FMA contraction is sensitive to
+INLINING CONTEXT, not just to the expression** — at `nw == 1` the worker body inlines, at
+`nw > 1` it is emitted out-of-line, and the two contract `eta*conj(G[i])*f[i] + keep*a[i]`
+differently. 1 ulp of A was disqualifying because A is carried frame to frame at eta = 0.125, so
+it settles at ~8 ulps and flips occasional bins across 200 frames — tracking would come back
+*nearly* identical, the one outcome that makes the bit-identical criterion useless.
 
-| split | result |
-|---|---|
-| by ELEMENT range | A 1 ulp off. Not reassociation — B was exact, which is what an element split protects |
-| by CHANNEL, inner loops full `[0,n)` | A 1 ulp off. So the loop BOUND was not the cause either |
-| + `noinline` wrapper so the body is emitted once | workers finally agree — but the fused path then stopped matching `filter_update` + `filter_quantize_q15` |
-
-**Root cause: GCC's FMA contraction is sensitive to INLINING CONTEXT, not just to the
-expression.** With `nw == 1` the worker body inlines into the fast path; with `nw > 1` it is
-instantiated out-of-line, and the two contract `eta*conj(G[i])*f[i] + keep*a[i]` differently.
-
-**Why 1 ulp of A was disqualifying**: A is carried frame to frame at eta = 0.125, so a per-frame
-1-ulp injection settles at ~8 ulps ≈ 1.2e-7 relative ≈ 0.004 LSB of H — H stays identical almost
-always, but across 262144 elements and 200 frames some bins flip. Tracking would come back
-*nearly* identical, which is exactly the outcome that makes the bit-identical criterion useless.
-
-**What survives for the next attempt.** (1) The `-ffp-contract=fast` second build in
-`make test_host` found every one of these and `-O2` found none. (2) An element-range split really
-does protect B's channel-order sum. (3) The `|H|` max scan needs a lowest-global-index tie-break
-to be split at all, since `std::abs()` is `hypot()` and two elements with identical `re²+im²` can
-hypot one ulp apart. (4) **Parallelise across FUNCTIONS, not inside them** — the tail split
-worked precisely because it moved a whole function and touched no arithmetic.
+**What survives for a next attempt.** (1) `make test_host`'s `-ffp-contract=fast` second build
+found every one of these; `-O2` found none. (2) An element-range split does protect B's
+channel-order sum. (3) The `|H|` max scan needs a lowest-global-index tie-break to be split at
+all, since `std::abs()` is `hypot()`. (4) **Parallelise across FUNCTIONS, not inside them** — the
+`TAIL_PARALLEL` split worked precisely because it moved a whole function and touched no
+arithmetic.
 
 ### Scale filter — root-caused offline, confirmed on hardware (2026-08-20)
 
@@ -565,6 +560,15 @@ Two principles that have repeatedly earned their keep: **instruments before chan
   gated`, PSR min 15.95 / mean 26.60 — while IoU fell to 0.0656. The response really was sharply
   peaked, just in the wrong place. **IoU is the only metric in the harness that can fail a
   confidently-wrong tracker.** Read `track.csv`, not the console.
+- **`[diag] F_ch` IS CHANNEL 0 ONLY, not a bank maximum.** It is printed under `if (ch == 0)`
+  (`mosse_tracker.cpp:3966`), while `accum` and `response` are bank-wide. So "F_ch looks
+  comfortable" says nothing about the other 15 channels, and a hot channel elsewhere is
+  invisible. It matters most at `CONV_IN_CH=3`: **ch0 is one of the four colour-opponent
+  channels** (0/2/9/10), so its amplitude is the one number in the console that discriminates a
+  real colour path from a colour-free one. Predicted input-referred gain for ch0, from the
+  exported weights: gray 8.72, RGB `FRAME_RGB_MODE=1` 10.87 (1.25×), RGB `FRAME_RGB_MODE=0`
+  0.80 (**0.09×, near-dead**). If ch0's `F_ch` does not collapse ~10× between those two RGB
+  arms, colour is not reaching conv2d.
 - **`err=0 px` is a weak pass criterion too.** It cannot see mainlobe width, drift, a DC
   pedestal, or a gated frame (where a mismatch is a *pass*).
 - **A centred test impulse cannot validate localisation** — `peak_detect_sw`'s old scan returned
@@ -620,36 +624,32 @@ Two principles that have repeatedly earned their keep: **instruments before chan
   scene's own zero-shift autocorrelation, not a defect. The 0.3 healthy ceiling is calibrated for
   the 128×128 ch16 geometry and does **not** transfer. What is geometry-independent is that the
   defect makes the ratio GROW at the learning rate while the fix leaves it flat.
-- **Background lock was the WRONG explanation for the above** — worth knowing because the
-  measurements are real and the mechanism does exist. `fill_background()` is cached (~0.6-1.2 s
-  on the A72) and only the dirty rect is restored, so outside the target the frame repeated to
-  the LSB, and a DCF fed a perfectly repeating background correlates with it at exactly zero
-  shift. Measured 2026-08-17: two competing peaks every frame, the static one worth 69-86% of the
-  true one, winning 21 of 48 frames, each win costing a permanent ~9.4 px offset (centre error
-  1.35 → 9.56 → 87 → 292 px) **while PSR read 24-35 throughout**.
+- **Background lock was the WRONG explanation for the above** — worth keeping because the
+  measurements are real and the mechanism does exist. `fill_background()` is cached and only the
+  dirty rect is restored, so outside the target the frame repeats to the LSB, and a DCF fed a
+  perfectly repeating background correlates with it at exactly zero shift. Measured 2026-08-17:
+  the static peak was worth 69-86% of the true one and won 21 of 48 frames, each win costing a
+  permanent ~9.4 px offset (centre error 1.35 → 9.56 → 87 → 292 px) **while PSR read 24-35
+  throughout**.
   **`FRAME_NOISE` is not the fix**: independent additive noise cannot decorrelate a static
-  pattern — the background still correlates with itself at zero shift, and the added variance
-  inflates numerator and shared denominator alike. It appeared to work on 2026-08-17 only because
-  the frame buffer was not yet seeded and the ROI was mostly zeros.
-  **`BG_PAN` is the right instrument** (it is what real camera motion does) and it measurably
-  works — but it changed the tracker not at all, which is what refuted this explanation.
-  **The magnitude must be swept against the texture's wavelengths, not guessed in pixels**
-  (`scripts/bg_pan_sweep.py`, seconds, no hardware): corr@0shift is +0.60 / +0.61 / +0.64 / +0.54
-  / +0.31 / **+0.09** / −0.25 at 0,0 / 3,5 / 7,11 / 15,23 / 23,37 / **31,47** / 47,71 px per
-  frame. The obvious guess of 3-5 px/frame is **worthless** — the texture's shortest wavelength
-  is 180 rows. Re-run the sweep after any change to `fill_background()`, `FRAME_TEXTURE` or the
-  ROI size.
-  **`fill_background()` rounds its frequencies to WHOLE CYCLES per frame** so the pan's wraparound
-  is seamless: with continuous frequencies the row wrap is a **8.10 LSB** discontinuity against
-  0.98 LSB between interior rows, a 128-px ROI straddles it ~12% of frames, and an artificial
-  edge is exactly what a DCF locks onto. Rounded, the seam is 1.02 LSB. 31 and 47 are coprime to
-  1080 and 1920, so the offsets visit every row and column before repeating.
-  **This fixes the TEST BENCH, not the tracker.** Do not tune anything in the tracker against
-  this artifact. Watch for one thing: on a white-noise background a rigid pan creates a
-  correlation peak at exactly the pan offset.
-  **Discriminating background lock from a DC pedestal** (they look similar and have opposite
-  fixes): a pedestal lifts every bin uniformly; background lock is a *localised blob* at the
-  origin with a sidelobe mean ≈ 0.
+  pattern, and it inflates numerator and shared denominator alike. It appeared to work on
+  08-17 only because the frame buffer was not yet seeded and the ROI was mostly zeros.
+  **`BG_PAN` is the right instrument** and measurably works — but it changed the tracker not at
+  all, which is what refuted this explanation. **Sweep the magnitude against the texture's
+  wavelengths, not in pixels** (`scripts/bg_pan_sweep.py`, seconds, no hardware): corr@0shift is
+  +0.60 / +0.61 / +0.64 / +0.54 / +0.31 / **+0.09** / −0.25 at 0,0 / 3,5 / 7,11 / 15,23 / 23,37 /
+  **31,47** / 47,71 px per frame. The obvious guess of 3-5 px/frame is worthless — the texture's
+  shortest wavelength is 180 rows. Re-run the sweep after any change to `fill_background()`,
+  `FRAME_TEXTURE` or the ROI size.
+  **`fill_background()` rounds its frequencies to WHOLE CYCLES per frame** so the pan wraps
+  seamlessly: with continuous frequencies the row wrap is a **8.10 LSB** discontinuity against
+  0.98 LSB between interior rows, and an artificial edge is exactly what a DCF locks onto.
+  Rounded, the seam is 1.02 LSB. 31 and 47 are coprime to 1080 and 1920.
+  **This fixes the TEST BENCH, not the tracker** — do not tune the tracker against this artifact.
+  On a white-noise background a rigid pan creates a correlation peak at exactly the pan offset.
+  **Discriminating background lock from a DC pedestal** (similar look, opposite fixes): a pedestal
+  lifts every bin uniformly; background lock is a *localised blob* at the origin with sidelobe
+  mean ≈ 0.
 - **THE FRAME BUFFER WAS NEVER SEEDED WITH THE BACKGROUND. Fixed 2026-08-18** — one 2 MB `memcpy`
   at startup, which **must** come after `rc_control_cu_probe()` (which zero-fills `frame_bo` by
   design).
@@ -764,11 +764,9 @@ Two principles that have repeatedly earned their keep: **instruments before chan
 
   Rank and participation ratio do NOT move (9 / 4.94) — the collapse is a property of the
   weights, not the bias, so this fix and RGB are independent wins.
-  **Two conditions attach.** (1) It only pays with `CONV_RELU=0` — see the ReLU entry under
-  Settled; corrected+ReLU is the worst of the three arms measured. (2) It changes the effective
-  input scale, so **the 4-4-4 budget must be re-swept over ≥20 hardware frames** before any
-  tracking number from a `roi` build is trusted. Every hardware measurement in this file — the
-  4-4-4 validation, mean IoU 0.9188, the 38.04 FPS run — predates it.
+  **It only pays with `CONV_RELU=0`** — see the ReLU entry under Settled; corrected+ReLU is the
+  worst of the three arms measured. It also spent the accumulator margin, which is what forced
+  `H_SHIFT` 10 → 11 on 2026-08-24; that is now closed on hardware for both arms.
   Still unfixed, and unrelated: the semantic mismatch of weights quantized against
   ImageNet-normalized linear luminance being fed a z-score of the log.
 - **`gen_aiesim_vectors.py`'s float Stage A differs from the kernel on 40.9% of samples**, by up
@@ -978,58 +976,83 @@ Two principles that have repeatedly earned their keep: **instruments before chan
   fix is RGB. `check_collapse.py` Q2 used to print "14 independent filters" here — that was a
   count of near-parallel GROUPS, not a rank, and it understated the problem for months.
 
-## RGB features — BUILT AND TESTED OFFLINE, never run on hardware (2026-08-23)
+## RGB features — VALIDATED ON HARDWARE 2026-08-24
 
-| piece | state |
-|---|---|
-| `export_weights.py` | DONE — `make weights CONV_IN_CH=3`; bit-identical taps/shift/bias to the offline RGB arm |
-| weight-buffer layout | DONE — `conv_weight_layout.h`, tag byte, three mismatch guards |
-| `conv2d_kernel.cpp` | DONE, **vectorized** (27 `aie::mac` over `CONV_VEC` lanes). Needed `CONV2D_STACK` |
-| `roi_crop` Stage A | DONE — 3-plane, joint normalization, interleaved; 8 RGB cases bit-exact |
-| host frame path | DONE — luma scene + colourise; `frame_bo` 2 → 6 MB |
-| `gen_aiesim_vectors.py` | DONE — `s6rgb` |
-| **hardware** | **NOTHING HAS RUN.** No RGB bitstream, no frame. The shift budget is uncalibrated |
+Code was complete 2026-08-23; three hardware runs on 08-24 closed it. Build with
+`make weights CONV_IN_CH=3` then `ARM=rgb scripts/calib_build.sh`. `H_SHIFT=11` / 4-4-4 carries
+both arms — no RGB-specific budget was needed.
 
-### Why RGB — the offline evidence
+### What hardware proved, and how
 
-**RGB IS A ROBUSTNESS CHANGE, NOT AN ACCURACY CHANGE.** No hardware; all reproducible from
-`scripts/rgb_vs_gray_*.py`:
+Three 200-frame arms, one variable moved at a time (`run_0824_1354` / `_1432` / `_1442`):
+
+| | gray (9-tap) | RGB tint | RGB replicated luma (CONTROL) |
+|---|---|---|---|
+| tracking-identical to gray | — | 121 / 199 | **199 / 199** |
+| mean IoU | 0.9188 | 0.9173 | 0.9188 |
+| **PSR min / mean** | 25.92 / 84.06 | **42.65 / 100.44** | 25.69 / 84.83 |
+| ch0 `F_ch` median | 7398 | 3834 (0.52×) | **623 (0.084×)** |
+| rails / gate holds | 0 / 0 | 0 / 0 | 0 / 0 |
+
+**The control is what makes this conclusive, and it is stronger than the offline version.** Same
+27 taps, bias, quantization grid and joint normalization, fed three IDENTICAL luma planes: it
+reproduces grayscale's decisions **bit-for-bit on all 199 frames** and its PSR lands within 1%.
+So (a) the whole RGB datapath — 3-plane Stage A, interleaved wire format, de-interleave, 27-tap
+MAC — is validated against a known-good reference, and (b) the **1.65× PSR floor is colour, not
+bookkeeping**. This reproduces the offline finding on hardware, including its shape:
+**RGB IS A ROBUSTNESS CHANGE, NOT AN ACCURACY CHANGE** — mean IoU actually moves the wrong way
+(0.9188 → 0.9173) and the colour-free control is tied for most accurate, exactly as offline.
+
+**ch0's collapse was PREDICTED to 7%.** From the exported weights alone, the input-referred gain
+for ch0 is gray 8.72 / RGB-decorrelated 10.87 / RGB-luma-replicated 0.80, i.e. the control should
+sit at 0.09× of gray. Measured 0.084×. That is the sharpest confirmation in this file that the
+weight-collapse model is right, and it makes ch0's `F_ch` the cheap on-board colour-path test
+(see the ch0-only trap under "Metrics that cannot fail a broken tracker").
+
+**Amplitudes.** RGB's converged response is **0.785× of gray on both median and max**, against a
+prediction of 0.685–0.790× computed from `‖taps‖₂ / 2^out_shift` summed over the bank. Do NOT
+size RGB from early frames: at f1-4 the ratio reads ~1.03× because the filter is barely trained,
+and trusting that over the weights model was a wrong call made on this project. `calib_report.py`
+flags RGB as UNDERSHOOT (response med 22.2%, max 38.5%) — advisory only: the band is calibrated
+for gray at `BIAS_SCALE=127`, and PSR went UP, which is the metric a quantization floor shows in.
+
+### THE SYNTHETIC SCENE IS A WEAK COLOUR STIMULUS — do not read accuracy from it
+
+`FRAME_RGB_MODE=1` tints one luma image per plane, i.e. `plane_p ≈ a_p·luma + b_p`. That is
+**rank-1 across the plane dimension**: there is no chromatic texture independent of luma, and a
+colour-opponent channel sees a scaled copy of luma rather than real chroma. Hence ch0 lands at
+0.52× (between the 0.09× replicated case and the 1.25× decorrelated case) instead of 1.25×.
+**A good IoU on this scene is NOT evidence for the VOT result below.** The offline accuracy and
+failure-rate numbers stay the claim of record until real video is fed through the board.
+
+### Why RGB — the offline evidence (still the accuracy claim of record)
+
+Reproducible from `scripts/rgb_vs_gray_*.py`:
 
 | measurement | gray | RGB |
 |---|---|---|
 | feature-bank rank / participation ratio | 9 (hard cap) / 4.94 | 16 / 7.43 |
-| held-out Bolme PSR (147 paired evals, car1) | 12.97 | 21.18 (**+1.63×**, 92.5% of pairs) |
+| held-out Bolme PSR (147 paired evals, car1) | 12.97 | 21.18 (**+1.63×**) |
 | VOT supervised failures (16 seq, 5971 frames) | 51 | **42 (−18%)** |
 | VOT supervised accuracy | 0.4484 | 0.4642 (+0.016) |
-| conv2d scheduled cycles/frame (ch16) | 4.60 ms | 9.19 ms (**2.00×**, measured) |
-| frame rate | 38 FPS | ~30 (bracket 27–34) |
+| conv2d scheduled cycles/frame (ch16) | 4.60 ms | 9.19 ms (**2.00×**) |
 
-**The CONTROL is what makes this conclusive.** A third arm carries RGB's 27 taps, bias and
-quantization grid but is fed three IDENTICAL luminance planes — everything except colour. It
-scores 55 failures against gray's 51 and PSR 28.67 against 33.86, i.e. it reproduces gray. So the
-win is colour and not bookkeeping. Per sequence the failure delta is 6 wins / 8 ties / 2 losses
-and it survives dropping `tiger` (40 → 37), which the first single-sequence run did not.
-Accuracy is NOT the payoff: it moves +0.016, and the colour-free control is the most accurate arm
-of the three. Read A and R together — RGB survives 18% longer between resets, so its accuracy is
-measured on harder frames.
+The offline control scores 55 failures against gray's 51 and PSR 28.67 against 33.86 — it
+reproduces gray, as the hardware control now does. Per sequence the failure delta is 6 wins /
+8 ties / 2 losses and survives dropping `tiger` (40 → 37). Read accuracy and failures together:
+RGB survives 18% longer between resets, so its accuracy is measured on harder frames.
 
 **Why the collapse costs anything.** A 3×3 grayscale kernel lives in 9 dimensions, so 16 channels
 CANNOT be independent — the cap is structural, not a property of the pretrained weights. BT.601
-still guts the four colour-opponent channels: 0/2/9/10 keep 0.32/0.60/0.63/**0.037** of the
-per-plane norm against 1.24–1.39 for the achromatic ones, so **ch10 survives luminance no better
-than it survives the unweighted sum**, and per-channel int8 then renormalises that residue to full
-scale. ch0/ch9/ch14 sit within 2–6° of one line in gray and 59–72° apart in RGB.
-
-**Still unproven**: Danelljan Fig. 3's 52.1-vs-37.0 is *CNN features vs raw intensity*, already
-banked here. The literature has no RGB-vs-gray-input delta for conv layer-1, and the nearest proxy
-(colour names, 49.7) is *below* it — which is why the numbers above were measured, not cited.
+guts the four colour-opponent channels: 0/2/9/10 keep 0.32/0.60/0.63/**0.037** of the per-plane
+norm against 1.24–1.39 for the achromatic ones, and per-channel int8 then renormalises that
+residue to full scale. ch0/ch9/ch14 sit within 2–6° of one line in gray, 59–72° apart in RGB.
 
 **Retired — "RGB is handicapped by its larger `out_shift`."** 27 taps triple `ACC_MAX_THEORY`,
-pushing mean out_shift 3.69 → 4.25, so RGB does carry ~0.6 fewer signal bits per channel. But
-forcing gray's shifts onto RGB (`--match-shift`) makes it **worse**, 42 → 53 failures, with
-**0.0000% saturation at all three clip sites** — so it is not clipping. Most likely the
-per-channel re-weighting of the shared denominator `B = Σ|F|²`, which Stage B3's per-channel
-normalization does not cover. Hypothesis, not verified.
+pushing mean out_shift 3.69 → 4.25 (confirmed on the shipping export). But forcing gray's shifts
+onto RGB (`--match-shift`) makes it **worse**, 42 → 53 failures, with 0.0000% saturation at all
+three clip sites — so it is not clipping. Hypothesis: the per-channel re-weighting of the shared
+denominator `B = Σ|F|²`. Not verified, and hardware did not need it.
 
 ### The datapath, end to end
 
@@ -1106,11 +1129,10 @@ reason `mosse_filter` is — off-board testability. `verify()` and `colourise()`
 `colourise_rect()`, because a verifier carrying its own copy of the rule proves only that two
 copies agree.
 
-### Cost, and what is left
+### Cost — predicted offline, then measured on hardware
 
-- **conv2d 2.00× — MEASURED from the compiler's schedules** (`make graph TARGET=hw_emu
-  CONV_IN_CH=3`, read the `HW do-loop … : N cycles` lines; `TARGET=hw_emu` is a sandbox because
-  `AIE_FLAGS` is `--target=hw` either way, so it cannot overwrite `build/hw`):
+- **conv2d 2.00×**, from the compiler's schedules. The 08-24 RGB build that actually LINKED
+  reproduces them byte-for-byte, so the figure no longer rests on a build that never linked:
 
   | loop | gray | RGB | ratio |
   |---|---|---|---|
@@ -1124,31 +1146,29 @@ copies agree.
   cycle 200 against gray's 24, resource floor 90. So 219 is a give-up number and a tuned variant
   (smaller `CONV_VEC`, or splitting the 27 MACs) could plausibly beat it. Treat 2.00× as an upper
   bound on the MAC half and a hard floor on the read half.
-- **Two traps in taking that measurement.** (1) `aiecompiler` reuses a cached per-kernel object
+- **Two traps in reading those schedules.** (1) `aiecompiler` reuses a cached per-kernel object
   when the preprocessed source is unchanged, so a `CONV_IN_CH=1` baseline silently reports NO
   conv2d schedule — `rm -rf $(BUILD_DIR)/Work $(BUILD_DIR)/libadf.a` first. (2) The "conv2d 140
   cyc/16px" figure in the Makefile is the `main_` WRAPPER block, not conv2d's body: it measures
   130/135 identically in both arms, i.e. it does not move when the arithmetic triples.
+- **Host cost, MEASURED 08-24** (`run_0824_1432` vs `run_0824_1354`): `roi_crop launch`
+  0.993 → 1.456 ms (predicted ≈ +1.1 ms for 3× the bilinear taps), `colourise RGB` 0.31 ms,
+  **GMIO unchanged at 11.23 vs 11.14 ms and the same transaction count** — RGB touches none of
+  the DMA or the CPU-bound APU tail, as predicted. `frame_bo` 2 → 6 MB.
 - **Caching the patch in conv2d's tile does not fit.** At `FFT_ROW_WS=64` the output window is
   32 KB and its ping-pong is 64 KB — the whole tile. A 48 KB RGB patch cache would force
   `FFT_ROW_WS` down, and 64→32 cost 10.2 ms/frame on hardware. Net loss.
-- **`roi_crop` Pass 1 is 10.9 cyc/output-px** (m_axi latency on the four scattered bilinear taps,
-  NOT the II=4 the source comment claims); RGB triples the taps, so ~33 cyc/px is the floor,
-  ≈ +1.1 ms exposed on channel 0. DSP 44 → ~132, trivial.
-- **RGB touches none of the CPU-bound 84% of the frame.** The APU tail, the 6.6 ms of GMIO
-  descriptor cost and the DMA transaction count are unchanged. Host cost is `frame_bo` 2→6 MB,
-  push ~0.6 → ~1.8 ms.
-- **No alignment obstacle** — `export_weights.py`'s old "does not divide evenly into 16-byte
-  beats" was false twice over: the PLIO is 32-bit, and 128·128·3 = 49152 B divides exactly (one
-  row = 384 B = 96 words), also at 64×64 and 256×256. See [[verify-stated-blockers-arithmetically]].
+- **RGB's FRAME RATE IS STILL UNMEASURED.** Every RGB run so far is `VERBOSITY=1`, which costs
+  ~36 ms/frame of console. Offline predicts ~30 FPS (bracket 27–34). A `VERBOSITY=0` repackage
+  would settle it in minutes.
+- **No alignment obstacle** — the old "does not divide evenly into 16-byte beats" was false twice
+  over: the PLIO is 32-bit, and 128·128·3 = 49152 B divides exactly.
+  See [[verify-stated-blockers-arithmetically]].
 
-**WHAT IS LEFT IS CALIBRATION, NOT CODE.** Joint normalization and the 27-tap accumulator both
-change the effective input scale, so the shift budget must be re-swept on hardware over ≥20
-frames. Do the grayscale `BIAS_SCALE=roi` run FIRST (`scripts/calib_build.sh`) — it moves one
-variable against a known-good comparator; `ARM=rgb` moves the bias scale, the feature bank and
-the input scale at once and a bad result would be unattributable. The fixed-point cost of RGB is
-the one thing the offline measurements do NOT cover: they use a float FFT deliberately, so a
-gray-tuned budget could not be mistaken for a feature result.
+**Calibration is DONE** — see the hardware table above. The gray `BIAS_SCALE=roi` run went
+first deliberately (one variable against a known-good comparator); `ARM=rgb` moves the bias
+scale, the feature bank and the input scale at once, and a bad result would have been
+unattributable. That ordering is why the RGB result was readable on the first try.
 
 ## Weight export
 
@@ -1260,8 +1280,11 @@ scripts/  export_weights.py, gen_aiesim_vectors.py, gen_filter_golden.py,
                               #   layer0_weights.bin goes through it; the tag byte makes a
                               #   layout mismatch loud instead of plausible.
           gen_roi_crop_golden.py, synth_frame.py, sweep_shift.sh, fix_sd_rootfs.sh
-          calib_build.sh      # hardware build for a shift-budget run: pre-flight, then
-                              #   verifies the FLAGSTAMPS against the intended config
+          calib_build.sh      # hardware build for a shift-budget or bring-up run: pre-flight,
+                              #   then verifies the FLAGSTAMPS against the intended config and
+                              #   records calib_cfg.txt. Budget defaults are DERIVED from the
+                              #   Makefile (print-%), never copied. ARM=gray|rgb, MODE=budget|
+                              #   bringup, H_SHIFT=, FRAME_RGB_MODE=, SCENE_VERIFY=, COMPARATOR=
           calib_report.py     # turns a run's console+track.csv into a budget verdict
                               #   (rails, amplitude early vs converged, IoU)
           bg_pan_sweep.py     # picks BG_PAN_R/C from the texture spectrum, no hardware

@@ -40,25 +40,87 @@ RAILS_RE = re.compile(r'\[diag\]\s+(\S+)\s+max\|\.\|=\s*(\d+)\s+.*rails=(\d+)')
 # line carries a time prefix. An anchored ^Frame matched nothing and the report
 # silently claimed one frame — found by running this against an existing log
 # instead of against the run it was written for.
-FRAME_RE = re.compile(r'(?:^|\s)Frame\s+(\d+)\s*:')
+# Matches the frame HEADER only. `Frame N:` alone is not enough: the per-frame
+# block also carries `Frame N: displacement ...` AFTER the F_ch/accum/response
+# scans and BEFORE the H(q15) scan, so a loose pattern starts a second, empty
+# record for the same index mid-frame. That is not a cosmetic parse loss — the
+# report then scans only H(q15) and prints "RAILS: none OK" over a run that
+# railed the accumulator (run_calib.log frame 173, accum rails=2). Same failure
+# class as the anchoring bug above: a parser that finds nothing looks exactly
+# like a clean run. Belt and braces — parse_log() also MERGES repeated indices,
+# so neither half alone can lose a scan.
+FRAME_RE = re.compile(r'(?:^|\s)Frame\s+(\d+):\s+(?:target at|\[INIT\])')
 
 
 def parse_log(path):
-    """Per-frame {tag: (max, rails)} plus the frames where anything railed."""
-    frames, cur, idx = {}, {}, -1
+    """Per-frame {tag: (max, rails)}. Repeated indices MERGE, never overwrite."""
+    frames, idx = {}, -1
     for line in Path(path).read_text(errors='replace').splitlines():
         m = FRAME_RE.search(line)
         if m:
-            if cur:
-                frames[idx] = cur
-            idx, cur = int(m.group(1)), {}
+            idx = int(m.group(1))
+            frames.setdefault(idx, {})
             continue
         m = RAILS_RE.search(line)
-        if m:
-            cur[m.group(1)] = (float(m.group(2)), int(m.group(3)))
-    if cur:
-        frames[idx] = cur
-    return frames
+        if m and idx >= 0:
+            frames[idx][m.group(1)] = (float(m.group(2)), int(m.group(3)))
+    return {f: d for f, d in frames.items() if d}
+
+
+def check_coverage(frames):
+    """Warn when frames disagree about WHICH scans they carry.
+
+    The whole point: an under-parse is silent. Every frame emits the same set
+    of [diag] tags, so a frame missing one means the parser dropped it, not
+    that the run skipped it.
+    """
+    if not frames:
+        print("\n  WARNING: no [diag] scans parsed at all — check the log format"
+              " before reading anything below.")
+        return
+    full = max((set(d) for d in frames.values()), key=len)
+    short = {f: sorted(full - set(d)) for f, d in frames.items() if set(d) != full}
+    if short:
+        print(f"\n  WARNING: {len(short)} of {len(frames)} frame(s) are missing"
+              f" scans that other frames carry — the parser may be dropping them.")
+        for f in sorted(short)[:5]:
+            print(f"    frame {f:>4}  missing {', '.join(short[f])}")
+
+
+def parse_csv_frames(rows):
+    """parse_log()'s shape, rebuilt from track.csv's diag columns.
+
+    Those columns (rails, accum_max, fch0_max, h_max) were added 2026-08-24 so a
+    VERBOSITY=0 run — the only kind that can also be an FPS measurement — stays
+    diagnosable. Before that the amplitudes existed ONLY in the console, and at
+    VERBOSITY=0 the [diag] lines print only when something rails, so a healthy
+    run yielded nothing at all.
+
+    Returns (frames, rails_by_frame, have_cols). have_cols is False for a CSV
+    that predates the columns, so the caller can report "no data" rather than
+    the much more dangerous "no rails".
+    """
+    if not rows or 'rails' not in rows[0]:
+        return {}, {}, False
+    frames, rails = {}, {}
+    col = [('response', 'peak'), ('accum', 'accum_max'),
+           ('F_ch', 'fch0_max'), ('H(q15)', 'h_max')]
+    for r in rows:
+        try:
+            f = int(r['frame'])
+        except (KeyError, ValueError):
+            continue
+        d = {}
+        for tag, c in col:
+            if r.get(c) not in (None, ''):
+                # rails is per FRAME in the CSV, not per buffer, so it is carried
+                # separately rather than pinned to a buffer that may not be the
+                # one that railed.
+                d[tag] = (abs(float(r[c])), 0)
+        if d:
+            frames[f] = d
+            rails[f] = int(r['rails'] or 0)
+    return frames, rails, True
 
 
 def parse_csv(path):
@@ -108,14 +170,33 @@ def main():
     print("=" * 78)
 
     frames = parse_log(log)
-    print(f"\nframes with [diag] scans: {len(frames)}")
+    csv_rows = parse_csv(csv_path) if Path(csv_path).exists() else []
+    csv_frames, csv_rails, csv_has_cols = parse_csv_frames(csv_rows)
+    source = "console [diag]"
+    if not frames and csv_frames:
+        # VERBOSITY=0 run: the console has nothing, the CSV has everything.
+        frames, source = csv_frames, f"{csv_path} (VERBOSITY=0 run)"
+    tags_seen = sorted({t for d in frames.values() for t in d})
+    print(f"\nframes with amplitude data: {len(frames)}   source: {source}"
+          f"\n  buffers: {', '.join(tags_seen) if tags_seen else '(none)'}")
+    check_coverage(frames)
 
     # ---- rails: the hard gate --------------------------------------------
     railed = {f: {t: v for t, v in d.items() if v[1] > 0}
               for f, d in frames.items()}
     railed = {f: d for f, d in railed.items() if d}
+    if not railed and csv_rails:
+        # CSV rails is a per-frame total; the buffer is not identified there.
+        railed = {f: {'(frame total)': (0, n)} for f, n in csv_rails.items() if n}
     print("\nRAILS (must be zero on EVERY frame)")
-    if not railed:
+    if not frames and not csv_has_cols:
+        # "none" and "never looked" are different answers and must not print
+        # the same word. This log has no [diag] scans at all (VERBOSITY=0
+        # prints them only when something rails), so the run is UNCHECKED.
+        print("  NOT CHECKED — no [diag] scans in this log and no rails column"
+              " in the CSV.\n  Re-run with VERBOSITY=1, or rebuild so track.csv"
+              " carries rails (2026-08-24+).")
+    elif not railed:
         print("  none   OK")
     else:
         print(f"  {len(railed)} frame(s) railed   <-- BUDGET IS WRONG")
@@ -130,7 +211,7 @@ def main():
                  " convergence-growth trap)" if first > 5 else ""))
 
     # ---- response amplitude, early vs converged --------------------------
-    tags = sorted({t for d in frames.values() for t in d})
+    tags = tags_seen
     print("\nAMPLITUDE by buffer  (target for `response`: 49-64% of int16 at the"
           " converged end)")
     for tag in tags:
@@ -141,8 +222,8 @@ def main():
         band(f"{tag}  frames 21+", late, lo, hi)
 
     # ---- tracking, from the CSV ------------------------------------------
-    if Path(csv_path).exists():
-        rows = parse_csv(csv_path)
+    if csv_rows:
+        rows = csv_rows
         ious = [float(r['iou']) for r in rows if r.get('iou')]
         cerr = [float(r['centre_err']) for r in rows if r.get('centre_err')]
         peaks = [float(r['peak']) for r in rows if r.get('peak')]

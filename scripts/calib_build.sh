@@ -19,10 +19,12 @@
 # numbers themselves have not changed. This build re-establishes it.
 #
 # ARMS, and why gray goes first
-#   gray (default)  CONV_IN_CH=1, BIAS_SCALE=roi. ONE variable moves against
-#                   runs/run_0821_1725.log (mean IoU 0.9188, rails 0, peak
-#                   49-64% of int16). That log is the known-good comparator and
-#                   it used this exact geometry, trajectory and frame count.
+#   gray (default)  CONV_IN_CH=1, BIAS_SCALE=roi. The known-good comparator is
+#                   now runs/run_0824_1354.log (H_SHIFT=11, mean IoU 0.9188,
+#                   rails 0, response max 49% of int16) — same geometry,
+#                   trajectory and frame count. It superseded run_0821_1725.log,
+#                   which predates the bias_acc correction, and run_calib.log,
+#                   which is the same build at H_SHIFT=10 and RAILED on f173.
 #   rgb             CONV_IN_CH=3. Do NOT run this first: it moves the bias scale
 #                   AND the feature bank AND the input scale at once, and a bad
 #                   result would be unattributable. See "never move two
@@ -32,7 +34,9 @@
 #   scripts/calib_build.sh                 # gray, 4-4-4, 200 frames
 #   ARM=rgb scripts/calib_build.sh         # after gray has been validated
 #   FFT_SHIFT=4 IFFT_ROW_SHIFT=5 IFFT_COL_SHIFT=5 scripts/calib_build.sh
+#   H_SHIFT=11 scripts/calib_build.sh      # accumulator headroom, FFT budget unchanged
 #   DRY_RUN=1 scripts/calib_build.sh       # pre-flight only, build nothing
+#   COMPARATOR=runs/run_calib.log H_SHIFT=11 scripts/calib_build.sh
 #
 set -euo pipefail
 cd "$(dirname "$0")/.."
@@ -44,11 +48,68 @@ case "$ARM" in
   *) echo "ARM must be gray or rgb, got '$ARM'" >&2; exit 2 ;;
 esac
 
-# The budget under test. Defaults are the incumbent; change these to sweep.
-FFT_SHIFT=${FFT_SHIFT:-4}
-IFFT_ROW_SHIFT=${IFFT_ROW_SHIFT:-4}
-IFFT_COL_SHIFT=${IFFT_COL_SHIFT:-4}
-BIAS_SCALE=${BIAS_SCALE:-roi}
+# The budget under test. Defaults are DERIVED FROM THE MAKEFILE via its print-%
+# target, never copied. This script used to hardcode `H_SHIFT=${H_SHIFT:-10}`,
+# and the moment the Makefile default moved to 11 that copy would have silently
+# rebuilt the RAILING configuration while the banner and calib_cfg.txt reported
+# 10 in good faith. Same class as the constants that must reach both toolchains
+# from one variable: a second copy of a default is a second source of truth.
+# Override any of them on the command line to sweep.
+mk() { make --no-print-directory -s "print-$1" | sed 's/^[^=]*= *//'; }
+FFT_SHIFT=${FFT_SHIFT:-$(mk FFT_SHIFT)}
+IFFT_ROW_SHIFT=${IFFT_ROW_SHIFT:-$(mk IFFT_ROW_SHIFT)}
+IFFT_COL_SHIFT=${IFFT_COL_SHIFT:-$(mk IFFT_COL_SHIFT)}
+BIAS_SCALE=${BIAS_SCALE:-$(mk BIAS_SCALE)}
+
+# H_SHIFT is NOT part of the FFT budget and is swept separately, because it is
+# the only knob upstream of BOTH the cmul accumulator and the response:
+#   accum ~ F * 2^-H_SHIFT ,  response ~ accum * 2^-(IFFT_ROW+IFFT_COL)
+# so IFFT_* can only fix the response, and FFT_SHIFT moves the response by two
+# bits at once (it applies to the row AND the column pass). When both the
+# accumulator and the response need the same correction — run_calib.log, where
+# accum hit 104% of int16 on f173 and the response 98% on f187 — this is the
+# only single knob that delivers it.
+#
+# It reaches make through VARS below, is CHECKED against both flagstamps after
+# the build, and is recorded in calib_cfg.txt. It used to be none of those: an
+# env-var H_SHIFT did reach make (an exported variable beats `?=`), so the build
+# would have been correct while nothing verified it and the config record still
+# said only "budget=4-4-4" — a run whose one variable under test was invisible
+# in its own provenance.
+H_SHIFT=${H_SHIFT:-$(mk H_SHIFT)}
+
+# Re-colourise the whole frame each push and abort on a mismatch. O(frame)/frame,
+# so it belongs on a short BRING-UP run, never on a 200-frame budget run.
+SCENE_VERIFY=${SCENE_VERIFY:-$(mk SCENE_VERIFY)}
+
+# What "colour" means for the SYNTHETIC scene at CONV_IN_CH=3. 1 = per-plane
+# tint; 0 = replicate luma into all three planes, which is the hardware analogue
+# of the offline colour-free control arm — same 27 taps, same bias and
+# quantization grid, no colour. Inert at CONV_IN_CH=1.
+#
+# This is THE variable under test for a control run, so it is recorded and
+# stamp-checked like any other. It reached make by environment inheritance
+# before, which builds the right thing but leaves the run's own provenance
+# silent about the one knob that was moved.
+FRAME_RGB_MODE=${FRAME_RGB_MODE:-$(mk FRAME_RGB_MODE)}
+
+# What KIND of run this image is for. The two have genuinely different
+# requirements and conflating them is how a 5-frame result gets quoted as a
+# budget validation:
+#   budget  (default) a shift-budget / tracking measurement. >=20 frames, hard.
+#   bringup           a correctness gate for a path that has never run on this
+#                     hardware — short on purpose, and its amplitudes prove
+#                     NOTHING about the budget (the response grows as the filter
+#                     converges; the retired 4-2-2 point peaked at 56% on frame 1
+#                     and railed from frame 15).
+# calib_cfg.txt records which one, so the artifacts carry the distinction too.
+MODE=${MODE:-budget}
+case "$MODE" in budget|bringup) ;; *) echo "MODE must be budget or bringup, got '$MODE'" >&2; exit 2 ;; esac
+
+# The known-good run this build is one variable away from. Recorded next to the
+# artifacts so the A/B is legible months later; override it when the comparator
+# moves (after a successful H_SHIFT sweep it becomes runs/run_calib.log).
+COMPARATOR=${COMPARATOR:-"runs/run_0824_1354.log (gray/roi/4-4-4/H_SHIFT=11: mean IoU 0.9188, rails 0, accum max 52%, response max 49%)"}
 
 # Run shape. 200 frames because THE RESPONSE GROWS AS THE FILTER CONVERGES — a
 # budget validated at ITER_CNT=2 is not validated, and the retired 4-2-2 point
@@ -69,6 +130,9 @@ VARS=(TARGET=hw
       FFT_SHIFT=$FFT_SHIFT
       IFFT_ROW_SHIFT=$IFFT_ROW_SHIFT
       IFFT_COL_SHIFT=$IFFT_COL_SHIFT
+      H_SHIFT=$H_SHIFT
+      SCENE_VERIFY=$SCENE_VERIFY
+      FRAME_RGB_MODE=$FRAME_RGB_MODE
       ITER_CNT=$ITER_CNT
       VERBOSITY=$VERBOSITY
       DUMP_BUFFERS=$DUMP_BUFFERS
@@ -86,9 +150,18 @@ printf '  arm            %s (CONV_IN_CH=%d)\n' "$ARM" "$CONV_IN_CH"
 printf '  budget         %d-%d-%d   (total 2*%d+%d+%d = %d)\n' \
        "$FFT_SHIFT" "$IFFT_ROW_SHIFT" "$IFFT_COL_SHIFT" \
        "$FFT_SHIFT" "$IFFT_ROW_SHIFT" "$IFFT_COL_SHIFT" "$TOTAL"
+printf '  H_SHIFT        %d   (cmul filter-product shift, independent of the budget)\n' "$H_SHIFT"
 printf '  bias scale     %s\n' "$BIAS_SCALE"
 printf '  frames         %d   verbosity %d   dumps %d\n' \
        "$ITER_CNT" "$VERBOSITY" "$DUMP_BUFFERS"
+printf '  mode           %s%s\n' "$MODE" \
+       "$([ "$MODE" = bringup ] && echo '   <-- CORRECTNESS GATE. Its amplitudes are NOT a budget result.' || true)"
+printf '  scene verify   %d%s\n' "$SCENE_VERIFY" \
+       "$([ "$SCENE_VERIFY" = 1 ] && echo '   (O(frame)/frame — short runs only)' || true)"
+if [ "$CONV_IN_CH" = 3 ]; then
+  printf '  frame rgb mode %d   %s\n' "$FRAME_RGB_MODE" \
+    "$([ "$FRAME_RGB_MODE" = 0 ] && echo 'REPLICATED LUMA — this is the COLOUR-FREE CONTROL arm' || echo 'per-plane tint')"
+fi
 echo
 
 fail=0
@@ -98,9 +171,22 @@ bad()  { printf '  %-42s FAIL — %s\n' "$1" "$2"; fail=1; }
 # ---- 1. frame count -------------------------------------------------------
 # Rule 1 of the shift budget: size it from frames 1-20, not from frame 1.
 if [ "$ITER_CNT" -lt 20 ]; then
-    bad "frames >= 20" "ITER_CNT=$ITER_CNT cannot show convergence growth"
+    if [ "$MODE" = bringup ]; then
+        note "frames >= 20" "WAIVED — MODE=bringup ($ITER_CNT frames)"
+        note "  -> this image CANNOT validate a shift budget" "correctness gate only"
+    else
+        bad "frames >= 20" "ITER_CNT=$ITER_CNT cannot show convergence growth (MODE=bringup waives this)"
+    fi
 else
     note "frames >= 20" "OK ($ITER_CNT)"
+fi
+
+# SCENE_VERIFY on a long run is a mistake, not a choice: it re-expands the whole
+# frame every push. Catch it here rather than in a run that takes all afternoon.
+if [ "$SCENE_VERIFY" = 1 ] && [ "$ITER_CNT" -gt 20 ]; then
+    bad "SCENE_VERIFY vs frame count" "SCENE_VERIFY=1 with ITER_CNT=$ITER_CNT is O(frame)/frame — use a short MODE=bringup run"
+else
+    note "SCENE_VERIFY vs frame count" "OK (verify=$SCENE_VERIFY, frames=$ITER_CNT)"
 fi
 
 # ---- 2. the weights file must match the arm -------------------------------
@@ -170,12 +256,21 @@ set +x
 # exists, and record the result next to it.
 echo
 echo "=== post-build verification (the stamps, not .last_cfg) ==="
+# A plain substring grep passes on the WRONG value: "ITER_CNT=200" matches
+# "ITER_CNT=2000", and "CMUL_H_SHIFT=1" matches "CMUL_H_SHIFT=10". In a stamp
+# every value is terminated by a quote or by whitespace, so require that
+# boundary. The check exists to catch a build that did not take the flag; one
+# that silently accepts a longer value is the same silent pass in a new place.
+stamp_has() {   # stamp_has <file> <FLAG=VALUE>
+    grep -qE -- "${2}(\"|[[:space:]]|\$)" "$1"
+}
 for want in "FFT_2D_TP_SHIFT=$FFT_SHIFT" \
             "FFT_2D_TP_IFFT_ROW_SHIFT=$IFFT_ROW_SHIFT" \
             "FFT_2D_TP_IFFT_COL_SHIFT=$IFFT_COL_SHIFT" \
+            "CMUL_H_SHIFT=$H_SHIFT" \
             "CONV_IN_CH=$CONV_IN_CH" \
             "CONV2D_ECHO_TEST=0"; do
-    if grep -q -- "$want" "$BUILD_DIR/aie.flagstamp"; then
+    if stamp_has "$BUILD_DIR/aie.flagstamp" "$want"; then
         printf '  aie.flagstamp  %-34s OK\n' "$want"
     else
         printf '  aie.flagstamp  %-34s MISSING\n' "$want"; fail=1
@@ -183,8 +278,10 @@ for want in "FFT_2D_TP_SHIFT=$FFT_SHIFT" \
 done
 for want in "-DITER_CNT=$ITER_CNT" "-DCONV_IN_CH=$CONV_IN_CH" \
             "-DFFT_SHIFT_CFG=$FFT_SHIFT" "-DVERBOSITY=$VERBOSITY" \
+            "-DCMUL_H_SHIFT=$H_SHIFT" "-DSCENE_VERIFY=$SCENE_VERIFY" \
+            "-DFRAME_RGB_MODE=$FRAME_RGB_MODE" \
             "-DDUMP_BUFFERS=$DUMP_BUFFERS" "-DTRAJECTORY=1"; do
-    if grep -q -- "$want" "$BUILD_DIR/app.flagstamp"; then
+    if stamp_has "$BUILD_DIR/app.flagstamp" "$want"; then
         printf '  app.flagstamp  %-34s OK\n' "$want"
     else
         printf '  app.flagstamp  %-34s MISSING\n' "$want"; fail=1
@@ -195,10 +292,11 @@ CFG="$BUILD_DIR/calib_cfg.txt"
 {
     date -Is
     echo "arm=$ARM CONV_IN_CH=$CONV_IN_CH BIAS_SCALE=$BIAS_SCALE"
-    echo "budget=${FFT_SHIFT}-${IFFT_ROW_SHIFT}-${IFFT_COL_SHIFT} total=$TOTAL"
+    echo "budget=${FFT_SHIFT}-${IFFT_ROW_SHIFT}-${IFFT_COL_SHIFT} total=$TOTAL H_SHIFT=$H_SHIFT"
     echo "ITER_CNT=$ITER_CNT VERBOSITY=$VERBOSITY DUMP_BUFFERS=$DUMP_BUFFERS"
+    echo "mode=$MODE SCENE_VERIFY=$SCENE_VERIFY FRAME_RGB_MODE=$FRAME_RGB_MODE"
     echo "weights_md5=$(md5sum "$WBIN" | cut -d' ' -f1)"
-    echo "comparator=runs/run_0821_1725.log (mean IoU 0.9188, rails 0)"
+    echo "comparator=$COMPARATOR"
 } > "$CFG"
 echo
 echo "recorded: $CFG"
