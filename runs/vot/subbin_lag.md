@@ -1,5 +1,63 @@
 # `nature`: the tracker fails without the gate ever firing
 
+> **CORRECTION, 2026-08-25 (same day). THE MECHANISM BELOW IS REFUTED. The
+> OBSERVATIONS are all correct; the explanation built on them is not, and the
+> fix it proposed would not have fixed this sequence.** Two independent benches,
+> neither needing the board:
+>
+> **1. The closed-loop sim says quantisation cannot compound.**
+> `python3 scripts/mosse_loop_sim.py --subbin` runs 9 configurations (resample
+> ratio 1-3 x speed 0.1-1.5 bins/frame, 200 frames). The detector reports (0,0)
+> on up to **86%** of frames, exactly as predicted — and the tracking error does
+> not grow at all: worst late-half / early-half error ratio **1.00**, error
+> bounded at ~half a bin throughout. The reason is structural and was missed
+> here: **the detector measures the offset that exists NOW, not the increment.**
+> Lag accumulates only until it crosses half a bin, at which point the next
+> measurement is a whole bin and takes it back. The loop is self-correcting.
+> The bench is known to be capable of showing compounding drift — its `centred`
+> arm is exactly that and ends tens of pixels off.
+>
+> **2. The real trajectory says the frozen frames are not sub-bin frames.**
+> `scripts/vot_traj_anatomy.py` compares the board's own `nature` trajectory
+> against groundtruth in units of the tracker's bin:
+>
+> ```
+>                       no motion reported     no motion reported     motion
+>                       & truth >= 1 bin       & truth < 1 bin        reported
+>   nature   (fails)          44.3%                 41.9%              13.8%
+>   tiger    (fails)          62.4%                  1.4%              36.3%
+>   car1     (best)           13.5%                  0.4%              86.1%
+> ```
+>
+> **44% of `nature`'s frames report zero motion while the target moved MORE than
+> a bin** — including frame 2 (+6.5 px = 4 row bins), frame 19 (−8.0 = 5 bins)
+> and frame 23 (−10.0 = 6 bins). Sub-bin refinement cannot touch those: it
+> adjusts the argmax by at most half a bin, and the argmax is wrong by six. On
+> `tiger` the sub-bin case is 1.4% of frames and the failure is the same shape.
+>
+> **The arithmetic that convinced me was a conflation.** "The tracker captures
+> ~83% of the motion" came from mean SPEED (|d| averaged), where the tracker's
+> smooth path scores lower than a jittering groundtruth by construction. Mean
+> DISPLACEMENT — the statistic that would show a systematic lag — matches truth
+> or exceeds it: row truth +0.002 vs track +0.024 px/frame, col +0.022 vs
+> −0.075. There is no systematic under-measurement to compound.
+>
+> **What survives:** every observation in the original note (86.1% of frames
+> report (0,0); PSR rises 20 → 111 as IoU falls; the gate never fires; the aspect
+> problem in the second section). What replaces the explanation: the detector is
+> **pinned at the origin**, which is this project's already-documented background
+> / zero-shift lock — "a localised blob at the origin, PSR 24-35 throughout, each
+> win costing a permanent offset" (CLAUDE.md). `resp00_over_peak` is the
+> instrument for it, it is already in `track.csv`, and the evidence run's CSVs
+> were never collected off the board. `scripts/vot_sweep.sh` now collects them.
+>
+> **The general lesson is the one this project keeps paying for: a mechanism
+> inferred from a correlation between two console statistics is a hypothesis.**
+> This one was written as a finding, promoted into CLAUDE.md as a validated fact,
+> and would have spent a hardware A/B on a fix for a mechanism that is not there.
+> It cost one afternoon offline to refute and would have cost a board day to
+> discover.
+
 **2026-08-25, from the first arm of the multi-anchor evidence run
 (`runs/run_0825_1546.log`, 14 runs, 10,604 frames, `HOLD_COAST=0`).**
 

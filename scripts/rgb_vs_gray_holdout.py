@@ -54,6 +54,7 @@ Usage
 
 import argparse
 import os
+import re
 import sys
 from pathlib import Path
 
@@ -64,6 +65,7 @@ os.environ.setdefault('GEN_PATCH_ROWS', '128')
 os.environ.setdefault('GEN_PATCH_COLS', '128')
 
 import roi_crop_ref as RC          # noqa: E402
+from vot_prepare import reduce_box  # noqa: E402
 import gen_aiesim_vectors as G     # noqa: E402
 
 LUM = np.array([0.2989, 0.5870, 0.1140], dtype=np.float64)
@@ -77,6 +79,59 @@ HANN = G.HANNING.astype(np.int64)
 
 SEQ = Path("test-sequences/car1")
 GT = Path("test-sequences/car1-annotations/groundtruth.txt")
+_FRAMES = None          # set by set_sequence(); None = the %08d.jpg pattern above
+
+
+def set_sequence(name):
+    """Point the harness at another sequence, by name.
+
+    TWO LAYOUTS, because the project holds the same data twice:
+
+      test-sequences/<name>/*.jpg          + <name>-annotations/groundtruth.txt
+      $VOT_ROOT/workspace/sequences/<name>/color/*.jpg + groundtruth.txt
+
+    The annotation directories in test-sequences/ are named inconsistently
+    ("car1-annotations" but "fernando - annotations"), so the match is loose --
+    the same rule rgb_vs_gray_vot.discover() uses.
+
+    stb2022 is preferred when both exist: it is the dataset the board runs, its
+    groundtruth is the 4-column rectangle format, and the two are NOT the same
+    annotations even where the frames match.
+    """
+    global SEQ, GT, _FRAMES
+    if name is None:
+        return len(load_gt())
+
+    root = Path(os.environ.get('VOT_ROOT', str(Path.home() / 'vot')))
+    cand = root / "workspace" / "sequences" / name
+    if (cand / "color").is_dir() and (cand / "groundtruth.txt").is_file():
+        SEQ, GT = cand / "color", cand / "groundtruth.txt"
+    else:
+        local = Path("test-sequences") / name
+        if not local.is_dir():
+            raise SystemExit(
+                f"sequence '{name}' not found in {cand} or {local}")
+        ann = None
+        key = re.sub(r'[^a-z0-9]', '', name.lower())
+        for d in Path("test-sequences").iterdir():
+            if d.is_dir() and 'annotation' in d.name.lower() and \
+                    re.sub(r'[^a-z0-9]', '', d.name.lower()).startswith(key):
+                ann = d
+                break
+        if ann is None or not (ann / "groundtruth.txt").is_file():
+            raise SystemExit(f"no annotations found for '{name}'")
+        SEQ, GT = local, ann / "groundtruth.txt"
+
+    _FRAMES = sorted(SEQ.glob("*.jpg"))
+    if not _FRAMES:
+        raise SystemExit(f"no frames in {SEQ}")
+    gt = load_gt()
+    if len(_FRAMES) != len(gt):
+        # Not fatal on its own, but it means one of the two is not what it
+        # claims -- say so rather than silently tracking against the shorter.
+        print(f"  WARNING: {name} has {len(_FRAMES)} frames and "
+              f"{len(gt)} groundtruth lines")
+    return min(len(_FRAMES), len(gt))
 
 
 # ---------------------------------------------------------------------------
@@ -84,20 +139,29 @@ GT = Path("test-sequences/car1-annotations/groundtruth.txt")
 # ---------------------------------------------------------------------------
 
 def load_gt():
-    """VOT rotated polygons -> axis-aligned (row, col, h, w), min-max convention."""
-    out = []
-    for line in GT.read_text().split():
-        v = np.array([float(x) for x in line.split(',')])
-        x, y = v[0::2], v[1::2]
-        out.append((0.5 * (y.min() + y.max()), 0.5 * (x.min() + x.max()),
-                    y.max() - y.min(), x.max() - x.min()))
-    return out
+    """Groundtruth -> axis-aligned (row, col, h, w) per frame.
+
+    SINGLE-SOURCED FROM vot_prepare.reduce_box. This function used to carry its
+    own polygon-only copy, which is correct for test-sequences/ and silently
+    wrong for stb2022's 4-column rectangles -- reading (440,229,198,230) as a
+    polygon gives a 1.0 x 242.0 sliver. That copy was harmless only because this
+    harness had never been pointed at stb2022; set_sequence() is exactly what
+    points it there. Same fix rgb_vs_gray_vot.py already carries.
+    """
+    return [reduce_box([float(t) for t in line.split(',')])
+            for line in GT.read_text().split()]
 
 
 def load_frame_rgb(idx):
-    """1-based frame index -> uint8 [3, H, W]."""
+    """1-based frame index -> uint8 [3, H, W].
+
+    Indexes a sorted listing when set_sequence() has run, rather than formatting
+    a name: stb2022 numbers from 00000001.jpg but nothing guarantees that for
+    every sequence, and an off-by-one here would look like a tracking result.
+    """
     from PIL import Image
-    im = Image.open(SEQ / f"{idx:08d}.jpg").convert("RGB")
+    path = SEQ / f"{idx:08d}.jpg" if _FRAMES is None else _FRAMES[idx - 1]
+    im = Image.open(path).convert("RGB")
     return np.asarray(im, dtype=np.uint8).transpose(2, 0, 1)
 
 

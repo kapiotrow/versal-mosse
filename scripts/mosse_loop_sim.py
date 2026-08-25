@@ -64,13 +64,22 @@ def make_background(rng):
 
 
 def stamp_target(frame, row, col, size=64):
-    """An asymmetric, structured target -- a centred blob hides sign errors."""
-    r0, c0 = int(round(row - size / 2)), int(round(col - size / 2))
-    rr = np.arange(size).reshape(-1, 1)
-    cc = np.arange(size).reshape(1, -1)
+    """An asymmetric, structured target -- a centred blob hides sign errors.
+
+    The target is rendered at its exact SUB-PIXEL position, evaluated on the
+    frame's own grid rather than stamped into an integer box. That matters for
+    the sub-bin experiment and only for it: with integer stamping a target moving
+    0.35 px/frame does not move at all for three frames and then jumps one pixel,
+    which is a different phenomenon from the one under test and would let a
+    quantised detector look correct. The 1 px/frame arms are unaffected -- at
+    integer offsets this evaluates to the same picture the old code stamped.
+    """
+    rr = np.arange(FRAME_R).reshape(-1, 1) - (row - size / 2.0)
+    cc = np.arange(FRAME_C).reshape(1, -1) - (col - size / 2.0)
+    inside = (rr >= 0) & (rr < size) & (cc >= 0) & (cc < size)
     t = 60.0 * np.exp(-((rr - size * 0.35)**2 + (cc - size * 0.6)**2) / (2 * 12.0**2))
-    t += 40.0 * ((rr > size * 0.6) & (cc < size * 0.4))
-    frame[r0:r0 + size, c0:c0 + size] += t
+    t = t + 40.0 * ((rr > size * 0.6) & (cc < size * 0.4))
+    frame += np.where(inside, t, 0.0)
     return frame
 
 
@@ -106,18 +115,67 @@ def features(patch):
     return out
 
 
-def crop(frame, row, col):
-    r0, c0 = int(round(row - ROWS / 2)), int(round(col - COLS / 2))
-    rr = np.clip(np.arange(r0, r0 + ROWS), 0, FRAME_R - 1)
-    cc = np.clip(np.arange(c0, c0 + COLS), 0, FRAME_C - 1)
-    return frame[np.ix_(rr, cc)].astype(np.float64)
+def crop(frame, row, col, ratio=1.0):
+    """ROI of ROWS*ratio frame pixels, bilinearly resampled to ROWS x COLS.
+
+    `ratio` is roi_h / patch_rows -- the resample factor roi_crop applies on
+    hardware, and therefore the size of ONE PATCH BIN in frame pixels. At 1.0
+    this is the plain integer crop the earlier arms used, evaluated identically.
+
+    This is the whole reason sub-bin motion exists: on `nature` the box is
+    103x178, the ROI is twice that, and roi_crop squeezes it into 128x128, so one
+    bin is 1.61 x 2.78 frame px while the target moves 2.06 px/frame.
+    """
+    if ratio == 1.0:
+        r0, c0 = int(round(row - ROWS / 2)), int(round(col - COLS / 2))
+        rr = np.clip(np.arange(r0, r0 + ROWS), 0, FRAME_R - 1)
+        cc = np.clip(np.arange(c0, c0 + COLS), 0, FRAME_C - 1)
+        return frame[np.ix_(rr, cc)].astype(np.float64)
+
+    # Sample centres of the ROI, mapped onto the frame grid.
+    rr = (np.arange(ROWS) + 0.5) * ratio + (row - ROWS * ratio / 2.0) - 0.5
+    cc = (np.arange(COLS) + 0.5) * ratio + (col - COLS * ratio / 2.0) - 0.5
+    r0 = np.clip(np.floor(rr).astype(int), 0, FRAME_R - 2)
+    c0 = np.clip(np.floor(cc).astype(int), 0, FRAME_C - 2)
+    fr = (rr - r0).reshape(-1, 1)
+    fc = (cc - c0).reshape(1, -1)
+    a = frame[np.ix_(r0,     c0)];      b = frame[np.ix_(r0,     c0 + 1)]
+    c = frame[np.ix_(r0 + 1, c0)];      d = frame[np.ix_(r0 + 1, c0 + 1)]
+    return ((a * (1 - fc) + b * fc) * (1 - fr) +
+            (c * (1 - fc) + d * fc) * fr).astype(np.float64)
+
+
+def parabolic(y_m, y_0, y_p):
+    """3-point parabola vertex offset in [-0.5, 0.5], 0 when not a maximum.
+
+    THE SAME EXPRESSION AS THE C++ (mosse_filter.cpp, refine_peak_axis). Two
+    implementations of one rule is how this project has been bitten before, so
+    the C++ unit test pins the identical numeric cases -- see
+    run_subbin_tests() in test_mosse_filter.cpp.
+    """
+    den = y_m - 2.0 * y_0 + y_p
+    if den >= 0.0:            # flat or a minimum: the fit says nothing
+        return 0.0
+    d = 0.5 * (y_m - y_p) / den
+    return float(np.clip(d, -0.5, 0.5))
 
 
 def signed_bin(k, n):
     return k - n if k > n // 2 else k
 
 
-def run(arm, n_frames, vel, seed=0, verbose=True):
+def run(arm, n_frames, vel, seed=0, verbose=True, ratio=1.0, subbin=False):
+    """One closed-loop arm.
+
+    arm     'centred' | 'shifted'   -- where the TRAINING target is centred
+    ratio   frame px per patch bin  -- 1.0 is the historical 1:1 crop
+    subbin  refine the integer argmax with a 3-point parabola before using it
+
+    `subbin` deliberately affects BOTH uses of the measurement, because they are
+    the same number: the position update AND the centre of the training G. A
+    refinement applied only to the position would leave the filter still being
+    taught that a drifted appearance is centred, which is the actual mechanism.
+    """
     rng = np.random.default_rng(seed)
     bg = make_background(rng)
 
@@ -132,7 +190,7 @@ def run(arm, n_frames, vel, seed=0, verbose=True):
 
     for t in range(n_frames):
         frame = stamp_target(bg.copy(), truth_r, truth_c)
-        F = features(crop(frame, est_r, est_c))
+        F = features(crop(frame, est_r, est_c, ratio))
 
         if t == 0:
             # Bootstrap: the crop IS centred on the target, so a centred G is
@@ -148,14 +206,28 @@ def run(arm, n_frames, vel, seed=0, verbose=True):
             peak = abs(R[idx])
             resp00 = abs(R[0, 0]) / peak if peak else 0.0
 
-            est_r += dr
-            est_c += dc
+            fdr, fdc = float(dr), float(dc)
+            if subbin:
+                # Neighbours WRAP: the response map is circular, exactly as the
+                # PSR exclusion window is. Fit on sign(peak)*R so a legitimately
+                # negative peak is still a maximum of the fitted parabola.
+                sg = 1.0 if R[idx] >= 0 else -1.0
+                r_, c_ = idx
+                fdr += parabolic(sg * R[(r_ - 1) % ROWS, c_], sg * R[r_, c_],
+                                 sg * R[(r_ + 1) % ROWS, c_])
+                fdc += parabolic(sg * R[r_, (c_ - 1) % COLS], sg * R[r_, c_],
+                                 sg * R[r_, (c_ + 1) % COLS])
+
+            # Patch bins -> frame pixels. At ratio 1.0 this is the old `+= dr`.
+            est_r += fdr * ratio
+            est_c += fdc * ratio
             cerr = np.hypot(est_r - truth_r, est_c - truth_c)
             rows.append((t, dr, dc, resp00, cerr))
 
-            # THE DEFECT AND THE FIX, in one line.
+            # THE DEFECT AND THE FIX, in one line. The training target is centred
+            # at the SAME measurement the position moved by -- refined or not.
             G = G0 if arm == 'centred' else \
-                gaussian_target_spectrum(ROWS, COLS, SIGMA, dr, dc)
+                gaussian_target_spectrum(ROWS, COLS, SIGMA, fdr, fdc)
             A, B = filter_update(A, B, F, G, ETA)
 
         truth_r += vel[0]
@@ -169,13 +241,70 @@ def run(arm, n_frames, vel, seed=0, verbose=True):
     return rows
 
 
+def subbin_experiment(frames, quiet):
+    """Does sub-bin motion compound into unbounded lag? MEASURED: no.
+
+    The hypothesis (runs/vot/subbin_lag.md) was that a target moving less than
+    one patch bin per frame is reported as (0,0), the filter is then trained
+    against a G centred at that (0,0), and the lag compounds forever. The first
+    half is true and the second is not, and the reason is structural: the
+    detector measures the offset that EXISTS RIGHT NOW, not the increment. Lag
+    accumulates only until it exceeds half a bin, at which point the next
+    measurement is a whole bin and takes it back. The loop is self-correcting and
+    the error is bounded by half a bin, whatever the speed or the resample ratio.
+
+    This bench is known to be CAPABLE of showing compounding drift: the 'centred'
+    arm above is exactly that, and it ends tens of pixels off. So a flat error
+    here is a result, not an insensitive instrument.
+    """
+    print("\n=== sub-bin motion: does quantised measurement compound?")
+    print("  The claim under test is GROWTH, not magnitude: a compounding lag makes")
+    print("  the second half of a run much worse than the first. A bounded error does")
+    print("  not, however often the detector reports (0,0).\n")
+    print(f"  {'ratio':>6}{'vel px/f':>10}{'bins/f':>8}{'(0,0)%':>8}"
+          f"{'argmax 1st/2nd half':>22}{'parabolic':>11}")
+    worst_growth = 0.0
+    for ratio in (1.0, 2.0, 3.0):
+        for v in (0.3, 0.7, 1.5):
+            res = {}
+            for sub in (False, True):
+                rows = run('shifted', frames, (v * 0.8, v * 0.6), verbose=False,
+                           ratio=ratio, subbin=sub)
+                post = rows[1:]
+                half = len(post) // 2
+                early = max(r[4] for r in post[:half])
+                late = max(r[4] for r in post[half:])
+                res[sub] = (early, late)
+                if not sub:
+                    z = 100 * sum(1 for r in post if r[1] == 0 and r[2] == 0) / len(post)
+            e, l = res[False]
+            growth = l / e if e > 0 else (0.0 if l == 0 else 99.0)
+            worst_growth = max(worst_growth, growth)
+            print(f"  {ratio:6.1f}{v:10.2f}{v / ratio:8.2f}{z:8.0f}"
+                  f"{e:11.2f} /{l:8.2f}{res[True][1]:11.2f}")
+
+    ok = worst_growth < 1.5
+    print(f"\n  worst late/early error ratio: {worst_growth:.2f}")
+    print("  VERDICT:", "sub-bin quantisation does NOT compound -- the loop measures the\n"
+          "           offset that exists now, so lag is corrected the moment it exceeds\n"
+          "           half a bin. Error is bounded, not accumulating."
+          if ok else
+          "the error GREW -- the compounding hypothesis survives this bench")
+    return 0 if ok else 1
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument('--frames', type=int, default=40)
     ap.add_argument('--vel', type=float, nargs=2, default=[3.0, -2.0],
                     help='target velocity in frame px/frame')
     ap.add_argument('--quiet', action='store_true')
+    ap.add_argument('--subbin', action='store_true',
+                    help='run the sub-bin experiment instead of the training-target one')
     args = ap.parse_args()
+
+    if args.subbin:
+        return subbin_experiment(max(args.frames, 200), args.quiet)
 
     summary = {}
     for arm in ('centred', 'shifted'):

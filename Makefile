@@ -1714,7 +1714,35 @@ $(ROOTFS): $(COMMON_IMAGE_VERSAL)/rootfs.ext4
 	cp $< $@
 	tune2fs -O ^orphan_file,^metadata_csum_seed,^metadata_csum $@
 	e2fsck -fy $@ || test $$? -lt 4
+	$(MAKE) --no-print-directory board_provision ROOTFS_IMG=$@
 	@echo "rootfs: $@ ready for packaging"
+
+# Board provisioning: a static address on end0 and an authorized key for root,
+# written into the rootfs so the board comes up as an ssh target with nothing
+# typed at the console. sshd is already enabled in the stock image; see
+# scripts/board_provision.sh for what was verified and what was missing.
+#
+# BOARD_KEY=none opts out EXPLICITLY. There is deliberately no silent skip when
+# the key is absent: a rootfs quietly built without it boots unreachable, and
+# that is indistinguishable from a cable fault at the moment it costs most.
+BOARD_KEY   ?= $(HOME)/.ssh/id_ed25519.pub
+BOARD_IP    ?= 192.168.10.2/24
+BOARD_IFACE ?= end0
+ROOTFS_IMG  ?= $(ROOTFS)
+
+.PHONY: board_provision
+board_provision:
+ifeq ($(BOARD_KEY),none)
+	@echo "board_provision: SKIPPED (BOARD_KEY=none) -- this image has no ssh key"
+else
+	@test -f $(BOARD_KEY) || { \
+	  echo "ERROR: BOARD_KEY=$(BOARD_KEY) not found."; \
+	  echo "       ssh-keygen -t ed25519    to make one, or"; \
+	  echo "       make ... BOARD_KEY=none  to build an image with no ssh access."; \
+	  exit 1; }
+	scripts/board_provision.sh $(ROOTFS_IMG) \
+	    --key $(BOARD_KEY) --ip $(BOARD_IP) --iface $(BOARD_IFACE)
+endif
 
 # The on-target run script is GENERATED, not copied, because XCL_EMULATION_MODE
 # must be set for hw_emu and must NOT be set on real hardware. Packaging the

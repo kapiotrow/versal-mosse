@@ -551,6 +551,20 @@ Two principles that have repeatedly earned their keep: **instruments before chan
   conv2d returns at the top: no MAC, no ReLU, no B1, **no Hanning window** (so B2's 9-bin
   identity does not hold), and all 16 channels are bit-identical (so the accumulator sums 16
   coherent copies and every amplitude and PSR figure is inflated).
+- **LAUNCHING OVER SSH CHANGES THE FRAME-TIME MEASUREMENT.** `scripts/vot_sweep.sh` drives the
+  board over ssh, which moves the ELF's stdout off the 115200 console. That console is itself a
+  distortion — 15% of the frame at `VERBOSITY=0`, **58% on `animal`** — so ssh frame times are
+  more honest AND **not comparable to any run before 2026-08-25**, `run_0821_1725` included.
+  `ts` on the PC side of a TCP stream is good to about a second: it locates a stall, it is not
+  the instrument `picocom … | ts` was. Take frame time from the `AP_*` slots and `track.csv`, and
+  quote FPS only from a serial-console run. Incidental gain: ssh without a pty emits clean `\n`,
+  where picocom's bare `\r` made `readlines()` and `grep` disagree about line numbers.
+  See `runs/vot/automation.md`.
+- **`debugfs`'s `mkdir` ALLOCATES THE INODE BEFORE it fails on an existing directory**, so
+  re-running an image-provisioning script leaves an unconnected inode and a filesystem `e2fsck`
+  calls dirty. Test-then-create. The read-back verification passed both times — only the closing
+  `e2fsck -fn` caught it, which is the argument for ending image surgery with a filesystem check
+  rather than with a content check.
 - **hw_emu packaging stalls on `udevadm settle` when the card reader is plugged in** — ~120 s per
   repeat, turning a 45 s package into 10 min. Not a failure. Unplug the reader.
 - **hw_emu wall-clock timings are not hardware timings — but hw_emu SIMULATED PL CYCLES are.**
@@ -905,18 +919,74 @@ Two principles that have repeatedly earned their keep: **instruments before chan
   assertions incl. an anisotropic box), because while `roi_h == patch_rows` the two are
   accidentally the same number and padding breaks both by the resample ratio — a tracker that
   localises confidently and *drifts*, invisible to `err=0 px`.
-- **SUB-BIN MOTION IS REPORTED AS ZERO, AND THE FILTER IS THEN TRAINED ON THAT — measured
-  2026-08-25 on `nature`.** The peak detector is a pure integer argmax (`PsrResult::dr/dc` are
-  `int`, no parabolic refinement anywhere), and one patch bin is `roi/128` FRAME pixels — 1.61 x
-  2.78 px on `nature`'s 103x178 box. Its true motion is 2.06 px/frame median, so **86.1% of
-  frames report displacement exactly (0,0)** while the target is moving. `filter_update()` then
-  trains against a G centred at that measured (0,0), teaching the filter that a drifted
-  appearance is centred; the lag compounds at ~0.35 px/frame and the tracker ends 350-500 px off
-  with **PSR RISING from 20 to 111**. Mean IoU 0.1535 over 14 runs, and **the gate never fires**
-  (18 of 10,604 frames; 9 of 14 runs hold nothing). This is the training-target trap arriving
-  through a resolution error rather than a sign error, and it is invisible to every instrument
-  built for the fast-motion failure. Candidate fix: 3-point parabolic sub-bin interpolation,
-  standard in MOSSE/DSST and absent here. See `runs/vot/subbin_lag.md`.
+- **`nature` IS NOT A TRACKER DEFECT — ITS PIXELS DO NOT MOVE. Measured 2026-08-25, offline.**
+  Three diagnoses of that sequence (sub-bin lag, then origin lock, then background lock) all
+  assumed the target moves and the tracker fails to follow. `scripts/vot_motion_check.py` tests
+  the premise: correlate frame f−1's box content against frame f at the position the annotation
+  moved to, and at the position it came from. **On 80% of `nature`'s frames NOT MOVING correlates
+  better** (NCC 0.940 vs 0.816). The target deforms in place — aspect 0.58 → 1.65, appearance
+  decorrelating to 0.072 by frame 50 — and the box centre moves because it is a min–max over a
+  changing shape. Corroborated two ways: the response is healthy and says zero translation
+  (frame 2, one update after init: peak at (0,0), `resp00/peak` 1.0000, PSR 33, sidelobe mean
+  +0.0001, mainlobe 16 bins vs an ideal 13), and **at `padding = 1.0`, with no background in the
+  ROI at all, it still reports (0,0) on 98% of frames** — so it is not background lock either.
+  **`nature` is 46% of the frames in the 8-sequence evidence set**, so read
+  `runs/vot/evidence_ar.md`'s per-sequence table rather than any frame-weighted aggregate, and
+  never tune against it. See `runs/vot/frozen_detector.md`.
+- **`tiger`: eta / sigma / eps_rel SWEPT, and the freeze is a SYMPTOM, not the objective.**
+  `SIGMA=1` and `EPS_REL=0.1` each unfreeze the detector completely (froze-while-needed 65.8% →
+  0.5% / 0.0%) and tracking does not improve — IoU stays ~0.21 and centre error gets worse. A
+  detector that moves every frame to the wrong place scores no better than one that refuses to
+  move, and it looks healthier. **Do not optimise the freeze rate.**
+  Three mechanisms were tested and killed: (1) ATTENUATION — the early trace fits it perfectly
+  (needs +21 bins, reports +8), but iterated re-cropping, which attacks exactly that and helps
+  `car1` (cerr 5.6 → 4.7 px), makes `tiger` worse (lost at 137 → 70); (2) the ONLINE UPDATE — with
+  the crop placed at groundtruth every frame the detector is still wrong by a median **17 bins**,
+  and identically so with `eta = 0`, so the filter is wrong before learning touches it (`car1`: 2
+  bins); (3) the filter INVENTING the offset — a plain NCC template search with no filter, no conv
+  features and no window puts the best match at **(−6.7, −8.9) px** from the annotation centre,
+  within 8 px on 27% of frames (`car1`: (+2.8, −0.4) px, 100%).
+  **So `tiger` is `nature`'s disease in a milder form**: the box centre is a min–max over a
+  deforming object and drifts against the appearance, ~11 px ≈ 8 bins, which the filter amplifies
+  ~1.7×. Trackable but permanently penalised. See `runs/vot/tiger.md`.
+- **`MOSSE_ETA = 0.05` is the one candidate this produced — worth a hardware A/B.** Offline over 8
+  full sequences, gray: frame-weighted mean IoU 0.2533 → 0.2599, unweighted 0.1382 → 0.1480, six
+  sequences better, two tied, one worse by 0.0017 (and that one is `nature`). **Uniform in sign,
+  which `HOLD_COAST` was not.** The sweep is not monotone — 0.025 is much worse than 0.05 — so it
+  is a shallow optimum, not a trend. Caveat: the offline model holds box size fixed (no DSST), so
+  `eta` has not been tested against a live scale filter.
+- **PHASE CORRELATION IS THE WRONG INSTRUMENT FOR "did the target move".** It returns the
+  DOMINANT motion in the window, so static background filling the box makes it read zero: it
+  reported **0.00 px on `car1`**, a car crossing the frame at 20 px/frame. It nearly produced a
+  fourth wrong diagnosis of `nature`. Ask about the target's own pixels at two named hypotheses
+  instead (`vot_motion_check.py`), which has no dominance failure mode.
+- **`rgb_vs_gray_loop.py --sequence <name>` reproduces the board's tracking failures at 3.5 s per
+  100 frames** — `nature` 38.4% frozen against hardware's 44.3%, `tiger` 65.8% against 62.4%. It
+  resolves stb2022 under `$VOT_ROOT` first, then `test-sequences/`. **Its `load_gt` used to carry
+  a polygon-only copy of the groundtruth rule**, which is correct for `test-sequences/` and
+  silently wrong for every stb2022 rectangle (the Phase 1 bug); it now single-sources
+  `vot_prepare.reduce_box`, so pointing it at stb2022 is safe.
+- **Padding 2.0 beats 1.5 on real moving video** — `car1`, 200 frames closed-loop, mean IoU
+  0.857 / 0.780 / 0.174 at padding 2.0 / 1.5 / 1.2. This is the measurement the "1.5 verdict is
+  REOPENED" note under Settled asked for: the original holdout was on a static scene where
+  background lock costs nothing. The shipping default stands.
+- **SUB-BIN INTERPOLATION IS A SMALL ACCURACY WIN, NOT A FIX — and the compounding-lag argument
+  for it is wrong.** The peak detector is a pure integer argmax (`PsrResult::dr/dc` are `int`,
+  no parabolic refinement anywhere), and on `nature` one bin is 1.61 × 2.78 frame px against
+  2.06 px/frame of true motion, so 86% of frames really do report (0,0). What does NOT follow is
+  that the error compounds: **the detector measures the offset that exists now, not the
+  increment**, so lag accumulates only until it crosses half a bin and the next measurement takes
+  it back. `python3 scripts/mosse_loop_sim.py --subbin` sweeps ratio 1-3 × 0.1-1.5 bins/frame
+  over 200 frames — up to 86% zero-reports, worst late/early error ratio **1.00**, error bounded
+  at ~half a bin. The same bench's `centred` arm DOES compound, so a flat result there is a
+  finding and not an insensitive instrument. Parabolic refinement does cut the bounded error at
+  large resample ratios (2.68 → 1.25 px at ratio 3), which is worth well under 1% of IoU on a
+  100 px box.
+  **The arithmetic that sold the wrong story was a conflation of mean SPEED with mean
+  DISPLACEMENT**: a tracker moving smoothly through a jittering groundtruth scores a lower mean
+  speed while its mean displacement matches exactly (`nature` row: truth +0.002, track +0.024
+  px/frame). See `runs/vot/subbin_lag.md`, whose observations all stand and whose mechanism does
+  not.
 - **The HOLD on a gated frame is NOT unconditionally correct — measured 2026-08-25.** On a gate
   veto the host holds position, which assumes the target stays put while the filter is frozen.
   Measured from stb2022 groundtruth alone (`scripts/vot_hold_budget.py`, no tracker, no board):
@@ -1158,6 +1228,25 @@ guts the four colour-opponent channels: 0/2/9/10 keep 0.32/0.60/0.63/**0.037** o
 norm against 1.24–1.39 for the achromatic ones, and per-channel int8 then renormalises that
 residue to full scale. ch0/ch9/ch14 sit within 2–6° of one line in gray, 59–72° apart in RGB.
 
+**stb2022, CLOSED LOOP, 8 SEQUENCES, 2841 FRAMES — RGB IS A TIE ON MEAN IoU (2026-08-25).**
+`rgb_vs_gray_loop.py --sequence`, full sequences, gray / RGB / colour-free control:
+
+| | car1 | tiger | nature | crabs1 | book | soccer2 | animal | ball3 | frame-wtd |
+|---|---|---|---|---|---|---|---|---|---|
+| gray | 0.7131 | **0.1696** | 0.1121 | 0.0188 | **0.0187** | 0.0141 | 0.0227 | 0.0366 | 0.2533 |
+| RGB | **0.7237** | 0.1526 | 0.1121 | **0.0230** | 0.0184 | **0.0177** | **0.0257** | **0.0372** | **0.2544** |
+| control | 0.7130 | 0.1696 | 0.1101 | 0.0188 | 0.0187 | 0.0141 | 0.0227 | 0.0366 | 0.2526 |
+
+RGB wins five, loses two, ties one, for **+0.0011 frame-weighted — noise**. The colour-free
+control reproduces gray to 4 decimal places on five of eight sequences, so the comparison is
+sound and the answer really is "no difference". **This CONFIRMS rather than contradicts the
+claim of record**: RGB was never an accuracy change (mean IoU moved the wrong way on the
+synthetic hardware arm too, 0.9188 → 0.9173). Its claim is **failures**, −18% under the
+supervised protocol — a robustness metric mean IoU cannot express, since a tracker that survives
+longer is scored on harder frames. **To decide RGB on stb2022, run the supervised/AR protocol,
+not this table**; `rgb_vs_gray_vot.py` is that harness and still discovers sequences only under
+`test-sequences/`.
+
 **Retired — "RGB is handicapped by its larger `out_shift`."** 27 taps triple `ACC_MAX_THEORY`,
 pushing mean out_shift 3.69 → 4.25 (confirmed on the shipping export). But forcing gray's shifts
 onto RGB (`--match-shift`) makes it **worse**, 42 → 53 failures, with 0.0000% saturation at all
@@ -1332,10 +1421,14 @@ make test_host                     # native unit tests for filter/PSR/scale/scal
                                    #   bit-exactness claim proven only at -O2 is proven on the
                                    #   wrong machine. That build caught real bugs -O2 missed.
 python3 scripts/mosse_loop_sim.py  # closed-loop MOSSE regression, centred-G vs shifted-G
+python3 scripts/mosse_loop_sim.py --subbin   # ...and the sub-bin experiment: sweeps resample
+                                   #   ratio x speed and shows quantisation does NOT compound
 # gray vs RGB vs a colour-free control, on real VOT video. Needs the venv, and the Vitis
 # env MASKS it: PYTHONHOME/PYTHONPATH point python at Vivado's build, which has no _ctypes.
 env -u PYTHONPATH -u PYTHONHOME ./.venv/bin/python scripts/rgb_vs_gray_holdout.py   # frozen filter
 env -u PYTHONPATH -u PYTHONHOME ./.venv/bin/python scripts/rgb_vs_gray_loop.py      # closed loop, 1 seq
+#   ... --sequence tiger   picks the sequence ($VOT_ROOT stb2022 first, then test-sequences/).
+#   Reproduces the board's frozen-detector failures at 3.5 s per 100 frames.
 env -u PYTHONPATH -u PYTHONHOME ./.venv/bin/python scripts/rgb_vs_gray_vot.py       # VOT supervised, all seqs
 #   ... --oracle-scale takes box size from ground truth (isolates localisation from the
 #   missing DSST scale filter); the two modes BRACKET what scale handling is worth.
@@ -1366,7 +1459,14 @@ make x86sim_check KUT=conv2d SCENARIO=s6rgb CONV_IN_CH=3 # RGB conv2d, 27 taps, 
 make aiesim CMUL_SPLIT_ACCUM=0     # AIE simulator — bypasses PatchIn→conv2d→row-FFT
 make aiesim_plio                   # same, but forces the REAL PatchIn path
 make aiesim_plio CONV2D_MODE=2     # bisect: conv2d synthesizes output, never reads the stream
-make rootfs                        # feature-downgraded rootfs copy (v++ corrupts the pristine one)
+make rootfs                        # feature-downgraded rootfs copy (v++ corrupts the pristine one).
+                                   #   ALSO provisions the board for ssh (static end0 + an
+                                   #   authorized key). BOARD_KEY=none opts out explicitly;
+                                   #   there is no silent skip when the key is missing
+make board_provision ROOTFS_IMG=<img>   # same, against an existing sd_card.img: no re-package
+# One command per sweep: mounts, pushes the ELF, guards, runs, collects, ingests.
+scripts/vot_sweep.sh --arm coast0 --seqs car1,tiger --ingest
+scripts/vot_sweep.sh --arm x --seqs car1 --dry-run    # prints every remote command, runs none
 make kernels / xsa / application / sd_card
 make sd_card TARGET=hw
 make run_emu LAUNCH_HW_EMU_EXEC=1
@@ -1434,6 +1534,22 @@ scripts/  export_weights.py, gen_aiesim_vectors.py, gen_filter_golden.py,
           vot_roundtrip.py    # Phase 0b: toolkit result format, written and read with the
                               #   toolkit's own writers/readers over a fake workspace
           vot_check_trajectory.py  # the BOARD's writer against the toolkit's reader
+          board_provision.sh  # writes a static end0 address and root's authorized_keys
+                              #   into the rootfs (or into an sd_card.img's partition 2)
+                              #   with debugfs -- no root, no loop device. sshd is
+                              #   already enabled in the stock image
+          vot_sweep.sh        # drives a whole sweep from the PC over ssh: mount, push the
+                              #   ELF, guard the build, run each sequence, collect, ingest.
+                              #   --dry-run prints every remote command
+          vot_motion_check.py # does a sequence's ANNOTATED motion appear in the pixels?
+                              #   NCC of the box content at "moved" vs "still". No
+                              #   tracker, no board. Phase correlation cannot answer
+                              #   this -- it returns the window's dominant motion
+          vot_traj_anatomy.py # a board trajectory vs groundtruth, in units of the
+                              #   tracker's own BIN. Prints the one number that
+                              #   discriminates a resolution limit from a pinned
+                              #   detector: how often it reports no motion on a frame
+                              #   whose true motion exceeds a bin
           vot_ingest.py       # board trajectories -> a toolkit workspace -> `vot analysis`.
                               #   One directory per ARM. Re-derives every run name from the
                               #   sequence's own anchors and checks each trajectory's LENGTH
