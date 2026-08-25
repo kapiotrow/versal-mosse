@@ -12,8 +12,8 @@
  * taps [0:9] as a 3x3 kernel and slices out_shift out of the
  * G plane. Byte 63 of every channel buffer carries the same
  * number so a reader can assert at runtime. */
-#define LAYER0_IN_CH         3
-#define LAYER0_N_TAPS        27
+#define LAYER0_IN_CH         1
+#define LAYER0_N_TAPS        9
 #define LAYER0_BIAS_SCALE    32.0f
 
 #include "conv_weight_layout.h"
@@ -23,23 +23,23 @@
 
 /* Per-channel dequantization scale: y_float ≈ out_int16 * scale * (1<<shift) */
 static const float layer0_dequant_scales[16] = {
-    7.4986263825e-06f,
-    8.0352070724e-05f,
-    1.3814256236e-05f,
-    1.0884304387e-04f,
-    2.9798013075e-05f,
-    3.6352130866e-05f,
-    9.9826163807e-07f,
-    1.2979397190e-06f,
-    2.9627799993e-05f,
-    1.2038508723e-05f,
-    1.0038287893e-05f,
-    1.0866567822e-03f,
-    7.7100540407e-07f,
-    5.7334828606e-07f,
-    5.3545176715e-07f,
-    1.1509162912e-04f,
+    1.4484671646e-06f,
+    5.8781805558e-05f,
+    5.4939386004e-06f,
+    6.9219774417e-05f,
+    2.2266383467e-05f,
+    2.7051856806e-05f,
+    7.2549686413e-07f,
+    1.0140085422e-06f,
+    2.1876990878e-05f,
+    4.5472069123e-06f,
+    3.5950400788e-07f,
+    8.2117995245e-04f,
+    5.8334443946e-07f,
+    4.5432246829e-07f,
+    3.9414867729e-07f,
+    7.9077565350e-05f,
 };
 
 /* Per-channel output right-shift stored at byte 9 of each 64-byte buffer */
-static const int layer0_out_shifts[16] = { 5, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 4, 5, 5, 5, 4 };
+static const int layer0_out_shifts[16] = { 5, 3, 4, 3, 3, 3, 3, 3, 3, 4, 6, 3, 4, 4, 5, 3 };

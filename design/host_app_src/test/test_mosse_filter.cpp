@@ -786,6 +786,11 @@ void run_scale_tests()
         const double H0 = 64.0, W0 = 64.0;
         const float  CONF = 2.0f;
         const double MINR = 0.5, MAXR = 2.0;
+        // The cases below predate the MaxStep rate limit and exercise the OTHER
+        // vetoes, several at |idx| far beyond any rate limit (-12, +-16, 15). They
+        // pass max_step = 0 so they keep asserting exactly what they asserted
+        // before it existed; MaxStep has its own block at the end.
+        const int NOSTEP = 0;
 
         auto mk = [](int idx, double factor, double conf) {
             ScaleResult r;
@@ -796,7 +801,7 @@ void run_scale_tests()
         // The five healthy frames: level +0, conf 3.30-3.31. All must pass.
         {
             ScaleDecision d = scale_gate(mk(0, 1.0, 3.31), S, H0, W0, H0, W0,
-                                         CONF, MINR, MAXR);
+                                         CONF, MINR, MAXR, NOSTEP);
             check_true("healthy (idx 0, conf 3.31) accepts", d.accept, "");
             check_true("healthy reason", d.reason == ScaleVeto::Accept, "");
         }
@@ -804,7 +809,7 @@ void run_scale_tests()
         // This is the single frame the whole gate exists to reject.
         {
             ScaleDecision d = scale_gate(mk(-12, 0.7885, 1.22), S, H0, W0, H0, W0,
-                                         CONF, MINR, MAXR);
+                                         CONF, MINR, MAXR, NOSTEP);
             check_true("frame-6 collapse (idx -12, conf 1.22) HELD", !d.accept, "");
             check_true("frame-6 reason is LOW_CONF",
                        d.reason == ScaleVeto::LowConf, "");
@@ -815,7 +820,7 @@ void run_scale_tests()
         // that ordering is the whole reason the reasons are an enum.
         {
             ScaleDecision d = scale_gate(mk(16, 1.3728, 1.57), S, H0, W0, H0, W0,
-                                         CONF, MINR, MAXR);
+                                         CONF, MINR, MAXR, NOSTEP);
             check_true("search-rail (idx +16) HELD", !d.accept, "");
             check_true("search-rail reason beats low-conf",
                        d.reason == ScaleVeto::AtSearchRail, "");
@@ -824,7 +829,7 @@ void run_scale_tests()
         // veto one direction only and look like a working gate.
         {
             ScaleDecision d = scale_gate(mk(-16, 0.7284, 3.0), S, H0, W0, H0, W0,
-                                         CONF, MINR, MAXR);
+                                         CONF, MINR, MAXR, NOSTEP);
             check_true("negative search-rail HELD, high conf", !d.accept, "");
             check_true("negative rail reason",
                        d.reason == ScaleVeto::AtSearchRail, "");
@@ -833,29 +838,29 @@ void run_scale_tests()
         // costs the outer levels of the search range.
         {
             ScaleDecision d = scale_gate(mk(15, 1.3459, 3.0), S, H0, W0, H0, W0,
-                                         CONF, MINR, MAXR);
+                                         CONF, MINR, MAXR, NOSTEP);
             check_true("idx 15 (interior) accepts", d.accept, "");
         }
         // Drift backstop: confident, interior, but the proposal leaves the bounds.
         {
             ScaleDecision d = scale_gate(mk(1, 1.02, 3.0), S, 20.0, 20.0, H0, W0,
-                                         CONF, MINR, MAXR);
+                                         CONF, MINR, MAXR, NOSTEP);
             check_true("below min_rel HELD", !d.accept, "");
             check_true("below min_rel reason",
                        d.reason == ScaleVeto::OutOfRange, "");
         }
         {
             ScaleDecision d = scale_gate(mk(1, 1.02, 3.0), S, 130.0, 130.0, H0, W0,
-                                         CONF, MINR, MAXR);
+                                         CONF, MINR, MAXR, NOSTEP);
             check_true("above max_rel HELD", !d.accept, "");
         }
         // The test sequence's own envelope (0.70x..1.30x) must NOT be clipped, or
         // the gate would fight the ground truth it is being scored against.
         {
             ScaleDecision a = scale_gate(mk(1, 1.0, 3.0), S, 64.0 * 0.70, 64.0 * 0.70,
-                                         H0, W0, CONF, MINR, MAXR);
+                                         H0, W0, CONF, MINR, MAXR, NOSTEP);
             ScaleDecision b = scale_gate(mk(1, 1.0, 3.0), S, 64.0 * 1.30, 64.0 * 1.30,
-                                         H0, W0, CONF, MINR, MAXR);
+                                         H0, W0, CONF, MINR, MAXR, NOSTEP);
             check_true("SCALE_TRAJ envelope 0.70x admitted", a.accept, "");
             check_true("SCALE_TRAJ envelope 1.30x admitted", b.accept, "");
         }
@@ -863,19 +868,205 @@ void run_scale_tests()
         // must survive, exactly as they do for PSR_GATE_MIN=0.
         {
             ScaleDecision d = scale_gate(mk(-12, 0.7885, 1.22), S, H0, W0, H0, W0,
-                                         0.0f, MINR, MAXR);
+                                         0.0f, MINR, MAXR, NOSTEP);
             check_true("conf_min=0 accepts a low-conf interior estimate",
                        d.accept, "");
             check_true("conf_min=0 reason", d.reason == ScaleVeto::Disabled, "");
             ScaleDecision r = scale_gate(mk(16, 1.3728, 1.57), S, H0, W0, H0, W0,
-                                         0.0f, MINR, MAXR);
+                                         0.0f, MINR, MAXR, NOSTEP);
             check_true("conf_min=0 still vetoes the search rail", !r.accept, "");
         }
+        // ---- MaxStep: the per-frame RATE limit -------------------------
+        // Driven by the values hardware produced on 2026-08-25 (car1 anchor 0,
+        // runs/run_0825_1314.log), not invented ones — every one of these idx
+        // values is one the board actually proposed.
+        {
+            const int STEP1 = 1;
+            // Frame 490: conf 2.00 against a 2.00 threshold, so it PASSES the
+            // confidence test on the nose, and moves the box 1.42x in one frame
+            // while the tracker was 227 px off target. This is the frame the
+            // veto exists for, and it must be rejected as MAX_STEP rather than
+            // as anything else — the reason is the finding.
+            ScaleDecision d = scale_gate(mk(9, 1.4233, 2.00), S, 105.0, 108.0,
+                                         H0, W0, CONF, MINR, 2.5, STEP1);
+            check_true("f490 (idx +9, conf 2.00) HELD", !d.accept, "");
+            check_true("f490 reason is MAX_STEP",
+                       d.reason == ScaleVeto::MaxStep, "");
+            check_double("f490 proposal still recorded", d.new_h,
+                         105.0 * 1.4233, 1e-9);
+        }
+        {
+            const int STEP1 = 1;
+            // Both signs, because a one-sided comparison vetoes growth only and
+            // still looks like a working gate — the same trap the search-rail
+            // case above guards.
+            ScaleDecision up = scale_gate(mk(2, 1.0816, 3.0), S, H0, W0, H0, W0,
+                                          CONF, MINR, MAXR, STEP1);
+            ScaleDecision dn = scale_gate(mk(-2, 0.9246, 3.0), S, H0, W0, H0, W0,
+                                          CONF, MINR, MAXR, STEP1);
+            check_true("idx +2 HELD at max_step 1", !up.accept, "");
+            check_true("idx -2 HELD at max_step 1", !dn.accept, "");
+            check_true("idx -2 reason", dn.reason == ScaleVeto::MaxStep, "");
+        }
+        {
+            const int STEP1 = 1;
+            // The boundary is INCLUSIVE, and it has to be: |idx| <= 1 is the
+            // entire population the synthetic detector ever proposed across 199
+            // frames, so an off-by-one here would freeze the scale filter
+            // completely while still reporting a reason that looks deliberate.
+            ScaleDecision a = scale_gate(mk(1, 1.04, 3.0), S, H0, W0, H0, W0,
+                                         CONF, MINR, MAXR, STEP1);
+            ScaleDecision b = scale_gate(mk(-1, 0.9615, 3.0), S, H0, W0, H0, W0,
+                                         CONF, MINR, MAXR, STEP1);
+            ScaleDecision z = scale_gate(mk(0, 1.0, 3.0), S, H0, W0, H0, W0,
+                                         CONF, MINR, MAXR, STEP1);
+            check_true("idx +1 accepted at max_step 1", a.accept, "");
+            check_true("idx -1 accepted at max_step 1", b.accept, "");
+            check_true("idx  0 accepted at max_step 1", z.accept, "");
+        }
+        {
+            // max_step = 0 disables the RATE test only, exactly as conf_min = 0
+            // disables the confidence test. The structural vetoes must survive,
+            // or "disabled" would quietly mean "ungated".
+            ScaleDecision d = scale_gate(mk(9, 1.4233, 3.0), S, 105.0, 108.0,
+                                         H0, W0, CONF, MINR, 2.5, 0);
+            check_true("max_step=0 admits idx +9", d.accept, "");
+            ScaleDecision r = scale_gate(mk(16, 1.3728, 3.0), S, H0, W0, H0, W0,
+                                         CONF, MINR, MAXR, 0);
+            check_true("max_step=0 still vetoes the search rail", !r.accept, "");
+            check_true("max_step=0 rail reason",
+                       r.reason == ScaleVeto::AtSearchRail, "");
+        }
+        {
+            // ORDERING. A proposal that is both at the rail and beyond the rate
+            // limit reports AT_SEARCH_RAIL, the stronger statement: the argmax is
+            // the edge of what was searched, so the true optimum is not merely
+            // large, it is unmeasured.
+            ScaleDecision d = scale_gate(mk(16, 1.3728, 3.0), S, H0, W0, H0, W0,
+                                         CONF, MINR, MAXR, 1);
+            check_true("rail beats max_step", d.reason == ScaleVeto::AtSearchRail, "");
+            // ...and a rate-limited proposal that is ALSO low-conf reports
+            // MAX_STEP, because conf provably cannot separate a wrong proposal
+            // from a big correct one and the magnitude can.
+            ScaleDecision e = scale_gate(mk(7, 1.3159, 1.20), S, H0, W0, H0, W0,
+                                         CONF, MINR, 2.5, 1);
+            check_true("max_step beats low_conf", e.reason == ScaleVeto::MaxStep, "");
+        }
+        {
+            // THE SHIPPING DEFAULT, asserted directly. The block above sweeps
+            // max_step as a parameter; this pins what the build actually uses,
+            // because the value was chosen by measurement (scale_loop_sim: a
+            // limit of 1 parks the smooth arm 123 of 200 frames) and a silent
+            // change back to 1 would look like a tightening rather than the
+            // regression it is.
+            const int D = DEFAULT_SCALE_MAX_STEP;
+            check_true("default max_step is 2, not the tempting 1", D == 2, "");
+            ScaleDecision two = scale_gate(mk(2, 1.0816, 3.0), S, H0, W0, H0, W0,
+                                           CONF, MINR, MAXR, D);
+            ScaleDecision nine = scale_gate(mk(9, 1.4233, 2.00), S, 105.0, 108.0,
+                                            H0, W0, CONF, MINR, 2.5, D);
+            check_true("default admits idx +-2 (the sim's smooth arm needs it)",
+                       two.accept, "");
+            check_true("default still vetoes f490's idx +9", !nine.accept, "");
+            check_true("default f490 reason", nine.reason == ScaleVeto::MaxStep, "");
+        }
+        {
+            // The tag and the sentence must exist for the new reason. A veto that
+            // prints "?" in the [scale] summary is a veto nobody will diagnose.
+            check_true("MAX_STEP has a tag",
+                       std::string(scale_veto_tag(ScaleVeto::MaxStep)) == "MAX_STEP", "");
+            check_true("MAX_STEP has a why",
+                       std::string(scale_veto_why(ScaleVeto::MaxStep)).size() > 40, "");
+        }
+
+        // ---- COASTING THROUGH A HOLD -----------------------------------
+        // The property that makes a coast safe is that its total drift is
+        // BOUNDED, so a long hold decays back to the freeze this replaces
+        // instead of becoming a second way to lose the target. Everything here
+        // asserts that bound rather than a transcribed constant.
+        {
+            CoastState c;
+            double dr = 0.0, dc = 0.0;
+            // Nothing measured yet: a hold before the first accepted frame must
+            // coast by NOTHING, not by an undefined velocity. This is the real
+            // frame-0-then-gated case, not a hypothetical.
+            check_true("coast with no measurement does not move",
+                       !coast_step(c, 0.5, &dr, &dc), "");
+
+            coast_observe(c, 10.0, -4.0);
+            check_true("first held frame gets the FULL measured velocity",
+                       coast_step(c, 0.5, &dr, &dc) && dr == 10.0 && dc == -4.0, "");
+            check_true("second held frame is halved at decay 0.5",
+                       coast_step(c, 0.5, &dr, &dc) && dr == 5.0 && dc == -2.0, "");
+            check_true("third is quartered",
+                       coast_step(c, 0.5, &dr, &dc) && dr == 2.5 && dc == -1.0, "");
+
+            // THE BOUND. Sum the whole run and check it against the closed form,
+            // which is what keeps a hold from walking the window away.
+            CoastState b;
+            coast_observe(b, 10.0, -4.0);
+            double sr = 0.0, sc = 0.0;
+            for (int i = 0; i < 200; ++i) {
+                double a = 0.0, o = 0.0;
+                if (!coast_step(b, 0.5, &a, &o)) break;
+                sr += a; sc += o;
+            }
+            const double drift = std::sqrt(sr * sr + sc * sc);
+            const double bound = coast_drift_bound(b, 0.5);
+            char det[96];
+            snprintf(det, sizeof det, "%.4f <= %.4f", drift, bound);
+            check_true("total drift stays within v/(1-decay)", drift <= bound + 1e-9, det);
+            // ...and it must actually APPROACH the bound, or "bounded" would be
+            // satisfied by a coast that does nothing at all.
+            check_true("drift reaches most of the bound", drift > 0.9 * bound, det);
+            // A faded run must stop rather than dribble forever, so a 200-frame
+            // hold does not accumulate denormal noise.
+            double a = 0.0, o = 0.0;
+            check_true("a faded coast reports nothing to do",
+                       !coast_step(b, 0.5, &a, &o), "");
+        }
+        {
+            // decay 0 is the "coast exactly one frame" policy the sweep measured
+            // at 94.8% -- it must be reachable, not an approximation of it.
+            CoastState c;
+            coast_observe(c, 3.0, 4.0);
+            double dr = 0.0, dc = 0.0;
+            check_true("decay 0: first held frame moves",
+                       coast_step(c, 0.0, &dr, &dc) && dr == 3.0 && dc == 4.0, "");
+            check_true("decay 0: second does not",
+                       !coast_step(c, 0.0, &dr, &dc), "");
+            check_double("decay 0 bound is |v|", coast_drift_bound(c, 0.0), 5.0, 1e-12);
+        }
+        {
+            // An accepted frame RESETS the run, so a hold after a long previous
+            // hold coasts at full velocity again. Without the reset the tracker
+            // would coast less and less the longer it ran, which is a slow
+            // failure and exactly the kind this project keeps not noticing.
+            CoastState c;
+            coast_observe(c, 8.0, 0.0);
+            double dr = 0.0, dc = 0.0;
+            coast_step(c, 0.5, &dr, &dc);
+            coast_step(c, 0.5, &dr, &dc);          // decayed to 0.5
+            coast_observe(c, 8.0, 0.0);            // a frame was accepted
+            check_true("an accepted frame restores full velocity",
+                       coast_step(c, 0.5, &dr, &dc) && dr == 8.0, "");
+        }
+        {
+            // A stationary target measured as stationary must not be coasted --
+            // this is the occlusion case the freeze policy exists for, and it is
+            // the direction in which a coast can do harm.
+            CoastState c;
+            coast_observe(c, 0.0, 0.0);
+            double dr = 0.0, dc = 0.0;
+            check_true("zero measured velocity never coasts",
+                       !coast_step(c, 0.5, &dr, &dc), "");
+        }
+
         // An invalid result must never resize the box, and must say so as
         // INVALID rather than masquerading as a rejection.
         {
             ScaleResult bad;                       // valid = false
-            ScaleDecision d = scale_gate(bad, S, H0, W0, H0, W0, CONF, MINR, MAXR);
+            ScaleDecision d = scale_gate(bad, S, H0, W0, H0, W0, CONF, MINR, MAXR, NOSTEP);
             check_true("invalid result HELD", !d.accept, "");
             check_true("invalid reason", d.reason == ScaleVeto::Invalid, "");
         }
@@ -884,12 +1075,19 @@ void run_scale_tests()
         // silently.
         {
             ScaleDecision d = scale_gate(mk(0, 1.0, 3.0), 1, H0, W0, H0, W0,
-                                         CONF, MINR, MAXR);
+                                         CONF, MINR, MAXR, NOSTEP);
             check_true("S=1 does not trip the rail veto", d.accept, "");
         }
         // Every reason must have a tag and a sentence — a verdict with no
         // explanation is the thing this design specifically does not ship.
         {
+            // The loop is bounded by the LAST enumerator, so a veto appended
+            // after OutOfRange would silently escape coverage -- the same shape
+            // as the layer0.h #error that turned out to be unreachable. This
+            // line makes adding one a compile error instead.
+            static_assert((int)ScaleVeto::OutOfRange == 6,
+                          "ScaleVeto changed: check this coverage loop still "
+                          "reaches every enumerator");
             bool all = true;
             for (int i = 0; i <= (int)ScaleVeto::OutOfRange; ++i) {
                 const char *t = scale_veto_tag((ScaleVeto)i);

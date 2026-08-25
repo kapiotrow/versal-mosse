@@ -10,6 +10,7 @@
                        // this file is also cross-compiled for aarch64.
 #include <climits>
 #include <cmath>
+#include <limits>
 #include <cstring>
 
 namespace mosse {
@@ -912,7 +913,8 @@ void filter_quantize_q15(const FilterState &st, const double *energy,
 // -----------------------------------------------------------------------
 ScaleDecision scale_gate(const ScaleResult &sr, int n_scales,
                          double cur_h, double cur_w, double h0, double w0,
-                         float conf_min, double min_rel, double max_rel)
+                         float conf_min, double min_rel, double max_rel,
+                         int max_step)
 {
     ScaleDecision d;
     d.conf      = sr.psr;
@@ -938,6 +940,22 @@ ScaleDecision scale_gate(const ScaleResult &sr, int n_scales,
         return d;
     }
 
+    // RATE limit on this frame's proposal, as distinct from the drift bound
+    // below. See the MaxStep note in the header for the two datasets behind the
+    // default and for what it costs when it is wrong. Disabled at max_step <= 0,
+    // the same convention conf_min <= 0 uses.
+    //
+    // Deliberately checked before the confidence test: conf cannot distinguish a
+    // wrong proposal from a big correct correction — that is a documented
+    // property of the measurement, not a tuning failure — so a large jump has to
+    // be judged on its magnitude rather than on how confident it looks. On
+    // hardware the frame that inflated the box 1.42x carried conf 2.00 against a
+    // 2.00 threshold, i.e. it passed the confidence test on the nose.
+    if (max_step > 0 && (sr.idx > max_step || sr.idx < -max_step)) {
+        d.reason = ScaleVeto::MaxStep;
+        return d;
+    }
+
     // The absolute backstop is checked before the confidence test so that a
     // proposal which is BOTH confident and out of bounds is reported as what it
     // is. It is a drift bound, not a per-frame plausibility test.
@@ -956,6 +974,34 @@ ScaleDecision scale_gate(const ScaleResult &sr, int n_scales,
     return d;
 }
 
+void coast_observe(CoastState &c, double dr_frame, double dc_frame)
+{
+    c.vr    = dr_frame;
+    c.vc    = dc_frame;
+    c.scale = 1.0;          // a fresh hold run starts at full velocity
+}
+
+bool coast_step(CoastState &c, double decay, double *dr_frame, double *dc_frame)
+{
+    if (c.scale <= 0.0 || (c.vr == 0.0 && c.vc == 0.0)) return false;
+    *dr_frame = c.vr * c.scale;
+    *dc_frame = c.vc * c.scale;
+    // Decay AFTER applying, so the first held frame gets the full measured
+    // velocity. That frame is the one the hold budget is usually spent on --
+    // 30 of 62 sequences have a median budget of 4 frames or fewer.
+    c.scale *= decay;
+    if (c.scale < 1e-6) c.scale = 0.0;   // a coast that has faded is a freeze
+    return true;
+}
+
+double coast_drift_bound(const CoastState &c, double decay)
+{
+    const double v = std::sqrt(c.vr * c.vr + c.vc * c.vc);
+    if (decay >= 1.0) return std::numeric_limits<double>::infinity();
+    if (decay <= 0.0) return v;
+    return v / (1.0 - decay);
+}
+
 const char *scale_veto_tag(ScaleVeto v)
 {
     switch (v) {
@@ -963,6 +1009,7 @@ const char *scale_veto_tag(ScaleVeto v)
         case ScaleVeto::Disabled:     return "ACCEPT(conf gate disabled)";
         case ScaleVeto::Invalid:      return "INVALID";
         case ScaleVeto::AtSearchRail: return "AT_SEARCH_RAIL";
+        case ScaleVeto::MaxStep:      return "MAX_STEP";
         case ScaleVeto::LowConf:      return "LOW_CONF";
         case ScaleVeto::OutOfRange:   return "OUT_OF_RANGE";
     }
@@ -986,6 +1033,12 @@ const char *scale_veto_why(ScaleVeto v)
                    "the edge of what was searched rather than a maximum. The size "
                    "envelope moves far slower than the filter steps, so the true "
                    "level can never legitimately be at the rail.";
+        case ScaleVeto::MaxStep:
+            return "the proposal moves the box by more levels in ONE frame than "
+                   "SCALE_MAX_STEP allows. A rate limit, not a drift bound: a "
+                   "rigid target's size cannot change this fast between frames, "
+                   "and confidence cannot tell a wrong proposal from a big "
+                   "correct one, so the magnitude is judged directly.";
         case ScaleVeto::LowConf:
             return "scale confidence is below the threshold — the size response "
                    "is not peaked enough to act on. This is the occlusion / "

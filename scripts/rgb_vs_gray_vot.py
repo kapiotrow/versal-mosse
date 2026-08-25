@@ -70,6 +70,7 @@ from rgb_vs_gray_holdout import (                   # noqa: E402
     sat_reset, sat_frac,
 )
 from rgb_vs_gray_loop import box_iou, ETA, PSR_GATE_MIN   # noqa: E402
+from vot_prepare import reduce_box                  # noqa: E402
 
 ROOT = Path("test-sequences")
 SKIP = 5        # frames skipped after a failure before re-initialisation
@@ -107,14 +108,33 @@ def discover():
 
 
 def load_gt(path):
-    """VOT rotated polygon -> axis-aligned (row, col, h, w), min-max convention."""
-    out = []
-    for line in path.read_text().split():
-        v = np.array([float(x) for x in line.split(',')])
-        x, y = v[0::2], v[1::2]
-        out.append((0.5 * (y.min() + y.max()), 0.5 * (x.min() + x.max()),
-                    y.max() - y.min(), x.max() - x.min()))
-    return out
+    """One groundtruth file -> axis-aligned (row, col, h, w) per frame.
+
+    THE REDUCTION IS SINGLE-SOURCED FROM vot_prepare.reduce_box, DELIBERATELY.
+
+    This function used to carry its own polygon-only copy of the rule. VOT uses
+    two groundtruth formats -- 4-value `x,y,w,h` rectangles (ALL of stb2022) and
+    2n-value rotated polygons (the VOT2015-era sequences in test-sequences/) --
+    and the polygon rule applied to a rectangle silently gives x=[x,w], y=[y,h]:
+    `fernando` frame 291 (440,229,198,230) reduces to a 1.0 x 242.0 sliver
+    instead of 230 x 198. Complete, plausible, and wrong in every box.
+
+    On test-sequences/ the polygon-only rule is correct, so this file was right
+    for every run it has ever done -- and would have produced garbage the first
+    time it was pointed at stb2022. Phase 1 found it in vot_prepare; the copy
+    here was the reason Phase 0c's "independent" cross-check agreed, since it
+    was two implementations of ONE wrong rule.
+
+    So there is now one implementation. `vot_prepare.verify --check-gt` compares
+    the manifests against the toolkit's own parse_region(), a genuinely
+    independent parser, which means this function inherits that check instead of
+    needing its own. Importing the converter costs nothing: its module level is
+    numpy and constants, and the dependency runs offline-harness -> converter,
+    never the other way (vot_prepare imports nothing from the offline stack, on
+    purpose).
+    """
+    return [reduce_box([float(t) for t in line.split(',')])
+            for line in path.read_text().split()]
 
 
 def load_frame(path):

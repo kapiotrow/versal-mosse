@@ -65,7 +65,34 @@
 // unit, with no XRT header, so `make test_scene` compiles and tests it natively
 // in seconds — the same reason mosse_filter.{h,cpp} is separate. Both of its
 // failure modes (wrong interleave, missed touch) are silent on hardware.
+#include <map>
+
 #include "scene_colour.h"
+
+// WHERE FRAMES COME FROM. The Makefile passes -DFRAME_SOURCE_VOT on BOTH arms
+// (FRAME_SOURCE=synth emits 0, =vot emits 1) rather than only on one -- a bare
+// #ifndef default in the host is not a safety net, it is what makes a
+// build/flag mismatch silent, which is precisely how SCENE_VERIFY=1 once built
+// the instrument DISABLED. The default below exists only so a stray compile of
+// this file outside the Makefile still means "synthetic scene".
+#ifndef FRAME_SOURCE_VOT
+#  define FRAME_SOURCE_VOT 0
+#endif
+#if FRAME_SOURCE_VOT
+// Manifest, blob, run order and trajectory. No XRT header in it, so
+// `make test_vot_source` runs its 19 mutants natively in seconds.
+#  include "vot_source.h"
+#  if CONV_IN_CH == 3
+// DELIBERATELY LOUD RATHER THAN PLAUSIBLE. The RGB arm needs the manifest's
+// `.luma` sidecar staged alongside the blob, because scale_extract() reads an
+// intensity template out of scene_luma() and a VOT frame arrives interleaved.
+// vot_prepare.py emits that sidecar at --channels 3 but it has never been
+// exercised, and the plan runs grayscale first (runs/vot/phase1.md). Building
+// this pair today would give a colour datapath with a scale filter reading the
+// R plane as luma -- a tracker that works slightly worse, not one that fails.
+#    error "FRAME_SOURCE=vot with CONV_IN_CH=3 is not wired yet: scale_extract needs the manifest's .luma sidecar. Run grayscale first."
+#  endif
+#endif
 
 // -----------------------------------------------------------------------
 // Build-time constants (set via Makefile -D flags)
@@ -213,6 +240,394 @@ constexpr size_t RESP_BYTES        = PATCH_ELEMS * 4;
 // * ROI_IN_CH itself. Do not pre-multiply it, or the ROI walks off the row.
 constexpr size_t FRAME_PIXELS      = (size_t)FRAME_ROWS * FRAME_COLS;
 constexpr size_t FRAME_BYTES       = FRAME_PIXELS * CONV_IN_CH;
+
+// ---- RUNTIME frame geometry --------------------------------------------
+// FRAME_ROWS/FRAME_COLS above are the MAXIMUM, i.e. what frame_bo, g_frame_host
+// and the background are ALLOCATED at. What the pipeline RUNS at is these, and
+// at FRAME_SOURCE=vot they come from the sequence's manifest and change per
+// sequence. Everything downstream already took rows/cols as arguments --
+// scene_*, scale_extract, roi_crop's AXI-Lite registers -- so this is a
+// substitution, not a rewrite, and at FRAME_SOURCE=synth they hold the macro
+// values and every existing result stands unchanged.
+//
+// The stride is g_frame_cols, so a smaller sequence occupies a dense PREFIX of
+// the buffer rather than a sub-rectangle of a 1920-wide one. g_frame_host and
+// frame_bo agree on that because the only writer of frame_bo is a bulk memcpy
+// of g_frame_bytes out of g_frame_host.
+static int    g_frame_rows  = FRAME_ROWS;
+static int    g_frame_cols  = FRAME_COLS;
+static size_t g_frame_bytes = FRAME_BYTES;
+
+static inline void set_frame_geometry(int rows, int cols)
+{
+    g_frame_rows  = rows;
+    g_frame_cols  = cols;
+    g_frame_bytes = (size_t)rows * cols * CONV_IN_CH;
+}
+
+// Frames this run executes. ITER_CNT at FRAME_SOURCE=synth; the job's length at
+// FRAME_SOURCE=vot, where the dataset decides and ITER_CNT is IGNORED (the run
+// covers [anchor .. end] or [anchor .. 0] and nothing else -- a run truncated to
+// ITER_CNT would emit a short trajectory, which the toolkit reads without
+// complaint and scores as a tracker that stopped early).
+static int g_run_frames = ITER_CNT;
+// Frames executed across ALL runs in this process. The [dma] and [apu]
+// cumulative reports are process-wide, so they must divide by this and not by
+// the last run's length -- which at multi-start would be a per-frame average
+// computed over the wrong denominator, i.e. a plausible wrong number.
+static int g_frames_total = 0;
+
+// THE RUN-STATE DIGEST, and why the trajectory alone is not enough.
+//
+// The first determinism run (RESET_MUTANT=1, runs/run_0825_1443.log) had the
+// mean_prev re-seed DELIBERATELY skipped and still produced a BYTE-IDENTICAL
+// trajectory. The leak was real and visible in the diagnostics from frame 1 —
+// accum 1963 vs 1961, response 1556 vs 1553, B2 removing 667 vs 671 — but a
+// trajectory is quantised: the box comes from an integer peak bin, so a 0.1%
+// difference in the response never reaches it. "Nearly identical tracking" is
+// precisely the outcome CLAUDE.md records as making a bit-identical criterion
+// useless, and this test had walked into it.
+//
+// So the digest hashes what the pipeline actually PRODUCED, before any argmax:
+// the full response buffer, plus the tracker's own continuous state. Two runs
+// that agree here agree bit-for-bit on the datapath, not merely on their
+// conclusions.
+//
+// FNV-1a, because it needs to be reproducible across builds and is not
+// security-relevant. Its cost is measured in its own AP slot.
+static uint64_t g_det_hash = 1469598103934665603ULL;
+
+static inline void det_hash_bytes(const void *p, size_t n)
+{
+    const uint8_t *b = (const uint8_t *)p;
+    uint64_t h = g_det_hash;
+    for (size_t i = 0; i < n; ++i) {
+        h ^= b[i];
+        h *= 1099511628211ULL;
+    }
+    g_det_hash = h;
+}
+
+// Available on BOTH arms deliberately. This project's acceptance criterion for
+// every optimisation has been "tracking comes back bit-identical", checked by
+// eye across two logs; the digest makes that one number. It is printed at the
+// end of every run, so any two runs anywhere can be compared without a diff.
+
+// ---- COASTING THROUGH A HOLD ------------------------------------------
+// On a gate veto the host holds position. That is right for occlusion and it
+// assumes the target STAYS PUT while the filter is frozen — an assumption
+// stb2022 violates on most of its sequences. Measured from groundtruth alone
+// (scripts/vot_hold_budget.py): the HOLD BUDGET, i.e. frames before the target
+// leaves the frozen box*padding window and recovery becomes impossible for ANY
+// tracker, has a median of 6 frames, is <= 4 on 30 of 62 sequences, and is 0 on
+// four of them. car1's budget is 4 and its longest hold on hardware was 53.
+//
+// So during a hold the window COASTS at the last measured velocity instead of
+// freezing, with the velocity DECAYING each held frame. The decay is what makes
+// this safe rather than a second way to lose the target: total drift over a hold
+// run is bounded by v/(1-decay) = 2v at the default, so a hold can never walk
+// the window further than two frames' worth of motion from where it froze. Pure
+// constant velocity (decay 1.0) is NOT the right answer and was measured to be
+// worse — on a near-stationary target the "velocity" is mostly detection noise,
+// and it took `nature` from 83 frames of budget to 34 and `girl` from 39 to 21.
+//
+// Swept offline over all 62 sequences, mean over sequences:
+//
+//   policy              P(survive 1 held frame)   P(survive 3)   median budget
+//   freeze (was)                  90.3%              69.9%             6
+//   coast decay 0.0               94.8%              74.4%             7
+//   coast decay 0.5  <-- ship     94.9%              76.2%             8
+//   coast decay 1.0               94.9%              74.6%             6
+//
+// At 0.5: 40 of 62 sequences improve, 15 unchanged, 7 marginally worse (the
+// worst being soccer1 12 -> 9), and the mean per-sequence escape rate — frames
+// where even a ONE-frame hold is already fatal — halves, 9.7% -> 5.1%.
+// ball2 goes 55.3% -> 13.5%.
+//
+// DEFAULT OFF, AFTER BEING ON FOR PART OF 2026-08-25. THE TWO METRICS DISAGREE.
+// It shipped OFF first, because the budget metric measures TIME TO FIRST ESCAPE
+// rather than time to unrecoverable, and at car1's three hold onsets it gave
+// freeze 10/0/0 against coast 1/1/1 — i.e. it predicted no rescue. Hardware over
+// 8 sequences and 54 runs said otherwise on mean IoU
+// (runs/vot/evidence_arm_ab.md): 0.2709 -> 0.3005 frame-weighted, nothing worse
+// than -0.0042, car1 job 0 tracking all the way out. Then the SAME 54
+// trajectory pairs were scored by the toolkit (runs/vot/evidence_ar.md) and the
+// ordering reversed: accuracy 0.638 -> 0.616, robustness 0.309 -> 0.288, EAO
+// 0.208 -> 0.194. AR is the metric of record, so the default follows it.
+//
+// The disagreement is mechanical, not statistical. vot fails a run on 10
+// CONSECUTIVE frames at overlap <= 0.1; on a direction change the coast carries
+// the box the old way while the target reverses, so car1 anchor 741 drops out
+// for 13 frames coasting against 7 freezing — over the grace instead of under
+// it. That run then REACQUIRES and tracks ~470 more frames at overlap 0.82,
+// every one of which the rule discards. Failure counts barely move (48 of 54
+// runs vs 49); only their timing does, and a mean cannot see timing.
+//
+// So the coast wins on MANY SHORT holds and loses on ONE LONG hold that crosses
+// a turn. The untested middle is a cap on consecutive coasted frames, k from
+// the per-sequence budget above (median 6, car1 4). Closed loop: it needs a
+// board run, not more analysis of the trajectories already on disk.
+//
+// THE MODEL WAS OPEN LOOP AND THE TRACKER IS CLOSED LOOP. It treated the
+// observed 29-frame gated run as a fixed input, when in fact coasting keeps the
+// window on the target so frames that would have been GATED are ACCEPTED — and
+// every accept resets the velocity and restarts the coast. The 29-frame hold was
+// a consequence of freezing, not a property of the scene.
+//
+// What the coast CANNOT do, also measured: rescue a tracker that never acquires.
+// ball3 gates on 69% of frames and coasted ZERO times, because it has no
+// accept->hold transitions at all — every hold run starts before any frame has
+// been accepted, so there is no measured velocity and coast_step() correctly
+// refuses. Holding a lot is not the same as having something to coast on.
+#ifndef HOLD_COAST
+#  define HOLD_COAST 0
+#endif
+#ifndef COAST_DECAY
+#  define COAST_DECAY 0.5
+#endif
+
+#if FRAME_SOURCE_VOT
+// -----------------------------------------------------------------------
+// THE VOT RUN — one sequence, one job (Phase 2). Everything here happens
+// OUTSIDE the frame loop: a manifest parse and one sequential blob read per
+// sequence, and one trajectory write at the end. Nothing in this block runs
+// per frame except vot_frame(), which is a memcpy.
+// -----------------------------------------------------------------------
+#ifndef VOT_DATA_DIR
+#  define VOT_DATA_DIR    "/mnt/vot"
+#endif
+#ifndef VOT_RESULTS_DIR
+#  define VOT_RESULTS_DIR "/mnt/vot-results"
+#endif
+#ifndef VOT_SEQUENCE
+#  define VOT_SEQUENCE    "car1"
+#endif
+#ifndef VOT_JOB
+#  define VOT_JOB         0
+#endif
+// DELIBERATELY BREAK ONE PIECE OF run_reset(), to prove the determinism test can
+// FAIL. A reset test that has never been shown to fail is worth nothing on a
+// path with no prior coverage — the same rule every RGB suite was built to.
+// A flag rather than a code edit so the negative control is repeatable, is in
+// the log, and cannot be left commented out by accident.
+//   0 none        1 skip mean_prev   2 skip filter_bo zeroing
+//   3 skip g_filter   4 skip coast    5 skip the scale reconfigure
+#ifndef RESET_MUTANT
+#  define RESET_MUTANT 0
+#endif
+
+struct VotRun {
+    std::string   data_dir    = VOT_DATA_DIR;
+    std::string   results_dir = VOT_RESULTS_DIR;
+    std::string   sequence    = VOT_SEQUENCE;
+    int           job_index   = VOT_JOB;
+    int           max_frames  = 0;      // >0 = bring-up truncation, see below
+    std::vector<int> job_list;          // runs to execute, in order
+    std::string   job_spec;             // --vot-jobs: "all" or "0,3,0"; empty = --vot-job
+    vot::Manifest manifest;
+    vot::Blob     blob;
+    vot::Job      job;
+    std::vector<int> order;             // dataset frame index, in RUN order
+    vot::Trajectory  traj;
+};
+static VotRun g_vot;
+
+// argv[1] is the xclbin; everything after it is ours. UNRECOGNISED ARGUMENTS
+// ARE FATAL, not ignored: a typo in --vot-seq that silently falls back to the
+// compiled-in default produces a complete run attributed to the wrong sequence,
+// and the console would not say so.
+static bool vot_parse_args(int argc, char **argv)
+{
+    for (int i = 2; i < argc; ++i) {
+        const std::string a = argv[i];
+        const bool needs_value = (a == "--vot-data" || a == "--vot-results" ||
+                                  a == "--vot-seq" || a == "--vot-job" ||
+                                  a == "--vot-jobs" || a == "--vot-max-frames");
+        if (needs_value && i + 1 >= argc) {
+            fprintf(stderr, "%s needs a value\n", a.c_str());
+            return false;
+        }
+        if      (a == "--vot-data")    g_vot.data_dir    = argv[++i];
+        else if (a == "--vot-results") g_vot.results_dir = argv[++i];
+        else if (a == "--vot-seq")     g_vot.sequence    = argv[++i];
+        else if (a == "--vot-job")     g_vot.job_index   = atoi(argv[++i]);
+        else if (a == "--vot-jobs")    g_vot.job_spec    = argv[++i];
+        else if (a == "--vot-max-frames") g_vot.max_frames = atoi(argv[++i]);
+        else {
+            fprintf(stderr,
+                    "unrecognised argument '%s'\n"
+                    "usage: %s <xclbin> [--vot-data DIR] [--vot-results DIR]\n"
+                    "                   [--vot-seq NAME] [--vot-job N]\n"
+                    "                   [--vot-jobs all|N,M,...] [--vot-max-frames N]\n"
+                    "  --vot-jobs runs several anchors in ONE process. Naming the\n"
+                    "  same job twice is the determinism test: its two trajectories\n"
+                    "  must come back byte-identical.\n",
+                    a.c_str(), argv[0]);
+            return false;
+        }
+    }
+    return true;
+}
+
+// Manifest + blob into heap, geometry and run order set. Returns false with a
+// message rather than aborting: this is the staging slot, and Phase 5 runs it 62
+// times in one process.
+static bool vot_stage(void)
+{
+    const std::string mpath = g_vot.data_dir + "/" + g_vot.sequence + ".json";
+    std::string err;
+    if (!vot::manifest_load(mpath, g_vot.manifest, err)) {
+        fprintf(stderr, "[vot] %s\n", err.c_str());
+        return false;
+    }
+    const vot::Manifest &m = g_vot.manifest;
+
+    // The channel count is a BUILD property (CONV_IN_CH picks roi_crop's
+    // datapath and the conv weight layout), so a blob converted for the other
+    // arm cannot be fed to this ELF. Caught here, where it is one line, rather
+    // than as sixteen plausible feature channels.
+    if (m.channels != CONV_IN_CH) {
+        fprintf(stderr, "[vot] %s has %d channel(s), this build is CONV_IN_CH=%d\n",
+                m.sequence.c_str(), m.channels, CONV_IN_CH);
+        return false;
+    }
+    if (m.rows > FRAME_ROWS || m.cols > FRAME_COLS) {
+        fprintf(stderr, "[vot] %s is %dx%d, frame_bo is allocated at %dx%d\n",
+                m.sequence.c_str(), m.rows, m.cols, FRAME_ROWS, FRAME_COLS);
+        return false;
+    }
+    if (g_vot.job_index < 0 || g_vot.job_index >= (int)m.jobs.size()) {
+        fprintf(stderr, "[vot] job %d out of range, %s has %zu\n",
+                g_vot.job_index, m.sequence.c_str(), m.jobs.size());
+        return false;
+    }
+    g_vot.job = m.jobs[g_vot.job_index];
+
+    // 41 frames of stb2022 (0.21%) carry an EMPTY groundtruth box, and Phase 1
+    // checked that no anchor lands on one -- 0 of 419. Asserted anyway because
+    // it is one comparison and the alternative is a filter initialised on a
+    // degenerate box, which tracks confidently and means nothing.
+    if (g_vot.job.init_box.empty()) {
+        fprintf(stderr, "[vot] %s job %d has an empty init box\n",
+                m.sequence.c_str(), g_vot.job_index);
+        return false;
+    }
+
+    const std::string bpath = g_vot.data_dir + "/" + m.blob;
+    if (!g_vot.blob.load(bpath, m, err)) {
+        fprintf(stderr, "[vot] %s\n", err.c_str());
+        return false;
+    }
+
+    set_frame_geometry(m.rows, m.cols);
+    g_vot.order = vot::job_order(g_vot.job, m.frames);
+    if ((int)g_vot.order.size() != g_vot.job.length) {
+        fprintf(stderr, "[vot] run order is %zu frames, job length is %d\n",
+                g_vot.order.size(), g_vot.job.length);
+        return false;
+    }
+    g_run_frames = (int)g_vot.order.size();
+
+    // Bring-up truncation. It shortens the run and therefore the trajectory, so
+    // the trajectory is NOT written -- a short result file is read back without
+    // complaint and scored as a tracker that stopped early.
+    if (g_vot.max_frames > 0 && g_vot.max_frames < g_run_frames) {
+        printf("[vot] TRUNCATED to %d of %d frames for bring-up. NO TRAJECTORY "
+               "WILL BE WRITTEN — a short result scores as a tracker that "
+               "stopped early.\n", g_vot.max_frames, g_run_frames);
+        g_run_frames = g_vot.max_frames;
+    }
+    // The run list. "all" is every job in the manifest, in manifest order; a
+    // comma list runs exactly those, in the order given, and MAY repeat an index
+    // — that is the determinism test, not a mistake, so it is not de-duplicated.
+    g_vot.job_list.clear();
+    if (g_vot.job_spec.empty()) {
+        g_vot.job_list.push_back(g_vot.job_index);
+    } else if (g_vot.job_spec == "all") {
+        for (size_t k = 0; k < m.jobs.size(); ++k) g_vot.job_list.push_back((int)k);
+    } else {
+        const char *p = g_vot.job_spec.c_str();
+        while (*p) {
+            char *end = nullptr;
+            const long v = strtol(p, &end, 10);
+            if (end == p) { fprintf(stderr, "[vot] bad --vot-jobs '%s'\n",
+                                    g_vot.job_spec.c_str()); return false; }
+            g_vot.job_list.push_back((int)v);
+            p = end;
+            while (*p == ',' || *p == ' ') ++p;
+        }
+    }
+    for (int j : g_vot.job_list)
+        if (j < 0 || j >= (int)m.jobs.size()) {
+            fprintf(stderr, "[vot] job %d out of range, %s has %zu\n",
+                    j, m.sequence.c_str(), m.jobs.size());
+            return false;
+        }
+
+    g_vot.traj.begin(g_vot.job);
+
+    printf("[vot] %s  %dx%d x%d  %d frames  md5 %s\n",
+           m.sequence.c_str(), m.rows, m.cols, m.channels, m.frames,
+           m.blob_md5.c_str());
+    printf("[vot] job %d/%zu: anchor %d %s, %d frames  init box %.1fx%.1f at "
+           "(%.1f,%.1f)  anchors=%s\n",
+           g_vot.job_index, m.jobs.size(), g_vot.job.anchor,
+           g_vot.job.forward ? "forward" : "BACKWARD", g_vot.job.length,
+           g_vot.job.init_box.h, g_vot.job.init_box.w,
+           g_vot.job.init_box.row, g_vot.job.init_box.col,
+           m.anchors_source.c_str());
+    // Reported as its own slot, the way the AP_* slots are. phase0a.md budgets
+    // ~4 s for the largest sequence at 117.2 MB/s and expects staging to be
+    // 2-4% of the run -- measure it, do not assume it amortises.
+    if (RESET_MUTANT)
+        printf("[vot] *** RESET_MUTANT=%d IS ACTIVE — run_reset() is DELIBERATELY "
+               "BROKEN (1 mean_prev, 2 filter_bo, 3 g_filter, 4 coast, 5 scale). "
+               "The determinism test MUST fail. Results from this build are not "
+               "tracking results. ***\n", RESET_MUTANT);
+    printf("[vot] %zu run(s) queued: %s\n", g_vot.job_list.size(),
+           g_vot.job_spec.empty() ? "one" : g_vot.job_spec.c_str());
+    printf("[vot] staged %.1f MB in %.2f s = %.1f MB/s\n",
+           g_vot.blob.bytes() / 1048576.0, g_vot.blob.load_seconds(),
+           g_vot.blob.bytes() / 1048576.0 / (g_vot.blob.load_seconds() > 0.0
+                                             ? g_vot.blob.load_seconds() : 1.0));
+    // Advisory, both of them, and both are things Phase 1 measured in this
+    // dataset rather than hypothesised: 11 of 62 sequences push the padded ROI
+    // past the frame edge on 9.6% of frames (roi_crop border-clamps), and 22 of
+    // 419 anchors init from a box under 16 px, the smallest being tennis at 2.0.
+    if (m.roi_exceeds_frame > 0)
+        printf("[vot] NOTE: roi = box x %.1f exceeds the frame on %d of %d "
+               "frames — roi_crop border-clamps them\n",
+               (double)mosse::DEFAULT_PADDING, m.roi_exceeds_frame, m.frames);
+    {
+        const double side = std::min(g_vot.job.init_box.h, g_vot.job.init_box.w);
+        if (side < 16.0)
+            printf("[vot] NOTE: init box side %.1f px — roi_crop's bilinear "
+                   "interpolator runs at %.1fx UPSAMPLE\n",
+                   side, PATCH_ROWS / (side * (double)mosse::DEFAULT_PADDING));
+    }
+    fflush(stdout);
+    return true;
+}
+
+// The per-frame seam: dataset frame for run index k. One memcpy.
+static inline const uint8_t *vot_frame(int k)
+{
+    return g_vot.blob.frame(g_vot.order[(size_t)k]);
+}
+
+// Frames whose groundtruth box is empty. 41 of 19,903 in stb2022, across 12
+// sequences. The toolkit's failure rule ignores them; the board's IoU line
+// cannot, so they are COUNTED and reported rather than quietly scored as 0.
+static int g_vot_empty_gt = 0;
+
+// Trajectories already produced in this process, keyed by job index. A repeated
+// job must come back byte-identical; see the DETERMINISM block after the run
+// loop. Kept in memory because both runs write the same filename.
+static std::map<int, std::string> g_det_seen;
+static int g_det_failures = 0;
+static bool g_det_repeat = false;   // this run repeats an earlier job index
+
+#endif  // FRAME_SOURCE_VOT
 // conv2d weights: CONV_WEIGHT_BYTES_RAW INT8 taps (9 gray / 27 RGB) plus the
 // scalar fields, padded to 64-byte GMIO alignment. See conv_weight_layout.h.
 constexpr size_t WEIGHT_CH_BYTES   = CONV_WEIGHT_BYTES_PAD;
@@ -490,6 +905,9 @@ enum {
                      // calls/frame since 2026-08-21, not four: F_ch's scan now
                      // rides along with unpack_spectrum and its cost is in
                      // AP_UNPACK. The accum scan reads a heap copy, not the BO.
+    AP_DET_HASH,     // the run-state digest — see g_det_hash. Its own slot
+                     // because it is an INSTRUMENT added to the timed path, and
+                     // an instrument whose cost is invisible cannot be judged.
     AP_N
 };
 static const char *g_ap_name[AP_N] = {
@@ -498,7 +916,7 @@ static const char *g_ap_name[AP_N] = {
     "fcol_bo.sync", "BO<->heap stage", "unpack F_ch", "cmul packing",
     "B2 correction", "PSR scan",
     "filter upd+quant", "publish (pack)", "scale extract", "scale detect+update",
-    "diag scan (rails)"
+    "diag scan (rails)", "determinism hash"
 };
 // The enum and the name table are two lists that must stay the same length, in
 // the same order — exactly the class of coupling CLAUDE.md flags as "duplicated
@@ -686,7 +1104,7 @@ static inline int drain_depth_for_frame(int frame)
 // as the first, since it is the converged state.
 static inline bool trace_frame(int frame)
 {
-    return frame == 0 || frame == ITER_CNT - 1;
+    return frame == 0 || frame == g_run_frames - 1;
 }
 
 #define RC_MAX_CALLS 64
@@ -869,7 +1287,7 @@ static void rc_report_calls(int frame)
     // The caller gates this to the first and last frame; RC_TRACE_FRAMES is kept
     // as an additional cap so `RC_TRACE_FRAMES=0` silences the per-call detail
     // without silencing the timeline next to it.
-    if (frame >= RC_TRACE_FRAMES && frame != ITER_CNT - 1) return;
+    if (frame >= RC_TRACE_FRAMES && frame != g_run_frames - 1) return;
     printf("[roi_crop] frame %d per-call detail, ms (look for tick quantization):\n",
            frame);
     for (int i = 0; i < RC_N; ++i) {
@@ -1392,6 +1810,16 @@ static void gate_track(int frame, const mosse::GateDecision &g)
     fflush(stdout);
 }
 
+// Multi-start: every one of these is PER RUN, and a run that inherits the
+// previous one's counters reports a plausible summary for a run that did not
+// happen. Reset from run_reset() together with the tracking and scale counters.
+static void gate_reset_run(void)
+{
+    g_gate_run = g_gate_worst = g_gate_eval = g_gate_hold = 0;
+    for (int i = 0; i < 8; ++i) g_gate_reason_n[i] = 0;
+    g_psr_min = g_psr_max = g_psr_sum = 0.0;
+}
+
 static void gate_report_run(int frames)
 {
     printf("\n[gate] SUMMARY over %d frame(s): %d evaluated, %d accepted, %d gated\n",
@@ -1481,6 +1909,9 @@ static void dump_buffer(const char *tag, int frame, const void *p, size_t bytes)
 #endif
 
 static FILE *g_csv = nullptr;
+// Which run each CSV row belongs to. -1 at FRAME_SOURCE=synth, where there is
+// exactly one run and no anchor.
+static int g_csv_job = 0, g_csv_anchor = -1;
 
 struct FrameDiag {
     double fch = 0.0, accum = 0.0, resp = 0.0, h = 0.0;
@@ -1491,15 +1922,59 @@ static FrameDiag g_fdiag;
 static void csv_open(void)
 {
 #if CSV_LOG
+    // THE NAME CARRIES THE SEQUENCE at FRAME_SOURCE=vot, because one evidence
+    // sweep is one ELF invocation PER SEQUENCE and this file opens in "w" mode:
+    // a fixed name means eight sequences leave one file, and the loss is silent
+    // — the survivor looks like a perfectly good CSV. The arm (HOLD_COAST and
+    // the rest) is NOT in the name: that separation comes from --vot-results,
+    // which already has to differ per arm because the trajectories collide too.
+    //
+    // It stays on the SD card and NOT on the results mount: csv_row() still
+    // fflush()es every row, and putting that on NFS would move a filesystem sync
+    // into the timed path (Phase 4's open item).
+    char namebuf[128];
+    const char *path = "track.csv";
+#if FRAME_SOURCE_VOT
+    {
+        // Defensive sanitisation: the sequence name reaches here from a manifest
+        // on a mount, so it is INPUT. Anything outside [A-Za-z0-9._-] becomes
+        // '_', which keeps a hostile or merely odd name from composing a path.
+        char safe[64];
+        size_t k = 0;
+        for (const char *c = g_vot.manifest.sequence.c_str();
+             *c && k < sizeof(safe) - 1; ++c) {
+            const bool ok = (*c >= 'a' && *c <= 'z') || (*c >= 'A' && *c <= 'Z') ||
+                            (*c >= '0' && *c <= '9') || *c == '.' || *c == '_' ||
+                            *c == '-';
+            safe[k++] = ok ? *c : '_';
+        }
+        safe[k] = '\0';
+        if (k > 0) {
+            snprintf(namebuf, sizeof namebuf, "track_%s.csv", safe);
+            path = namebuf;
+        }
+    }
+#else
+    (void)namebuf;
+#endif
     // Same best-effort placement as dump_buffer(): cwd (the SD card) first, then
     // /tmp. Never fatal — losing the CSV must not abort a 500-frame run.
-    const char *path = "track.csv";
+    char tmpbuf[160];
     g_csv = fopen(path, "w");
-    if (!g_csv) { path = "/tmp/track.csv"; g_csv = fopen(path, "w"); }
+    if (!g_csv) {
+        snprintf(tmpbuf, sizeof tmpbuf, "/tmp/%s", path);
+        path = tmpbuf;
+        g_csv = fopen(path, "w");
+    }
     if (!g_csv) {
         printf("[csv] no writable location — stdout diagnostics only\n");
         return;
     }
+    // job,anchor are TRAILING columns, added 2026-08-25 for multi-start. One
+    // track.csv now carries several runs, and rows from different anchors are
+    // otherwise indistinguishable -- a mean IoU computed over the whole file
+    // would silently average unrelated runs. Trailing so every existing reader
+    // that selects by header name is unaffected.
     fprintf(g_csv,
             "frame,occluded,evaluated,accept,reason,psr_bolme,psr_ratio,peak,"
             "dr_bin,dc_bin,resp00_over_peak,est_row,est_col,est_h,est_w,"
@@ -1514,7 +1989,7 @@ static void csv_open(void)
             // accum_max/h_max are the other two the console alone had; fch0_max
             // is ch0 ONLY (see diag_record) — not a bank maximum. `response` is
             // deliberately absent: `peak` above already is it.
-            "rails,accum_max,fch0_max,h_max\n");
+            "rails,accum_max,fch0_max,h_max,job,anchor\n");
     fflush(g_csv);
     printf("[csv] per-frame log -> %s\n", path);
 #endif
@@ -1533,7 +2008,7 @@ static void csv_row(int frame, bool occluded, bool evaluated,
     fprintf(g_csv,
             "%d,%d,%d,%d,%s,%.4f,%.4f,%ld,%d,%d,%.4f,"
             "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.4f,%.2f,%d,"
-            "%d,%.4f,%s,%d,%.0f,%.0f,%.0f\n",
+            "%d,%.4f,%s,%d,%.0f,%.0f,%.0f,%d,%d\n",
             frame, occluded ? 1 : 0, evaluated ? 1 : 0, gate.accept ? 1 : 0,
             mosse::gate_reason_tag(gate.reason),
             p.psr, p.ratio, p.peak, p.dr, p.dc, resp00_over_peak,
@@ -1547,7 +2022,8 @@ static void csv_row(int frame, bool occluded, bool evaluated,
             scale_evaluated ? scale_idx : 0,
             scale_evaluated ? sd.conf : 0.0,
             scale_evaluated ? mosse::scale_veto_tag(sd.reason) : "NOT_RUN",
-            g_fdiag.rails, g_fdiag.accum, g_fdiag.fch, g_fdiag.h);
+            g_fdiag.rails, g_fdiag.accum, g_fdiag.fch, g_fdiag.h,
+            g_csv_job, g_csv_anchor);
     // Per ROW, not per run: the whole point is surviving a power cut. A 500-frame
     // run writes 500 flushes of ~40 B, which is nothing against 1216 KB/frame of
     // binaries or 8.3 KB/frame of console.
@@ -2835,6 +3311,31 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
+#if !FRAME_SOURCE_VOT
+    // FRAME_SOURCE=synth MUST reproduce today's behaviour exactly, and the
+    // runtime-geometry substitution above is only safe if these hold. Checked
+    // rather than argued: it is four comparisons once per run, and the argument
+    // is exactly the kind that reads as obviously true right up until someone
+    // adds a knob that sets one of them. Not a static_assert — g_frame_rows and
+    // friends are mutable globals precisely so the vot arm can move them.
+    if (g_frame_rows != FRAME_ROWS || g_frame_cols != FRAME_COLS ||
+        g_frame_bytes != FRAME_BYTES || g_run_frames != ITER_CNT) {
+        fprintf(stderr, "FRAME_SOURCE=synth but the runtime geometry moved: "
+                "%dx%d (%zu B), %d frames\n",
+                g_frame_rows, g_frame_cols, g_frame_bytes, g_run_frames);
+        return EXIT_FAILURE;
+    }
+#endif
+
+#if FRAME_SOURCE_VOT
+    // BEFORE the device is opened. Staging is a manifest parse and one blob read
+    // (up to 1.27 GB for flamingo1), all of it host-side and none of it needing
+    // hardware — so a wrong sequence name, an out-of-range job or a truncated
+    // blob costs a message instead of an xclbin load and a graph start.
+    if (!vot_parse_args(argc, argv)) return EXIT_FAILURE;
+    if (!vot_stage())                return EXIT_FAILURE;
+#endif
+
     // ------------------------------------------------------------------
     // Device and xclbin setup
     // ------------------------------------------------------------------
@@ -2983,10 +3484,21 @@ int main(int argc, char **argv)
     // padding, so the filter sees background context — which is the whole reason
     // both papers use a window larger than the object.
     mosse::TargetBox box;
-    box.row = FRAME_ROWS / 2.0;
-    box.col = FRAME_COLS / 2.0;
+#if FRAME_SOURCE_VOT
+    // The job's init box, i.e. the dataset's groundtruth at the anchor frame.
+    // TARGET_H/TARGET_W are inert here: the box is the dataset's, and with it the
+    // ROI, sigma and the DSST template size, all of which are DERIVED from the
+    // box and so follow it without further plumbing.
+    box.row = g_vot.job.init_box.row;
+    box.col = g_vot.job.init_box.col;
+    box.h   = g_vot.job.init_box.h;
+    box.w   = g_vot.job.init_box.w;
+#else
+    box.row = g_frame_rows / 2.0;
+    box.col = g_frame_cols / 2.0;
     box.h   = (double)TARGET_H;
     box.w   = (double)TARGET_W;
+#endif
 
     // Recomputed per frame inside the loop, because the scale filter moves
     // box.h/box.w. This copy is for the startup report only.
@@ -3014,7 +3526,7 @@ int main(int argc, char **argv)
     // moved out of here because they were one veto of three and the other two
     // have to be applied in the same place and reported in the same vocabulary;
     // they also tightened from 0.25/4.0, which was so loose it never fired.
-    const double box_h0 = box.h, box_w0 = box.w;
+    double box_h0 = box.h, box_w0 = box.w;   // reset per run — see run_reset()
 
     printf("box: %.0fx%.0f px at (%.0f,%.0f)  padding %.2f  ->  roi %dx%d @(%d,%d)\n",
            box.h, box.w, box.row, box.col, (double)mosse::DEFAULT_PADDING,
@@ -3073,10 +3585,12 @@ int main(int argc, char **argv)
     // and needs it by address. Bound once, immediately after it exists.
     g_filter_scratch_p = &filter_scratch;
 
-    if (ITER_CNT < 2)
-        printf("WARNING: ITER_CNT=%d. Frame 0 is consumed by filter initialisation,\n"
-               "         so a single-frame run cannot test localisation. Build with\n"
-               "         ITER_CNT=2 or more for a meaningful result.\n", ITER_CNT);
+    if (g_run_frames < 2)
+        printf("WARNING: this run is %d frame(s). Frame 0 is consumed by filter\n"
+               "         initialisation, so a single-frame run cannot test\n"
+               "         localisation. Build with ITER_CNT=2 or more (synth), or\n"
+               "         pick an anchor that is not the last frame (vot).\n",
+               g_run_frames);
     printf("filter: sigma=%.1f eta=%.3f H_SHIFT=%d — frame 0 initialises, "
            "frame 1+ tracks\n",
            (double)mosse::DEFAULT_SIGMA, (double)mosse::DEFAULT_ETA, CMUL_H_SHIFT);
@@ -3085,17 +3599,32 @@ int main(int argc, char **argv)
     // console level appeared anywhere in the log itself — so which of the two
     // was stale could not be settled from the artifact. A log that cannot state
     // its own configuration is one reflash away from the stale-card trap.
-    printf("run: ITER_CNT=%d  VERBOSITY=%d  DUMP_BUFFERS=%d  shift %d-%d-%d  "
-           "N_CHANNELS=%d  %dx%d\n",
-           ITER_CNT, VERBOSITY, DUMP_BUFFERS,
+    // The frame SOURCE and the frame COUNT are both on this line, and the count
+    // is the one the loop will actually run (g_run_frames), not the ITER_CNT the
+    // build was configured with -- at FRAME_SOURCE=vot those differ by design,
+    // and a log that reports the configured number rather than the executed one
+    // is the exact artifact runs/.last_cfg was.
+    printf("run: source=%s  frames=%d (ITER_CNT=%d)  VERBOSITY=%d  DUMP_BUFFERS=%d  "
+           "shift %d-%d-%d  N_CHANNELS=%d  %dx%d  frame %dx%d\n",
+           FRAME_SOURCE_VOT ? "vot" : "synth",
+           g_run_frames, ITER_CNT, VERBOSITY, DUMP_BUFFERS,
            FFT_SHIFT_CFG, IFFT_ROW_SHIFT_CFG, IFFT_COL_SHIFT_CFG,
-           N_CHANNELS, PATCH_ROWS, PATCH_COLS);
+           N_CHANNELS, PATCH_ROWS, PATCH_COLS, g_frame_rows, g_frame_cols);
     fflush(stdout);
 
     // Tracked position, kept as ints because roi_crop takes integer coordinates.
     // They mirror box.row/box.col, which stay the authoritative state.
     int pos_row = (int)llround(box.row);
     int pos_col = (int)llround(box.col);
+
+    // Coast state — see HOLD_COAST at the top. `coast_scale` is the decay factor
+    // for the CURRENT hold run and is reset to 1.0 by every accepted frame, so a
+    // long hold fades to a freeze and the next accept restores full velocity.
+    // Zero-initialised, so the first hold before any accepted frame (which can
+    // only be frame 0's, and frame 0 initialises rather than detects) coasts by
+    // nothing at all rather than by an undefined velocity.
+    mosse::CoastState coast;
+    (void)coast;                                 // unused at HOLD_COAST=0
 
     // Where the target was actually injected, for the IoU report.
     mosse::TargetBox truth = box;
@@ -3107,7 +3636,9 @@ int main(int argc, char **argv)
 
     // Background is generated ONCE — see scene_init(). Regenerating it per frame
     // costs ~0.6-1.2 s on the A72, which would be 30-90x the whole pipeline.
-    scene_init(FRAME_ROWS, FRAME_COLS);
+#if !FRAME_SOURCE_VOT
+    scene_init(g_frame_rows, g_frame_cols);
+#endif
 
     // Per-run tracking statistics. The point of a long hardware run is the CURVE,
     // not a single frame, and these are what make it a result rather than a smoke
@@ -3198,7 +3729,7 @@ int main(int argc, char **argv)
     const auto _rc_t0 = std::chrono::steady_clock::now();
 #if ROI_CROP_USER_MANAGED
     CropIp crop_ip(device, uuid);
-    crop_ip.set_static_args(frame_bo, (uint32_t)FRAME_ROWS, (uint32_t)FRAME_COLS,
+    crop_ip.set_static_args(frame_bo, (uint32_t)g_frame_rows, (uint32_t)g_frame_cols,
                             (uint32_t)PATCH_ROWS, (uint32_t)PATCH_COLS);
     printf("[roi_crop] USER-MANAGED (xrt::ip) launch path, CU driven directly; "
            "KDS completion bypassed. Constructed in %.3f ms\n",
@@ -3207,8 +3738,8 @@ int main(int argc, char **argv)
 #else
     xrt::run crop_run(crop);
     crop_run.set_arg(0, frame_bo);
-    crop_run.set_arg(2, (uint32_t)FRAME_ROWS);
-    crop_run.set_arg(3, (uint32_t)FRAME_COLS);
+    crop_run.set_arg(2, (uint32_t)g_frame_rows);
+    crop_run.set_arg(3, (uint32_t)g_frame_cols);
     crop_run.set_arg(8, (uint32_t)PATCH_ROWS);
     crop_run.set_arg(9, (uint32_t)PATCH_COLS);
     printf("[roi_crop] KDS (xrt::run) launch path. crop_run constructed once "
@@ -3387,6 +3918,25 @@ int main(int argc, char **argv)
     // ~9.2x, which is why the shift budget moved from 4-3-3 to 4-5-5 in the same
     // change. See the FFT_SHIFT block in the Makefile. Seeding without that is a
     // railed response.
+#if FRAME_SOURCE_VOT
+    // NOTHING TO SEED. The seeding above exists because the synthetic scene only
+    // ever writes its dirty rect, so the rest of the frame would be whatever the
+    // probe left; a VOT frame is memcpy'd WHOLE every frame, so the first push
+    // covers the buffer completely. The buffers are still sized here, at the
+    // SEQUENCE's geometry rather than the maximum, because that is what the push
+    // copies and what scene_luma() indexes with a g_frame_cols stride.
+    {
+        g_frame_host.assign(g_frame_bytes, 0);
+#if CONV_IN_CH == 3
+        g_scene_luma.assign((size_t)g_frame_rows * g_frame_cols, 0);
+#endif
+        printf("[vot] frame buffers sized at %dx%d x%d = %zu B (frame_bo is "
+               "allocated at %dx%d)\n",
+               g_frame_rows, g_frame_cols, CONV_IN_CH, g_frame_bytes,
+               FRAME_ROWS, FRAME_COLS);
+        fflush(stdout);
+    }
+#else
     {
 #if CONV_IN_CH == 3
         // Luma scene first, then colourise the WHOLE frame once. The per-frame
@@ -3395,8 +3945,8 @@ int main(int argc, char **argv)
         g_scene_luma.assign(g_background.begin(), g_background.end());
         g_frame_host.assign(FRAME_BYTES, 0);
         g_tint_target = DirtyRect{};              // no target drawn yet
-        scene_touch(0, 0, FRAME_ROWS - 1, FRAME_COLS - 1);
-        scene_colourise(FRAME_ROWS, FRAME_COLS);
+        scene_touch(0, 0, g_frame_rows - 1, g_frame_cols - 1);
+        scene_colourise(g_frame_rows, g_frame_cols);
 #else
         g_frame_host.assign(g_background.begin(), g_background.end());
 #endif
@@ -3408,8 +3958,146 @@ int main(int argc, char **argv)
                FRAME_BYTES, CONV_IN_CH, CONV_IN_CH == 1 ? "" : "s");
         fflush(stdout);
     }
+#endif  // FRAME_SOURCE_VOT
 
-    for (int frame = 0; frame < ITER_CNT; ++frame) {
+    // How many runs this process executes. One at FRAME_SOURCE=synth, one per
+    // entry of the job list at FRAME_SOURCE=vot (which may name the same job
+    // twice — that is the determinism test).
+#if FRAME_SOURCE_VOT
+    const size_t n_jobs = g_vot.job_list.size();
+#else
+    const size_t n_jobs = 1;
+#endif
+
+#if FRAME_SOURCE_VOT
+    // EVERY piece of state that outlives a run. The list is the deliverable of
+    // Phase 3; each entry is here because leaving it out is silent:
+    //
+    //   g_filter        run B would start from A's trained filter
+    //   filter_bo       ...and the DEVICE would still hold A's H on frame 0
+    //   scale           the template size is DERIVED from the init box, so
+    //                   reusing it mis-sizes the DSST template for the new box
+    //   g_target/sigma  G is built from the box; a new box needs a new G
+    //   mean_prev       missing this makes Stage B1 inert on the one frame the
+    //                   filter trains from, and the ch16 response rails flat
+    //   g_energy        filter_quantize_q15 reads it; stale values mis-scale H
+    //   g_target_shift  the exact variable the first TAIL_PARALLEL attempt read
+    //                   stale, taking mean IoU 0.9188 -> 0.4794
+    //   coast           NEW 2026-08-25: run B would coast on A's velocity
+    //   counters        a run that inherits them reports a plausible summary
+    //                   for a run that did not happen
+    auto run_reset = [&](size_t ji) -> bool {
+        g_vot.job_index = g_vot.job_list[ji];
+        if (g_vot.job_index < 0 ||
+            g_vot.job_index >= (int)g_vot.manifest.jobs.size()) {
+            fprintf(stderr, "[vot] job %d out of range\n", g_vot.job_index);
+            return false;
+        }
+        g_vot.job = g_vot.manifest.jobs[g_vot.job_index];
+        if (g_vot.job.init_box.empty()) {
+            fprintf(stderr, "[vot] job %d has an empty init box\n", g_vot.job_index);
+            return false;
+        }
+        g_vot.order = vot::job_order(g_vot.job, g_vot.manifest.frames);
+        g_run_frames = (int)g_vot.order.size();
+        if (g_vot.max_frames > 0 && g_vot.max_frames < g_run_frames)
+            g_run_frames = g_vot.max_frames;
+        g_vot.traj.begin(g_vot.job);
+        g_vot_empty_gt = 0;
+
+        // --- the tracker's own state ---
+        box.row = g_vot.job.init_box.row;  box.col = g_vot.job.init_box.col;
+        box.h   = g_vot.job.init_box.h;    box.w   = g_vot.job.init_box.w;
+        box_h0  = box.h;                   box_w0  = box.w;
+        pos_row = (int)llround(box.row);   pos_col = (int)llround(box.col);
+        truth   = box;
+        if (RESET_MUTANT != 4) coast = mosse::CoastState{};
+
+        // G is derived from the box, so both sigma and the target spectrum move
+        // with it. Rebuilt exactly as at startup rather than scaled, because the
+        // startup path is the one that is known to be right.
+        const mosse::RoiGeometry r0 =
+            mosse::roi_for(box, mosse::DEFAULT_PADDING, PATCH_ROWS, PATCH_COLS);
+        mosse::sigma_for(box, r0, &sigma_r, &sigma_c);
+        mosse::gaussian_target_spectrum(g_target.data(), PATCH_ROWS, PATCH_COLS,
+                                        sigma_r, sigma_c, 0, 0);
+
+        if (RESET_MUTANT != 5) {
+            mosse::scale_filter_config(scale, mosse::DEFAULT_SCALE_N,
+                                       mosse::DEFAULT_SCALE_STEP,
+                                       box.h, box.w, (float)SCALE_SIGMA_FACTOR);
+            scale_sample.assign((size_t)(scale.enabled() ? scale.sample_elems() : 1),
+                                mosse::cfloat{});
+        }
+
+        if (RESET_MUTANT != 3)
+            g_filter = mosse::FilterState{};    // exactly the startup condition
+        std::fill(g_target_shift.begin(), g_target_shift.end(), mosse::cfloat{});
+        for (int ch = 0; ch < N_CHANNELS; ++ch) g_energy[ch] = 0.0;
+
+        // THE DEVICE holds state too. Without this, frame 0 of run B correlates
+        // against run A's trained H — and frame 0 is the frame run B trains
+        // FROM, so the damage is in the initialisation, where it is hardest to
+        // see. Same memset as at startup.
+        if (RESET_MUTANT != 2) {
+            memset(filter_bo.map<void *>(), 0, FILTER_BYTES * N_CHANNELS);
+            filter_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        }
+
+        // Re-seed mean_prev from the weight buffer's own bias/shift fields, then
+        // push. Idempotent: bias_acc and out_shift are never written during a
+        // run, so this recomputes the same seed the startup path produced.
+        if (RESET_MUTANT != 1) {
+            uint8_t *wmap = weights_bo.map<uint8_t *>();
+            for (int ch = 0; ch < N_CHANNELS; ++ch) {
+                uint8_t *w = wmap + (size_t)ch * WEIGHT_CH_BYTES;
+                int32_t bias;
+                memcpy(&bias, w + CONV_W_OFF_BIAS, sizeof(int32_t));
+                const int32_t seed = bias >> (int)w[CONV_W_OFF_SHIFT];
+                memcpy(w + CONV_W_OFF_MEAN, &seed, sizeof(int32_t));
+                g_mean_prev[ch] = seed;
+            }
+            weights_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        }
+
+        // --- per-run reporting counters ---
+        g_det_hash   = 1469598103934665603ULL;   // FNV-1a offset basis
+        g_csv_job    = g_vot.job_index;
+        g_csv_anchor = g_vot.job.anchor;
+        gate_reset_run();
+        trk_eval = trk_ok = trk_lost = 0;
+        trk_iou_sum = 0.0; trk_iou_min = 1.0;
+        trk_cerr_sum = 0.0; trk_cerr_max = 0.0;
+        scale_n_eval = scale_n_accept = scale_n_hold = 0;
+        for (int i = 0; i < 8; ++i) scale_reason_n[i] = 0;
+        scale_conf_min_seen = 1e300; scale_conf_max_seen = -1e300;
+
+        printf("\n========== RUN %zu/%zu: %s job %d, anchor %d %s, %d frames, "
+               "init box %.0fx%.0f at (%.0f,%.0f) ==========\n",
+               ji + 1, n_jobs, g_vot.manifest.sequence.c_str(), g_vot.job_index,
+               g_vot.job.anchor, g_vot.job.forward ? "forward" : "BACKWARD",
+               g_run_frames, box.h, box.w, box.row, box.col);
+        fflush(stdout);
+        return true;
+    };
+#endif  // FRAME_SOURCE_VOT
+
+    // ================= THE RUN LOOP (multi-start) =====================
+    // One iteration per JOB. At FRAME_SOURCE=synth there is exactly one, and
+    // run_reset() below is a no-op on the first pass, so this arm executes the
+    // same sequence of operations it always has.
+    //
+    // EVERY piece of state that survives a run is reset here, and the list is
+    // not obvious — each entry has caused a documented failure somewhere in this
+    // project. See runs/vot/phase3.md. The determinism test (job A, job B, job A
+    // in one process, A's two trajectories byte-identical) is the instrument
+    // that can actually see a miss; nothing else here can.
+    for (size_t job_i = 0; job_i < n_jobs; ++job_i) {
+#if FRAME_SOURCE_VOT
+    if (!run_reset(job_i)) return EXIT_FAILURE;
+#endif
+
+    for (int frame = 0; frame < g_run_frames; ++frame) {
 
         dma_reset_frame();
         rc_reset_frame();
@@ -3455,6 +4143,51 @@ int main(int argc, char **argv)
         // `occluded` outlives the block: the diagnostics further down report
         // against the injected offset, which does not exist on an occluded frame.
         bool occluded = false;
+#if FRAME_SOURCE_VOT
+        // ---- THE FRAME SEAM, VOT ARM ----------------------------------
+        // The whole synthetic scene block below is replaced by two memcpys.
+        // Everything the generator existed to do — background, trajectory,
+        // target injection, occluder, noise, pan — is inert here: the frames are
+        // whatever the dataset holds, and the groundtruth comes from the
+        // manifest instead of from what the host drew.
+        {
+            const bool init_frame = !g_filter.initialized;
+            const int  src = g_vot.order[(size_t)frame];   // dataset frame index
+
+            // TWO copies, blob -> g_frame_host -> frame_bo, and the first one is
+            // deliberate. Repointing scene_luma() at the blob would save it, and
+            // would put the colourise path, the dirty-rect invariant and
+            // scale_extract's luma pointer on a buffer nothing else in this file
+            // expects to be read-only. Heap-to-heap runs at 7359 MB/s: 0.04 ms
+            // for a 640x480 frame, against a refactor with no measurable gain.
+            AP_T(AP_SCENE, memcpy(g_frame_host.data(), vot_frame(frame),
+                                  g_frame_bytes));
+
+            // Groundtruth for the IoU line and track.csv. REPORTING ONLY — it
+            // never steers the tracker, which is the entire point of the board
+            // knowing nothing about failure detection.
+            const vot::Box &g = g_vot.manifest.groundtruth[(size_t)src];
+            truth.row = g.row; truth.col = g.col;
+            truth.h   = g.h;   truth.w   = g.w;
+            if (g.empty()) ++g_vot_empty_gt;
+
+            AP_T(AP_FRAME_PUSH,
+                 memcpy(frame_bo.map<uint8_t *>(), g_frame_host.data(),
+                        g_frame_bytes));
+            AP_T(AP_FRAME_SYNC,
+                 frame_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE));
+
+            if (init_frame)
+                VP1("Frame %d: [INIT] %s frame %d (anchor), box %.0fx%.0f at "
+                    "(%.0f,%.0f)\n", frame, g_vot.manifest.sequence.c_str(), src,
+                    box.h, box.w, box.row, box.col);
+            else
+                VP1("Frame %d: [vot] %s frame %d%s\n", frame,
+                    g_vot.manifest.sequence.c_str(), src,
+                    g.empty() ? "  (groundtruth EMPTY)" : "");
+            fflush(stdout);
+        }
+#else
         {
             // The scene functions are all single-plane; scene_colourise()
             // below expands what they wrote into g_frame_host.
@@ -3522,14 +4255,14 @@ int main(int argc, char **argv)
                 // produce a near-zero response and trip ZeroResponse or
                 // FlatSidelobe instead, which tests the structural guards rather
                 // than the PSR one.
-                inject_checkerboard_frame(frame_ptr, FRAME_ROWS, FRAME_COLS,
+                inject_checkerboard_frame(frame_ptr, g_frame_rows, g_frame_cols,
                                           OCCLUDE_SQUARE);
             } else {
                 // Asymmetric structured target, not a single-pixel impulse: an
                 // impulse is symmetric, and a symmetric training patch makes a
                 // transposed pack_filter() and a wrong conjugation both invisible.
                 // See inject_target_frame().
-                AP_T(AP_SCENE, inject_target_frame(frame_ptr, FRAME_ROWS, FRAME_COLS,
+                AP_T(AP_SCENE, inject_target_frame(frame_ptr, g_frame_rows, g_frame_cols,
                                     test_row, test_col, test_h, test_w));
                 // Ground truth for the IoU report. Taken from what was actually
                 // DRAWN, not from the tracker's box — that is the whole point of
@@ -3553,7 +4286,7 @@ int main(int argc, char **argv)
             // as perfectly repeating as the background is.
             {
                 const int nr = pos_row - roi.roi_h / 2, nc = pos_col - roi.roi_w / 2;
-                scene_add_noise(frame_ptr, FRAME_ROWS, FRAME_COLS,
+                scene_add_noise(frame_ptr, g_frame_rows, g_frame_cols,
                                 nr - 4, nc - 4,
                                 nr + roi.roi_h + 3, nc + roi.roi_w + 3);
             }
@@ -3565,11 +4298,11 @@ int main(int argc, char **argv)
             // the scene has run by here — restore, target, occluder, noise — so
             // the touched rect is complete and this is the only place the two
             // representations are guaranteed to agree.
-            AP_T(AP_COLOURISE, scene_colourise(FRAME_ROWS, FRAME_COLS));
-            scene_verify(FRAME_ROWS, FRAME_COLS, frame);   // no-op unless SCENE_VERIFY
+            AP_T(AP_COLOURISE, scene_colourise(g_frame_rows, g_frame_cols));
+            scene_verify(g_frame_rows, g_frame_cols, frame);   // no-op unless SCENE_VERIFY
             AP_T(AP_FRAME_PUSH,
                  memcpy(frame_bo.map<uint8_t *>(), g_frame_host.data(),
-                        FRAME_BYTES));
+                        g_frame_bytes));
             AP_T(AP_FRAME_SYNC,
                  frame_bo.sync(XCL_BO_SYNC_BO_TO_DEVICE));  // Flush host → device
             if (occluded)
@@ -3584,6 +4317,7 @@ int main(int argc, char **argv)
                        frame, IMPULSE_DR, IMPULSE_DC, test_row, test_col);
             fflush(stdout);
         }
+#endif  // FRAME_SOURCE_VOT — the frame seam
 
         // 2. Per-channel: conv2d + FFT2D + cmul_accum
         //
@@ -4099,6 +4833,10 @@ int main(int argc, char **argv)
         // report_cint16, both PSR scans, the resp00 ratio and the dump.
         AP_T(AP_BO_STAGE,
              memcpy(g_stage_c.data(), resp_bo.map<void *>(), RESP_BYTES));
+        // The response is the pipeline's output and the last thing that exists
+        // before an argmax throws its precision away, so it is what the digest
+        // is taken over. Hashed from the HEAP copy, never the BO mapping.
+        AP_T(AP_DET_HASH, det_hash_bytes(g_stage_c.data(), RESP_BYTES));
         report_cint16("response", (const int16_t *)g_stage_c.data(),
                       PATCH_ROWS, PATCH_COLS, "rowmajor");
         dump_buffer("resp", frame, g_stage_c.data(), RESP_BYTES);
@@ -4185,13 +4923,40 @@ int main(int argc, char **argv)
                 box.col += dc_frame;
                 pos_row = (int)llround(box.row);
                 pos_col = (int)llround(box.col);
+#if HOLD_COAST
+                // The velocity is the displacement THIS accepted frame applied,
+                // i.e. one frame's motion, because the position advances every
+                // frame on both paths. See coast_observe() for why a coasted
+                // frame must never feed this.
+                mosse::coast_observe(coast, dr_frame, dc_frame);
+#endif
             }
+#if HOLD_COAST
+            else {
+                double cr = 0.0, cc = 0.0;
+                if (mosse::coast_step(coast, (double)(COAST_DECAY), &cr, &cc)) {
+                    // COAST. Moves the position only; the box size, the filter
+                    // and the scale model stay frozen exactly as before.
+                    box.row += cr;
+                    box.col += cc;
+                    pos_row  = (int)llround(box.row);
+                    pos_col  = (int)llround(box.col);
+                    // Printed at EVERY verbosity, like the other anomalies: a
+                    // coast moves the search window on NO evidence, and a run of
+                    // them is the shape of a loss in progress.
+                    printf("Frame %d: [coast] hold + (%.2f,%.2f) px of the last "
+                           "measured velocity (%.2f,%.2f) -> pos (%d,%d)\n",
+                           frame, cr, cc, coast.vr, coast.vc, pos_row, pos_col);
+                }
+            }
+#endif
 
             const bool ok = (peak != 0 && dr == exp_dr && dc == exp_dc);
             VP1("Frame %d: displacement (%d,%d) bins = (%.2f,%.2f) frame px %s "
                 "pos (%d,%d)  peak=%ld  [%s]\n",
                    frame, dr, dc, dr_frame, dc_frame,
-                   gate.accept ? "→" : "HELD, pos stays",
+                   gate.accept ? "→"
+                               : (HOLD_COAST ? "HELD, pos COASTS" : "HELD, pos stays"),
                    pos_row, pos_col, peak,
                    peak == 0   ? "VOID: zero response — result carries no information"
                    : occluded  ? "occluded frame — no target to match, gate decides"
@@ -4291,7 +5056,7 @@ int main(int argc, char **argv)
                 // pays the uncached read; scale_detect is pure heap. 13.86 ms was
                 // one number and could not be apportioned.
                 AP_T(AP_SCALE_EXTRACT,
-                     mosse::scale_extract(scale, fp, FRAME_ROWS, FRAME_COLS,
+                     mosse::scale_extract(scale, fp, g_frame_rows, g_frame_cols,
                                           box.row, box.col, box.h, box.w,
                                           scale_sample.data()));
                 AP_T(AP_SCALE_MODEL,
@@ -4305,7 +5070,8 @@ int main(int argc, char **argv)
                                       box.h, box.w, box_h0, box_w0,
                                       mosse::DEFAULT_SCALE_CONF_MIN,
                                       mosse::DEFAULT_SCALE_MIN_REL,
-                                      mosse::DEFAULT_SCALE_MAX_REL);
+                                      mosse::DEFAULT_SCALE_MAX_REL,
+                                      mosse::DEFAULT_SCALE_MAX_STEP);
                 scale_evaluated = true;
                 scale_idx       = sr.idx;
                 if (scale_gate_dec.accept) { box.h = scale_gate_dec.new_h;
@@ -4418,7 +5184,7 @@ int main(int argc, char **argv)
                 // no recalibration at all.
                 const uint8_t *fp = scene_luma();
                 AP_T(AP_SCALE_EXTRACT,
-                     mosse::scale_extract(scale, fp, FRAME_ROWS, FRAME_COLS,
+                     mosse::scale_extract(scale, fp, g_frame_rows, g_frame_cols,
                                           box.row, box.col, box.h, box.w,
                                           scale_sample.data()));
                 AP_T(AP_SCALE_MODEL,
@@ -4584,6 +5350,38 @@ int main(int argc, char **argv)
                     box, truth, iou, cerr, published,
                     scale_evaluated, scale_idx, scale_gate_dec);
 
+            // The HOST side of the state, in full precision. box carries the
+            // position and the scale filter's output; psr carries the gate's
+            // input. Together with the response hash above this covers the
+            // datapath and the decisions taken from it.
+            {
+                const double st[6] = { box.row, box.col, box.h, box.w,
+                                       gate.psr, (double)psr_abs.peak };
+                AP_T(AP_DET_HASH, det_hash_bytes(st, sizeof st));
+            }
+
+#if FRAME_SOURCE_VOT
+            // The result, accumulated in RAM. Nothing touches the NFS mount
+            // inside the frame loop — the whole trajectory is one write at the
+            // end of the run (phase0a.md).
+            //
+            // Index 0 is the anchor, and it is written as Special(INITIALIZATION)
+            // rather than as the init box: EVERY VOT trajectory begins with a
+            // special code, and a file that begins with a rectangle is read back
+            // without complaint and scored one frame out of step (phase0b.md).
+            {
+                const double ms = std::chrono::duration<double, std::milli>(
+                    std::chrono::steady_clock::now() - g_ap_frame_t0).count();
+                if (frame == 0) {
+                    g_vot.traj.push_init(ms);
+                } else {
+                    vot::Box b;
+                    b.row = box.row; b.col = box.col; b.h = box.h; b.w = box.w;
+                    g_vot.traj.push(b, ms);
+                }
+            }
+#endif
+
             // VERBOSITY 0: the ONE line per frame that keeps the frame period
             // measurable. ~45 B, ~4 ms at 115200, 4% of the ~87 ms GMIO floor.
             // Everything on it is already in track.csv — the point is not the
@@ -4632,7 +5430,86 @@ int main(int argc, char **argv)
         }
     }
 
-    csv_close();
+#if FRAME_SOURCE_VOT
+    // ONE write per run, after the loop. Reported as its own step, and a failure
+    // here is fatal to the run's meaning even though every frame tracked fine —
+    // so it is announced rather than returned quietly.
+    {
+        // THE DETERMINISM TEST. If this job index has already run in this
+        // process, its trajectory must come back byte-identical — that is the
+        // only cheap instrument that can see state leaking across run_reset(),
+        // and it needs no groundtruth to be meaningful. Compared in memory
+        // because both runs write the same filename.
+        const std::string traj_text = g_vot.traj.as_text();
+        char hashline[64];
+        snprintf(hashline, sizeof hashline, "\nstate %016llx",
+                 (unsigned long long)g_det_hash);
+        // The key is trajectory AND digest. Reported separately below, because
+        // "same boxes, different datapath" is a distinct and more informative
+        // verdict than either half alone.
+        const std::string key = traj_text + hashline;
+        printf("\n[vot] run state digest %016llx  (response + box + psr, every "
+               "frame)\n", (unsigned long long)g_det_hash);
+        auto prev = g_det_seen.find(g_vot.job_index);
+        g_det_repeat = (prev != g_det_seen.end());
+        if (prev == g_det_seen.end()) {
+            g_det_seen.emplace(g_vot.job_index, key);
+        } else if (prev->second == key) {
+            printf("[vot] DETERMINISM: job %d re-run, trajectory AND state digest "
+                   "IDENTICAL (%zu B) — no state leaked across run_reset()\n",
+                   g_vot.job_index, traj_text.size());
+        } else if (prev->second.compare(0, traj_text.size(), traj_text) == 0) {
+            // The case RESET_MUTANT=1 produced on 2026-08-25 and the reason this
+            // digest exists: identical boxes, different arithmetic. A leak too
+            // small to move an argmax is still a leak, and on a longer sequence
+            // or a different scene it would move one.
+            printf("[vot] DETERMINISM FAILED: job %d re-run has the SAME "
+                   "trajectory but a DIFFERENT state digest. State leaked across "
+                   "run_reset() without moving a peak — see the [diag] lines.\n",
+                   g_vot.job_index);
+            g_det_failures++;
+        } else {
+            size_t at = 0;
+            while (at < key.size() && at < prev->second.size() &&
+                   key[at] == prev->second[at]) ++at;
+            printf("\n[vot] DETERMINISM FAILED: job %d re-run differs at byte %zu "
+                   "(%zu B vs %zu B). STATE LEAKED ACROSS run_reset().\n",
+                   g_vot.job_index, at, prev->second.size(), key.size());
+            g_det_failures++;
+        }
+    }
+    {
+        if (g_vot.max_frames > 0 && g_run_frames < g_vot.job.length) {
+            printf("\n[vot] trajectory NOT written: this was a %d-frame bring-up "
+                   "of a %d-frame job.\n", g_run_frames, g_vot.job.length);
+        } else if (g_det_repeat) {
+            // A repeat exists to be COMPARED, not to overwrite the first run's
+            // result. On a determinism failure the file on disk is then the
+            // first run's, which is the one the comparison reports against.
+            printf("\n[vot] job %d already written this process; the re-run was "
+                   "compared, not written\n", g_vot.job_index);
+        } else {
+            std::string err;
+            const auto t0 = std::chrono::steady_clock::now();
+            const bool ok = g_vot.traj.write(g_vot.results_dir,
+                                             g_vot.manifest.sequence, err);
+            const double ms = std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - t0).count();
+            if (ok)
+                printf("\n[vot] wrote %s/%s_%08d.txt  (%zu regions, %.1f ms)\n",
+                       g_vot.results_dir.c_str(), g_vot.manifest.sequence.c_str(),
+                       g_vot.job.anchor, g_vot.traj.size(), ms);
+            else
+                fprintf(stderr, "\n[vot] TRAJECTORY NOT WRITTEN: %s\n", err.c_str());
+        }
+        if (g_vot_empty_gt > 0)
+            printf("[vot] %d frame(s) of this run have an EMPTY groundtruth box. "
+                   "The IoU figures below score them as 0; the toolkit's failure "
+                   "rule ignores them, so the PC-side AR is the number of "
+                   "record.\n", g_vot_empty_gt);
+        fflush(stdout);
+    }
+#endif
 
     // Tracking result across the run — the thing a long hardware run exists to
     // produce, and which no hw_emu run could ever afford to compute (2-3 frames
@@ -4688,7 +5565,29 @@ int main(int argc, char **argv)
 
     // Gate outcome across the run. Printed here for the same reason the DMA
     // summary below is: gr.end(0) never returns, so anything after it is lost.
-    gate_report_run(ITER_CNT);
+    gate_report_run(g_run_frames);
+
+#if !FRAME_SOURCE_VOT
+    // Same instrument on the synthetic arm: one number that stands in for "does
+    // this build track bit-identically to the last one". Compare it across two
+    // logs instead of diffing per-frame lines by eye.
+    printf("\n[run] state digest %016llx  (response + box + psr, every frame)\n",
+           (unsigned long long)g_det_hash);
+#endif
+
+    g_frames_total += g_run_frames;
+    }   // ===== end of the run loop =====================================
+
+    csv_close();
+
+#if FRAME_SOURCE_VOT
+    if (g_det_seen.size() < g_vot.job_list.size()) {
+        printf("\n[vot] DETERMINISM: %d failure(s) across %zu run(s)\n",
+               g_det_failures, g_vot.job_list.size());
+    }
+    printf("\n[vot] %zu run(s), %d frames total\n",
+           g_vot.job_list.size(), g_frames_total);
+#endif
 
     // Cumulative GMIO cost across all frames. Printed before teardown because
     // gr.end(0) never returns (see the "host does not exit" note in CLAUDE.md) —
@@ -4697,7 +5596,7 @@ int main(int argc, char **argv)
         double        tot_us = 0.0;
         unsigned long tot_n  = 0;
         double tot_wait = 0.0;
-        printf("\n[dma] CUMULATIVE over %d frame(s):\n", ITER_CNT);
+        printf("\n[dma] CUMULATIVE over %d frame(s):\n", g_frames_total);
         for (int i = 0; i < DMA_N; ++i) {
             if (!g_dma_total[i].calls) continue;
             printf("  %-18s %6lu tx  %9.3f ms  %7.2f us/tx   wait %9.3f ms (%3.0f%%)\n",
@@ -4715,7 +5614,7 @@ int main(int argc, char **argv)
                "TOTAL", tot_n, tot_us / 1000.0, tot_n ? tot_us / tot_n : 0.0,
                tot_wait / 1000.0, tot_us > 0.0 ? 100.0 * tot_wait / tot_us : 0.0);
         printf("  per frame: %.0f tx, %.3f ms  (N_CHANNELS=%d, %dx%d)\n",
-               (double)tot_n / ITER_CNT, tot_us / 1000.0 / ITER_CNT,
+               (double)tot_n / g_frames_total, tot_us / 1000.0 / g_frames_total,
                N_CHANNELS, PATCH_ROWS, PATCH_COLS);
         // THE NUMBER THE THREADING DECISION RESTS ON.
         //
@@ -4727,9 +5626,9 @@ int main(int argc, char **argv)
         // made in the other direction.
         printf("  HOST BLOCKED in wait(): %.3f ms/frame of %.3f ms GMIO "
                "(%.0f%%); host-side async work %.3f ms/frame\n",
-               tot_wait / 1000.0 / ITER_CNT, tot_us / 1000.0 / ITER_CNT,
+               tot_wait / 1000.0 / g_frames_total, tot_us / 1000.0 / g_frames_total,
                tot_us > 0.0 ? 100.0 * tot_wait / tot_us : 0.0,
-               (tot_us - tot_wait) / 1000.0 / ITER_CNT);
+               (tot_us - tot_wait) / 1000.0 / g_frames_total);
         fflush(stdout);
 
         // APU CUMULATIVE. This is the number to read, not the two per-frame
@@ -4737,29 +5636,29 @@ int main(int argc, char **argv)
         // runs the scale detector, so it is the least representative frame in
         // the run. Averaged over ITER_CNT, against the measured mean frame body.
         {
-            const double mf = g_ap_run_us / ITER_CNT;
+            const double mf = g_ap_run_us / g_frames_total;
             double apu = 0.0;
             for (int i = 0; i < AP_N; ++i) apu += g_ap_tot_us[i];
             double rc = 0.0;
             for (int i = 0; i < RC_N; ++i) rc += g_rc_us_total[i];
             printf("\n[apu] CUMULATIVE over %d frame(s), mean frame body %.2f ms:\n",
-                   ITER_CNT, mf / 1000.0);
+                   g_frames_total, mf / 1000.0);
             printf("  %-20s %9s %10s %9s %7s\n",
                    "stage", "calls/fr", "ms/frame", "us/call", "share");
             for (int i = 0; i < AP_N; ++i) {
                 if (!g_ap_tot_n[i]) continue;
                 printf("  %-20s %9.1f %10.3f %9.1f %6.1f%%\n",
-                       g_ap_name[i], (double)g_ap_tot_n[i] / ITER_CNT,
-                       g_ap_tot_us[i] / 1000.0 / ITER_CNT,
+                       g_ap_name[i], (double)g_ap_tot_n[i] / g_frames_total,
+                       g_ap_tot_us[i] / 1000.0 / g_frames_total,
                        g_ap_tot_us[i] / (double)g_ap_tot_n[i],
                        100.0 * g_ap_tot_us[i] / g_ap_run_us);
             }
             printf("  %-20s %9s %10.3f %9s %6.1f%%\n", "-- APU subtotal", "",
-                   apu / 1000.0 / ITER_CNT, "", 100.0 * apu / g_ap_run_us);
+                   apu / 1000.0 / g_frames_total, "", 100.0 * apu / g_ap_run_us);
             printf("  %-20s %9s %10.3f %9s %6.1f%%\n", "-- GMIO (DMA_T)", "",
-                   tot_us / 1000.0 / ITER_CNT, "", 100.0 * tot_us / g_ap_run_us);
+                   tot_us / 1000.0 / g_frames_total, "", 100.0 * tot_us / g_ap_run_us);
             printf("  %-20s %9s %10.3f %9s %6.1f%%\n", "-- roi_crop launch", "",
-                   rc / 1000.0 / ITER_CNT, "", 100.0 * rc / g_ap_run_us);
+                   rc / 1000.0 / g_frames_total, "", 100.0 * rc / g_ap_run_us);
             // The slots sum to more wall time than the frame spent, by exactly
             // the overlap measured at the join. Report BOTH: the subtotal keeps
             // its old meaning so every figure recorded before threading stays
@@ -4769,16 +5668,16 @@ int main(int argc, char **argv)
             if (ovl > 0.0) {
                 printf("  %-20s %9s %10.3f %9s %6.1f%%   <-- ran CONCURRENTLY on "
                        "core 1; the subtotal above counts it, the frame does not\n",
-                       "-- of which OVERLAP", "", -ovl / 1000.0 / ITER_CNT, "",
+                       "-- of which OVERLAP", "", -ovl / 1000.0 / g_frames_total, "",
                        -100.0 * ovl / g_ap_run_us);
                 printf("  %-20s %9s %10.3f %9s %6.1f%%\n", "-- APU wall", "",
-                       (apu - ovl) / 1000.0 / ITER_CNT, "",
+                       (apu - ovl) / 1000.0 / g_frames_total, "",
                        100.0 * (apu - ovl) / g_ap_run_us);
             }
             const double resid = g_ap_run_us - (apu - ovl) - tot_us - rc;
             printf("  %-20s %9s %10.3f %9s %6.1f%%   <-- console, dumps, printf, "
                    "uninstrumented\n", "== UNATTRIBUTED", "",
-                   resid / 1000.0 / ITER_CNT, "", 100.0 * resid / g_ap_run_us);
+                   resid / 1000.0 / g_frames_total, "", 100.0 * resid / g_ap_run_us);
             if (resid > 0.25 * g_ap_run_us)
                 printf("  NOTE: unattributed is over 25%% of the frame. This "
                        "breakdown is NOT the frame — find the missing cost "

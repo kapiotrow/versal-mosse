@@ -52,6 +52,11 @@ namespace {
 
 int    g_every    = 10;      // verbose print stride (--every)
 float  g_conf_min = mosse::DEFAULT_SCALE_CONF_MIN;   // --conf-min
+// --max-step: the per-frame rate limit. Its own switch because this sim's `step`
+// arm is the ONLY place a large correction is known to be CORRECT -- the
+// detector proposes idx=-14 after an abrupt jump and it is right -- so it is the
+// bench that measures what the limit costs, not just that it fires.
+int    g_max_step = mosse::DEFAULT_SCALE_MAX_STEP;   // --max-step
 float  g_sigma_f  = (float)(SCALE_SIGMA_FACTOR);  // --sigma-factor
 // --pos-err: offset the box centre from the target's true centre, in frame px.
 // The hardware run's centre error grew 1.26 -> 10.97 px AFTER the scale parked,
@@ -218,7 +223,8 @@ Result run(const std::string &arm, int frames, float eta, int n_scales,
                     mosse::scale_gate(sr, n_scales, box, box, BOX0, BOX0,
                                       g_conf_min,
                                       mosse::DEFAULT_SCALE_MIN_REL,
-                                      mosse::DEFAULT_SCALE_MAX_REL);
+                                      mosse::DEFAULT_SCALE_MAX_REL,
+                                      g_max_step);
                 if (g_no_gate && sr.valid) { d.accept = true; d.new_h = box * sr.factor;
                                              d.new_w = box * sr.factor; }
                 if (it == 0) { idx = sr.idx; conf = d.conf; veto = mosse::scale_veto_tag(d.reason);
@@ -293,6 +299,7 @@ int main(int argc, char **argv)
         else if (a == "-v")            verbose = true;
         else if (a == "--every")       g_every = atoi(val("10"));
         else if (a == "--conf-min")    g_conf_min = (float)atof(val("2.0"));
+        else if (a == "--max-step")    g_max_step = atoi(val("1"));
         else if (a == "--no-gate")     g_no_gate = true;
         else if (a == "--reuse")       g_reuse = true;
         else if (a == "--re-extract")  g_reuse = false;

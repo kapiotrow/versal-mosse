@@ -44,6 +44,9 @@ the `dsp` subdirectory (the Makefile appends `/dsp`).
 | `CONV2D_STACK` | `2048` | conv2d's AIE stack, bytes. Applied **only at `CONV_IN_CH=3`**, where the 27-tap chain needs 1344 against the 1024 default and the mapper otherwise refuses to emit a `libadf.a` |
 | `BIAS_SCALE` | `roi` | `bias_acc` input scale for `make weights`. **Default changed 2026-08-23**; `127` restores the pre-correction weights. See "The bias_acc correction" |
 | `FRAME_RGB_MODE` | `1` | Synthetic scene colour at `CONV_IN_CH=3`. 1 = per-plane tint; 0 = replicate luma — the COLOUR-FREE CONTROL, run on hardware 2026-08-24 (`run_0824_1442`) where it reproduced grayscale bit-for-bit. Inert at `CONV_IN_CH=1`; a real frame source ignores it. Host-only |
+| `FRAME_SOURCE` | `synth` | `synth` = the generated scene (unchanged, and `vot_source.cpp` is not even linked); `vot` = frames memcpy'd from a converted VOT blob, geometry and init box from its manifest. At `vot` the scene generator, `TRAJECTORY`, `OCCLUDE_MASK`, `BG_PAN` and `FRAME_NOISE` are all inert, and `ITER_CNT` is ignored — the run length is the job's. `vot` + `CONV_IN_CH=3` is a deliberate `#error` (needs the `.luma` sidecar). Host-only. See `runs/vot/phase2.md` |
+| `RESET_MUTANT` | `0` | Deliberately breaks ONE item of `run_reset()` so the multi-start determinism test's ability to FAIL is demonstrated, not assumed: `1` mean_prev, `2` filter_bo, `3` g_filter, `4` coast, `5` scale reconfigure. Non-zero prints a banner and invalidates the run's tracking output. See `runs/vot/phase3.md`. Host-only |
+| `VOT_DATA_DIR` / `VOT_RESULTS_DIR` / `VOT_SEQUENCE` / `VOT_JOB` | `/mnt/vot` / `/mnt/vot-results` / `car1` / `0` | Compiled-in defaults, each overridable on the board's command line (`--vot-data`, `--vot-results`, `--vot-seq`, `--vot-job`, `--vot-jobs all|N,M,...` for multi-start in one process, plus `--vot-max-frames` for a bring-up truncation that then REFUSES to write the trajectory). **Repeating a job index in `--vot-jobs` is the determinism test** — its two trajectories must come back byte-identical. An unrecognised argument is fatal — a typo falling back to the default would run the wrong sequence silently. Host-only |
 | `SCENE_VERIFY` | `0` | Re-colourise the whole frame each push and abort with coordinates on a mismatch. O(frame)/frame — for a short `MODE=bringup` run, never a 200-frame one (`calib_build.sh` refuses that combination). Plumbed 2026-08-24; it was a bare `#ifndef` before, so `SCENE_VERIFY=1` silently built it DISABLED. Host-only |
 | `B2_NULL_BINS` | `1` | 1 = null the 9 low-frequency bins, 0 = subtract µ·W |
 | `PSR_GATE_MIN` | `7.0` | Bolme §3.5. Below it the host HOLDS position and skips `filter_update` + `publish_filter`. `0` disables the threshold test only (structural vetoes remain). Host-only |
@@ -54,6 +57,8 @@ the `dsp` subdirectory (the Makefile appends `/dsp`).
 | `SCALE_N` / `SCALE_STEP` | `33` / `1.04` | DSST scale levels; `SCALE_N=1` disables the scale filter. **1.04 beats DSST §6.1's 1.02 on hardware** (IoU 0.807 → 0.917) |
 | `SCALE_ETA` | `0.025` | Scale filter learning rate (deliberately ≠ `MOSSE_ETA`) |
 | `SCALE_CONF_MIN` | `2.0` | Scale gate on `conf`. A veto HOLDS the box and SKIPS `scale_update()`. `0` disables the threshold test only. Host-only |
+| `HOLD_COAST` / `COAST_DECAY` | `0` / `0.5` | `1` = a held frame moves the search window at the last measured velocity, decayed each successive held frame (drift bounded by `v/(1-decay)` = 2v, so a long hold fades back to a freeze); `0` = the freeze. **Flipped to 1 on 2026-08-25 and reverted to 0 the same day**: the same 54 trajectory pairs win on mean IoU (0.2709 → 0.3005 frame-weighted) and LOSE on the toolkit's own metric (accuracy 0.638 → 0.616, robustness 0.309 → 0.288, EAO 0.208 → 0.194). AR is the metric of record. Not "coasting is bad" — it wins on many short holds and loses on one long hold crossing a turn; see `runs/vot/evidence_ar.md` and the capped-coast proposal there. Host-only |
+| `SCALE_MAX_STEP` | `2` | Largest `|idx|` ONE frame may move the box — a RATE limit, where `MIN_REL`/`MAX_REL` are a drift bound. `0` disables it. **`1` was measured and rejected**: `scale_sim` parks the smooth arm 123 of 200 frames and ends 28.0% wrong at 1, against 1.0% unlimited. Added 2026-08-25 after `car1` frame 490 inflated the box 1.42× in one frame while 227 px off target. Host-only |
 | `SCALE_MIN_REL` / `SCALE_MAX_REL` | `0.5` / `2.0` | Absolute drift bounds vs initial box size. Must still admit `SCALE_TRAJ_AMP` (0.70×..1.30×) |
 | `OCCLUDE_MASK` | `0` | Bitmask over frame index: bit *f* ⇒ frame *f* occluded. Bit 0 ignored. `ITER_CNT=3 OCCLUDE_MASK=0x2` is the occlude-then-reacquire test |
 | `OCCLUDE_SQUARE` / `OCCLUDE_START` | `8` / `30` | `OCCLUDE_START` is a warm-up: 30 ≈ 4 time constants at `MOSSE_ETA=0.125`. The scale filter needs ~120 frames to settle |
@@ -64,7 +69,7 @@ the `dsp` subdirectory (the Makefile appends `/dsp`).
 | `BG_PAN` / `BG_PAN_R` / `BG_PAN_C` | `1` / `31` / `47` | Camera pan over the cached background, px/frame. Decorrelates the background 6.6× (swept with `scripts/bg_pan_sweep.py`) but **did not fix tracking** — see the training-target trap. Host-only |
 | `VERBOSITY` | `1` | `0` = one compact line/frame (~45 B); `1` = per-frame block, roi_crop/DMA tables on first+last frame only; `2` = everything. Anomalies print at every level. **No longer a diagnostics trade-off** — since 2026-08-24 `track.csv` carries `rails`/`accum_max`, so a `VERBOSITY=0` run is a full budget verdict AND an FPS measurement. Host-only |
 | `DUMP_BUFFERS` | `1` | Per-frame binary dumps. **1216 KB/frame, ~2 s/frame**. Set `0` for any run measuring tracking or FPS |
-| `CSV_LOG` | `1` | One row/frame to `track.csv` — gate verdict, both PSRs, peak, displacement, `resp00_over_peak`, both boxes, IoU, centre error, scale fields, and (2026-08-24+) `rails,accum_max,fch0_max,h_max`. ~60 B/frame |
+| `CSV_LOG` | `1` | One row/frame to `track.csv` (`track_<sequence>.csv` at `FRAME_SOURCE=vot`, since one sweep is one invocation per sequence and the file opens `"w"`; the arm is separated by `--vot-results` instead) — gate verdict, both PSRs, peak, displacement, `resp00_over_peak`, both boxes, IoU, centre error, scale fields, and (2026-08-24+) `rails,accum_max,fch0_max,h_max`. ~60 B/frame |
 
 Artifacts land in `build/$(TARGET)/$(PATCH_ROWS)x$(PATCH_COLS)/ch$(N_CHANNELS)/`.
 
@@ -387,9 +392,26 @@ reproduce.
 mean/worst centre error 2.47/11.07 px → **1.30/3.52**. **Centre error fell 3.2× from a size-only
 change** — independent confirmation that position error was downstream of the scale error.
 
-**The detector proposed only −1, 0 or +1 over 199 frames** (174/13/12) — never ±2, at either step
-size, and still true on both RGB arms. The decisions overlap heavily in error (idx 0 spans
-−5.3%..+9.6%), so near zero it is a noisy estimator, not a dead zone with a clean threshold.
+**On hardware the detector proposed only −1, 0 or +1 over 199 frames** (174/13/12) — never ±2, at
+either step size, and still true on both RGB arms. The decisions overlap heavily in error (idx 0
+spans −5.3%..+9.6%), so near zero it is a noisy estimator, not a dead zone with a clean threshold.
+
+**That sentence describes ONE SYNTHETIC SCENE and does not generalise — it failed twice on
+2026-08-25.** On real video (`car1`) the detector proposed ±2 or more seven times, up to **+9**,
+every one on a frame whose IoU was 0.000. And in `scale_loop_sim` the detector uses ±2
+*legitimately* on a smooth envelope: capping at 1 parks the `moving` arm for 123 of 200 frames and
+ends it 28.0% wrong against 1.0% uncapped. Reading ±1 as a property of the DETECTOR rather than of
+that scene is exactly what `SCALE_MAX_STEP=1` would have been, and the sim — not the hardware
+observation — is the bench that decides that parameter.
+
+**The scale filter is ALREADY slaved to the position gate, and that is not sufficient.** The whole
+scale block runs under `if (scale.enabled() && gate.accept && scale.initialized)`, so a held frame
+never reaches it — verified on hardware (`run_0825_1314`: 577 position ACCEPTs, 577 scale
+evaluations, zero on a held frame). Frame 490 still got through because the POSITION gate accepted
+it at PSR 7.87 against a 7.00 threshold while the tracker was 227 px off target. **Do not "add"
+that slaving; it is there.** `SCALE_MAX_STEP` exists because the precondition is only ever as good
+as the PSR gate, and PSR is a weak pass criterion — see "Metrics that cannot fail a broken
+tracker".
 
 **`SCALE_CONF_MIN` blocks legitimate large corrections.** On the sim's `step` arm the detector
 proposes the correct `idx=-14` after a jump and the gate vetoes it as `LOW_CONF` for four frames;
@@ -730,9 +752,19 @@ Two principles that have repeatedly earned their keep: **instruments before chan
   read by a `CONV_IN_CH=1` reader takes `out_shift` out of the G plane and `bias_acc` out of G/B
   taps — no crash, sixteen plausible channels, a meaningless tracker. **Byte 63 of every channel
   buffer carries the layout tag** (= `CONV_IN_CH`; 0 in pre-tag files, read as grayscale), and
-  three independent guards fire on a mismatch: a `#error` in the generated `layer0.h`, a runtime
-  tag check in the host before any weight byte is read, and `SystemExit` in
-  `check_collapse.py` / `gen_aiesim_vectors.py` / `phase1_sweep.py`. All three tested firing.
+  three independent guards were claimed on a mismatch — and **one of the three is inert**.
+  Corrected 2026-08-25: the `#error` in the generated `layer0.h` CANNOT fire, because no
+  translation unit in either the AIE or the host build includes that header
+  (`grep -rn layer0.h design/` returns nothing but the file itself). What actually fires is
+  the **runtime tag check in the host**, before any weight byte is read, and `SystemExit` in
+  `check_collapse.py` / `gen_aiesim_vectors.py` / `phase1_sweep.py`. The runtime check caught
+  a real one on 2026-08-25: an RGB `layer0_weights.bin` (tag 3) on the SD card under a
+  `CONV_IN_CH=1` ELF — `FATAL: layer0_weights.bin ch0 has layout tag 3`. **The dead guard went
+  unnoticed precisely because a live guard covers the same case**, which is the argument for
+  testing each guard separately rather than testing that the case is caught.
+  **The weights are a RUNTIME data file**: nothing includes `layer0.h`, and `hanning_128.h`
+  does not depend on `CONV_IN_CH`, so switching arms needs `make weights CONV_IN_CH=<n>` and a
+  1 KB file copy onto the card — no re-synthesis, no re-package, no re-flash.
   Gray resolves to the historical offsets; **proven, not assumed** — preprocessing
   `conv2d_kernel.cpp` at `CONV_IN_CH=1` from `HEAD` and from the working tree and folding the 18
   constant index expressions gives identical text.
@@ -873,6 +905,49 @@ Two principles that have repeatedly earned their keep: **instruments before chan
   assertions incl. an anisotropic box), because while `roi_h == patch_rows` the two are
   accidentally the same number and padding breaks both by the resample ratio — a tracker that
   localises confidently and *drifts*, invisible to `err=0 px`.
+- **SUB-BIN MOTION IS REPORTED AS ZERO, AND THE FILTER IS THEN TRAINED ON THAT — measured
+  2026-08-25 on `nature`.** The peak detector is a pure integer argmax (`PsrResult::dr/dc` are
+  `int`, no parabolic refinement anywhere), and one patch bin is `roi/128` FRAME pixels — 1.61 x
+  2.78 px on `nature`'s 103x178 box. Its true motion is 2.06 px/frame median, so **86.1% of
+  frames report displacement exactly (0,0)** while the target is moving. `filter_update()` then
+  trains against a G centred at that measured (0,0), teaching the filter that a drifted
+  appearance is centred; the lag compounds at ~0.35 px/frame and the tracker ends 350-500 px off
+  with **PSR RISING from 20 to 111**. Mean IoU 0.1535 over 14 runs, and **the gate never fires**
+  (18 of 10,604 frames; 9 of 14 runs hold nothing). This is the training-target trap arriving
+  through a resolution error rather than a sign error, and it is invisible to every instrument
+  built for the fast-motion failure. Candidate fix: 3-point parabolic sub-bin interpolation,
+  standard in MOSSE/DSST and absent here. See `runs/vot/subbin_lag.md`.
+- **The HOLD on a gated frame is NOT unconditionally correct — measured 2026-08-25.** On a gate
+  veto the host holds position, which assumes the target stays put while the filter is frozen.
+  Measured from stb2022 groundtruth alone (`scripts/vot_hold_budget.py`, no tracker, no board):
+  the **hold budget** — frames before the target's centre leaves the frozen `box × padding`
+  window, i.e. before recovery is impossible for ANY tracker — has a median of **6 frames**, is
+  **≤ 4 on 30 of 62 sequences**, and is **0 on four** (`ball3` escapes in a single frame on 75.7%
+  of frames). `car1`'s budget is 4 and its longest hold on hardware was **53**. See
+  `runs/vot/hold_policy.md`. The candidate fix is a constant-velocity coast, `HOLD_COAST`
+  (`coast_observe()`/`coast_step()` in `mosse_filter`, natively tested), and **it is OFF by
+  default because the two metrics disagree about it — see the entry below.** On hardware over 8
+  sequences and 54 runs it is +0.0296 frame-weighted mean IoU, with `car1` job 0 going from a
+  permanent loss at frame 461 to tracking all 739 frames.
+  **THE OFFLINE BUDGET MODEL PREDICTED THE OPPOSITE FOR `car1`, BECAUSE IT WAS OPEN LOOP**: it
+  treated the observed 29-frame gated run as fixed, when coasting turns frames that would have
+  been gated into accepted ones and every accept restarts the coast. Read the budget as a bound
+  on ONE uninterrupted hold, never as a prediction of tracking outcome. What the coast cannot do
+  is rescue a tracker that never acquires — `ball3` gates on 69% of frames and coasted zero
+  times, having no accept→hold transitions at all. See `runs/vot/evidence_arm_ab.md`. Note `TARGET_PADDING` is the cheapest lever here and its 1.5-vs-2.0
+  holdout was measured on a STATIC scene, where this effect cannot appear.
+- **MEAN IoU AND THE TOOLKIT'S AR CAN ORDER TWO ARMS OPPOSITELY, ON THE SAME RUNS —
+  2026-08-25.** The `HOLD_COAST` A/B was decided on frame-weighted mean IoU (+0.0296, arm B
+  wins); ingesting the identical 54 trajectory pairs into a VOT workspace
+  (`scripts/vot_ingest.py`) reversed it — accuracy 0.638 → 0.616, robustness 0.309 → 0.288,
+  EAO 0.208 → 0.194, arm A wins. **The cause is that `vot` fails a run on 10 CONSECUTIVE frames
+  at overlap ≤ 0.1 and discards everything after**, so a short excursion outweighs hundreds of
+  good frames: `car1` anchor 741 coasts 13 frames the wrong way through a turn (freezing drops
+  out for 7, under the grace), then reacquires and tracks ~470 more frames at overlap 0.82 that
+  the rule throws away. Failure COUNTS barely moved (48 of 54 runs vs 49) — only their timing
+  did. **Quote which metric produced a verdict, and prefer AR for anything that will be
+  reported**; mean IoU cannot see the timing of a loss, and that is what the challenge scores.
+  See `runs/vot/evidence_ar.md`.
 - **PSR gating (Bolme §3.5)** — four veto reasons reported separately: `ZERO_RESPONSE`,
   `FLAT_SIDELOBE` (sdev 0 — PSR undefined, not infinite), `NEGATIVE_PEAK`, `LOW_PSR`. Only
   `LOW_PSR` is disabled by `PSR_GATE_MIN=0`. On a gated frame the host **holds the position**
@@ -880,6 +955,13 @@ Two principles that have repeatedly earned their keep: **instruments before chan
   required, not an optimization, because `filter_quantize_q15` reads `g_energy`, which the
   per-channel loop has already overwritten with the occluder's energies. Proven on hardware:
   PSR 3.90 → HOLD → reacquire with `err=0 px`, frozen filter byte-identical to the ungated run's.
+  **`HOLD_COAST=1` does NOT change the short occlusion regression**, and the reason is structural rather than lucky: `ITER_CNT=3 OCCLUDE_MASK=0x2`
+  occludes frame 1, and frame 0 takes the `if (!evaluate)` branch without ever reaching the
+  accept path, so no velocity has been measured and `coast_step()` refuses. **Longer occlusion
+  runs DO change** — at `OCCLUDE_START=30` the frames before the occlusion set a velocity and the
+  window coasts through it. Compare any such run against the shipping default (`0`) rather than
+  against the 08-25 arm-B runs, and use the run-state digest to tell "unchanged" from "nearly
+  unchanged".
 - **`scale_gate()`** — three vetoes reported separately for the same reason. `AT_SEARCH_RAIL` is
   checked *before* `LOW_CONF` because it is the more specific finding when both fire. **The
   update skip is the load-bearing half**, not the box hold. Guarded so a degenerate filter cannot
@@ -890,6 +972,29 @@ Two principles that have repeatedly earned their keep: **instruments before chan
   template capped at 512 px. A single application under-corrects (+3 where +5 is exact) because
   the response is a discrete peak smoothed by a σ=S/16 target — the property to assert is that
   **repeated** application converges monotonically, which it does to 0.5%.
+- **A BYTE-IDENTICAL TRAJECTORY IS NOT A BIT-IDENTICAL RUN — found 2026-08-25 BY A NEGATIVE
+  CONTROL.** The multi-start determinism test (job A, B, A in one process; A's two trajectories
+  must match) passed with `RESET_MUTANT=1` active, i.e. with `run_reset()`'s `mean_prev` re-seed
+  deliberately skipped. The leak was real and visible from frame 1 — `accum` 1963 vs 1961,
+  `response` 1556 vs 1553, B2 removing 667 vs 671, differing on ~15% of frames — but a box comes
+  from an INTEGER peak bin, so a 0.1% difference in the response never reaches the trajectory.
+  Same failure mode as the parallel-for FMA experiment: "nearly identical" is the outcome that
+  makes a bit-identical criterion useless. **Fix: a per-frame FNV-1a digest over the full response
+  buffer plus `box`/`psr` in full precision**, printed at the end of every run on BOTH arms and
+  folded into the determinism key. It also replaces "diff two logs by eye" as this project's
+  bit-identical check with a single number. **The lesson is about the CONTROL, not the test**: the
+  test had already "passed" on hardware once, and only running the deliberately-broken build
+  showed that the pass meant nothing.
+- **`strings` ON THE ELF CAN REPORT A FALSE ABSENCE — found 2026-08-25.** The check recommended
+  below (and for `SCENE_VERIFY`) is sound, but it answers "did the compiler emit this?", which is
+  not "did the build enable this?". The `[coast]` printf was absent from a `FRAME_SOURCE=synth
+  ITER_CNT=1` ELF with the feature correctly enabled: `g_run_frames` is a `static int` that
+  nothing writes on that arm, so GCC proved the frame loop runs ONCE, and any state carried
+  ACROSS iterations (here the coast velocity, set only in the mutually-exclusive branch) is then
+  provably dead. It reappears at `ITER_CNT=200` or at `FRAME_SOURCE=vot`, where the count is
+  written at runtime. **Verify a feature flag on a build that can actually exercise it**, and
+  when a `strings` check says a feature is missing, check the loop bounds before the flags. Cost
+  here: an hour of bisecting a compiler that was right.
 - **Console gating (`VERBOSITY`) details that mattered.** (1) The `VP1`/`VP2` macros are
   `if (VERBOSITY >= n)` on a compile-time constant, so format strings are **dead-code-eliminated,
   not merely skipped** — verify with `strings` on the ELF, a stronger check than reading a log.
@@ -1242,6 +1347,14 @@ make test_roi_crop                 # native bit-exact roi_crop test. BOTH arms: 
 make test_scene                    # native test of the luma -> interleaved-RGB pass,
                                    #   including a deliberately missed scene_touch() so
                                    #   the verifier is known to fire, not assumed to
+make test_vot_source               # native test of the VOT manifest parser, blob
+                                   #   offsets, run-order convention and trajectory
+                                   #   writer. 19 mutants, each of which must be
+                                   #   REJECTED; parses every real manifest in
+                                   #   $VOT_ROOT/data if that is exported
+make test_vot_format               # the BOARD's trajectory writer read back by the
+                                   #   toolkit's OWN reader, with the centre -> top-left
+                                   #   conversion re-derived in Python. Needs the venv
 make x86sim_check KUT=conv2d SCENARIO=s6 CONV2D_MODE=0   # bit-exact kernel diff (seconds)
 make x86sim_check KUT=cmul   SCENARIO=s7                 # ...same for cmul_accum
 make x86sim_check KUT=cmul   SCENARIO=cmul_stress        # ...exercising sat16's rails
@@ -1289,9 +1402,16 @@ design/
 │   ├── scene_colour.h/.cpp           # luma scene -> interleaved RGB, rect union, the
 │   │                                 #   incremental-vs-full verifier. NO XRT include, so
 │   │                                 #   `make test_scene` builds it in seconds
+│   ├── vot_source.h/.cpp             # VOT manifest/blob/run-order/trajectory. NO XRT
+│   │                                 #   include; linked only at FRAME_SOURCE=vot. Pure
+│   │                                 #   bookkeeping, so every failure mode is a
+│   │                                 #   plausible-but-invalid AR report -- hence the
+│   │                                 #   mutation suite
 │   └── test/                         # native tests + NumPy goldens
 │       ├── test_mosse_filter.cpp     # make test_host
 │       ├── test_scene_colour.cpp     # make test_scene
+│       ├── test_vot_source.cpp       # make test_vot_source; `<dir>` argument emits a
+│       │                             #   trajectory + its INPUT for make test_vot_format
 │       └── scale_loop_sim.cpp        # closed-loop DSST scale sim (make scale_sim)
 ├── system_configs/mosse_x1.cfg       # v++ linker
 ├── profiling_configs/, directives/
@@ -1307,6 +1427,19 @@ scripts/  export_weights.py, gen_aiesim_vectors.py, gen_filter_golden.py,
                               #   records calib_cfg.txt. Budget defaults are DERIVED from the
                               #   Makefile (print-%), never copied. ARM=gray|rgb, MODE=budget|
                               #   bringup, H_SHIFT=, FRAME_RGB_MODE=, SCENE_VERIFY=, COMPARATOR=
+          vot_prepare.py      # VOT sequences -> board-ready blobs + manifests, and the
+                              #   verifier (mutation-tested) that says the conversion was
+                              #   faithful. THE groundtruth reduction lives here --
+                              #   rgb_vs_gray_vot.load_gt imports reduce_box from it
+          vot_roundtrip.py    # Phase 0b: toolkit result format, written and read with the
+                              #   toolkit's own writers/readers over a fake workspace
+          vot_check_trajectory.py  # the BOARD's writer against the toolkit's reader
+          vot_ingest.py       # board trajectories -> a toolkit workspace -> `vot analysis`.
+                              #   One directory per ARM. Re-derives every run name from the
+                              #   sequence's own anchors and checks each trajectory's LENGTH
+                              #   against the multistart order before analysing -- scan()
+                              #   only notices a MISSING file, and a wrong-length run is
+                              #   scored without complaint
           calib_report.py     # turns a run's console+track.csv into a budget verdict
                               #   (rails, amplitude early vs converged, IoU)
           bg_pan_sweep.py     # picks BG_PAN_R/C from the texture spectrum, no hardware

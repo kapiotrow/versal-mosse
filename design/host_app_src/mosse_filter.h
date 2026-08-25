@@ -502,9 +502,16 @@ constexpr float DEFAULT_SCALE_ETA   = (float)(SCALE_ETA);
 #ifndef SCALE_MAX_REL
 #  define SCALE_MAX_REL 2.0
 #endif
+// Largest |idx| a SINGLE frame may move the box. 0 disables the test, matching
+// PSR_GATE_MIN=0 and SCALE_CONF_MIN=0 (the structural vetoes still apply).
+// See scale_gate()'s MaxStep block for the two datasets behind the default.
+#ifndef SCALE_MAX_STEP
+#  define SCALE_MAX_STEP 2
+#endif
 constexpr float  DEFAULT_SCALE_CONF_MIN = (float)(SCALE_CONF_MIN);
 constexpr double DEFAULT_SCALE_MIN_REL  = (double)(SCALE_MIN_REL);
 constexpr double DEFAULT_SCALE_MAX_REL  = (double)(SCALE_MAX_REL);
+constexpr int    DEFAULT_SCALE_MAX_STEP = (int)(SCALE_MAX_STEP);
 
 // Direct O(n^2) DFT. n = 33 is not a power of two, so an FFT would need a
 // Bluestein or mixed-radix path; at 33 points a direct transform is ~1089
@@ -627,6 +634,57 @@ void scale_update_shifted(ScaleFilter &sf, const cfloat *F, int idx, float eta);
 //                  legitimately be at the rail. Checked BEFORE LowConf because it
 //                  is the stronger statement: frame 13 of the run above argmaxed
 //                  at exactly +16 of +/-16.
+//   MaxStep        |idx| > max_step. A RATE limit on one frame's proposal, where
+//                  OutOfRange is a drift bound on the accumulated box. Checked
+//                  after AtSearchRail (an argmax on the boundary is the stronger
+//                  statement) and before the range and confidence tests, because
+//                  a proposal this large is implausible whatever its conf says.
+//
+//                  THE PRECONDITION THIS DOES NOT REPLACE: the caller must
+//                  already have decided the POSITION is trustworthy. The tracker
+//                  runs this whole block under `gate.accept`, so a held frame
+//                  never reaches the scale filter at all. That slaving is real
+//                  and was verified on hardware (run_0825_1314: 577 position
+//                  ACCEPTs, 577 scale evaluations, zero on a held frame) — this
+//                  veto exists because it is NOT sufficient. On that run the
+//                  position gate accepted frame 490 at PSR 7.87 against a 7.00
+//                  threshold while the tracker was 227 px off target, and the
+//                  scale filter then inflated the box 1.42x in one frame.
+//
+//                  DEFAULT 2, AND THE OBVIOUS 1 IS WRONG. The hardware evidence
+//                  alone argues for 1: on car1's 742 frames every proposal with
+//                  |idx| >= 2 (seven of them, up to +9) landed on a frame whose
+//                  IoU was 0.000. `make scale_sim` then measured what 1 costs on
+//                  the arm that tracks NORMALLY, and it is not subtle:
+//
+//                    --max-step   moving max|err|   end err   held   step end err
+//                        0 (off)          10.4%       1.0%       5         8.3%
+//                        1                81.2%      28.0%     123        42.9%
+//                        2                10.4%       1.0%       5        42.9%
+//                        3                10.4%       1.0%       5        42.9%
+//
+//                  The sim's detector legitimately USES |idx| = 2 on a smooth
+//                  envelope, so a limit of 1 parks the filter for 123 of 200
+//                  frames and ends 28% wrong. 2 is the tightest value that
+//                  costs the smooth arm exactly nothing, and it still vetoes
+//                  three of car1's seven bad proposals — including frame 490's
+//                  +9, the 1.42x inflation that motivated this. The four at
+//                  |idx| = 2 now pass; that is the price of not breaking the
+//                  normal case, and it is stated rather than hidden.
+//
+//                  NOTE this corrects a claim in CLAUDE.md: "the detector
+//                  proposed only -1, 0 or +1 over 199 frames, never +/-2" is
+//                  true of the HARDWARE run it was written from and NOT of the
+//                  sim, which is the bench that decides this parameter.
+//
+//                  THE COST IS REAL AND IT IS ON THE `step` ARM: an abrupt scale
+//                  change ends 42.9% wrong at ANY limit against 8.3% with none.
+//                  That is the same failure SCALE_CONF_MIN already has — the sim
+//                  proposes a correct idx=-14 after a jump and the conf gate
+//                  vetoes it — and it cannot be tuned away, because "wrong
+//                  proposal" and "big correct correction" are the same
+//                  measurement. Set SCALE_MAX_STEP=0 for a sequence with abrupt
+//                  scale change and accept the runaway risk knowingly.
 //   LowConf        conf < conf_min. The occlusion/deformation indicator.
 //   OutOfRange     the PROPOSED box leaves [h0*min_rel, h0*max_rel]. The old
 //                  0.25/4.0 was so loose it never fired in any run on record;
@@ -642,6 +700,7 @@ enum class ScaleVeto {
     Disabled,      // conf_min <= 0: threshold test off, accepted by policy
     Invalid,       // !sr.valid — filter disabled or not yet trained
     AtSearchRail,  // argmax on the boundary of the search range
+    MaxStep,       // one frame's proposal moves the box by more than max_step
     LowConf,       // conf below the threshold
     OutOfRange,    // proposed box outside the absolute bounds
 };
@@ -662,7 +721,57 @@ struct ScaleDecision {
 // depending on the build's -D.
 ScaleDecision scale_gate(const ScaleResult &sr, int n_scales,
                          double cur_h, double cur_w, double h0, double w0,
-                         float conf_min, double min_rel, double max_rel);
+                         float conf_min, double min_rel, double max_rel,
+                         int max_step);
+
+// ---------------------------------------------------------------------------
+// COASTING THROUGH A HOLD
+// ---------------------------------------------------------------------------
+// On a gate veto the tracker holds position, which assumes the target stays put
+// while the filter is frozen. Measured against stb2022 groundtruth
+// (scripts/vot_hold_budget.py), the HOLD BUDGET -- frames before the target
+// leaves the frozen box*padding window, after which recovery is impossible for
+// ANY tracker -- has a median of 6 frames, is <= 4 on 30 of 62 sequences and is
+// 0 on four. car1's budget is 4; its longest hold on hardware was 53.
+//
+// So a held frame moves the window at the last MEASURED velocity, decayed each
+// successive held frame. The decay is what makes this safe: total drift over one
+// hold run is bounded by |v| * 1/(1-decay), so a long hold fades back to a
+// freeze instead of becoming a second way to lose the target. That bound is the
+// property worth testing, and it is why this lives here rather than inline in
+// the tracker -- mosse_filter has no XRT header, so `make test_host` checks it
+// in seconds.
+//
+// Swept offline over all 62 sequences (mean over sequences):
+//
+//   policy             P(survive 1 held frame)  P(survive 3)  median budget
+//   freeze                       90.3%             69.9%            6
+//   coast decay 0.0              94.8%             74.4%            7
+//   coast decay 0.5  <-- ship    94.9%             76.2%            8
+//   coast decay 1.0              94.9%             74.6%            6
+//
+// PURE constant velocity (1.0) is NOT the answer: on a near-stationary target
+// the measured velocity is mostly detection noise, and it takes `nature` from 83
+// frames of budget to 34 and `girl` from 39 to 21. At 0.5, 40 sequences improve,
+// 15 are unchanged and 7 are marginally worse.
+struct CoastState {
+    double vr = 0.0, vc = 0.0;   // last measured per-frame velocity, FRAME px
+    double scale = 1.0;          // decay factor for the CURRENT hold run
+};
+
+// Called on an ACCEPTED frame with the displacement that frame applied. Never on
+// a coasted frame: a coast moves the box BY the velocity, so learning from it
+// would make the estimate self-confirming and the decay would never take effect.
+void coast_observe(CoastState &c, double dr_frame, double dc_frame);
+
+// Called on a HELD frame. Writes the offset to apply and advances the decay.
+// Returns false when there is nothing to coast on (no velocity measured yet, or
+// the run has decayed to nothing), in which case the caller freezes as before.
+bool coast_step(CoastState &c, double decay, double *dr_frame, double *dc_frame);
+
+// The drift bound above, as a function: |v| * 1/(1-decay), or infinity at
+// decay >= 1. Exposed so the test asserts the bound rather than a magic number.
+double coast_drift_bound(const CoastState &c, double decay);
 
 const char *scale_veto_tag(ScaleVeto v);   // "ACCEPT" / "AT_SEARCH_RAIL" / ...
 const char *scale_veto_why(ScaleVeto v);   // one sentence, for the log

@@ -610,8 +610,57 @@ IMPULSE_DR ?= 10
 IMPULSE_DC ?= -7
 GCC_FLAGS  += -DIMPULSE_DR=$(IMPULSE_DR)
 GCC_FLAGS  += "-DIMPULSE_DC=($(IMPULSE_DC))"
+# THE MAXIMUM frame geometry, which is what frame_bo is allocated at. It is no
+# longer the geometry the pipeline runs: at FRAME_SOURCE=vot every sequence
+# brings its own rows/cols from its manifest, and the host writes them to
+# roi_crop's AXI-Lite registers per sequence. Phase 1 checked all 62 stb2022
+# sequences against this bound -- none exceeds it, and birds2/zebrafish1/frisbee
+# sit EXACTLY at it, so the margin is zero and a new dataset needs the check
+# re-run rather than assumed (runs/vot/phase1.md).
 GCC_FLAGS  += -DFRAME_ROWS=1080
 GCC_FLAGS  += -DFRAME_COLS=1920
+# WHERE FRAMES COME FROM.
+#   synth  the generated scene -- background, scripted trajectory, injected
+#          target, occluder. Reproduces today's behaviour EXACTLY; every
+#          existing result and every knob above still means what it meant.
+#   vot    frames memcpy'd out of a converted VOT blob, geometry and init box
+#          from its manifest. The synthetic scene generator, TRAJECTORY,
+#          OCCLUDE_MASK, BG_PAN and FRAME_NOISE are all inert -- the frames are
+#          whatever the dataset holds -- and IoU is scored against the
+#          manifest's groundtruth instead of against what the host drew.
+# The board still does no protocol: no failure detection, no anchor logic, no
+# reset policy. See runs/vot/ and the plan artifact.
+FRAME_SOURCE ?= synth
+ifeq ($(FRAME_SOURCE),vot)
+  GCC_FLAGS += -DFRAME_SOURCE_VOT=1
+  # Linked on this arm ONLY. At synth it would be dead code in the ELF -- a
+  # manifest parser and a trajectory writer that nothing calls -- and the two
+  # arms should differ structurally, not just by a #define.
+  VOT_SRC := $(HOST_APP_SRC)/vot_source.cpp
+else ifeq ($(FRAME_SOURCE),synth)
+  GCC_FLAGS += -DFRAME_SOURCE_VOT=0
+  VOT_SRC :=
+else
+  $(error FRAME_SOURCE must be 'synth' or 'vot', got '$(FRAME_SOURCE)')
+endif
+# Defaults for the VOT run, all overridable on the board's command line
+# (--vot-data / --vot-results / --vot-seq / --vot-job) so picking a different
+# sequence or anchor costs neither a rebuild nor a re-flash. They are compiled in
+# as defaults only, and the ELF prints what it actually used.
+VOT_DATA_DIR    ?= /mnt/vot
+VOT_RESULTS_DIR ?= /mnt/vot-results
+VOT_SEQUENCE    ?= car1
+VOT_JOB         ?= 0
+# Deliberately break one item of run_reset(), so the determinism test's ability
+# to FAIL is demonstrated rather than assumed. 0 = none (the shipping build).
+#   1 mean_prev   2 filter_bo   3 g_filter   4 coast   5 scale reconfigure
+# Every non-zero value prints a banner and invalidates the run's tracking output.
+RESET_MUTANT    ?= 0
+GCC_FLAGS  += -DVOT_DATA_DIR='"$(VOT_DATA_DIR)"'
+GCC_FLAGS  += -DVOT_RESULTS_DIR='"$(VOT_RESULTS_DIR)"'
+GCC_FLAGS  += -DVOT_SEQUENCE='"$(VOT_SEQUENCE)"'
+GCC_FLAGS  += -DVOT_JOB=$(VOT_JOB)
+GCC_FLAGS  += -DRESET_MUTANT=$(RESET_MUTANT)
 # What "colour" means for the SYNTHETIC scene at CONV_IN_CH=3. 1 = per-plane
 # tint with a warmer target (real chroma for the joint normalisation to carry);
 # 0 = replicate luma into all three planes, which is the hardware analogue of the
@@ -1001,6 +1050,66 @@ SCALE_MIN_REL      ?= 0.5
 SCALE_MAX_REL      ?= 2.0
 GCC_FLAGS  += -DSCALE_CONF_MIN=$(SCALE_CONF_MIN)
 GCC_FLAGS  += -DSCALE_MIN_REL=$(SCALE_MIN_REL) -DSCALE_MAX_REL=$(SCALE_MAX_REL)
+# Largest |idx| ONE frame may move the box -- a rate limit, where MIN_REL/MAX_REL
+# are a drift bound. 0 disables the test.
+#
+# DEFAULT 2, AND 1 WAS MEASURED AND REJECTED. car1's hardware run argues for 1:
+# all seven proposals with |idx| >= 2 landed on frames whose IoU was 0.000,
+# including frame 490's +9 (a 1.42x inflation while the tracker was 227 px off).
+# But `make scale_sim` shows 1 parks the NORMAL smooth-envelope arm for 123 of
+# 200 frames and ends 28.0% wrong, against 1.0% unlimited -- the sim's detector
+# really does use |idx| = 2 there. 2 costs the smooth arm nothing and still
+# vetoes three of car1's seven. Sweep it with:
+#     make scale_sim && build/.../scale_loop_sim --max-step N
+SCALE_MAX_STEP     ?= 2
+# COASTING THROUGH A HOLD. On a gate veto the host holds position, which assumes
+# the target stays put while the filter is frozen -- an assumption stb2022
+# violates on most sequences. HOLD_COAST=1 moves the search window at the last
+# measured velocity instead, decayed by COAST_DECAY on each successive held
+# frame, so total drift over a hold run is bounded by v/(1-decay) = 2v and a long
+# hold fades back to a freeze. HOLD_COAST=0 restores the old freeze exactly.
+#
+# COAST_DECAY=0.5 chosen by sweeping all 62 stb2022 sequences offline
+# (scripts/vot_hold_budget.py --policy both --coast-decay D); PURE constant
+# velocity (1.0) is worse than 0.5 and is worse than freezing on slow sequences,
+# because a near-stationary target's measured velocity is mostly noise.
+# DEFAULT WAS FLIPPED TO 1 ON 2026-08-25 AND REVERTED TO 0 THE SAME DAY, WHEN
+# THE SAME 54 TRAJECTORY PAIRS WERE SCORED BY THE TOOLKIT INSTEAD OF BY MEAN IoU.
+# The two metrics disagree, and both readings are of the same runs:
+#
+#   mean IoU (evidence_arm_ab.md)   0.2709 -> 0.3005 frame-weighted   1 WINS
+#   vot AR / EAO (evidence_ar.md)   A 0.638 -> 0.616, R 0.309 -> 0.288,
+#                                   EAO 0.208 -> 0.194                0 WINS
+#
+# AR is the metric of record, so the default follows it. The mechanism is
+# understood: vot fails a run on 10 CONSECUTIVE frames at overlap <= 0.1, and on
+# a direction change the coast carries the box the old way while the target
+# reverses -- car1 anchor 741 drops out for 13 frames coasting against 7 frames
+# freezing, so the coast trips the grace where the freeze does not. The run then
+# REACQUIRES and tracks ~470 more frames at overlap 0.82, all of which the rule
+# discards. Failure counts barely move (48 of 54 runs vs 49); only their timing
+# does, which is exactly what a mean cannot see.
+#
+# So this is not "coasting is bad": it wins on many short holds (car1 job 0's
+# permanent loss disappears, 73 accept->hold transitions, ~5 coasted frames
+# each) and loses on one long hold that crosses a turn. The untested option is a
+# CAP on consecutive coasted frames -- k from hold_policy.md's per-sequence
+# budget (median 6, car1 4) -- which would plausibly keep the win and delete the
+# loss. It is closed loop, so it needs a board run, not more analysis.
+#
+# The earlier note stands on its own terms: the offline model predicted the
+# opposite for car1 and was wrong because it was OPEN LOOP -- it treated the
+# observed 29-frame gated run as fixed, when coasting turns frames that would
+# have been gated into ACCEPTED ones and every accept restarts the coast. Read
+# hold_policy.md's budgets as a bound on one uninterrupted hold, never as a
+# prediction of outcome.
+#
+# HOLD_COAST=1 reproduces the coast1 arm; every result recorded before
+# 2026-08-25 is reproducible at 0, which is again the default.
+HOLD_COAST         ?= 0
+COAST_DECAY        ?= 0.5
+GCC_FLAGS  += -DHOLD_COAST=$(HOLD_COAST) -DCOAST_DECAY=$(COAST_DECAY)
+GCC_FLAGS  += -DSCALE_MAX_STEP=$(SCALE_MAX_STEP)
 
 # Occlusion injection, to prove the gate actually FIRES — it cannot on the normal
 # synthetic target, which measures PSR ~172 against a threshold of 7. Bitmask over
@@ -1396,11 +1505,13 @@ $(BUILD_DIR)/$(APP_ELF): $(APP_FLAGS_STAMP)                 \
                          $(HOST_APP_SRC)/mosse_filter.cpp   \
                          $(HOST_APP_SRC)/mosse_filter.h     \
                          $(HOST_APP_SRC)/scene_colour.cpp   \
-                         $(HOST_APP_SRC)/scene_colour.h
+                         $(HOST_APP_SRC)/scene_colour.h     \
+                         $(VOT_SRC)                         \
+                         $(HOST_APP_SRC)/vot_source.h
 	mkdir -p $(BUILD_DIR)
 	$(CXX) $(GCC_FLAGS) $(GCC_INC) \
 	    $(HOST_APP_SRC)/mosse_tracker.cpp $(HOST_APP_SRC)/mosse_filter.cpp \
-	    $(HOST_APP_SRC)/scene_colour.cpp \
+	    $(HOST_APP_SRC)/scene_colour.cpp $(VOT_SRC) \
 	    $(GCC_LIBS) -o $@
 
 # -------------------------------------------------------
@@ -1433,6 +1544,47 @@ test_scene:
 	    $(TEST_HOST_DIR)/test_scene_colour.cpp \
 	    -o $(BUILD_DIR)/test_scene
 	$(BUILD_DIR)/test_scene
+
+# vot_source.{h,cpp} follows the same rule again: no XRT header, so the manifest
+# parser, the blob offsets, the run-order convention and the trajectory writer
+# are testable in seconds. They need to be, because NOTHING in that file
+# computes anything -- every failure mode is bookkeeping that produces a
+# complete, plausible, invalid AR report instead of an error. Phase 1 lost every
+# groundtruth box in 62 manifests to exactly that shape of bug.
+#
+# The suite is mutation-tested: 19 mutants, each of which must be REJECTED. If
+# $VOT_ROOT is exported it additionally parses every real manifest in
+# $VOT_ROOT/data, which is the only check that the converter's output and this
+# parser agree.
+.PHONY: test_vot_source
+test_vot_source:
+	mkdir -p $(BUILD_DIR)
+	g++ -O2 -std=c++17 -Wall -Wextra -Werror -I$(HOST_APP_SRC) \
+	    $(HOST_APP_SRC)/vot_source.cpp \
+	    $(TEST_HOST_DIR)/test_vot_source.cpp \
+	    -o $(BUILD_DIR)/test_vot_source
+	$(BUILD_DIR)/test_vot_source
+
+# The one piece of arithmetic in the whole result path -- the tracker's CENTRE
+# box becoming the toolkit's top-left x,y,w,h -- checked against the toolkit's
+# OWN reader rather than against a second copy of our format rules. Phase 0b
+# round-tripped the format using the toolkit's WRITER, which says nothing about
+# the printf that will actually run on the board.
+#
+# The C++ side emits its INPUT (centre boxes) next to the trajectory and the
+# conversion is re-derived in Python, so a wrong conversion disagrees instead of
+# agreeing with itself. Both a transposed pair and a missing centre offset were
+# confirmed to FAIL this check.
+#
+# Needs the venv (vot-toolkit), and the Vitis environment MASKS python -- hence
+# the env -u, the same one every offline script in scripts/ carries.
+.PHONY: test_vot_format
+test_vot_format: test_vot_source
+	rm -rf $(BUILD_DIR)/vot_format
+	mkdir -p $(BUILD_DIR)/vot_format
+	$(BUILD_DIR)/test_vot_source $(BUILD_DIR)/vot_format
+	cd $(PROJECT_REPO) && env -u PYTHONPATH -u PYTHONHOME ./.venv/bin/python \
+	    scripts/vot_check_trajectory.py $(BUILD_DIR)/vot_format
 
 .PHONY: test_host
 test_host:
@@ -1488,7 +1640,7 @@ scale_sim: $(BUILD_DIR)/scale_loop_sim
 # act on 2026-08-20 — changing the SCALE_STEP default left the sim reporting
 # step=1.020 from a stale ELF.
 SCALE_SIM_STAMP := $(BUILD_DIR)/scale_sim.flagstamp
-$(SCALE_SIM_STAMP): FLAGS_FOR_STAMP := $(SCALE_N)/$(SCALE_STEP)/$(SCALE_ETA)/$(SCALE_SIGMA_FACTOR)/$(SCALE_TMPL_AREA)/$(SCALE_CONF_MIN)/$(SCALE_MIN_REL)/$(SCALE_MAX_REL)
+$(SCALE_SIM_STAMP): FLAGS_FOR_STAMP := $(SCALE_N)/$(SCALE_STEP)/$(SCALE_ETA)/$(SCALE_SIGMA_FACTOR)/$(SCALE_TMPL_AREA)/$(SCALE_CONF_MIN)/$(SCALE_MIN_REL)/$(SCALE_MAX_REL)/$(SCALE_MAX_STEP)
 
 $(BUILD_DIR)/scale_loop_sim: $(SCALE_SIM_STAMP)                \
                              $(HOST_APP_SRC)/mosse_filter.cpp \
@@ -1504,6 +1656,7 @@ $(BUILD_DIR)/scale_loop_sim: $(SCALE_SIM_STAMP)                \
 	    -DSCALE_SIGMA_FACTOR=$(SCALE_SIGMA_FACTOR) -DSCALE_TMPL_AREA=$(SCALE_TMPL_AREA) \
 	    -DSCALE_CONF_MIN=$(SCALE_CONF_MIN) \
 	    -DSCALE_MIN_REL=$(SCALE_MIN_REL) -DSCALE_MAX_REL=$(SCALE_MAX_REL) \
+	    -DSCALE_MAX_STEP=$(SCALE_MAX_STEP) \
 	    $(HOST_APP_SRC)/mosse_filter.cpp $(TEST_HOST_DIR)/scale_loop_sim.cpp \
 	    -o $@
 

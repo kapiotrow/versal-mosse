@@ -56,13 +56,16 @@ Board:
 ```bash
 ip addr add 192.168.10.2/24 dev end0
 mkdir -p /mnt/vot
-mount -t nfs -o vers=3,nolock,ro,rsize=1048576,proto=tcp \
-      192.168.10.1:/srv/vot/data /mnt/vot
+mkdir -p /mnt/vot-results/coast0
+mount -t nfs -o vers=3,nolock,ro,rsize=1048576,proto=tcp 192.168.10.1:/srv/vot/data /mnt/vot
+mount -t nfs -o vers=3,nolock,rw,rsize=1048576,proto=tcp 192.168.10.1:/srv/vot/results /mnt/vot-results/coast0
 sync; echo 3 > /proc/sys/vm/drop_caches
 time dd if=/mnt/vot/probe.bin of=/dev/null bs=1M
 #   500+0 records in / 500+0 records out
 #   real 0m4.475s   ->  524288000 B / 4.475 s = 117.2 MB/s
 ```
+
+./mosse_tracker.elf a.xclbin --vot-seq soccer2 --vot-jobs all --vot-results /mnt/vot-results/coast0
 
 `nolock` is load-bearing: a trimmed rootfs has no `rpc.statd`, and without it the mount
 hangs rather than failing.
@@ -110,7 +113,11 @@ instead of an honest staging slot.
 ## Still open
 
 - The **results** export (`rw`) has not been exercised. `chown nobody:nogroup` is in place
-  against root-squash, but the first actual trajectory write is the test.
-- Throughput was measured on a `/dev/urandom` probe, not a real converted blob. No reason
-  to expect a difference — it is the same sequential read — but Phase 5's staging slot is
-  the measurement of record.
+  against root-squash, but the first actual trajectory write is the test. The board-side
+  mount command is in [phase2.md](phase2.md).
+- ~~Throughput was measured on a `/dev/urandom` probe, not a real converted blob.~~
+  **CLOSED 2026-08-25: a real blob stages at 101.2 MB/s, not 117.2** (`car1`, 217.4 MB in
+  2.15 s, board-side `[vot]` line). The "no reason to expect a difference" above was wrong,
+  by 13.7%, and the likely reason is not the link: the board's read allocates and
+  first-touches a 217 MB heap buffer, which `dd` to `/dev/null` never does. The run's own
+  number is the one to budget against. See [phase2.md](phase2.md).
