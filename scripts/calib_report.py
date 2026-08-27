@@ -67,6 +67,23 @@ def parse_log(path):
     return {f: d for f, d in frames.items() if d}
 
 
+def fnum(key):
+    """The frame INDEX out of a frames{} key.
+
+    Keys are a bare int at FRAME_SOURCE=synth and a (job, frame) tuple on a
+    multi-start CSV. Everything that asks "is this an early frame?" means the
+    frame index within its own run, not a position in the file -- on a
+    multi-start sweep frame 5 of job 12 is as early as frame 5 of job 0, and
+    the convergence-growth trap this report exists to catch is per RUN.
+    """
+    return key[1] if isinstance(key, tuple) else key
+
+
+def fname(key):
+    """How a frames{} key prints."""
+    return f"job {key[0]} frame {key[1]}" if isinstance(key, tuple) else f"frame {key}"
+
+
 def check_coverage(frames):
     """Warn when frames disagree about WHICH scans they carry.
 
@@ -103,20 +120,48 @@ def parse_csv_frames(rows):
     if not rows or 'rails' not in rows[0]:
         return {}, {}, False
     frames, rails = {}, {}
-    col = [('response', 'peak'), ('accum', 'accum_max'),
-           ('F_ch', 'fch0_max'), ('H(q15)', 'h_max')]
+    # amplitude column, and the PER-BUFFER rails column when the CSV has it.
+    #
+    # `resp_max` (2026-08-26+) is the response scan's own maximum. Before it,
+    # `peak` stood in -- and it is a good stand-in but not the same quantity:
+    # `peak` is the SIGNED REAL PART at the argmax of |real|, so it is blind to
+    # a bin saturating in the imaginary part alone. Measured agreement on the
+    # runs that had both: 199/199 synthetic, 739/741 on car1, the exceptions at
+    # amplitude ~25 of 32767. Prefer resp_max, fall back to peak, and say which.
+    col = [('response', 'resp_max', 'rails_resp'),
+           ('accum',    'accum_max', 'rails_accum'),
+           ('F_ch',     'fch0_max',  'rails_fch'),
+           ('H(q15)',   'h_max',     'rails_h')]
+    if 'resp_max' not in rows[0]:
+        col[0] = ('response', 'peak', 'rails_resp')
+    per_buffer = 'rails_resp' in rows[0]
+    # KEY BY (job, frame), NOT frame. A multi-start track.csv carries every
+    # anchor of a sequence in one file, so a bare frame index collides across
+    # runs and the last job silently overwrites the other fourteen. Measured on
+    # runs/vot/0825_1919-smoke/track_car1.csv: 8434 rows collapsed to 742
+    # frames and 266 railed frames were reported as 4 -- the tool that is
+    # supposed to be the rails gate under-reported them by 66x, and it did so
+    # while printing a confident "BUDGET IS WRONG" that happened to be right for
+    # the wrong reason. A composite key costs nothing at FRAME_SOURCE=synth,
+    # where `job` is absent and this degenerates to the old behaviour exactly.
+    multi = 'job' in rows[0]
     for r in rows:
         try:
             f = int(r['frame'])
         except (KeyError, ValueError):
             continue
+        if multi and r.get('job') not in (None, ''):
+            f = (int(r['job']), f)
         d = {}
-        for tag, c in col:
-            if r.get(c) not in (None, ''):
-                # rails is per FRAME in the CSV, not per buffer, so it is carried
-                # separately rather than pinned to a buffer that may not be the
-                # one that railed.
-                d[tag] = (abs(float(r[c])), 0)
+        for tag, c, rc in col:
+            if r.get(c) in (None, ''):
+                continue
+            # Per-buffer rails when the CSV carries them; 0 otherwise, with the
+            # frame TOTAL still reported separately. An unattributed total is
+            # what made the 2026-08-25 car1 evidence read as an accumulator
+            # problem when the console said the response railed twice as often.
+            n = int(r[rc] or 0) if per_buffer and r.get(rc) not in (None, '') else 0
+            d[tag] = (abs(float(r[c])), n)
         if d:
             frames[f] = d
             rails[f] = int(r['rails'] or 0)
@@ -186,8 +231,11 @@ def main():
               for f, d in frames.items()}
     railed = {f: d for f, d in railed.items() if d}
     if not railed and csv_rails:
-        # CSV rails is a per-frame total; the buffer is not identified there.
-        railed = {f: {'(frame total)': (0, n)} for f, n in csv_rails.items() if n}
+        # Only reachable on a PRE-2026-08-26 CSV, which carries the per-frame
+        # total and no attribution. Kept so an old run still reports its rails
+        # rather than reporting none -- but the buffer genuinely is unknown
+        # there, and the label has to say so rather than pick a plausible one.
+        railed = {f: {'(unattributed)': (0, n)} for f, n in csv_rails.items() if n}
     print("\nRAILS (must be zero on EVERY frame)")
     if not frames and not csv_has_cols:
         # "none" and "never looked" are different answers and must not print
@@ -202,21 +250,33 @@ def main():
         print(f"  {len(railed)} frame(s) railed   <-- BUDGET IS WRONG")
         for f in sorted(railed)[:10]:
             for tag, (mx, n) in railed[f].items():
-                print(f"    frame {f:>4}  {tag:<10} rails={n} max={mx:.0f}")
+                print(f"    {fname(f):<20} {tag:<14} rails={n} max={mx:.0f}")
         if len(railed) > 10:
             print(f"    ... and {len(railed) - 10} more")
-        first = min(railed)
-        print(f"  FIRST railed frame: {first}"
+        # Earliest by frame index WITHIN a run, not by file order: the trap
+        # this line names is a filter converging, which restarts every run.
+        first = min(railed, key=fnum)
+        # Per-buffer totals. WHICH buffer rails picks the knob: H_SHIFT is
+        # upstream of both the accumulator and the response, IFFT_ROW_SHIFT /
+        # IFFT_COL_SHIFT reach only the response. An unattributed count cannot
+        # choose between them.
+        by_tag = {}
+        for d in railed.values():
+            for tag, (_, n) in d.items():
+                by_tag[tag] = by_tag.get(tag, 0) + (n if n else 1)
+        print("  by buffer: " + ", ".join(f"{t}={n}" for t, n in
+                                          sorted(by_tag.items(), key=lambda x: -x[1])))
+        print(f"  FIRST railed: {fname(first)}"
               + ("   (frame 1 is fine but LATE frames rail — this is the"
-                 " convergence-growth trap)" if first > 5 else ""))
+                 " convergence-growth trap)" if fnum(first) > 5 else ""))
 
     # ---- response amplitude, early vs converged --------------------------
     tags = tags_seen
     print("\nAMPLITUDE by buffer  (target for `response`: 49-64% of int16 at the"
           " converged end)")
     for tag in tags:
-        early = [d[tag][0] for f, d in frames.items() if 1 <= f <= 20 and tag in d]
-        late = [d[tag][0] for f, d in frames.items() if f > 20 and tag in d]
+        early = [d[tag][0] for f, d in frames.items() if 1 <= fnum(f) <= 20 and tag in d]
+        late = [d[tag][0] for f, d in frames.items() if fnum(f) > 20 and tag in d]
         lo, hi = (TARGET_LO, TARGET_HI) if tag.startswith('resp') else (None, None)
         band(f"{tag}  frames 1-20", early)
         band(f"{tag}  frames 21+", late, lo, hi)

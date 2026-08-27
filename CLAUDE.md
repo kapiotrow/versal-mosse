@@ -47,6 +47,7 @@ the `dsp` subdirectory (the Makefile appends `/dsp`).
 | `FRAME_SOURCE` | `synth` | `synth` = the generated scene (unchanged, and `vot_source.cpp` is not even linked); `vot` = frames memcpy'd from a converted VOT blob, geometry and init box from its manifest. At `vot` the scene generator, `TRAJECTORY`, `OCCLUDE_MASK`, `BG_PAN` and `FRAME_NOISE` are all inert, and `ITER_CNT` is ignored — the run length is the job's. `vot` + `CONV_IN_CH=3` is a deliberate `#error` (needs the `.luma` sidecar). Host-only. See `runs/vot/phase2.md` |
 | `RESET_MUTANT` | `0` | Deliberately breaks ONE item of `run_reset()` so the multi-start determinism test's ability to FAIL is demonstrated, not assumed: `1` mean_prev, `2` filter_bo, `3` g_filter, `4` coast, `5` scale reconfigure. Non-zero prints a banner and invalidates the run's tracking output. See `runs/vot/phase3.md`. Host-only |
 | `VOT_DATA_DIR` / `VOT_RESULTS_DIR` / `VOT_SEQUENCE` / `VOT_JOB` | `/mnt/vot` / `/mnt/vot-results` / `car1` / `0` | Compiled-in defaults, each overridable on the board's command line (`--vot-data`, `--vot-results`, `--vot-seq`, `--vot-job`, `--vot-jobs all|N,M,...` for multi-start in one process, plus `--vot-max-frames` for a bring-up truncation that then REFUSES to write the trajectory). **Repeating a job index in `--vot-jobs` is the determinism test** — its two trajectories must come back byte-identical. An unrecognised argument is fatal — a typo falling back to the default would run the wrong sequence silently. Host-only |
+| `VOT_RESIDENT_MAX_MB` / `VOT_STREAM_RING` | `700` / `8` | Blob+sidecar size above which a sequence STREAMS from the NFS mount through a prefetched ring instead of staging into heap, and the ring depth in frames. Exists because usable heap is ~0.9-1.2 GB, not 12 GB: five RGB sequences (`flamingo1` 3631 MB, `zebrafish1` 2373, `nature` 1482, `frisbee` 1471, `girl` 1318) died on `std::bad_alloc`/OOM in the 2026-08-26 full-62 sweep while the other 57 completed. Ring < 2 is REFUSED, not clamped — `at(k)` holds slot k while the prefetcher fills ahead. Overridable per run with `--vot-stream auto|always|never`; `always` is the MODE-EQUIVALENCE TEST, since streaming changes no arithmetic and a sequence that fits in heap must return IDENTICAL run-state digests both ways. The resident path is untouched and stays the default, because 57 sequences already ran on it. Host-only |
 | `SCENE_VERIFY` | `0` | Re-colourise the whole frame each push and abort with coordinates on a mismatch. O(frame)/frame — for a short `MODE=bringup` run, never a 200-frame one (`calib_build.sh` refuses that combination). Plumbed 2026-08-24; it was a bare `#ifndef` before, so `SCENE_VERIFY=1` silently built it DISABLED. Host-only |
 | `B2_NULL_BINS` | `1` | 1 = null the 9 low-frequency bins, 0 = subtract µ·W |
 | `PSR_GATE_MIN` | `7.0` | Bolme §3.5. Below it the host HOLDS position and skips `filter_update` + `publish_filter`. `0` disables the threshold test only (structural vetoes remain). Host-only |
@@ -67,6 +68,8 @@ the `dsp` subdirectory (the Makefile appends `/dsp`).
 | `FRAME_TEXTURE` | — | Band-limited background instead of a flat fill |
 | `FRAME_NOISE` | `2` | Per-frame sensor noise, PEAK amplitude in LSB, over the ROI. Does **not** fix background lock |
 | `BG_PAN` / `BG_PAN_R` / `BG_PAN_C` | `1` / `31` / `47` | Camera pan over the cached background, px/frame. Decorrelates the background 6.6× (swept with `scripts/bg_pan_sweep.py`) but **did not fix tracking** — see the training-target trap. Host-only |
+| `PROGRESS_EVERY` | `1` | Frames between LEVEL-0 progress lines. `1` = every frame = byte-identical to every pre-2026-08-25 run (proven by an ELF `cmp`, not by reading the `#if`). The ~45 B line was priced at 4% of an ~87 ms floor; the floor is now 26.29 ms, so it is **15%** — and 58% of the frame on `animal`, where `correlation(gated%, unattributed) = 0.963`. Thins the marker, never silences it: frame 0 and the last frame always print, because a run missing its final line looks exactly like a run that hung. **Only has effect at `VERBOSITY=0`** — at 1 the line does not exist and the flag is provably inert. Host-only |
+| `CSV_FLUSH_EVERY` | `1` | Rows between `track.csv` flushes. `1` = every row = the old behaviour, kept as the default because per-row flushing was justified by surviving a power cut and one really did take out arm B's `car1` run. A **railed** row flushes regardless of N; a gate veto deliberately does not (vetoes are commonest on exactly the gate-heavy runs the knob exists for). Whole dataset is ~4.6 MB of rows, so buffering a full run is free. Host-only |
 | `VERBOSITY` | `1` | `0` = one compact line/frame (~45 B); `1` = per-frame block, roi_crop/DMA tables on first+last frame only; `2` = everything. Anomalies print at every level. **No longer a diagnostics trade-off** — since 2026-08-24 `track.csv` carries `rails`/`accum_max`, so a `VERBOSITY=0` run is a full budget verdict AND an FPS measurement. Host-only |
 | `DUMP_BUFFERS` | `1` | Per-frame binary dumps. **1216 KB/frame, ~2 s/frame**. Set `0` for any run measuring tracking or FPS |
 | `CSV_LOG` | `1` | One row/frame to `track.csv` (`track_<sequence>.csv` at `FRAME_SOURCE=vot`, since one sweep is one invocation per sequence and the file opens `"w"`; the arm is separated by `--vot-results` instead) — gate verdict, both PSRs, peak, displacement, `resp00_over_peak`, both boxes, IoU, centre error, scale fields, and (2026-08-24+) `rails,accum_max,fch0_max,h_max`. ~60 B/frame |
@@ -229,7 +232,16 @@ after all channels:
 
 ## Resources and cost
 
-VEK280 `xcve2802-vsvh1760-2MP-e-S`, 12 GB LPDDR4; AIE core clock 1 GHz
+VEK280 `xcve2802-vsvh1760-2MP-e-S`, 12 GB LPDDR4 **of which Linux maps 2 GB, and
+512 MB of that is CMA — usable heap is ~0.9-1.2 GB, NOT 12 GB** (see
+`runs/vot/TODO_board_memory.md`; it cost **5** of 62 sequences on the RGB VOT
+arm — the predicted 8 included three that turned out to fit, which is why the
+"derive luma on the board" step recovers zero sequences and the streaming reader
+was the only fix. `VOT_RESIDENT_MAX_MB` above is that reader).
+The device tree declares all three banks; `/proc/iomem` shows only
+`00000000-7fffffff : System RAM`, with the 2 GB at `0x8_00000000` reserved and
+the 8 GB at `0x500_00000000` absent. The figure below is the PART's capacity and
+has been misread as an available-memory budget once already; AIE core clock 1 GHz
 (`directives/post_sys_link.tcl`). Measured on the 128×128 ch1 build:
 
 | Resource | Available | Used | % |
@@ -258,7 +270,22 @@ orchestration, never core count. **`runtime<ratio>` is not utilization**: the ma
 These are the compiler's scheduled cycles — real cycles on an in-order VLIW core absent memory
 stalls, trustworthy for sizing but not a profile.
 
-## Current status (2026-08-24)
+## Current status (2026-08-27)
+
+**THE FULL VOT-STb2022 BENCHMARK IS DONE, ON HARDWARE, BOTH ARMS, ALL 62 SEQUENCES.**
+419 runs per arm, `~/vot/analysis/full62`. RGB wins accuracy, robustness and EAO and
+survives 12.8% more frames; see "Where this tracker sits" for the comparison against the
+41 published VOT-STb2022 entries, and the RGB section for the per-sequence breakdown.
+
+| arm | accuracy | robustness | EAO | frames |
+|---|---|---|---|---|
+| gray `H_SHIFT=14` | 0.4890 | 0.2743 | 0.1367 | 48,603 |
+| RGB `H_SHIFT=15` | 0.5043 | 0.3065 | 0.1474 | 54,813 |
+
+The last blocker was heap, not tracking: five RGB sequences exceed the board's ~1 GB and
+died on `std::bad_alloc`. `vot::StreamBlob` (ring + prefetch thread, `--vot-stream`) closed
+it, proven by identical run-state digests in both modes. See
+`runs/vot/TODO_board_memory.md`, now CLOSED.
 
 **Best hardware FPS: `runs/run_0821_1725.log`, 26.29 ms/frame = 38.04 FPS** —
 `MEMTILE_TRANSPOSE=1 ROI_CROP_PIPELINE=1 CMUL_SPLIT_ACCUM=1 TAIL_PARALLEL=1`. That run predates
@@ -331,6 +358,47 @@ slots credit (main's own work + H), so the double-count is exactly **H − W**. 
 itself: overlap 2.762 against a predicted `min(4.80, 2.89)` = 2.9, and the residual returned to
 +1.261 against +1.17 before threading — a correction tuned merely to erase a negative number
 would have had no reason to land there.
+
+### OPEN TODO — the shift budget on real video
+
+**`runs/vot/TODO_shift_budget.md`.** `car1` over 15 anchors rails on **266 of 8434 frames** on the
+shipping 4-4-4 / `H_SHIFT=11` gray build. **The instrument gap is CLOSED (2026-08-26, host-only)
+and the rails are now ATTRIBUTED** (`runs/vot/0826_1232-attrib`, all 15 digests identical to the
+smoke run, 0 of 8434 shared columns differing — a pure re-measurement):
+
+```
+response 1330 bins / 191 frames     accum 1055 bins / 123 frames     F_ch 0     H 0
+response only 143    accum only 75    BOTH 48
+```
+
+**Both buffers rail, so `H_SHIFT` — the only knob upstream of both — is the lever after all.** An
+`IFFT_*` fix reaches only the response and would leave 75 frames railing. An intermediate reading
+of a 12-frame console sample said "response only" and proposed `IFFT_COL_SHIFT`; the cheap
+host-only run killed it before the reflash, which is the whole reason it was sequenced first.
+
+**`accum_max = 46340 = 141.4% of the rail` IS NOT OVERSHOOT — it is 32767·√2**, the largest
+magnitude a non-saturated cint16 bin can hold (the rail is per COMPONENT, `accum_max` is a
+magnitude). Clean `rails=0` frames legitimately reach 131%. **`rails` is the only saturation
+instrument and always was.** Do not re-derive a budget from a magnitude-vs-component comparison.
+
+**The readings are CENSORED at the rail, so "one bit halves 46340 to 71%" is not derivable** — it
+halves a clipped number. Next step is a deliberately over-shifted arm (`H_SHIFT=14`) that cannot
+rail, which returns the true distribution; the real budget is then arithmetic, sized against the
+ACCUMULATOR (clean max 92.7% of ceiling vs the response's 70.4%). That arm needs the graph
+rebuild, re-package and re-flash.
+
+`track.csv` now carries `resp_max,rails_fch,rails_accum,rails_resp,rails_h`, and `calib_report.py`
+reports rails BY BUFFER. `resp_max` differs from `peak` on 1 of 8434 rows and changed no
+conclusion — the old "`peak` already is it" claim was correct, and is now checked rather than
+assumed. Rails are NOT correlated with tracking loss (`corr = −0.025`) and do NOT explain the
+`NEGATIVE_PEAK` vetoes; this is a budget defect, not a tracking fix.
+**`H_SHIFT` is the one knob left that is NOT host-only** — it reaches `AIE_FLAGS`, so unlike every
+arm since the automation landed it needs a graph rebuild, a re-package and a re-flash, and the
+sweep's xclbin guard will (correctly) refuse until the card is updated. **Re-provision after
+packaging**: `v++ --package` takes `build/rootfs/rootfs_compat.ext4`, which `make rootfs` only
+regenerates when the pristine rootfs changes, so a re-package inherits whatever that copy holds —
+it did not hold the ssh key until 2026-08-25, which would have produced a board that boots
+unreachable and reads as a cable fault.
 
 ### Next, in order
 
@@ -477,6 +545,13 @@ Two principles that have repeatedly earned their keep: **instruments before chan
   no AXIS port, ~6 µs of work — paying the same 512 ms turned "roi_crop is slow" into "any CU
   completion is slow"; after the fix, the *same* probe in the *same run* still paying 512 ms is
   what proves the fix is the fix.
+- **A MULTI-START CSV COLLIDES ON FRAME INDEX, AND IT SILENTLY DISARMED THE RAILS GATE.**
+  `calib_report.py`'s `parse_csv_frames` keyed by frame number, so one `track.csv` holding 15
+  anchors collapsed 8434 rows to 742 and reported **4 railed frames where there were 266** — a
+  66× under-report, printed next to a confident "BUDGET IS WRONG" that was right for the wrong
+  reason. Fixed 2026-08-26 by keying on `(job, frame)`. Any per-frame reader of a
+  `FRAME_SOURCE=vot` CSV has this bug until shown otherwise; `job` is a column for exactly this
+  reason and a bare frame index is not a key.
 - **Test an analysis tool against an OLD log before the run it was written for.**
   `calib_report.py` was written to parse a calibration run, then pointed at an existing board
   log: its frame regex was anchored at line start, but board logs are captured through
@@ -1065,6 +1140,33 @@ Two principles that have repeatedly earned their keep: **instruments before chan
   written at runtime. **Verify a feature flag on a build that can actually exercise it**, and
   when a `strings` check says a feature is missing, check the loop bounds before the flags. Cost
   here: an hour of bisecting a compiler that was right.
+- **PHASE 4's TWO KNOBS ARE WORTH 1.1%, NOT 15% — THE TRANSPORT WAS THE WHOLE WIN (2026-08-25).**
+  Three `car1` runs, 8434 frames each, all 15 state digests identical, so the differences are
+  console/IO only: UART + every-frame progress + every-row flush **28.48 ms**; ssh, same knobs
+  **24.69**; ssh + `CSV_FLUSH_EVERY=200` **24.70**; ssh + `PROGRESS_EVERY=25` **24.43**. So
+  UART→ssh is **3.79 ms**, `CSV_FLUSH_EVERY` is **0.00**, `PROGRESS_EVERY` is **0.27**.
+  **The written-down prediction was ~4.0 ms for the thinning; it is 0.27.** Premise again, not
+  arithmetic: 92.5 µs/byte is the cost of a byte *at 115200*, and the run being predicted was
+  launched over ssh where a byte is nearly free — the knob targeted a cost the automation had
+  already deleted. `CSV_FLUSH_EVERY` is zero for a second reason: the sweep runs from
+  `/tmp/mosse`, and `/tmp` is **tmpfs**, so the flush is a memcpy where the old SD-card CWD made
+  it a real sync. **`car1` at 24.43 ms = 40.9 FPS is the best frame time recorded and is NOT
+  comparable to the 26.29 ms in the performance history** (UART, synthetic scene) — the UART
+  alone was 3.79 ms of it.
+- **VERIFY A FEATURE FLAG ON A BUILD THAT CAN EXERCISE IT — the check caught its own case,
+  2026-08-25.** `PROGRESS_EVERY=25` produced an ELF byte-identical to the default, i.e. the knob
+  was INERT — correctly, because the default build is `VERBOSITY=1` where the level-0 line does
+  not exist and the branch is dead-code-eliminated. At `VERBOSITY=0` the ELF differs at 10 and 25
+  and matches at 1. Read the first result as "it works" and a sweep runs with an unthinned
+  console, with the lost time showing up as a regression in something else. Same lesson as the
+  `[coast]` printf that `strings` could not find, and as `SCENE_VERIFY` silently building
+  disabled.
+  **Two corrections were needed to make the defaults byte-identical**, both worth repeating: an
+  unconditional `static` counter changes codegen even when its value is never used, so the
+  default arm must be the original line TEXTUALLY (`#if N > 1 / #else`); and one inserted
+  `fflush()` shifted every later offset, producing 9958 differing bytes from a single redundant
+  call (`fclose()` flushes by definition). **The control:** building the same source twice gives
+  a byte-identical ELF, so an ELF `cmp` is a valid instrument on this project.
 - **Console gating (`VERBOSITY`) details that mattered.** (1) The `VP1`/`VP2` macros are
   `if (VERBOSITY >= n)` on a compile-time constant, so format strings are **dead-code-eliminated,
   not merely skipped** — verify with `strings` on the ELF, a stronger check than reading a log.
@@ -1098,6 +1200,78 @@ Two principles that have repeatedly earned their keep: **instruments before chan
   uint8→int8 contract fix, filter init/update + Q1.15 export, H_SHIFT, scenarios s6/s7, hw_emu
   PLIO smoke test, N_CHANNELS=16 in aiesim (accum 7728 = 24% of cint16 — the cint16 DDR
   accumulator is sufficient). See [[cmul-accum-wrap-bug]], [[weights-bo-never-populated]].
+
+## Where this tracker sits — the published VOT-STb2022 baselines
+
+**Directly comparable, and that is unusual enough to state: same dataset, same anchor-based
+multi-start protocol, and STb ground truth is axis-aligned boxes fitted to the segmentation
+masks — exactly what this harness scores against.** Source: Kristan et al., *The Tenth Visual
+Object Tracking VOT2022 Challenge Results*, ECCVW 2022, Table 12 (41 trackers, EAO 0.602 down
+to 0.195).
+
+| tracker | class | EAO | A | R |
+|---|---|---|---|---|
+| MixFormerL / DAMT | transformer (winners) | 0.602 | 0.831 / 0.776 | 0.859 / 0.887 |
+| DiMP | deep DCF | 0.430 | 0.689 | 0.760 |
+| ATOM | deep DCF | 0.386 | 0.668 | 0.716 |
+| TCLCFcpp | DCF | 0.267 | 0.550 | 0.598 |
+| ASMS | mean-shift | 0.255 | 0.526 | 0.599 |
+| **CSRDCF** | classical DCF | 0.251 | 0.519 | 0.580 |
+| **KCF** | classical DCF | 0.239 | 0.542 | 0.532 |
+| LGT | part-based, last of 41 | 0.195 | 0.461 | 0.486 |
+| **this tracker, RGB `H_SHIFT=15`, ALL 62 seq** | fixed-point MOSSE/DSST | **0.147** | **0.504** | **0.307** |
+| this tracker, gray `H_SHIFT=14`, ALL 62 seq | | 0.137 | 0.489 | 0.274 |
+
+**The split is the finding, and it is sharp: ACCURACY IS AT CLASSICAL-DCF PARITY, ROBUSTNESS
+IS NOT.** 0.541 is indistinguishable from KCF's 0.542 and above CSRDCF's 0.519 — when this
+tracker is on the target its boxes are as good as the published baselines. R = 0.334 is below
+every one of the 41, including LGT at 0.486, and EAO follows robustness because EAO is
+dominated by how long runs survive before the 10-consecutive-frame failure rule fires.
+
+**That is the same story `runs/vot/frozen_detector.md`, `tiger.md` and `hold_policy.md` tell
+from the inside** — deforming targets, a box centre that drifts against the appearance, 738
+`NEGATIVE_PEAK` vetoes, a hold budget with a median of 6 frames. None of those make boxes
+sloppy; they lose the target. AR says it in the challenge's own units.
+
+**What KCF and CSR-DCF have that this does not**, in the order it probably matters:
+1. **Pooled features.** HOG is gradient-orientation histograms over cells, so it tolerates
+   deformation and small misalignment. A 3x3 conv1 kernel has no pooling and responds to an
+   exact local edge pattern. HOG is 31 dimensions; this bank's participation ratio is 4.94
+   (gray) / 7.43 (RGB).
+2. **A spatial reliability map** (CSR-DCF's whole contribution) constrains the filter to the
+   segmented object, so a large context window can be used without learning it. Here the
+   target is 27% of the ROI area at `TARGET_PADDING=2` and nothing masks the rest.
+3. **Channel reliability at detection.** Stage B3 normalises channels by ENERGY, not by
+   discriminative power.
+4. **KCF is kernelized**; this is linear ridge regression.
+5. **Neither gates.** They follow the peak every frame; this vetoes and freezes, and a hold
+   longer than the recovery budget is an unrecoverable loss by construction.
+
+Not a differentiator but worth stating for the write-up: no tracker in that table estimates
+aspect ratio either, so the axis-aligned-box penalty on deforming targets is shared and does
+not explain the gap.
+
+**Full 62 as of 2026-08-27** (`~/vot/analysis/full62`, 419 runs per arm), so the comparison
+against the table is exact rather than approximate. The earlier 57-sequence figures are kept
+in the history below because of what changed when the five landed:
+
+| | A | R | EAO |
+|---|---|---|---|
+| RGB, 57 seq | 0.5406 | 0.3343 | 0.1314 |
+| RGB, **all 62** | 0.5043 | 0.3065 | **0.1474** |
+
+**A and R FELL while EAO ROSE.** The five are hard sequences, so A and R dropping is expected;
+EAO rising is not a contradiction but it is a warning. EAO pools over a subsequence-LENGTH
+curve, and the five change the length distribution (`girl` 1500, `flamingo1` 1377, `nature`
+999). **So the 57-sequence EAO was not a truncated version of the 62-sequence one, and only
+the full-62 figure may be quoted.** A subset's A and R degrade gracefully; its EAO does not.
+
+**One confound to state rather than hide: the two arms are at DIFFERENT `H_SHIFT`** — gray 14,
+RGB 15 — because each was built as its own uncensored over-shift arm. Both have `rails = 0`,
+so neither saturates, and the difference is one bit of quantization headroom. The
+quantization entry under Settled questions argues that bit is immaterial here (removing
+quantization ENTIRELY makes tracking worse), but the arms are not identical builds and a
+like-for-like re-run at one `H_SHIFT` is the clean version of this table.
 
 ## Settled questions — do not reopen
 
@@ -1149,6 +1323,47 @@ Two principles that have repeatedly earned their keep: **instruments before chan
   `fft_ifft_2d_graph` halves its memory tile for real input via `fft_dit_2ch_real_graph`, which
   computes only the independent half rather than computing both and discarding one. That saves
   work instead of reconstructing it, so per-stage rounding never enters the argument.
+- **QUANTIZATION IS NOT THE CAUSE OF THE POOR ROBUSTNESS. Removing it makes tracking
+  WORSE — measured 2026-08-27, offline, 8 sequences, 2841 frames.** The question was
+  prompted by the AR comparison against the published VOT-STb2022 baselines (see "Where
+  this tracker sits" above): accuracy is at classical-DCF parity and robustness is far
+  below it, which invites "the fixed-point pipeline is eating it". It is not, and the
+  suspects are now bracketed rather than argued:
+
+  | suspect | verdict | what settles it |
+  |---|---|---|
+  | cint16 / Q1.15 / `H_SHIFT` correlation pipeline | exonerated | `rgb_vs_gray_loop.py` is **float64 downstream of the features** and reproduces the board's failures anyway (`nature` 38.4% frozen vs hardware 44.3%, `tiger` 65.8% vs 62.4%) |
+  | saturation / rails | exonerated | `corr(rail rate, mean IoU)` = **−0.025** over 15 `car1` anchors; the `H_SHIFT=15` RGB arm has **zero** accum/response rails over 101,564 frames and still scores R = 0.334 |
+  | the int8 FEATURE path | **exonerated — it HELPS** | the `gray-float` arm below |
+
+  `rgb_vs_gray_loop.py --arms gray gray-float` runs the identical loop with unquantized
+  folded-BN weights, no `out_shift`, no int16 clips and a float Hann — everything else
+  bit-for-bit the same path. Frame-weighted mean IoU **0.2533 → 0.2350**. **Zero of eight
+  sequences improve**; four tie, four get worse (`tiger` −0.0714, `nature` −0.0166, `car1`
+  −0.0126). **The control is what makes it readable**: the int8 arm reproduces the gray
+  column of the stb2022 closed-loop table under "RGB features" below, to four decimal
+  places on all eight sequences, so the float column is the only thing that moved.
+
+  **WHY float is worse, and it is the third independent instance of a rule this project
+  already paid for.** On `tiger` the float arm takes the frozen-detector rate from 74.7%
+  to **1.4%** and IoU from 0.1696 to 0.0982, losing the target at frame 33 instead of 137;
+  on `nature` it goes 99.7% → 84.0% frozen and loses at frame 979 where the int8 arm never
+  loses at all. That is exactly `runs/vot/tiger.md`'s finding reached by a different lever
+  — `SIGMA=1` and `EPS_REL=0.1` each unfroze the detector and each made tracking worse.
+  **The int8 grid is acting as a DEADBAND**: it suppresses sub-threshold responses that a
+  float pipeline follows faithfully to the wrong place. *Do not optimise the freeze rate*,
+  and do not read "more precision" as "more accuracy" on a tracker whose features are the
+  binding constraint.
+
+  **So the robustness deficit is upstream of all arithmetic**, and the candidates are
+  structural: features with no pooling and a participation ratio of 4.94 (gray) / 7.43
+  (RGB) against HOG's 31 dimensions; no spatial reliability, so at `TARGET_PADDING=2` the
+  filter trains on 73% background where CSR-DCF masks it to the object; and a hold policy
+  whose duration exceeds the recovery budget (median 6 frames, `car1` held 53 against a
+  budget of 4 — `runs/vot/hold_policy.md`). **A useful corollary for the write-up: the
+  fixed-point design costs nothing in accuracy or robustness, so the frame rate is bought
+  at no algorithmic price.**
+
 - **Channel pruning is moot** with ReLU off, and doubly so at `BIAS_SCALE=roi`, which retires
   the last two structurally dead channels (ch3, ch15) outright. The real
   redundancy is the collapse: it caps the bank at **rank 9** (participation ratio 4.94) and
@@ -1246,6 +1461,27 @@ supervised protocol — a robustness metric mean IoU cannot express, since a tra
 longer is scored on harder frames. **To decide RGB on stb2022, run the supervised/AR protocol,
 not this table**; `rgb_vs_gray_vot.py` is that harness and still discovers sequences only under
 `test-sequences/`.
+
+**THAT PROTOCOL HAS NOW BEEN RUN, ON HARDWARE, OVER ALL 62 — AND RGB WINS IT (2026-08-27).**
+`~/vot/analysis/full62`, 419 runs per arm, both arms verified run-name-and-length against the
+dataset's own anchors before analysis:
+
+| arm | accuracy | robustness | EAO | frames tracked |
+|---|---|---|---|---|
+| gray `H_SHIFT=14` | 0.4890 | 0.2743 | 0.1367 | 48,603 |
+| **RGB `H_SHIFT=15`** | **0.5043** | **0.3065** | **0.1474** | **54,813** |
+
+Per sequence, robustness better on 37 / worse on 15 / tied on 10; accuracy better on 32 /
+worse on 27 / tied on 3. The largest swings are all RGB gains and all in ROBUSTNESS:
+`car1` 0.634 -> **1.000** (tracked to the end from all 15 anchors), `book` +0.311,
+`lamb` +0.272, `drone_across` +0.243.
+
+**This is the claim of record, and it is the one the offline work predicted.** RGB was never
+an accuracy change — the mean-IoU table above is a tie, the synthetic hardware arm moved the
+wrong way (0.9188 -> 0.9173), and the offline supervised protocol said **failures**, -18%.
+The board now says the same thing in the challenge's own units: **12.8% more frames survived**,
+which is exactly what a robustness win looks like and what mean IoU structurally cannot
+express. See the `H_SHIFT` confound noted under "Where this tracker sits".
 
 **Retired — "RGB is handicapped by its larger `out_shift`."** 27 taps triple `ACC_MAX_THEORY`,
 pushing mean out_shift 3.69 → 4.25 (confirmed on the shipping export). But forcing gray's shifts
@@ -1429,6 +1665,13 @@ env -u PYTHONPATH -u PYTHONHOME ./.venv/bin/python scripts/rgb_vs_gray_holdout.p
 env -u PYTHONPATH -u PYTHONHOME ./.venv/bin/python scripts/rgb_vs_gray_loop.py      # closed loop, 1 seq
 #   ... --sequence tiger   picks the sequence ($VOT_ROOT stb2022 first, then test-sequences/).
 #   Reproduces the board's frozen-detector failures at 3.5 s per 100 frames.
+#   ... --arms gray gray-float   is the QUANTIZATION COUNTERFACTUAL: gray-float and
+#   rgb-float run the same loop with unquantized folded-BN weights, no out_shift, no
+#   int16 clips and a float Hann. Everything else is identical, and since the model is
+#   already float64 downstream of the features, the pair brackets the whole
+#   quantization question. Answer: removing it makes tracking WORSE -- see the settled
+#   entry. Stage A's int8 patch is deliberately NOT removed (it is roi_crop's output,
+#   a separate choice with its own scale), so a difference stays attributable.
 env -u PYTHONPATH -u PYTHONHOME ./.venv/bin/python scripts/rgb_vs_gray_vot.py       # VOT supervised, all seqs
 #   ... --oracle-scale takes box size from ground truth (isolates localisation from the
 #   missing DSST scale filter); the two modes BRACKET what scale handling is worth.
@@ -1441,10 +1684,17 @@ make test_scene                    # native test of the luma -> interleaved-RGB 
                                    #   including a deliberately missed scene_touch() so
                                    #   the verifier is known to fire, not assumed to
 make test_vot_source               # native test of the VOT manifest parser, blob
-                                   #   offsets, run-order convention and trajectory
-                                   #   writer. 19 mutants, each of which must be
-                                   #   REJECTED; parses every real manifest in
-                                   #   $VOT_ROOT/data if that is exported
+                                   #   offsets, run-order convention, trajectory
+                                   #   writer and the STREAMING reader. The 19
+                                   #   manifest/blob/trajectory mutants plus 7
+                                   #   more for the ring, each REJECTED.
+                                   #   With $VOT_ROOT exported it also parses
+                                   #   every real manifest AND streams a forward
+                                   #   and a backward slice of the LARGEST real
+                                   #   blob against an independent fopen/fread —
+                                   #   the fixtures are 40-byte frames, where a
+                                   #   partial read is impossible and at 2.64 MB
+                                   #   it is routine
 make test_vot_format               # the BOARD's trajectory writer read back by the
                                    #   toolkit's OWN reader, with the centre -> top-left
                                    #   conversion re-derived in Python. Needs the venv
@@ -1506,7 +1756,12 @@ design/
 │   │                                 #   include; linked only at FRAME_SOURCE=vot. Pure
 │   │                                 #   bookkeeping, so every failure mode is a
 │   │                                 #   plausible-but-invalid AR report -- hence the
-│   │                                 #   mutation suite
+│   │                                 #   mutation suite. Blob is resident (one read()
+│   │                                 #   per sequence); StreamBlob is the ring +
+│   │                                 #   prefetch thread for the five RGB sequences
+│   │                                 #   that exceed the ~1 GB of usable heap. Access
+│   │                                 #   is strictly sequential in job_order() and
+│   │                                 #   OUT-OF-ORDER IS AN ERROR, not a seek
 │   └── test/                         # native tests + NumPy goldens
 │       ├── test_mosse_filter.cpp     # make test_host
 │       ├── test_scene_colour.cpp     # make test_scene
@@ -1562,6 +1817,9 @@ scripts/  export_weights.py, gen_aiesim_vectors.py, gen_filter_golden.py,
           mosse_loop_sim.py   # closed-loop MOSSE, centred-G vs shifted-G, no hardware
           rgb_vs_gray_holdout.py / _loop.py / _vot.py   # gray vs RGB vs a colour-free
                               #   control, on real VOT video. No hardware, minutes.
+                              #   _loop.py also carries the gray-float/rgb-float
+                              #   quantization counterfactual; conv_features_float
+                              #   lives in _holdout.py next to the integer one
 test-sequences/   VOT sequences + annotations (16 usable, 5971 frames). The annotation
                   directories are named inconsistently ("car1-annotations" but
                   "fernando - annotations"); the harness matches them loosely.

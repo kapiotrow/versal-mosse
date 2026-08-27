@@ -1,0 +1,9 @@
+date       2026-08-26T15:15:57+02:00
+arm        hs14full
+jobs       all
+sequences  zebrafish1 
+elf        build/hw/128x128/ch16/mosse_tracker.elf
+elf_md5    c8f08ab22a703609bbc6ab089e145568
+xclbin_md5 ebe9fc4e33fa84a39b13f2d86c6315fb
+weights    885d78ed67ada1b8b783fdd4dfb3fc26
+git        c9a65f9ec95162abc8ddff9fe7c802fb78fb6fe6 DIRTY

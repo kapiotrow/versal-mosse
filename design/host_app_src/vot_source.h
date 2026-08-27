@@ -22,9 +22,12 @@
 // ---------------------------------------------------------------------------
 #pragma once
 
+#include <condition_variable>
 #include <cstddef>
 #include <cstdint>
+#include <mutex>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace vot {
@@ -66,6 +69,19 @@ struct Manifest {
 bool manifest_parse(const char *text, size_t len, Manifest &m, std::string &err);
 bool manifest_load(const std::string &path, Manifest &m, std::string &err);
 
+// THE SIDECAR IS ONE PLANE, whatever the blob's channel count is. This is the
+// ONE site that knows it, and both readers below derive their frame size from
+// here. It used to live inside Blob::load_luma alone; StreamBlob would have been
+// a second copy, and the failure that copy reintroduces -- reading
+// rows*cols*channels per luma frame -- does not crash. It reads a stripe of the
+// wrong frame inside a correctly-sized window and hands it to scale_extract,
+// which degrades the scale filter and nothing else in the system notices.
+// t_luma_sidecar asserts BOTH directions for BOTH readers for that reason.
+inline size_t luma_frame_bytes(const Manifest &m)
+{
+    return (size_t)m.rows * (size_t)m.cols;
+}
+
 // The frame blob, resident in heap for the whole sequence.
 //
 // ONE read() PER SEQUENCE, NEVER mmap. mmap over NFS turns staging into demand
@@ -75,16 +91,132 @@ bool manifest_load(const std::string &path, Manifest &m, std::string &err);
 class Blob {
   public:
     bool load(const std::string &path, const Manifest &m, std::string &err);
+    // THE LUMA SIDECAR, at channels=3 only. Same container and the same one
+    // read(); the ONLY difference is the frame size, rows*cols instead of
+    // rows*cols*channels.
+    //
+    // It exists because scale_extract() is an INTENSITY template matcher and a
+    // VOT frame arrives pixel-interleaved. Deriving luma on the board would put
+    // a rows*cols BT.601 pass inside the frame loop; shipping the plane costs
+    // 33% of the blob and nothing per frame. The convention is the manifest's
+    // `luma_convention` and it is NOT PIL's `convert('L')` -- see vot_prepare.py.
+    bool load_luma(const std::string &path, const Manifest &m, std::string &err);
     const uint8_t *frame(int i) const;      // nullptr if out of range
     size_t frame_bytes() const { return frame_bytes_; }
     int    frames()      const { return frames_; }
     size_t bytes()       const { return data_.size(); }
     double load_seconds() const { return secs_; }   // the staging slot, measured
   private:
+    bool load_sized(const std::string &path, size_t frame_bytes, int frames,
+                    std::string &err);
     std::vector<uint8_t> data_;
     size_t frame_bytes_ = 0;
     int    frames_ = 0;
     double secs_ = 0.0;
+};
+
+// ---------------------------------------------------------------------------
+// StreamBlob — the same frames as Blob, for a sequence that does not fit in heap.
+//
+// WHY IT EXISTS. The board maps 2 GB of the VEK280's 12 GB and 512 MB of that is
+// CMA, so usable heap is ~0.9-1.2 GB (runs/vot/TODO_board_memory.md). Five RGB
+// sequences exceed it -- flamingo1 3631 MB, zebrafish1 2373, nature 1482,
+// frisbee 1471, girl 1318 -- and the 2026-08-26 full-62 RGB sweep lost exactly
+// those five to std::bad_alloc and the OOM killer while the other 57 completed.
+//
+// WHAT IT IS NOT. It is not mmap: over NFS that turns staging into demand paging
+// and moves the I/O into the frame loop as page faults, reported as unattributed
+// frame time (phase0a.md). It is not a synchronous refill every K frames either
+// -- that amortises to the same bytes on the same critical path and merely makes
+// the cost lumpy. It is a ring of K frames filled by a prefetch thread, so the
+// wait is (a) usually zero and (b) always MEASURED, in its own slot.
+//
+// WHAT MAKES IT SIMPLE ENOUGH TO TRUST. The entire access pattern is known
+// before the run starts: job_order() is the exact list of dataset indices, in
+// the exact order at() will ask for them. So the producer walks a known list and
+// the consumer's index is checked against it. OUT-OF-ORDER ACCESS IS AN ERROR,
+// NOT A SEEK: silently seeking would make a future caller that reads a frame
+// twice, or looks one ahead, quietly serialise the whole run against NFS -- a
+// 2.4x frame-time regression that reads as "streaming is slow" instead of as the
+// misuse it is.
+//
+// THE ARITHMETIC IS UNCHANGED, so the acceptance test is free and exact: a
+// sequence that fits in heap must produce an IDENTICAL run-state digest in both
+// modes. `--vot-stream always` exists to make that comparison runnable on car1.
+class StreamBlob {
+  public:
+    StreamBlob() = default;
+    ~StreamBlob();
+    StreamBlob(const StreamBlob &) = delete;
+    StreamBlob &operator=(const StreamBlob &) = delete;
+
+    // Open and size-check ONLY -- no frame is read until begin_run(). The length
+    // check is the same one Blob makes (a blob a byte short or a byte long means
+    // the manifest and the file disagree about geometry, and every frame offset
+    // after the first is then a guess), and it is made here because open() is the
+    // last moment it costs nothing.
+    bool open(const std::string &path, size_t frame_bytes, int frames,
+              int ring, std::string &err);
+    // The two named entry points mirror Blob::load / Blob::load_luma so the
+    // per-frame size is derived at the same two sites in both readers.
+    bool open_blob(const std::string &path, const Manifest &m, int ring,
+                   std::string &err);
+    bool open_luma(const std::string &path, const Manifest &m, int ring,
+                   std::string &err);
+
+    // Declare the run. `order` is the dataset index per run index, `length` how
+    // many of them will actually be visited (--vot-max-frames truncates it, and
+    // prefetching past the end would read frames the run never uses). Restarts
+    // the prefetch thread, so it is also the per-job re-arm: run_reset() calls
+    // it once per anchor, and a job that inherited the previous job's order
+    // would stream the right frames in the wrong order -- silent, and scored.
+    void begin_run(const std::vector<int> &order, size_t length);
+
+    // Frame for RUN index k. Blocks only if the prefetcher has not reached k.
+    // Returns nullptr on an I/O error or on out-of-order access; error() then
+    // says which. THE CALLER MUST CHECK -- the resident path can hand a nullptr
+    // only for an out-of-range index it never generates, so the existing call
+    // sites never had to.
+    const uint8_t *at(size_t k);
+
+    const std::string &error() const { return err_; }
+    // Seconds blocked in at() SINCE begin_run(), i.e. for the current job. The
+    // honest staging slot: a reader that quietly inflates frame time is worse
+    // than one that fails.
+    double wait_seconds() const { return wait_s_; }
+    size_t frame_bytes() const { return frame_bytes_; }
+    int    frames()      const { return frames_; }
+    int    ring()        const { return ring_; }
+    size_t ring_bytes()  const { return frame_bytes_ * (size_t)ring_; }
+    bool   is_open()     const { return fd_ >= 0; }
+    void   close();
+
+  private:
+    void stop_thread();
+    void producer();
+
+    int    fd_ = -1;
+    size_t frame_bytes_ = 0;
+    int    frames_ = 0;
+    int    ring_ = 0;
+    double wait_s_ = 0.0;
+    std::string path_, err_;
+
+    std::vector<uint8_t> buf_;        // ring_ frames, contiguous
+    std::vector<int>     order_;
+    size_t len_ = 0;                  // frames this run will visit
+
+    std::thread             th_;
+    std::mutex              mu_;
+    std::condition_variable cv_prod_, cv_cons_;
+    size_t produced_ = 0;             // frames fully written into the ring
+    size_t consumed_ = 0;             // lowest run index still needed
+    // The next run index at() will accept. SEPARATE from consumed_ on purpose:
+    // consumed_ is what the producer may overwrite past, served_ is what the
+    // caller must ask for next, and collapsing the two into one counter makes
+    // at(1) look out of order while the ring is still correct.
+    size_t served_ = 0;
+    bool   stop_ = false;
 };
 
 // Frame indices a job visits, IN RUN ORDER: forward [anchor .. frames-1],

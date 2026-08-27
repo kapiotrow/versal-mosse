@@ -1,0 +1,7 @@
+2026-08-26T13:05:32+02:00
+arm=gray CONV_IN_CH=1 BIAS_SCALE=roi
+budget=4-4-4 total=16 H_SHIFT=14
+ITER_CNT=200 VERBOSITY=1 DUMP_BUFFERS=0
+mode=budget SCENE_VERIFY=0 FRAME_RGB_MODE=1
+weights_md5=885d78ed67ada1b8b783fdd4dfb3fc26
+comparator=OVER-SHIFT MEASUREMENT ARM, not a tracking run. H_SHIFT=14 (3 bits over the shipping 11) chosen so the accumulator and response CANNOT rail, to return the UNCENSORED amplitude distribution that runs/vot/0826_1232-attrib could not (266 of 8434 car1 frames censored: response 191, accum 123). calib_report will say UNDERSHOOT and that is the intended state. Budget 4-4-4 unchanged. Baseline: runs/vot/0826_1232-attrib (H_SHIFT=11, 266 railed).

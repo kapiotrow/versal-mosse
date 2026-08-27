@@ -34,3 +34,12 @@ analyzer_input/
 *__pycache__*
 .ipcache/
 test-sequences/
+runs/vot/0825_1919-smoke
+runs/vot/0825_1931-pe1_control/
+runs/vot/0825_1935-csvflush_control/
+runs/vot/0826_1232-attrib/
+runs/vot/0826_1311-hshift14/
+runs/vot/0826_1324-hs14survey/
+runs/vot/0827_1313-streamA/
+runs/vot/0827_1318-streamB/
+runs/vot/0826_1346-rgbtest/

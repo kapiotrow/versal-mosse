@@ -52,7 +52,7 @@ import gen_filter_golden as FG                      # noqa: E402
 from rgb_vs_gray_holdout import (                   # noqa: E402
     LUM, N_OUT, PADDING, SIGMA, EPS_REL, R, C,
     load_gt, load_frame_rgb, to_luma, set_sequence,
-    stage_a_gray, stage_a_rgb, folded_weights, quantize,
+    stage_a_gray, stage_a_rgb, folded_weights, quantize, conv_features_float,
     conv_features, metrics, wrap,
 )
 
@@ -72,15 +72,21 @@ def box_iou(a, b):
 
 
 def make_patch(arm, planes, lum, roi_row, roi_col, roi_h, roi_w):
-    if arm == 'gray':
+    if arm in ('gray', 'gray-float'):
         return stage_a_gray(lum, roi_row, roi_col, roi_h, roi_w)[None]
-    if arm == 'rgb':
+    if arm in ('rgb', 'rgb-float'):
         return stage_a_rgb(planes, roi_row, roi_col, roi_h, roi_w)
     return stage_a_rgb(np.stack([lum] * 3), roi_row, roi_col, roi_h, roi_w)
 
 
 def run_arm(arm, wq, bias, shift, gt, n_frames, oracle_scale, verbose,
-            detect_iters=1, detect_gain=1.0):
+            detect_iters=1, detect_gain=1.0, float_conv=None):
+    # float_conv = (w_float, b_fold) runs the UNQUANTIZED conv instead of the
+    # int8 one, everything else identical. See conv_features_float's docstring:
+    # this arm exists to answer whether quantization causes the tracker's poor
+    # robustness, and it is the second half of that question -- the first half
+    # (the cint16/Q1.15 correlation pipeline) is already answered by this whole
+    # model being float64 downstream of the features.
     """One full pass over the sequence. Returns a per-frame record."""
     row, col, bh, bw = gt[0]
     A = B = None
@@ -104,7 +110,11 @@ def run_arm(arm, wq, bias, shift, gt, n_frames, oracle_scale, verbose,
 
         def crop_features(rr, rc, mp):
             patch = make_patch(arm, planes, lum, rr, rc, roi_h, roi_w)
-            ft, om = conv_features(patch, wq, bias, shift, mean_prev=mp)
+            if float_conv is not None:
+                ft, om = conv_features_float(patch, float_conv[0], float_conv[1],
+                                             mean_prev=mp)
+            else:
+                ft, om = conv_features(patch, wq, bias, shift, mean_prev=mp)
             return np.fft.fft2(ft.astype(np.float64), axes=(1, 2)), om
 
         F, own_mean = crop_features(roi_row, roi_col, mean_prev)
@@ -223,7 +233,12 @@ def main():
     w_gray = (w_rgb * LUM[None, :, None, None]).sum(axis=1, keepdims=True)
     W = {'gray': quantize(w_gray, b_fold),
          'rgb': quantize(w_rgb, b_fold),
-         'rgb-lum': quantize(w_rgb, b_fold)}
+         'rgb-lum': quantize(w_rgb, b_fold),
+         'gray-float': quantize(w_gray, b_fold),   # unused, keeps the call shape
+         'rgb-float': quantize(w_rgb, b_fold)}
+    # The unquantized counterparts. Same folded BN weights, same bias, no int8
+    # grid, no out_shift, no int16 clips, no integer Hann.
+    FLOATW = {'gray-float': (w_gray, b_fold), 'rgb-float': (w_rgb, b_fold)}
 
     print(f"{args.sequence or 'car1'}, {n} frames, closed loop: eta {ETA}, padding {PADDING}, "
           f"sigma {SIGMA}, PSR gate {PSR_GATE_MIN}")
@@ -233,7 +248,8 @@ def main():
     out = {}
     for a in args.arms:
         print(f"  running {a} ...", flush=True)
-        out[a] = run_arm(a, *W[a], gt, n, args.oracle_scale, args.verbose)
+        out[a] = run_arm(a, *W[a], gt, n, args.oracle_scale, args.verbose,
+                         float_conv=FLOATW.get(a))
 
     print()
     print(f"{'arm':<9} {'frozen, truth>=1bin':>20} {'frozen, <1bin':>14} "
@@ -242,11 +258,16 @@ def main():
     for a in args.arms:
         st = out[a]['step']
         big = small = moved = 0
-        for k, (dr, dc, br, bc) in enumerate(st, start=2):
+        # need_r/need_c COME FROM THE RECORD, they are not recomputed here.
+        # This used to unpack 4 fields from a 6-field record (a ValueError since
+        # need_* were added) and recompute the truth motion as a groundtruth
+        # DIFFERENCE -- which is the weaker question run_arm's own comment warns
+        # about: the target's motion only equals the required displacement while
+        # the tracker is exactly on target, and reading it that way "made a
+        # healthy car1 look like a 20%-correct detector".
+        for k, (dr, dc, _br, _bc, tdr, tdc) in enumerate(st, start=2):
             if k >= len(gt):
                 break
-            tdr = (gt[k-1][0] - gt[k-2][0]) / br
-            tdc = (gt[k-1][1] - gt[k-2][1]) / bc
             if dr == 0 and dc == 0:
                 if max(abs(tdr), abs(tdc)) >= 1.0:
                     big += 1

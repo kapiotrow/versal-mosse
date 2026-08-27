@@ -295,6 +295,47 @@ def conv_features(patch, wq, bias, shift, mean_prev=None):
     return out, own_mean
 
 
+def conv_features_float(patch, w_float, b_fold, mean_prev=None):
+    """The SAME conv as conv_features, in float64, with UNQUANTIZED weights.
+
+    WHY: "is the tracker's poor robustness caused by quantization?" is a
+    question about a counterfactual, and the closed-loop model already answers
+    half of it -- its FFT, filter and response are float64, so the cint16 /
+    Q1.15 / H_SHIFT pipeline is not in the loop and the board's failures are
+    reproduced anyway. What that model still shares with the board is the INT8
+    FEATURE path: per-channel weight quantization, out_shift, the int16 clips
+    and the integer Hann multiplies. This function removes exactly those and
+    nothing else, so the pair brackets the whole quantization question.
+
+    NOT removed, deliberately: Stage A's int8 patch. That is roi_crop's output
+    and a separate design choice with its own scale (ROI_NORM_Q); mixing it in
+    would make a difference unattributable. The input scale convention is the
+    same one quantize() uses -- ROI_NORM_Q counts as 1.0 -- which is why the
+    folded bias enters as b_fold * ROI_NORM_Q here and as
+    round(b_fold * ROI_NORM_Q / scale) there.
+    """
+    n_in = patch.shape[0]
+    pad = np.zeros((n_in, R + 2, C + 2), dtype=np.float64)
+    pad[:, 1:-1, 1:-1] = patch.astype(np.float64)
+
+    acc = np.zeros((N_OUT, R, C), dtype=np.float64)
+    for kr in range(KSIZE):
+        for kc in range(KSIZE):
+            tile = pad[:, kr:kr + R, kc:kc + C]
+            acc += np.einsum('oi,irc->orc', w_float[:, :, kr, kc], tile)
+    acc += (b_fold * ROI_NORM_Q)[:, None, None]
+
+    # No out_shift and no int16 clip: those exist only to fit a fixed-point
+    # container. B1 and the Hann window stay, because they are algorithm, not
+    # arithmetic -- dropping them would change what is being compared.
+    own_mean = acc.mean(axis=(1, 2))
+    mp = own_mean if mean_prev is None else mean_prev
+    cen = acc - mp[:, None, None]
+    hf = HANN.astype(np.float64) / 32768.0
+    out = cen * hf[None, :, None] * hf[None, None, :]
+    return out, own_mean
+
+
 # ---------------------------------------------------------------------------
 # filter + response  (float; see the module docstring)
 # ---------------------------------------------------------------------------

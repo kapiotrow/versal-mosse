@@ -82,16 +82,17 @@
 // Manifest, blob, run order and trajectory. No XRT header in it, so
 // `make test_vot_source` runs its 19 mutants natively in seconds.
 #  include "vot_source.h"
-#  if CONV_IN_CH == 3
-// DELIBERATELY LOUD RATHER THAN PLAUSIBLE. The RGB arm needs the manifest's
-// `.luma` sidecar staged alongside the blob, because scale_extract() reads an
-// intensity template out of scene_luma() and a VOT frame arrives interleaved.
-// vot_prepare.py emits that sidecar at --channels 3 but it has never been
-// exercised, and the plan runs grayscale first (runs/vot/phase1.md). Building
-// this pair today would give a colour datapath with a scale filter reading the
-// R plane as luma -- a tracker that works slightly worse, not one that fails.
-#    error "FRAME_SOURCE=vot with CONV_IN_CH=3 is not wired yet: scale_extract needs the manifest's .luma sidecar. Run grayscale first."
-#  endif
+// RGB + VOT: WIRED 2026-08-26. It used to be a deliberate `#error`, because
+// scale_extract() reads an intensity template out of scene_luma() while a VOT
+// frame arrives pixel-interleaved -- building the pair without the sidecar
+// would have given a colour datapath with the scale filter reading the R plane
+// as luma, i.e. a tracker that works slightly WORSE rather than one that fails.
+//
+// What makes it safe now is not that the sidecar is loaded but that its ABSENCE
+// is fatal: load_vot_sequence() refuses a manifest with no `luma_blob` at
+// CONV_IN_CH=3 rather than falling back to the interleaved plane. The failure
+// mode this guard existed to prevent is plausible-but-wrong, so the replacement
+// has to be loud too.
 #endif
 
 // -----------------------------------------------------------------------
@@ -426,6 +427,28 @@ struct VotRun {
     std::string   job_spec;             // --vot-jobs: "all" or "0,3,0"; empty = --vot-job
     vot::Manifest manifest;
     vot::Blob     blob;
+#if CONV_IN_CH == 3
+    // The single-plane sidecar that feeds scale_extract. Only allocated on the
+    // colour arm; at CONV_IN_CH=1 g_frame_host IS the luma and there is nothing
+    // to carry.
+    vot::Blob     luma;
+#endif
+    // THE STREAMING ARM. Both readers are constructed either way and exactly one
+    // is armed per sequence -- `streamed` says which, and every per-frame site
+    // branches on it. Two readers rather than one polymorphic one because the
+    // resident path must stay EXACTLY what it is: 57 of 62 RGB sequences already
+    // ran on it, and their results are only comparable to the remaining five if
+    // nothing about their frame delivery moved.
+    bool          streamed = false;
+    vot::StreamBlob stream;
+#if CONV_IN_CH == 3
+    vot::StreamBlob stream_luma;
+#endif
+    // auto = decide from the blob size against VOT_RESIDENT_MAX_MB;
+    // always/never force it. `always` is what makes the mode-equivalence test
+    // runnable: a sequence that fits in heap, run both ways, must produce
+    // identical run-state digests, because streaming changes no arithmetic.
+    std::string   stream_mode = "auto";
     vot::Job      job;
     std::vector<int> order;             // dataset frame index, in RUN order
     vot::Trajectory  traj;
@@ -442,7 +465,8 @@ static bool vot_parse_args(int argc, char **argv)
         const std::string a = argv[i];
         const bool needs_value = (a == "--vot-data" || a == "--vot-results" ||
                                   a == "--vot-seq" || a == "--vot-job" ||
-                                  a == "--vot-jobs" || a == "--vot-max-frames");
+                                  a == "--vot-jobs" || a == "--vot-max-frames" ||
+                                  a == "--vot-stream");
         if (needs_value && i + 1 >= argc) {
             fprintf(stderr, "%s needs a value\n", a.c_str());
             return false;
@@ -453,18 +477,30 @@ static bool vot_parse_args(int argc, char **argv)
         else if (a == "--vot-job")     g_vot.job_index   = atoi(argv[++i]);
         else if (a == "--vot-jobs")    g_vot.job_spec    = argv[++i];
         else if (a == "--vot-max-frames") g_vot.max_frames = atoi(argv[++i]);
+        else if (a == "--vot-stream")  g_vot.stream_mode  = argv[++i];
         else {
             fprintf(stderr,
                     "unrecognised argument '%s'\n"
                     "usage: %s <xclbin> [--vot-data DIR] [--vot-results DIR]\n"
                     "                   [--vot-seq NAME] [--vot-job N]\n"
                     "                   [--vot-jobs all|N,M,...] [--vot-max-frames N]\n"
+                    "                   [--vot-stream auto|always|never]\n"
                     "  --vot-jobs runs several anchors in ONE process. Naming the\n"
                     "  same job twice is the determinism test: its two trajectories\n"
                     "  must come back byte-identical.\n",
                     a.c_str(), argv[0]);
             return false;
         }
+    }
+    // Checked here rather than at the first use, for the same reason an
+    // unrecognised ARGUMENT is fatal above: an unrecognised VALUE that fell back
+    // to "auto" would run the whole sequence in the other mode and say nothing,
+    // and the one thing --vot-stream exists for is comparing the two modes.
+    if (g_vot.stream_mode != "auto" && g_vot.stream_mode != "always" &&
+        g_vot.stream_mode != "never") {
+        fprintf(stderr, "--vot-stream must be auto|always|never, got '%s'\n",
+                g_vot.stream_mode.c_str());
+        return false;
     }
     return true;
 }
@@ -513,11 +549,81 @@ static bool vot_stage(void)
         return false;
     }
 
+    // ----------------------------------------------------------------------
+    // RESIDENT OR STREAMED, decided here and announced.
+    //
+    // The board maps 2 GB of the part's 12 and 512 MB of that is CMA, so usable
+    // heap is ~0.9-1.2 GB. flamingo1 (3631 MB), zebrafish1 (2373), nature
+    // (1482), frisbee (1471) and girl (1318) do not fit at CONV_IN_CH=3, and on
+    // 2026-08-26 all five died on std::bad_alloc or the OOM killer AFTER the
+    // manifest had been read and the sweep had reported a start.
+    //
+    // PRINTED, ALWAYS, ON BOTH ARMS. A run whose frame delivery mechanism is not
+    // in its own log is a run whose frame time cannot be compared to any other,
+    // and the streamed arm's frame time is NOT comparable to the resident one on
+    // the two 1080p sequences (7.9 MB/frame against 117 MB/s of NFS is 67 ms,
+    // against ~28 ms of compute).
+    const size_t luma_fb   = (CONV_IN_CH == 3) ? vot::luma_frame_bytes(m) : 0;
+    const size_t resident_bytes =
+        (m.frame_bytes + luma_fb) * (size_t)m.frames;
+    const double resident_mb = resident_bytes / 1048576.0;
+    if (g_vot.stream_mode == "always")      g_vot.streamed = true;
+    else if (g_vot.stream_mode == "never")  g_vot.streamed = false;
+    else g_vot.streamed = (resident_mb > (double)VOT_RESIDENT_MAX_MB);
+    printf("[vot] %s: %.0f MB of frames -> %s (mode %s, threshold %d MB)\n",
+           m.sequence.c_str(), resident_mb,
+           g_vot.streamed ? "STREAMED through a prefetched ring" : "resident in heap",
+           g_vot.stream_mode.c_str(), VOT_RESIDENT_MAX_MB);
+
     const std::string bpath = g_vot.data_dir + "/" + m.blob;
-    if (!g_vot.blob.load(bpath, m, err)) {
+    if (g_vot.streamed) {
+        if (!g_vot.stream.open_blob(bpath, m, VOT_STREAM_RING, err)) {
+            fprintf(stderr, "[vot] %s\n", err.c_str());
+            return false;
+        }
+        printf("[vot] stream ring %d frames, %.1f MB\n",
+               g_vot.stream.ring(), g_vot.stream.ring_bytes() / 1048576.0);
+    } else if (!g_vot.blob.load(bpath, m, err)) {
         fprintf(stderr, "[vot] %s\n", err.c_str());
         return false;
     }
+#if CONV_IN_CH == 3
+    // REFUSED, NOT DERIVED. Computing luma here from the interleaved plane
+    // would work and would be wrong in a way nothing downstream can see: it
+    // puts a rows*cols BT.601 pass in the frame loop AND it would silently
+    // accept a blob converted without the sidecar, which is the case this
+    // check exists for. vot_prepare.py emits it at --channels 3; a manifest
+    // without it was converted for the grayscale arm.
+    if (m.luma_blob.empty()) {
+        fprintf(stderr, "[vot] %s has no luma_blob; this build is CONV_IN_CH=3 "
+                "and scale_extract needs the plane. Re-convert with "
+                "vot_prepare.py --channels 3\n", m.sequence.c_str());
+        return false;
+    }
+    {
+        const std::string lpath = g_vot.data_dir + "/" + m.luma_blob;
+        // The sidecar follows the blob's mode. Streaming one and staging the
+        // other would defeat the point on exactly the sequences that need it --
+        // the sidecar is a third of the bytes, and 494 MB of nature's luma is
+        // most of the heap the streamed blob just freed.
+        if (g_vot.streamed) {
+            if (!g_vot.stream_luma.open_luma(lpath, m, VOT_STREAM_RING, err)) {
+                fprintf(stderr, "[vot] luma sidecar: %s\n", err.c_str());
+                return false;
+            }
+            printf("[vot] luma sidecar %s STREAMED, ring %.1f MB\n",
+                   m.luma_blob.c_str(), g_vot.stream_luma.ring_bytes() / 1048576.0);
+        } else {
+            if (!g_vot.luma.load_luma(lpath, m, err)) {
+                fprintf(stderr, "[vot] luma sidecar: %s\n", err.c_str());
+                return false;
+            }
+            printf("[vot] luma sidecar %s staged, %.1f MB in %.2f s\n",
+                   m.luma_blob.c_str(), g_vot.luma.bytes() / 1048576.0,
+                   g_vot.luma.load_seconds());
+        }
+    }
+#endif
 
     set_frame_geometry(m.rows, m.cols);
     g_vot.order = vot::job_order(g_vot.job, m.frames);
@@ -586,10 +692,19 @@ static bool vot_stage(void)
                "tracking results. ***\n", RESET_MUTANT);
     printf("[vot] %zu run(s) queued: %s\n", g_vot.job_list.size(),
            g_vot.job_spec.empty() ? "one" : g_vot.job_spec.c_str());
-    printf("[vot] staged %.1f MB in %.2f s = %.1f MB/s\n",
-           g_vot.blob.bytes() / 1048576.0, g_vot.blob.load_seconds(),
-           g_vot.blob.bytes() / 1048576.0 / (g_vot.blob.load_seconds() > 0.0
-                                             ? g_vot.blob.load_seconds() : 1.0));
+    // On the streamed path there IS no staging read, and printing the resident
+    // reader's zeroed counters here read as "staged 0.0 MB in 0.00 s = 0.0 MB/s"
+    // -- a line that looks exactly like a blob that failed to load. Caught on
+    // the first streamed hardware run (2026-08-27); the run was correct and the
+    // log said otherwise, which is the wrong way round.
+    if (g_vot.streamed)
+        printf("[vot] no staging read: frames are fetched per frame from the "
+               "mount and the wait is in the AP_VOT_STAGE slot\n");
+    else
+        printf("[vot] staged %.1f MB in %.2f s = %.1f MB/s\n",
+               g_vot.blob.bytes() / 1048576.0, g_vot.blob.load_seconds(),
+               g_vot.blob.bytes() / 1048576.0 / (g_vot.blob.load_seconds() > 0.0
+                                                 ? g_vot.blob.load_seconds() : 1.0));
     // Advisory, both of them, and both are things Phase 1 measured in this
     // dataset rather than hypothesised: 11 of 62 sequences push the padded ROI
     // past the frame edge on 9.6% of frames (roi_crop border-clamps), and 22 of
@@ -610,10 +725,60 @@ static bool vot_stage(void)
 }
 
 // The per-frame seam: dataset frame for run index k. One memcpy.
+//
+// CAN NOW RETURN nullptr, and the caller checks. On the resident path it never
+// did -- the index comes from g_vot.order, which is built from the manifest --
+// so the check is new with the streamed path, where an I/O error mid-run is a
+// real outcome. Aborting the sequence with a message beats memcpy'ing from
+// nullptr, and beats the alternative this project keeps meeting: continuing with
+// a plausible frame.
 static inline const uint8_t *vot_frame(int k)
 {
+    if (g_vot.streamed) return g_vot.stream.at((size_t)k);
     return g_vot.blob.frame(g_vot.order[(size_t)k]);
 }
+
+// Cumulative seconds this sequence has spent BLOCKED waiting for a streamed
+// frame, both readers together. Zero on the resident path by construction, so
+// the slot it feeds is a no-op there rather than a small lie.
+static inline double vot_stage_wait_seconds(void)
+{
+    if (!g_vot.streamed) return 0.0;
+    double w = g_vot.stream.wait_seconds();
+#if CONV_IN_CH == 3
+    w += g_vot.stream_luma.wait_seconds();
+#endif
+    return w;
+}
+
+// The message for a frame that did not arrive. Both readers can fail, and
+// naming which one failed is the difference between a diagnosable log and
+// "[vot] frame 4102 unavailable".
+static void vot_report_frame_failure(int k)
+{
+    fprintf(stderr, "[vot] %s run index %d: frame unavailable\n",
+            g_vot.sequence.c_str(), k);
+    if (!g_vot.stream.error().empty())
+        fprintf(stderr, "[vot]   blob stream: %s\n", g_vot.stream.error().c_str());
+#if CONV_IN_CH == 3
+    if (!g_vot.stream_luma.error().empty())
+        fprintf(stderr, "[vot]   luma stream: %s\n",
+                g_vot.stream_luma.error().c_str());
+#endif
+}
+
+#if CONV_IN_CH == 3
+// Same run-order indexing as vot_frame(), deliberately sharing g_vot.order
+// rather than recomputing it: the sidecar is the SAME sequence in the SAME
+// frame order, and two copies of that indexing is how a backward run ends up
+// reading forward luma against interleaved colour -- a mismatch that degrades
+// the scale filter and nothing else, so nothing would report it.
+static inline const uint8_t *vot_luma_frame(int k)
+{
+    if (g_vot.streamed) return g_vot.stream_luma.at((size_t)k);
+    return g_vot.luma.frame(g_vot.order[(size_t)k]);
+}
+#endif
 
 // Frames whose groundtruth box is empty. 41 of 19,903 in stb2022, across 12
 // sequences. The toolkit's failure rule ignores them; the board's IoU line
@@ -908,6 +1073,24 @@ enum {
     AP_DET_HASH,     // the run-state digest — see g_det_hash. Its own slot
                      // because it is an INSTRUMENT added to the timed path, and
                      // an instrument whose cost is invisible cannot be judged.
+#if FRAME_SOURCE_VOT
+    // GUARDED, so the synth arm's ELF is byte-identical to a build without any
+    // of this. It is not enough that the slot would read zero there: an extra
+    // enumerator shifts nothing but does add a row to every frame report, and
+    // this project's own rule is that the two arms differ STRUCTURALLY rather
+    // than by a value that happens to be zero. `cmp` on the synth ELF against
+    // HEAD is the check, and it is the same instrument that caught
+    // PROGRESS_EVERY changing codegen through an unused static counter.
+    AP_VOT_STAGE,    // BLOCKED waiting for a streamed frame, both readers. Zero
+                     // on the resident path. Its own slot
+                     // because the whole argument for a prefetched ring over a
+                     // synchronous refill is that the wait is usually zero — and
+                     // a claim like that is worth nothing unless the run prints
+                     // the number. On the two 1080p sequences it will NOT be
+                     // zero (7.9 MB/frame against 117 MB/s is 67 ms), and this
+                     // is the slot that says so instead of inflating
+                     // UNATTRIBUTED, which is exactly what mmap would have done.
+#endif
     AP_N
 };
 static const char *g_ap_name[AP_N] = {
@@ -916,7 +1099,10 @@ static const char *g_ap_name[AP_N] = {
     "fcol_bo.sync", "BO<->heap stage", "unpack F_ch", "cmul packing",
     "B2 correction", "PSR scan",
     "filter upd+quant", "publish (pack)", "scale extract", "scale detect+update",
-    "diag scan (rails)", "determinism hash"
+    "diag scan (rails)", "determinism hash",
+#if FRAME_SOURCE_VOT
+    "vot frame stage (wait)",
+#endif
 };
 // The enum and the name table are two lists that must stay the same length, in
 // the same order — exactly the class of coupling CLAUDE.md flags as "duplicated
@@ -1092,6 +1278,29 @@ static inline int drain_depth_for_frame(int frame)
     return d[b];
 #endif
 }
+
+// HOW OFTEN THE LEVEL-0 PROGRESS LINE IS PRINTED.
+//
+// The comment above prices that line at "~4 ms against an ~87 ms floor, 4%".
+// Both halves of that were true in 2026-08-20 terms and the floor has since
+// moved: the frame is 26.29 ms, so the same line is now 15% of it, and on a
+// gate-heavy sequence like `animal` the console is 58% of the frame
+// (correlation(gated%, unattributed) = 0.963 over the 8-sequence sweep).
+//
+// The fix is NOT to silence level 0 -- its per-frame marker is what
+// `picocom | ts` times, and deleting it would delete the instrument. It is to
+// print the marker every Nth frame on runs that are measuring something else.
+//
+// DEFAULT 1 = every frame = byte-identical to the pre-2026-08-25 console. A VOT
+// sweep sets it to 10 or 25. Frame 0 and the last frame ALWAYS print, whatever
+// N: the first is the run's start marker and the last is its end, and a run
+// whose final line is missing looks exactly like a run that hung.
+#ifndef PROGRESS_EVERY
+#  define PROGRESS_EVERY 1
+#endif
+#if PROGRESS_EVERY < 1
+#  error "PROGRESS_EVERY must be >= 1 (1 = every frame)"
+#endif
 
 // Compile-time constant, so at VERBOSITY 0 the format strings themselves are
 // dead-code-eliminated rather than merely skipped at runtime.
@@ -1908,6 +2117,27 @@ static void dump_buffer(const char *tag, int frame, const void *p, size_t bytes)
 #  define CSV_LOG 1
 #endif
 
+// HOW OFTEN track.csv IS FLUSHED, IN ROWS.
+//
+// csv_row() used to fflush() every row, justified as "nothing against 1216 KB
+// of binaries per frame". At DUMP_BUFFERS=0 there are no binaries, so what is
+// left is a filesystem sync in the timed path, once per frame.
+//
+// DEFAULT 1 = flush every row = the previous behaviour exactly, and that
+// default is deliberate: the justification for per-row flushing was surviving a
+// power cut, and a power cut is not hypothetical here -- one took out arm B's
+// car1 run on 2026-08-25. Raising it is a decision to trade the tail of a run
+// for frame time, and a sweep makes that trade knowingly.
+//
+// The whole dataset's rows are ~4.6 MB, so buffering an entire run costs
+// nothing in memory. csv_close() flushes, and so does fclose() underneath it.
+#ifndef CSV_FLUSH_EVERY
+#  define CSV_FLUSH_EVERY 1
+#endif
+#if CSV_FLUSH_EVERY < 1
+#  error "CSV_FLUSH_EVERY must be >= 1 (1 = every row)"
+#endif
+
 static FILE *g_csv = nullptr;
 // Which run each CSV row belongs to. -1 at FRAME_SOURCE=synth, where there is
 // exactly one run and no anchor.
@@ -1916,6 +2146,17 @@ static int g_csv_job = 0, g_csv_anchor = -1;
 struct FrameDiag {
     double fch = 0.0, accum = 0.0, resp = 0.0, h = 0.0;
     int    rails = 0;
+    // PER-BUFFER rails, added 2026-08-26. `rails` above is the SUM over all four
+    // scans, so a railed row has never said WHICH buffer saturated -- and the
+    // lever differs by buffer: H_SHIFT is upstream of both the accumulator and
+    // the response, while IFFT_ROW_SHIFT/IFFT_COL_SHIFT reach only the response.
+    // Sizing the budget from an unattributed total is choosing a knob blind.
+    //
+    // The one attributed sample that existed (car1 anchor 0, VERBOSITY=1,
+    // runs/run_0825_1314.log) is 8 response-railed frames against 4 accum, i.e.
+    // it does NOT support the accumulator being the problem. Two columns retire
+    // the guess.
+    int    rails_fch = 0, rails_accum = 0, rails_resp = 0, rails_h = 0;
 };
 static FrameDiag g_fdiag;
 
@@ -1989,7 +2230,19 @@ static void csv_open(void)
             // accum_max/h_max are the other two the console alone had; fch0_max
             // is ch0 ONLY (see diag_record) — not a bank maximum. `response` is
             // deliberately absent: `peak` above already is it.
-            "rails,accum_max,fch0_max,h_max,job,anchor\n");
+            "rails,accum_max,fch0_max,h_max,job,anchor,"
+            // Added 2026-08-26, for the real-video shift-budget re-derivation.
+            //
+            // resp_max: the response scan's max COMPLEX MAGNITUDE. `peak` is a
+            // near-perfect proxy for it (identical on 739 of 741 car1 frames and
+            // on 199 of 199 synthetic ones, the two exceptions being amplitude
+            // ~25 of 32767) but it is not the same quantity: `peak` is the
+            // SIGNED REAL PART at the argmax of |real|, so it cannot see a bin
+            // that saturates in the IMAGINARY part alone. Budget sizing reads
+            // the buffer the rail detector reads.
+            //
+            // rails_*: which buffer railed. See FrameDiag.
+            "resp_max,rails_fch,rails_accum,rails_resp,rails_h\n");
     fflush(g_csv);
     printf("[csv] per-frame log -> %s\n", path);
 #endif
@@ -2008,7 +2261,8 @@ static void csv_row(int frame, bool occluded, bool evaluated,
     fprintf(g_csv,
             "%d,%d,%d,%d,%s,%.4f,%.4f,%ld,%d,%d,%.4f,"
             "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.4f,%.2f,%d,"
-            "%d,%.4f,%s,%d,%.0f,%.0f,%.0f,%d,%d\n",
+            "%d,%.4f,%s,%d,%.0f,%.0f,%.0f,%d,%d,"
+            "%.0f,%d,%d,%d,%d\n",
             frame, occluded ? 1 : 0, evaluated ? 1 : 0, gate.accept ? 1 : 0,
             mosse::gate_reason_tag(gate.reason),
             p.psr, p.ratio, p.peak, p.dr, p.dc, resp00_over_peak,
@@ -2023,11 +2277,31 @@ static void csv_row(int frame, bool occluded, bool evaluated,
             scale_evaluated ? sd.conf : 0.0,
             scale_evaluated ? mosse::scale_veto_tag(sd.reason) : "NOT_RUN",
             g_fdiag.rails, g_fdiag.accum, g_fdiag.fch, g_fdiag.h,
-            g_csv_job, g_csv_anchor);
-    // Per ROW, not per run: the whole point is surviving a power cut. A 500-frame
-    // run writes 500 flushes of ~40 B, which is nothing against 1216 KB/frame of
-    // binaries or 8.3 KB/frame of console.
-    fflush(g_csv);
+            g_csv_job, g_csv_anchor,
+            g_fdiag.resp, g_fdiag.rails_fch, g_fdiag.rails_accum,
+            g_fdiag.rails_resp, g_fdiag.rails_h);
+    // Per ROW by default: the point is surviving a power cut, and one really did
+    // happen mid-sweep. CSV_FLUSH_EVERY > 1 trades that tail for frame time on a
+    // run that is measuring frame time.
+    //
+    // A RAILED row flushes whatever N is. A rail invalidates the shift budget
+    // and is the one row worth interrupting a sweep over, and rails are rare on
+    // a healthy run -- 8 frames in 742 on the worst one recorded -- so the
+    // exception costs nothing.
+    //
+    // A GATE VETO deliberately does NOT force a flush, though it is tempting.
+    // Vetoes are a routine tracking outcome, not a defect, and they are
+    // COMMONEST on exactly the runs this knob exists for: `animal` gates 76% of
+    // its frames, so flushing on vetoes would flush 76% of rows and save nothing
+    // on the sequence where the console/IO cost is worst (58% of the frame).
+#if CSV_FLUSH_EVERY > 1
+    static long csv_rows = 0;
+    ++csv_rows;
+    if ((csv_rows % CSV_FLUSH_EVERY) == 0 || g_fdiag.rails > 0)
+        fflush(g_csv);
+#else
+    fflush(g_csv);      // the default arm is the ORIGINAL line, textually
+#endif
 #else
     (void)frame; (void)occluded; (void)evaluated; (void)gate; (void)p;
     (void)resp00_over_peak; (void)est; (void)truth; (void)iou; (void)cerr;
@@ -2038,6 +2312,8 @@ static void csv_row(int frame, bool occluded, bool evaluated,
 static void csv_close(void)
 {
 #if CSV_LOG
+    // fclose() flushes -- no explicit fflush needed, and adding one would make
+    // the CSV_FLUSH_EVERY=1 build differ from the pre-knob binary for no reason.
     if (g_csv) { fclose(g_csv); g_csv = nullptr; }
 #endif
 }
@@ -2107,10 +2383,15 @@ static Cint16Scan scan_cint16(const int16_t *b, int n)
 static void diag_record(const char *tag, const Cint16Scan &s)
 {
     const double m = (s.max_m2 > 0) ? sqrt((double)s.max_m2) : 0.0;
-    if      (!strcmp(tag, "F_ch"))     g_fdiag.fch   = m;
-    else if (!strcmp(tag, "accum"))    g_fdiag.accum = m;
-    else if (!strcmp(tag, "response")) g_fdiag.resp  = m;
-    else if (!strcmp(tag, "H(q15)"))   g_fdiag.h     = m;
+    if      (!strcmp(tag, "F_ch"))   { g_fdiag.fch   = m; g_fdiag.rails_fch   += s.rails; }
+    else if (!strcmp(tag, "accum"))  { g_fdiag.accum = m; g_fdiag.rails_accum += s.rails; }
+    else if (!strcmp(tag, "response")){g_fdiag.resp  = m; g_fdiag.rails_resp  += s.rails; }
+    else if (!strcmp(tag, "H(q15)")) { g_fdiag.h     = m; g_fdiag.rails_h     += s.rails; }
+    // The TOTAL still accumulates unconditionally, including for any tag not
+    // named above: a buffer that starts railing under a tag nobody added a
+    // column for must still make `rails` non-zero. The per-buffer columns are
+    // an attribution of the total, never a replacement for it -- if they stop
+    // summing to it, that discrepancy is itself the finding.
     g_fdiag.rails += s.rails;
 }
 
@@ -4002,6 +4283,19 @@ int main(int argc, char **argv)
         g_run_frames = (int)g_vot.order.size();
         if (g_vot.max_frames > 0 && g_vot.max_frames < g_run_frames)
             g_run_frames = g_vot.max_frames;
+        // THE STREAM'S PER-JOB RE-ARM, and it belongs here for the same reason
+        // every other line of run_reset() does: this list is what the prefetcher
+        // walks, a job that inherited the previous job's list would stream real
+        // frames in the wrong order, and nothing downstream can tell the
+        // difference — it is the backward-run-in-sequence-order failure wearing
+        // a new hat. g_run_frames, not order.size(), so --vot-max-frames does
+        // not prefetch frames the run will never ask for.
+        if (g_vot.streamed) {
+            g_vot.stream.begin_run(g_vot.order, (size_t)g_run_frames);
+#if CONV_IN_CH == 3
+            g_vot.stream_luma.begin_run(g_vot.order, (size_t)g_run_frames);
+#endif
+        }
         g_vot.traj.begin(g_vot.job);
         g_vot_empty_gt = 0;
 
@@ -4160,8 +4454,29 @@ int main(int argc, char **argv)
             // scale_extract's luma pointer on a buffer nothing else in this file
             // expects to be read-only. Heap-to-heap runs at 7359 MB/s: 0.04 ms
             // for a 640x480 frame, against a refactor with no measurable gain.
-            AP_T(AP_SCENE, memcpy(g_frame_host.data(), vot_frame(frame),
-                                  g_frame_bytes));
+            // THE FETCH IS SPLIT FROM THE COPY. On the resident path the two
+            // are the same instruction and the fetch costs nothing; on the
+            // streamed path the fetch can BLOCK and the copy cannot, so folding
+            // them would put NFS latency in a slot named "scene gen" and leave
+            // the only per-frame cost this feature adds invisible. AP_SCENE
+            // therefore keeps meaning exactly what it meant before on both.
+            const uint8_t *vot_px = nullptr;
+            AP_T(AP_VOT_STAGE, vot_px = vot_frame(frame));
+            if (!vot_px) { vot_report_frame_failure(frame); return EXIT_FAILURE; }
+            AP_T(AP_SCENE, memcpy(g_frame_host.data(), vot_px, g_frame_bytes));
+#if CONV_IN_CH == 3
+            // The interleaved frame went to g_frame_host above; the scale
+            // filter reads THIS. No colourise pass on the VOT arm -- the blob is
+            // already interleaved, so scene_colourise() would overwrite a
+            // correct colour frame with a tint of the luma plane. (It is only
+            // called in the synth branch; this comment is here because the
+            // asymmetry is the kind that gets "fixed" by symmetry later.)
+            const uint8_t *vot_lu = nullptr;
+            AP_T(AP_VOT_STAGE, vot_lu = vot_luma_frame(frame));
+            if (!vot_lu) { vot_report_frame_failure(frame); return EXIT_FAILURE; }
+            AP_T(AP_SCENE, memcpy(g_scene_luma.data(), vot_lu,
+                                  (size_t)g_frame_rows * g_frame_cols));
+#endif
 
             // Groundtruth for the IoU line and track.csv. REPORTING ONLY — it
             // never steers the tracker, which is the entire point of the board
@@ -5388,7 +5703,16 @@ int main(int argc, char **argv)
             // data, it is having a timestampable per-frame marker for
             // `picocom | ts`, which is how the frame time was measured in the
             // first place. Printing nothing at all would have deleted that.
-            if (VERBOSITY < 1)
+            // PROGRESS_EVERY thins this line without silencing it; frame 0 and
+            // the last frame always print. At the default 1 the condition folds
+            // away and the output is byte-identical to before the knob existed.
+#if PROGRESS_EVERY > 1
+            const bool progress_due = (frame % PROGRESS_EVERY) == 0 ||
+                                      (frame == g_run_frames - 1);
+#else
+            const bool progress_due = true;   // default arm: every frame
+#endif
+            if (VERBOSITY < 1 && progress_due)
                 printf("f%d d%d,%d psr%.0f iou%.2f r00 %.2f\n",
                        frame, psr_abs.dr, psr_abs.dc, gate.psr, iou,
                        resp00_over_peak);
@@ -5502,6 +5826,19 @@ int main(int argc, char **argv)
             else
                 fprintf(stderr, "\n[vot] TRAJECTORY NOT WRITTEN: %s\n", err.c_str());
         }
+        // TWO INDEPENDENT INSTRUMENTS ON THE SAME WAIT, which is this project's
+        // rule and not decoration: AP_VOT_STAGE times the at() CALL from the
+        // frame loop, this is the reader's own accounting from inside. They
+        // measure the same seconds by two routes, so a divergence means the
+        // wait is not where the slot says it is -- and a prefetcher that is
+        // secretly synchronous would show up here as the two agreeing at a
+        // number far above zero, rather than as a plausible frame time.
+        if (g_vot.streamed)
+            printf("[vot] streamed frame wait, cumulative for this job: %.3f s "
+                   "over %d frames (%.3f ms/frame)\n",
+                   vot_stage_wait_seconds(), g_run_frames,
+                   g_run_frames > 0 ? 1000.0 * vot_stage_wait_seconds() / g_run_frames
+                                    : 0.0);
         if (g_vot_empty_gt > 0)
             printf("[vot] %d frame(s) of this run have an EMPTY groundtruth box. "
                    "The IoU figures below score them as 0; the toolkit's failure "

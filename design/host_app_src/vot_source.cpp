@@ -7,6 +7,13 @@
 #include <cstdlib>
 #include <cstring>
 
+// POSIX, for StreamBlob only. pread() rather than fseek+fread because the
+// producer runs on its own thread: pread carries its own offset, so there is no
+// shared file position for the two to race on and no FILE* lock in the path.
+#include <fcntl.h>
+#include <sys/stat.h>
+#include <unistd.h>
+
 namespace vot {
 namespace {
 
@@ -306,7 +313,13 @@ bool manifest_load(const std::string &path, Manifest &m, std::string &err)
 }
 
 // ---------------------------------------------------------------------------
-bool Blob::load(const std::string &path, const Manifest &m, std::string &err)
+// The two loaders differ ONLY in frame size, so they share one reader rather
+// than carrying two copies of the short-read / long-blob checks. A second copy
+// of those checks is a second thing to get wrong, and the failure they catch --
+// a blob and a manifest disagreeing about geometry -- is silent in exactly the
+// way that makes every later frame offset a guess.
+bool Blob::load_sized(const std::string &path, size_t fb, int nframes,
+                      std::string &err)
 {
     const auto t0 = std::chrono::steady_clock::now();
     data_.clear();
@@ -314,7 +327,7 @@ bool Blob::load(const std::string &path, const Manifest &m, std::string &err)
     frames_ = 0;
     secs_ = 0.0;
 
-    const size_t want = m.frame_bytes * (size_t)m.frames;
+    const size_t want = fb * (size_t)nframes;
     FILE *f = fopen(path.c_str(), "rb");
     if (!f) { err = "cannot open " + path + ": " + strerror(errno); return false; }
 
@@ -340,22 +353,241 @@ bool Blob::load(const std::string &path, const Manifest &m, std::string &err)
     if (got != want || longer) {
         char b[192];
         snprintf(b, sizeof b, "%s: %zu bytes, manifest says %d frames x %zu = %zu",
-                 path.c_str(), longer ? got + 1 : got, m.frames, m.frame_bytes, want);
+                 path.c_str(), longer ? got + 1 : got, nframes, fb, want);
         data_.clear();
         err = b;
         return false;
     }
 
-    frame_bytes_ = m.frame_bytes;
-    frames_      = m.frames;
+    frame_bytes_ = fb;
+    frames_      = nframes;
     secs_ = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
     return true;
+}
+
+bool Blob::load(const std::string &path, const Manifest &m, std::string &err)
+{
+    return load_sized(path, m.frame_bytes, m.frames, err);
+}
+
+bool Blob::load_luma(const std::string &path, const Manifest &m, std::string &err)
+{
+    // rows*cols, NOT m.frame_bytes: the sidecar is one plane whatever the blob's
+    // channel count is. Taking m.frame_bytes here would read 3x the bytes, fail
+    // the length check, and report it as a corrupt sidecar rather than as this
+    // bug -- so the size is derived from the geometry, at the one site that
+    // knows the sidecar is single-plane. That site is now luma_frame_bytes() in
+    // the header, shared with StreamBlob::open_luma: this used to be the only
+    // copy, and the streaming reader would have been the second.
+    return load_sized(path, luma_frame_bytes(m), m.frames, err);
 }
 
 const uint8_t *Blob::frame(int i) const
 {
     if (i < 0 || i >= frames_) return nullptr;
     return data_.data() + (size_t)i * frame_bytes_;
+}
+
+// ---------------------------------------------------------------------------
+// StreamBlob
+// ---------------------------------------------------------------------------
+StreamBlob::~StreamBlob() { close(); }
+
+bool StreamBlob::open(const std::string &path, size_t fb, int nframes,
+                      int ring, std::string &err)
+{
+    close();
+
+    // ring < 2 is not "no prefetch", it is a correctness bug: at(k) holds slot
+    // k while the producer fills ahead, so a single slot would be overwritten
+    // under the caller's memcpy. Refused rather than clamped -- a silently
+    // promoted 1 would make the one configuration that cannot work look
+    // configured.
+    if (ring < 2)            { err = "StreamBlob ring must be >= 2"; return false; }
+    if (fb == 0 || nframes <= 0) { err = "StreamBlob: empty geometry"; return false; }
+
+    const int fd = ::open(path.c_str(), O_RDONLY);
+    if (fd < 0) { err = "cannot open " + path + ": " + strerror(errno); return false; }
+
+    // The SAME length check the resident reader makes, at the only moment it is
+    // still free. Streaming reads one frame at a time, so a blob a frame short
+    // would otherwise surface as a short read on the last frame of a run that
+    // has already spent an hour -- or, on a backward run, never at all.
+    struct stat st;
+    if (fstat(fd, &st) != 0) {
+        err = "cannot stat " + path + ": " + strerror(errno);
+        ::close(fd);
+        return false;
+    }
+    const size_t want = fb * (size_t)nframes;
+    if ((size_t)st.st_size != want) {
+        char b[224];
+        snprintf(b, sizeof b, "%s: %lld bytes, manifest says %d frames x %zu = %zu",
+                 path.c_str(), (long long)st.st_size, nframes, fb, want);
+        err = b;
+        ::close(fd);
+        return false;
+    }
+
+    fd_          = fd;
+    path_        = path;
+    frame_bytes_ = fb;
+    frames_      = nframes;
+    ring_        = ring;
+    wait_s_      = 0.0;
+    err_.clear();
+    buf_.assign(fb * (size_t)ring, 0);
+    return true;
+}
+
+bool StreamBlob::open_blob(const std::string &path, const Manifest &m, int ring,
+                           std::string &err)
+{
+    return open(path, m.frame_bytes, m.frames, ring, err);
+}
+
+bool StreamBlob::open_luma(const std::string &path, const Manifest &m, int ring,
+                           std::string &err)
+{
+    return open(path, luma_frame_bytes(m), m.frames, ring, err);
+}
+
+void StreamBlob::stop_thread()
+{
+    if (!th_.joinable()) return;
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        stop_ = true;
+    }
+    cv_prod_.notify_all();
+    th_.join();
+}
+
+void StreamBlob::close()
+{
+    stop_thread();
+    if (fd_ >= 0) ::close(fd_);
+    fd_ = -1;
+    buf_.clear();
+    buf_.shrink_to_fit();
+    order_.clear();
+    frame_bytes_ = 0;
+    frames_ = 0;
+    ring_ = 0;
+    len_ = produced_ = consumed_ = served_ = 0;
+    stop_ = false;
+}
+
+void StreamBlob::begin_run(const std::vector<int> &order, size_t length)
+{
+    stop_thread();
+    {
+        std::lock_guard<std::mutex> lk(mu_);
+        order_    = order;
+        len_      = length < order.size() ? length : order.size();
+        produced_ = 0;
+        consumed_ = 0;
+        served_   = 0;
+        stop_     = false;
+        // PER JOB, not per sequence. begin_run() is the per-anchor reset, so
+        // scoping the wait to it makes the number the caller prints at the end
+        // of a job be that job's -- a sequence-cumulative counter reported as a
+        // per-job figure is the kind of plausible wrong number this file exists
+        // to avoid.
+        wait_s_ = 0.0;
+        err_.clear();
+    }
+    if (fd_ < 0 || len_ == 0) return;
+    th_ = std::thread(&StreamBlob::producer, this);
+}
+
+void StreamBlob::producer()
+{
+    for (size_t i = 0; i < len_; ++i) {
+        {
+            std::unique_lock<std::mutex> lk(mu_);
+            // Fill at most ring_ ahead of what the consumer still needs. The
+            // slot the consumer is HOLDING is consumed_, and the furthest this
+            // admits is consumed_ + ring_ - 1, whose slot index differs from
+            // consumed_'s for every ring_ >= 2. That is the whole mutual
+            // exclusion: no lock is held across a read or across the caller's
+            // memcpy.
+            cv_prod_.wait(lk, [&] { return stop_ || i < consumed_ + (size_t)ring_; });
+            if (stop_) return;
+        }
+
+        const int    src = order_[i];
+        const off_t  off = (off_t)src * (off_t)frame_bytes_;
+        uint8_t     *dst = buf_.data() + (i % (size_t)ring_) * frame_bytes_;
+
+        size_t got = 0;
+        while (got < frame_bytes_) {
+            const ssize_t n = ::pread(fd_, dst + got, frame_bytes_ - got,
+                                      off + (off_t)got);
+            if (n > 0) { got += (size_t)n; continue; }
+            if (n < 0 && errno == EINTR) continue;
+            char b[256];
+            snprintf(b, sizeof b,
+                     "%s: read of frame %d (run index %zu) returned %zd after "
+                     "%zu of %zu bytes: %s",
+                     path_.c_str(), src, i, n, got, frame_bytes_,
+                     n < 0 ? strerror(errno) : "end of file");
+            {
+                std::lock_guard<std::mutex> lk(mu_);
+                err_ = b;
+            }
+            cv_cons_.notify_all();
+            return;
+        }
+
+        {
+            std::lock_guard<std::mutex> lk(mu_);
+            produced_ = i + 1;
+        }
+        cv_cons_.notify_all();
+    }
+}
+
+const uint8_t *StreamBlob::at(size_t k)
+{
+    std::unique_lock<std::mutex> lk(mu_);
+    if (fd_ < 0)   { err_ = "StreamBlob::at on a closed stream"; return nullptr; }
+    if (len_ == 0) {
+        err_ = "StreamBlob::at before begin_run() — no run order has been declared";
+        return nullptr;
+    }
+    if (k >= len_) {
+        char b[128];
+        snprintf(b, sizeof b, "StreamBlob::at(%zu) past the run length %zu", k, len_);
+        err_ = b;
+        return nullptr;
+    }
+    // STRICTLY SEQUENTIAL, ASSERTED. See the header: a seek here would be a
+    // silent 2.4x, and every caller this file has visits run indices 0,1,2,...
+    // exactly once. `k == consumed_` on every call after the first, because
+    // consumed_ is set to k below and begin_run() zeroes it.
+    if (k != served_) {
+        char b[176];
+        snprintf(b, sizeof b,
+                 "StreamBlob::at(%zu) is out of order — the stream expects %zu. "
+                 "Access must follow the order passed to begin_run().",
+                 k, served_);
+        err_ = b;
+        return nullptr;
+    }
+    // Releases every slot below k. The producer is then free to fill up to
+    // k + ring_ - 1, which never collides with k's own slot.
+    consumed_ = k;
+    cv_prod_.notify_all();
+
+    const auto t0 = std::chrono::steady_clock::now();
+    cv_cons_.wait(lk, [&] { return produced_ > k || !err_.empty(); });
+    wait_s_ += std::chrono::duration<double>(
+                   std::chrono::steady_clock::now() - t0).count();
+
+    if (produced_ <= k) return nullptr;      // producer failed; err_ is set
+    served_ = k + 1;
+    return buf_.data() + (k % (size_t)ring_) * frame_bytes_;
 }
 
 // ---------------------------------------------------------------------------

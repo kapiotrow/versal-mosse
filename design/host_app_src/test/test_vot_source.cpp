@@ -261,6 +261,352 @@ void t_trajectory()
 }
 
 // ---------------------------------------------------------------------------
+// Defined below, next to the manifest mutants that are its main user.
+std::string mutate(const std::string &s, const std::string &from,
+                   const std::string &to);
+
+// -----------------------------------------------------------------------
+// THE LUMA SIDECAR (channels=3). New path, so it needs a test that is known to
+// be able to FAIL before it is worth anything.
+//
+// The one way this breaks silently is SIZING: the sidecar is one plane,
+// rows*cols per frame, while the manifest's frame_bytes is rows*cols*channels.
+// Size it with frame_bytes and every frame offset is 3x too large -- which does
+// NOT crash, it reads within a correctly-sized-but-wrong window and hands
+// scale_extract a stripe of the wrong frame. The scale filter then degrades and
+// nothing else in the system notices, because no other consumer reads the
+// sidecar. So the assertion is BOTH directions: the right size is accepted, and
+// the frame_bytes-sized one is rejected.
+void t_luma_sidecar()
+{
+    printf("\n  luma sidecar (channels=3)\n");
+    constexpr int  LROWS = 3, LCOLS = 4, LCH = 3, LFRAMES = 5;
+    constexpr size_t LFB   = (size_t)LROWS * LCOLS * LCH;   // 36, interleaved
+    constexpr size_t LUMAFB = (size_t)LROWS * LCOLS;        // 12, one plane
+
+    std::string mtext = good_manifest();
+    mtext = mutate(mtext, "\"channels\": 1", "\"channels\": 3");
+    mtext = mutate(mtext, "\"frame_bytes\": 12", "\"frame_bytes\": 36");
+    mtext = mutate(mtext, "\"luma_blob\": null", "\"luma_blob\": \"fixture.luma\"");
+
+    vot::Manifest m;
+    std::string err;
+    if (!vot::manifest_parse(mtext.data(), mtext.size(), m, err)) {
+        check("channels=3 fixture parses", false, err);
+        return;
+    }
+    check("luma_blob parsed", m.luma_blob == "fixture.luma", m.luma_blob);
+    check("frame_bytes is the INTERLEAVED size", m.frame_bytes == LFB,
+          std::to_string(m.frame_bytes));
+
+    const std::string dir = tmpdir();
+
+    // (1) the correct sidecar is ACCEPTED and indexes one plane per frame.
+    {
+        const std::string path = dir + "/good.luma";
+        write_file(path, good_blob(LFRAMES, LUMAFB));
+        vot::Blob luma;
+        std::string lerr;
+        const bool ok = luma.load_luma(path, m, lerr);
+        check("rows*cols sidecar accepted", ok, ok ? "" : lerr);
+        if (ok) {
+            check("sidecar frame_bytes == rows*cols",
+                  luma.frame_bytes() == LUMAFB, std::to_string(luma.frame_bytes()));
+            check("sidecar frames == manifest frames",
+                  luma.frames() == LFRAMES, std::to_string(luma.frames()));
+            // good_blob fills frame i with byte i+1, so a stride error shows up
+            // as the wrong frame rather than as a crash.
+            const uint8_t *f2 = luma.frame(2);
+            check("sidecar frame(2) has frame 2's content", f2 && f2[0] == 3,
+                  f2 ? std::to_string((int)f2[0]) : "null");
+            check("sidecar frame(LFRAMES) is out of range",
+                  luma.frame(LFRAMES) == nullptr, "");
+        }
+    }
+
+    // (2) THE MUTANT: a sidecar sized rows*cols*channels must be REJECTED.
+    // This is what load_luma would happily read if it used m.frame_bytes, so if
+    // this check ever passes-by-accepting, the sizing bug is back.
+    {
+        const std::string path = dir + "/interleaved_sized.luma";
+        write_file(path, good_blob(LFRAMES, LFB));
+        vot::Blob luma;
+        std::string lerr;
+        const bool accepted = luma.load_luma(path, m, lerr);
+        check("sidecar sized rows*cols*channels REJECTED", !accepted,
+              accepted ? "ACCEPTED — load_luma is using frame_bytes" : lerr);
+    }
+
+    // (3) the ordinary short/long checks still apply through the shared reader.
+    {
+        const std::string path = dir + "/short.luma";
+        write_file(path, good_blob(LFRAMES, LUMAFB).substr(0, LUMAFB * LFRAMES - 1));
+        vot::Blob luma;
+        std::string lerr;
+        check("sidecar one byte short REJECTED", !luma.load_luma(path, m, lerr), lerr);
+    }
+}
+
+// ---------------------------------------------------------------------------
+// StreamBlob — the reader for sequences that do not fit in heap.
+//
+// WHAT MAKES THIS TESTABLE AT ALL, and why it is worth more than the usual
+// "new code, new test": StreamBlob changes no arithmetic. It returns the SAME
+// bytes as Blob in the SAME order, from a file instead of from heap. So the
+// assertion is not a property of the streamed output -- it is EQUALITY with the
+// resident reader, frame for frame, on the same run order. That is the native
+// form of the acceptance test the board will run (identical run-state digests
+// in both modes on a sequence that fits), and it costs milliseconds.
+//
+// The failure modes are the ones a ring buffer has and a heap array does not,
+// and none of them crash:
+//   * a slot released one frame too early -> the producer overwrites the frame
+//     under the caller's memcpy, so the tracker sees a frame from K ahead;
+//   * an off-by-one in the slot index -> every frame is the neighbour of the
+//     right one, which on real video looks like a tracker that lags by a frame;
+//   * a run re-armed without begin_run() -> job N streams job N-1's order,
+//     which is the backward-run-in-sequence-order bug wearing a new hat.
+// Each is exercised below with a ring DELIBERATELY smaller than the run, since
+// a ring larger than the run wraps zero times and proves nothing about any of
+// them.
+constexpr int STREAM_FRAMES = 17;
+constexpr size_t STREAM_FB  = 40;
+
+// Distinct in BOTH indices, unlike good_blob()'s constant-per-frame fill: a
+// constant frame cannot tell a short read from a complete one, and a short read
+// is exactly what a per-frame reader risks and a single whole-blob read does not.
+std::string stream_blob(int frames = STREAM_FRAMES, size_t fb = STREAM_FB)
+{
+    std::string s;
+    s.reserve((size_t)frames * fb);
+    for (int i = 0; i < frames; ++i)
+        for (size_t j = 0; j < fb; ++j)
+            s.push_back((char)(uint8_t)((i * 31 + j * 7 + 5) & 0xFF));
+    return s;
+}
+
+// Every frame of `order`, streamed, compared against the file's own bytes.
+// Returns the run index of the first mismatch, or -1.
+int stream_matches(vot::StreamBlob &sb, const std::vector<int> &order,
+                   const std::string &truth, size_t fb)
+{
+    for (size_t k = 0; k < order.size(); ++k) {
+        const uint8_t *p = sb.at(k);
+        if (!p) return (int)k;
+        if (memcmp(p, truth.data() + (size_t)order[k] * fb, fb) != 0) return (int)k;
+    }
+    return -1;
+}
+
+void t_stream_blob()
+{
+    printf("\n  StreamBlob — streamed frames must equal resident frames\n");
+    const std::string dir  = tmpdir();
+    const std::string path = dir + "/stream.raw";
+    const std::string truth = stream_blob();
+    write_file(path, truth);
+
+    std::string err;
+
+    // (1) EQUALITY WITH THE RESIDENT READER, forward order, ring < run length.
+    // Ring 3 against 17 frames wraps five times, so a slot-index error cannot
+    // hide in a ring that never wraps.
+    {
+        vot::Blob resident;
+        const bool rok = resident.load(path, [&] {
+            vot::Manifest m; m.frames = STREAM_FRAMES; m.frame_bytes = STREAM_FB;
+            return m; }(), err);
+        check("resident reader loads the fixture", rok, rok ? "" : err);
+
+        vot::StreamBlob sb;
+        const bool ok = sb.open(path, STREAM_FB, STREAM_FRAMES, 3, err);
+        check("stream opens (ring 3, 17 frames)", ok, ok ? "" : err);
+        if (ok && rok) {
+            std::vector<int> order;
+            for (int i = 0; i < STREAM_FRAMES; ++i) order.push_back(i);
+            sb.begin_run(order, order.size());
+            int bad = -1;
+            for (size_t k = 0; k < order.size() && bad < 0; ++k) {
+                const uint8_t *sp = sb.at(k);
+                const uint8_t *rp = resident.frame(order[k]);
+                if (!sp || !rp || memcmp(sp, rp, STREAM_FB) != 0) bad = (int)k;
+            }
+            check("forward run: every frame == the resident reader's",
+                  bad < 0, bad < 0 ? "" : "first mismatch at run index "
+                                          + std::to_string(bad) + " " + sb.error());
+        }
+    }
+
+    // (2) BACKWARD ORDER. Descending offsets defeat sequential read-ahead, so
+    // this is the case where a reader that quietly assumed forward-only would
+    // still return data -- the wrong data, silently, on half the dataset's runs.
+    {
+        vot::StreamBlob sb;
+        const bool ok = sb.open(path, STREAM_FB, STREAM_FRAMES, 4, err);
+        check("stream reopens for the backward run", ok, ok ? "" : err);
+        if (ok) {
+            std::vector<int> order;
+            for (int i = STREAM_FRAMES - 1; i >= 0; --i) order.push_back(i);
+            sb.begin_run(order, order.size());
+            const int bad = stream_matches(sb, order, truth, STREAM_FB);
+            check("backward run: every frame matches the blob", bad < 0,
+                  bad < 0 ? "" : "run index " + std::to_string(bad) + " " + sb.error());
+        }
+    }
+
+    // (3) RE-ARM. One StreamBlob serves every job of a sequence, so begin_run()
+    // is the per-anchor reset. A stream that kept the previous job's order would
+    // return real frames in the wrong order -- scored without complaint.
+    {
+        vot::StreamBlob sb;
+        const bool ok = sb.open(path, STREAM_FB, STREAM_FRAMES, 2, err);
+        check("stream opens for the re-arm case", ok, ok ? "" : err);
+        if (ok) {
+            const std::vector<int> jobA = {5, 6, 7, 8, 9, 10};
+            const std::vector<int> jobB = {12, 11, 10, 9};
+            sb.begin_run(jobA, jobA.size());
+            const int a1 = stream_matches(sb, jobA, truth, STREAM_FB);
+            sb.begin_run(jobB, jobB.size());
+            const int b = stream_matches(sb, jobB, truth, STREAM_FB);
+            sb.begin_run(jobA, jobA.size());
+            const int a2 = stream_matches(sb, jobA, truth, STREAM_FB);
+            check("job A, then B, then A again — all three correct",
+                  a1 < 0 && b < 0 && a2 < 0,
+                  "A1=" + std::to_string(a1) + " B=" + std::to_string(b) +
+                  " A2=" + std::to_string(a2) + " " + sb.error());
+            check("ring 2 is the minimum that can work (it wraps every frame)",
+                  sb.ring() == 2, std::to_string(sb.ring()));
+        }
+    }
+
+    // (4) TRUNCATION. --vot-max-frames shortens the run; the prefetcher must
+    // stop at the truncated length rather than read frames the run never uses.
+    // Asserted by asking for the frame PAST it and requiring a refusal, because
+    // "it read too much" is otherwise invisible from outside.
+    {
+        vot::StreamBlob sb;
+        const bool ok = sb.open(path, STREAM_FB, STREAM_FRAMES, 3, err);
+        check("stream opens for the truncation case", ok, ok ? "" : err);
+        if (ok) {
+            std::vector<int> order;
+            for (int i = 0; i < STREAM_FRAMES; ++i) order.push_back(i);
+            sb.begin_run(order, 4);
+            const std::vector<int> first4(order.begin(), order.begin() + 4);
+            check("truncated run returns its 4 frames",
+                  stream_matches(sb, first4, truth, STREAM_FB) < 0, sb.error());
+            // ONE call, into a local. at() is STATEFUL -- it advances the
+            // stream -- and naming it twice in one check() left the order of
+            // the two calls unspecified: with the detail evaluated first, the
+            // condition's call was rejected as out-of-order and the check
+            // passed for the wrong reason. It survived the "begin_run ignores
+            // the truncated length" mutant because of exactly that.
+            const uint8_t *past = sb.at(4);
+            check("frame 4 of a 4-frame run REFUSED", past == nullptr,
+                  past == nullptr ? sb.error() : "returned a pointer");
+        }
+    }
+
+    // (5) THE LUMA SIDECAR, through the streaming reader. Same assertion as
+    // t_luma_sidecar makes of the resident one, and it is made HERE rather than
+    // trusted because open_luma() is a second call site of the one-plane rule.
+    {
+        vot::Manifest m;
+        m.rows = 3; m.cols = 4; m.channels = 3;
+        m.frames = 5; m.frame_bytes = 36;          // interleaved
+        const std::string lpath = dir + "/stream.luma";
+        write_file(lpath, stream_blob(5, 12));      // rows*cols
+        vot::StreamBlob sb;
+        check("open_luma accepts a rows*cols sidecar",
+              sb.open_luma(lpath, m, 2, err), err);
+        check("streamed sidecar frame_bytes == rows*cols",
+              sb.frame_bytes() == 12, std::to_string(sb.frame_bytes()));
+
+        const std::string ipath = dir + "/stream_interleaved.luma";
+        write_file(ipath, stream_blob(5, 36));
+        vot::StreamBlob bad;
+        const bool accepted = bad.open_luma(ipath, m, 2, err);
+        check("open_luma REJECTS a rows*cols*channels sidecar", !accepted,
+              accepted ? "ACCEPTED — open_luma is using frame_bytes" : err);
+    }
+}
+
+// The StreamBlob mutants. Separated from the parser mutants only because they
+// need a file on disk; the contract is the same one — each must be REJECTED,
+// and a reader that accepts them produces plausible frames instead of an error.
+void t_stream_mutants()
+{
+    printf("\n  StreamBlob mutants — each must be REJECTED\n");
+    const std::string dir = tmpdir();
+    const std::string truth = stream_blob();
+    std::string err;
+
+    // A blob one frame SHORT. The resident reader catches this in its single
+    // read; a per-frame reader would not notice until the last frame of the run,
+    // hours in — or never, on a backward run that ends at frame 0.
+    {
+        const std::string p = dir + "/short_stream.raw";
+        write_file(p, truth.substr(0, truth.size() - STREAM_FB));
+        vot::StreamBlob sb;
+        check("blob one frame short REJECTED at open",
+              !sb.open(p, STREAM_FB, STREAM_FRAMES, 3, err), err);
+    }
+    // ...and one byte LONG, which means the manifest and the file disagree about
+    // geometry, so every frame offset after the first is a guess.
+    {
+        const std::string p = dir + "/long_stream.raw";
+        write_file(p, truth + std::string(1, 'x'));
+        vot::StreamBlob sb;
+        check("blob one byte long REJECTED at open",
+              !sb.open(p, STREAM_FB, STREAM_FRAMES, 3, err), err);
+    }
+    // ring 1 cannot work: at(k) holds slot k while the producer fills ahead, so
+    // one slot is overwritten under the caller. Refused, not clamped to 2 — a
+    // silent promotion makes the one broken configuration look configured.
+    {
+        const std::string p = dir + "/stream.raw";
+        vot::StreamBlob sb;
+        check("ring 1 REJECTED", !sb.open(p, STREAM_FB, STREAM_FRAMES, 1, err), err);
+    }
+    // OUT-OF-ORDER ACCESS. The whole design rests on the run order being known
+    // in advance, so a caller that skips, repeats or looks ahead must get an
+    // error rather than a seek: seeking silently serialises the run against NFS.
+    {
+        const std::string p = dir + "/stream.raw";
+        vot::StreamBlob sb;
+        if (sb.open(p, STREAM_FB, STREAM_FRAMES, 4, err)) {
+            std::vector<int> order;
+            for (int i = 0; i < STREAM_FRAMES; ++i) order.push_back(i);
+            sb.begin_run(order, order.size());
+            (void)sb.at(0);
+            check("skipping a run index REJECTED", sb.at(2) == nullptr, sb.error());
+        }
+        vot::StreamBlob sb2;
+        if (sb2.open(p, STREAM_FB, STREAM_FRAMES, 4, err)) {
+            std::vector<int> order;
+            for (int i = 0; i < STREAM_FRAMES; ++i) order.push_back(i);
+            sb2.begin_run(order, order.size());
+            (void)sb2.at(0);
+            (void)sb2.at(1);
+            check("re-reading a run index REJECTED", sb2.at(1) == nullptr, sb2.error());
+        }
+    }
+    // at() before begin_run(): no order has been declared, so there is nothing
+    // to serve. Returning frame 0 would be the plausible-and-wrong answer.
+    {
+        const std::string p = dir + "/stream.raw";
+        vot::StreamBlob sb;
+        if (sb.open(p, STREAM_FB, STREAM_FRAMES, 3, err))
+            check("at() before begin_run() REJECTED", sb.at(0) == nullptr, sb.error());
+    }
+    // A missing file is an open failure, not an empty stream.
+    {
+        vot::StreamBlob sb;
+        check("missing blob REJECTED",
+              !sb.open(dir + "/does_not_exist.raw", STREAM_FB, STREAM_FRAMES, 3, err),
+              err);
+    }
+}
+
 // The assertion: every mutant must be REJECTED. A parser that accepts a corrupt
 // manifest is indistinguishable, from the console, from one that works.
 // ---------------------------------------------------------------------------
@@ -362,6 +708,147 @@ void t_mutants_are_caught()
 // fixture — it asserts nothing about values — but it is the only check that the
 // converter's actual output and this parser agree, and it costs nothing.
 // ---------------------------------------------------------------------------
+// ---------------------------------------------------------------------------
+// THE STREAMED READER ON A REAL BLOB, at the real geometry. Skipped without
+// $VOT_ROOT.
+//
+// The fixtures above use 40-byte frames, which exercise the ring's bookkeeping
+// and nothing about a 7.9 MB pread over a real filesystem: a partial read is
+// impossible at 40 bytes and routine at 8 MB, and it is the one failure the
+// resident reader's single whole-blob read never had to handle. So this walks a
+// slice of a real forward job and a real backward job on the LARGEST blob
+// present -- which is one of the five sequences this reader exists for -- and
+// compares every byte against an independent fopen/fread, a different mechanism
+// from the pread the producer uses.
+struct RealPick {
+    std::string dir, manifest;
+    vot::Manifest m;
+    size_t bytes = 0;
+};
+
+bool pick_largest_blob(RealPick &out)
+{
+    const char *root = getenv("VOT_ROOT");
+    if (!root) return false;
+    for (const char *sub : {"/data-rgb", "/data"}) {
+        const std::string dir = std::string(root) + sub;
+        FILE *p = popen(("ls " + dir + "/*.json 2>/dev/null").c_str(), "r");
+        if (!p) continue;
+        char line[1024];
+        while (fgets(line, sizeof line, p)) {
+            std::string path(line);
+            while (!path.empty() && (path.back() == '\n' || path.back() == '\r'))
+                path.pop_back();
+            vot::Manifest m;
+            std::string err;
+            if (!vot::manifest_load(path, m, err)) continue;
+            const size_t b = m.frame_bytes * (size_t)m.frames;
+            if (b <= out.bytes) continue;
+            FILE *bf = fopen((dir + "/" + m.blob).c_str(), "rb");
+            if (!bf) continue;                    // manifest without its blob
+            fclose(bf);
+            out.dir = dir; out.manifest = path; out.m = m; out.bytes = b;
+        }
+        pclose(p);
+    }
+    return out.bytes > 0;
+}
+
+// One frame, read by a mechanism the reader under test does not use.
+bool read_frame_directly(const std::string &path, size_t fb, int index,
+                         std::vector<uint8_t> &out)
+{
+    FILE *f = fopen(path.c_str(), "rb");
+    if (!f) return false;
+    out.assign(fb, 0);
+    const bool ok = (fseeko(f, (off_t)index * (off_t)fb, SEEK_SET) == 0) &&
+                    (fread(out.data(), 1, fb, f) == fb);
+    fclose(f);
+    return ok;
+}
+
+void t_stream_on_real_blob()
+{
+    printf("\n  StreamBlob on a real blob (skipped without $VOT_ROOT)\n");
+    RealPick pick;
+    if (!pick_largest_blob(pick)) {
+        printf("    no real blob found — skipped\n");
+        return;
+    }
+    const vot::Manifest &m = pick.m;
+    const std::string bpath = pick.dir + "/" + m.blob;
+    printf("    %s  %dx%dx%d  %d frames  %.0f MB  %.2f MB/frame\n",
+           m.sequence.c_str(), m.rows, m.cols, m.channels, m.frames,
+           pick.bytes / 1048576.0, m.frame_bytes / 1048576.0);
+
+    // A slice, not the run: this is a per-frame reader test, and 12 frames at
+    // this geometry already moves ~100 MB. The ring depth is deliberately below
+    // the slice length so it wraps.
+    constexpr size_t SLICE = 12;
+    std::string err;
+    vot::StreamBlob sb;
+    const bool bopen = sb.open_blob(bpath, m, 4, err);
+    check("real blob opens (length check against the manifest)", bopen,
+          bopen ? "" : err);
+    if (!bopen) return;
+
+    // Forward from the first anchor, and backward from the last job that runs
+    // backward -- the two directions the dataset actually contains.
+    for (int backward = 0; backward < 2; ++backward) {
+        std::vector<int> order;
+        if (!backward)
+            for (int i = 0; i < m.frames && order.size() < SLICE; ++i)
+                order.push_back(i);
+        else
+            for (int i = m.frames - 1; i >= 0 && order.size() < SLICE; --i)
+                order.push_back(i);
+
+        sb.begin_run(order, order.size());
+        int bad = -1;
+        std::vector<uint8_t> truth;
+        for (size_t k = 0; k < order.size() && bad < 0; ++k) {
+            const uint8_t *p = sb.at(k);
+            if (!p) { bad = (int)k; break; }
+            if (!read_frame_directly(bpath, m.frame_bytes, order[k], truth)) {
+                bad = (int)k; break;
+            }
+            if (memcmp(p, truth.data(), m.frame_bytes) != 0) bad = (int)k;
+        }
+        check(backward ? "real backward slice matches a direct read"
+                       : "real forward slice matches a direct read",
+              bad < 0,
+              bad < 0 ? std::to_string(m.frame_bytes) + " B/frame x "
+                        + std::to_string(order.size())
+                      : "run index " + std::to_string(bad) + " " + sb.error());
+    }
+
+    // The sidecar, if this manifest has one: the board arms both streams
+    // together and they must agree about frame size, which is the one place the
+    // two differ.
+    if (!m.luma_blob.empty()) {
+        const std::string lpath = pick.dir + "/" + m.luma_blob;
+        vot::StreamBlob sl;
+        const bool lopen = sl.open_luma(lpath, m, 4, err);
+        check("real luma sidecar opens at rows*cols", lopen, lopen ? "" : err);
+        if (lopen) {
+            std::vector<int> order;
+            for (int i = 0; i < m.frames && order.size() < SLICE; ++i)
+                order.push_back(i);
+            sl.begin_run(order, order.size());
+            int bad = -1;
+            std::vector<uint8_t> truth;
+            for (size_t k = 0; k < order.size() && bad < 0; ++k) {
+                const uint8_t *p = sl.at(k);
+                if (!p || !read_frame_directly(lpath, vot::luma_frame_bytes(m),
+                                               order[k], truth)) { bad = (int)k; break; }
+                if (memcmp(p, truth.data(), vot::luma_frame_bytes(m)) != 0) bad = (int)k;
+            }
+            check("real sidecar slice matches a direct read", bad < 0,
+                  bad < 0 ? "" : "run index " + std::to_string(bad) + " " + sl.error());
+        }
+    }
+}
+
 void t_real_manifest_if_present()
 {
     printf("\n  real manifest (skipped if $VOT_ROOT/data is absent)\n");
@@ -442,8 +929,12 @@ int main(int argc, char **argv)
     t_blob();
     t_job_order();
     t_trajectory();
+    t_luma_sidecar();
+    t_stream_blob();
+    t_stream_mutants();
     t_mutants_are_caught();
     t_real_manifest_if_present();
+    t_stream_on_real_blob();
     printf("\n  OVERALL: %s (%d failure%s)\n\n",
            g_failures ? "FAIL" : "PASS", g_failures,
            g_failures == 1 ? "" : "s");

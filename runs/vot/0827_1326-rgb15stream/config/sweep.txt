@@ -1,0 +1,10 @@
+date       2026-08-27T13:26:11+02:00
+arm        rgb15stream
+jobs       all
+stream     auto
+sequences  flamingo1 zebrafish1 nature frisbee girl 
+elf        build/hw/128x128/ch16/mosse_tracker.elf
+elf_md5    fac2d6d7e35543b5196653adf39c7c45
+xclbin_md5 52235f49221e1098500aa54a654616c9
+weights    2aa7031f1f537e1a4f073642c7d50f4a
+git        c9a65f9ec95162abc8ddff9fe7c802fb78fb6fe6 DIRTY

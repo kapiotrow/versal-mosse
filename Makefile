@@ -656,6 +656,29 @@ VOT_JOB         ?= 0
 #   1 mean_prev   2 filter_bo   3 g_filter   4 coast   5 scale reconfigure
 # Every non-zero value prints a banner and invalidates the run's tracking output.
 RESET_MUTANT    ?= 0
+# STREAMING FRAME SOURCE, for the sequences that do not fit in heap.
+#
+# The board maps 2 GB of the VEK280's 12 GB and 512 MB of that is CMA, so usable
+# heap is ~0.9-1.2 GB -- not the 12 GB the resource table records, which is the
+# PART's capacity (runs/vot/TODO_board_memory.md). At CONV_IN_CH=3 five stb2022
+# sequences exceed it and the 2026-08-26 full-62 RGB sweep lost exactly those
+# five to std::bad_alloc and the OOM killer.
+#
+# VOT_RESIDENT_MAX_MB is the blob+sidecar size above which the run streams from
+# the NFS mount through a prefetched ring instead of staging into heap. 700 MB
+# leaves room for frame_bo, the scene buffers and the filter state against the
+# ~950-1200 MB actually available -- it is a ceiling on the DATA, not on the
+# process. --vot-stream on the board's command line overrides it without a
+# rebuild, which is what the mode-equivalence test uses.
+#
+# VOT_STREAM_RING is the ring depth in FRAMES. It must be >= 2 (at(k) holds slot
+# k while the prefetcher fills ahead) and the reader refuses 1 rather than
+# clamping it. 8 frames is 63 MB at stb2022's largest geometry (1080x1920 RGB
+# plus the luma plane) and under 10 MB for most of the dataset.
+VOT_RESIDENT_MAX_MB ?= 700
+VOT_STREAM_RING     ?= 8
+GCC_FLAGS  += -DVOT_RESIDENT_MAX_MB=$(VOT_RESIDENT_MAX_MB)
+GCC_FLAGS  += -DVOT_STREAM_RING=$(VOT_STREAM_RING)
 GCC_FLAGS  += -DVOT_DATA_DIR='"$(VOT_DATA_DIR)"'
 GCC_FLAGS  += -DVOT_RESULTS_DIR='"$(VOT_RESULTS_DIR)"'
 GCC_FLAGS  += -DVOT_SEQUENCE='"$(VOT_SEQUENCE)"'
@@ -773,6 +796,21 @@ DUMP_BUFFERS ?= 1
 # where something other than the UART sets the frame time.
 VERBOSITY  := 1
 GCC_FLAGS  += -DVERBOSITY=$(VERBOSITY)
+# How often the LEVEL-0 progress line prints, in frames. 1 = every frame =
+# byte-identical to every run before 2026-08-25.
+#
+# The 4%-of-the-frame justification for that line was written against an ~87 ms
+# floor. The floor is now 26.29 ms, so the same ~45 B is 15% of it -- and on a
+# gate-heavy sequence the console is worse still: correlation(gated%,
+# unattributed frame time) = 0.963 across the 8-sequence sweep, and `animal`
+# spends 58% of its frame printing. Thinning the line is the fix; SILENCING it
+# is not, because `picocom | ts` needs a per-frame marker to time and that
+# marker is how the frame time was measured in the first place.
+#
+# Frame 0 and the last frame always print, whatever N -- a run whose last line
+# is missing looks exactly like a run that hung. Host-only.
+PROGRESS_EVERY ?= 1
+GCC_FLAGS  += -DPROGRESS_EVERY=$(PROGRESS_EVERY)
 # Row-FFT drain pipeline depth. 1 = the historical per-firing barrier; 0 = sweep
 # 1,2,4,8,16 in 40-frame blocks inside one run. See the note in mosse_tracker.cpp:
 # GMIO is 67% of the frame and gmio_fft_row_out is 73 of its 87 ms, so this is the
@@ -803,6 +841,21 @@ GCC_FLAGS  += -DDUMP_BUFFERS=$(DUMP_BUFFERS)
 # frame. Everything plotted in the thesis comes from here.
 CSV_LOG ?= 1
 GCC_FLAGS  += -DCSV_LOG=$(CSV_LOG)
+# How often track.csv is flushed, in rows. 1 = every row = the previous
+# behaviour, and that stays the default deliberately: per-row flushing was
+# justified by surviving a power cut, and a power cut really did take out arm B's
+# car1 run on 2026-08-25. At DUMP_BUFFERS=0 there are no per-frame binaries to
+# hide behind, so this is a filesystem sync in the timed path once per frame.
+#
+# A RAILED row flushes regardless of N -- it invalidates the shift budget and is
+# the one row worth interrupting a sweep over. A gate veto deliberately does not,
+# because vetoes are commonest on exactly the runs this knob exists for (`animal`
+# gates 76% of frames), so flushing on them would save nothing there.
+#
+# The whole 62-sequence dataset is ~4.6 MB of rows, so buffering a full run costs
+# nothing. Host-only.
+CSV_FLUSH_EVERY ?= 1
+GCC_FLAGS  += -DCSV_FLUSH_EVERY=$(CSV_FLUSH_EVERY)
 
 # ---------------------------------------------------------------------------
 # Launch-path diagnosis knobs (roi_crop's 505 ms crop_run.wait()). HOST-ONLY —
@@ -1559,7 +1612,7 @@ test_scene:
 .PHONY: test_vot_source
 test_vot_source:
 	mkdir -p $(BUILD_DIR)
-	g++ -O2 -std=c++17 -Wall -Wextra -Werror -I$(HOST_APP_SRC) \
+	g++ -O2 -std=c++17 -Wall -Wextra -Werror -pthread -I$(HOST_APP_SRC) \
 	    $(HOST_APP_SRC)/vot_source.cpp \
 	    $(TEST_HOST_DIR)/test_vot_source.cpp \
 	    -o $(BUILD_DIR)/test_vot_source
