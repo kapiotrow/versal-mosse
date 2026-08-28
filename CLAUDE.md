@@ -26,7 +26,7 @@ the `dsp` subdirectory (the Makefile appends `/dsp`).
 | `FFT_2D_DT` | `0` | 0=cint16, 1=cfloat |
 | `ITER_CNT` | `1` | Frames. **Needs ≥2** — frame 0 initialises the filter |
 | `PL_FREQ` | `312.5` | MHz. Platform also offers 625 / 156.25 / 100 / 78.125 |
-| `H_SHIFT` | `11` | cmul_accum filter-product shift; H is Q1.15. Independent of the FFT budget — and that independence is what fixed the 2026-08-24 rail. Was 10 until then |
+| `H_SHIFT` | `15` | Deliberately OVER-shifted: `rails=0` over 101,564 frames, and what the flashed xclbin was built with. 13 is the tight RGB value, 12 rails, gray's arm is 14. cmul_accum filter-product shift; H is Q1.15. Independent of the FFT budget. **Reaches `AIE_FLAGS` — the ONLY non-host-only knob in this table** |
 | `FFT_SHIFT` / `IFFT_ROW_SHIFT` / `IFFT_COL_SHIFT` | `4` / `4` / `4` | See "Shift budget" — validated on hardware, do not change without a ≥20-frame hw run |
 | `FFT_ROW_WS` | `64` | Rows per FFT invocation — the DMA transaction-count knob. Exhausted, see history |
 | `FFT_COL_WS` | `8` | Cols per FFT invocation. **32 is a 9.6 ms LOSS — do not raise** |
@@ -40,26 +40,26 @@ the `dsp` subdirectory (the Makefile appends `/dsp`).
 | `CONV2D_MODE` | `0` | 0 = real 3×3 conv, 1 = echo passthrough, 2 = synthesize |
 | `CONV_VECTORIZE` / `CMUL_VECTORIZE` | `1` | Vectorized kernels, bit-identical to scalar; 0 restores scalar for bisection |
 | `CONV_RELU` | `0` | Off — ReLU costs ~25% of the peak/sidelobe ratio |
-| `CONV_IN_CH` | `1` | conv2d input planes. 1 = BT.601 luminance, 3 = RGB. Picks the **weight-buffer layout**, so it drives `AIE_FLAGS`, `GCC_FLAGS` and `ROI_IN_CH` from this one variable. Both arms build and link; see the RGB section |
+| `CONV_IN_CH` | `3` | conv2d input planes. 1 = BT.601 luminance, 3 = RGB. Picks the **weight-buffer layout**, so it drives `AIE_FLAGS`, `GCC_FLAGS` and `ROI_IN_CH` from this one variable. Both arms build and link; see the RGB section |
 | `CONV2D_STACK` | `2048` | conv2d's AIE stack, bytes. Applied **only at `CONV_IN_CH=3`**, where the 27-tap chain needs 1344 against the 1024 default and the mapper otherwise refuses to emit a `libadf.a` |
 | `BIAS_SCALE` | `roi` | `bias_acc` input scale for `make weights`. **Default changed 2026-08-23**; `127` restores the pre-correction weights. See "The bias_acc correction" |
-| `FRAME_RGB_MODE` | `1` | Synthetic scene colour at `CONV_IN_CH=3`. 1 = per-plane tint; 0 = replicate luma — the COLOUR-FREE CONTROL, run on hardware 2026-08-24 (`run_0824_1442`) where it reproduced grayscale bit-for-bit. Inert at `CONV_IN_CH=1`; a real frame source ignores it. Host-only |
-| `FRAME_SOURCE` | `synth` | `synth` = the generated scene (unchanged, and `vot_source.cpp` is not even linked); `vot` = frames memcpy'd from a converted VOT blob, geometry and init box from its manifest. At `vot` the scene generator, `TRAJECTORY`, `OCCLUDE_MASK`, `BG_PAN` and `FRAME_NOISE` are all inert, and `ITER_CNT` is ignored — the run length is the job's. `vot` + `CONV_IN_CH=3` is a deliberate `#error` (needs the `.luma` sidecar). Host-only. See `runs/vot/phase2.md` |
+| `FRAME_RGB_MODE` | `1` | Synthetic scene colour at `CONV_IN_CH=3`. 1 = per-plane tint; 0 = replicate luma — the COLOUR-FREE CONTROL, which reproduced grayscale bit-for-bit on hardware. Inert at `CONV_IN_CH=1`; a real frame source ignores it. Host-only |
+| `FRAME_SOURCE` | `synth` | `synth` = the generated scene (unchanged, and `vot_source.cpp` is not even linked); `vot` = frames memcpy'd from a converted VOT blob, geometry and init box from its manifest. At `vot` the scene generator, `TRAJECTORY`, `OCCLUDE_MASK`, `BG_PAN` and `FRAME_NOISE` are all inert, and `ITER_CNT` is ignored — the run length is the job's. `vot` + `CONV_IN_CH=3` needs the `.luma` sidecar, which the converter emits and the host streams or stages; this is the SHIPPING combination. Host-only. See `runs/vot/phase2.md` |
 | `RESET_MUTANT` | `0` | Deliberately breaks ONE item of `run_reset()` so the multi-start determinism test's ability to FAIL is demonstrated, not assumed: `1` mean_prev, `2` filter_bo, `3` g_filter, `4` coast, `5` scale reconfigure. Non-zero prints a banner and invalidates the run's tracking output. See `runs/vot/phase3.md`. Host-only |
-| `VOT_DATA_DIR` / `VOT_RESULTS_DIR` / `VOT_SEQUENCE` / `VOT_JOB` | `/mnt/vot` / `/mnt/vot-results` / `car1` / `0` | Compiled-in defaults, each overridable on the board's command line (`--vot-data`, `--vot-results`, `--vot-seq`, `--vot-job`, `--vot-jobs all|N,M,...` for multi-start in one process, plus `--vot-max-frames` for a bring-up truncation that then REFUSES to write the trajectory). **Repeating a job index in `--vot-jobs` is the determinism test** — its two trajectories must come back byte-identical. An unrecognised argument is fatal — a typo falling back to the default would run the wrong sequence silently. Host-only |
-| `VOT_RESIDENT_MAX_MB` / `VOT_STREAM_RING` | `700` / `8` | Blob+sidecar size above which a sequence STREAMS from the NFS mount through a prefetched ring instead of staging into heap, and the ring depth in frames. Exists because usable heap is ~0.9-1.2 GB, not 12 GB: five RGB sequences (`flamingo1` 3631 MB, `zebrafish1` 2373, `nature` 1482, `frisbee` 1471, `girl` 1318) died on `std::bad_alloc`/OOM in the 2026-08-26 full-62 sweep while the other 57 completed. Ring < 2 is REFUSED, not clamped — `at(k)` holds slot k while the prefetcher fills ahead. Overridable per run with `--vot-stream auto|always|never`; `always` is the MODE-EQUIVALENCE TEST, since streaming changes no arithmetic and a sequence that fits in heap must return IDENTICAL run-state digests both ways. The resident path is untouched and stays the default, because 57 sequences already ran on it. Host-only |
-| `SCENE_VERIFY` | `0` | Re-colourise the whole frame each push and abort with coordinates on a mismatch. O(frame)/frame — for a short `MODE=bringup` run, never a 200-frame one (`calib_build.sh` refuses that combination). Plumbed 2026-08-24; it was a bare `#ifndef` before, so `SCENE_VERIFY=1` silently built it DISABLED. Host-only |
+| `VOT_DATA_DIR` / `VOT_RESULTS_DIR` / `VOT_SEQUENCE` / `VOT_JOB` | `/mnt/vot` / `/mnt/vot-results` / `car1` / `0` | Compiled-in defaults, each overridable on the board's command line (`--vot-data`, `--vot-results`, `--vot-seq`, `--vot-job`, `--vot-jobs all|N,M,...`, `--vot-max-frames` which then REFUSES to write the trajectory). **Repeating a job index in `--vot-jobs` is the determinism test** — its two trajectories must come back byte-identical. An unrecognised argument is fatal. Host-only |
+| `VOT_RESIDENT_MAX_MB` / `VOT_STREAM_RING` | `700` / `8` | Blob+sidecar size above which a sequence STREAMS from the NFS mount through a prefetched ring, and the ring depth. Exists because usable heap is ~0.9-1.2 GB, not 12 GB: five RGB sequences died on `std::bad_alloc` while 57 completed. Ring < 2 is REFUSED, not clamped. `--vot-stream auto|always|never`; `always` is the MODE-EQUIVALENCE TEST — streaming changes no arithmetic, so digests must be IDENTICAL both ways. Host-only |
+| `SCENE_VERIFY` | `0` | Re-colourise the whole frame each push and abort on a mismatch. O(frame)/frame — for a short `MODE=bringup` run only (`calib_build.sh` refuses otherwise). It was a bare `#ifndef` before 2026-08-24, so `SCENE_VERIFY=1` silently built it DISABLED. Host-only |
 | `B2_NULL_BINS` | `1` | 1 = null the 9 low-frequency bins, 0 = subtract µ·W |
-| `PSR_GATE_MIN` | `7.0` | Bolme §3.5. Below it the host HOLDS position and skips `filter_update` + `publish_filter`. `0` disables the threshold test only (structural vetoes remain). Host-only |
+| `PSR_GATE_MIN` | `5.0` | +0.0134 R against 7.0 on the full benchmark. **Its worth depends on the PSR scale**, so anything moving PSR re-opens it. Bolme §3.5. Below it the host HOLDS position and skips `filter_update` + `publish_filter`. `0` disables the threshold test only (structural vetoes remain). Host-only |
 | `TARGET_H` / `TARGET_W` | `64` | Target box size, frame px. Host-only |
-| `TARGET_PADDING` | `2` | `roi = box × padding`. At 64/2 the ROI is 128 ⇒ resample is 1:1 |
+| `TARGET_PADDING` | `2` | Settled at 2.0 three ways; 1.5 and 3.0 both measured worse. `roi = box × padding`. At 64/2 the ROI is 128 ⇒ resample is 1:1. Host-only |
 | `MOSSE_SIGMA` / `SIGMA_FROM_TARGET` | `2.0` / `0` | `SIGMA_FROM_TARGET=1` applies DSST's target/16 rule (σ=4 at padding 2) |
-| `MOSSE_ETA` | `0.125` | Translation filter learning rate |
+| `MOSSE_ETA` | `0.05` | +0.0218 R, +8.5% EAO against 0.125. Not monotone — 0.025 is much worse, so it is a shallow optimum. Translation filter learning rate. Host-only |
 | `SCALE_N` / `SCALE_STEP` | `33` / `1.04` | DSST scale levels; `SCALE_N=1` disables the scale filter. **1.04 beats DSST §6.1's 1.02 on hardware** (IoU 0.807 → 0.917) |
 | `SCALE_ETA` | `0.025` | Scale filter learning rate (deliberately ≠ `MOSSE_ETA`) |
 | `SCALE_CONF_MIN` | `2.0` | Scale gate on `conf`. A veto HOLDS the box and SKIPS `scale_update()`. `0` disables the threshold test only. Host-only |
-| `HOLD_COAST` / `COAST_DECAY` | `0` / `0.5` | `1` = a held frame moves the search window at the last measured velocity, decayed each successive held frame (drift bounded by `v/(1-decay)` = 2v, so a long hold fades back to a freeze); `0` = the freeze. **Flipped to 1 on 2026-08-25 and reverted to 0 the same day**: the same 54 trajectory pairs win on mean IoU (0.2709 → 0.3005 frame-weighted) and LOSE on the toolkit's own metric (accuracy 0.638 → 0.616, robustness 0.309 → 0.288, EAO 0.208 → 0.194). AR is the metric of record. Not "coasting is bad" — it wins on many short holds and loses on one long hold crossing a turn; see `runs/vot/evidence_ar.md` and the capped-coast proposal there. Host-only |
-| `SCALE_MAX_STEP` | `2` | Largest `|idx|` ONE frame may move the box — a RATE limit, where `MIN_REL`/`MAX_REL` are a drift bound. `0` disables it. **`1` was measured and rejected**: `scale_sim` parks the smooth arm 123 of 200 frames and ends 28.0% wrong at 1, against 1.0% unlimited. Added 2026-08-25 after `car1` frame 490 inflated the box 1.42× in one frame while 227 px off target. Host-only |
+| `HOLD_COAST` / `COAST_DECAY` | `0` / `0.5` | `1` = a held frame moves the search window at the last measured velocity, decayed each held frame (drift bounded by 2v); `0` = the freeze. **Flipped to 1 and reverted the same day**: the same 54 trajectory pairs win on mean IoU (0.2709 → 0.3005) and LOSE on the toolkit's metric (A 0.638 → 0.616, R 0.309 → 0.288, EAO 0.208 → 0.194). AR is the metric of record. See `runs/vot/evidence_ar.md`. Host-only |
+| `SCALE_MAX_STEP` | `2` | Largest `|idx|` ONE frame may move the box — a RATE limit, where `MIN_REL`/`MAX_REL` are a drift bound. `0` disables. **`1` was measured and rejected**: `scale_sim` parks the smooth arm 123 of 200 frames and ends 28.0% wrong. Added after `car1` f490 inflated the box 1.42× while 227 px off target. Host-only |
 | `SCALE_MIN_REL` / `SCALE_MAX_REL` | `0.5` / `2.0` | Absolute drift bounds vs initial box size. Must still admit `SCALE_TRAJ_AMP` (0.70×..1.30×) |
 | `OCCLUDE_MASK` | `0` | Bitmask over frame index: bit *f* ⇒ frame *f* occluded. Bit 0 ignored. `ITER_CNT=3 OCCLUDE_MASK=0x2` is the occlude-then-reacquire test |
 | `OCCLUDE_SQUARE` / `OCCLUDE_START` | `8` / `30` | `OCCLUDE_START` is a warm-up: 30 ≈ 4 time constants at `MOSSE_ETA=0.125`. The scale filter needs ~120 frames to settle |
@@ -68,56 +68,54 @@ the `dsp` subdirectory (the Makefile appends `/dsp`).
 | `FRAME_TEXTURE` | — | Band-limited background instead of a flat fill |
 | `FRAME_NOISE` | `2` | Per-frame sensor noise, PEAK amplitude in LSB, over the ROI. Does **not** fix background lock |
 | `BG_PAN` / `BG_PAN_R` / `BG_PAN_C` | `1` / `31` / `47` | Camera pan over the cached background, px/frame. Decorrelates the background 6.6× (swept with `scripts/bg_pan_sweep.py`) but **did not fix tracking** — see the training-target trap. Host-only |
-| `PROGRESS_EVERY` | `1` | Frames between LEVEL-0 progress lines. `1` = every frame = byte-identical to every pre-2026-08-25 run (proven by an ELF `cmp`, not by reading the `#if`). The ~45 B line was priced at 4% of an ~87 ms floor; the floor is now 26.29 ms, so it is **15%** — and 58% of the frame on `animal`, where `correlation(gated%, unattributed) = 0.963`. Thins the marker, never silences it: frame 0 and the last frame always print, because a run missing its final line looks exactly like a run that hung. **Only has effect at `VERBOSITY=0`** — at 1 the line does not exist and the flag is provably inert. Host-only |
-| `CSV_FLUSH_EVERY` | `1` | Rows between `track.csv` flushes. `1` = every row = the old behaviour, kept as the default because per-row flushing was justified by surviving a power cut and one really did take out arm B's `car1` run. A **railed** row flushes regardless of N; a gate veto deliberately does not (vetoes are commonest on exactly the gate-heavy runs the knob exists for). Whole dataset is ~4.6 MB of rows, so buffering a full run is free. Host-only |
+| `PROGRESS_EVERY` | `1` | Frames between LEVEL-0 progress lines. `1` = byte-identical to every pre-2026-08-25 run (proven by an ELF `cmp`). Thins the marker, never silences it: frame 0 and the last frame always print, because a run missing its final line looks exactly like a run that hung. **Only has effect at `VERBOSITY=0`.** Worth 0.27 ms, not the 4.0 predicted. Host-only |
+| `CSV_FLUSH_EVERY` | `1` | Rows between `track.csv` flushes. Per-row flushing survived a power cut that really did take out a run. A **railed** row flushes regardless of N; a gate veto deliberately does not. Worth 0.00 ms from tmpfs. Host-only |
 | `VERBOSITY` | `1` | `0` = one compact line/frame (~45 B); `1` = per-frame block, roi_crop/DMA tables on first+last frame only; `2` = everything. Anomalies print at every level. **No longer a diagnostics trade-off** — since 2026-08-24 `track.csv` carries `rails`/`accum_max`, so a `VERBOSITY=0` run is a full budget verdict AND an FPS measurement. Host-only |
 | `DUMP_BUFFERS` | `1` | Per-frame binary dumps. **1216 KB/frame, ~2 s/frame**. Set `0` for any run measuring tracking or FPS |
 | `CSV_LOG` | `1` | One row/frame to `track.csv` (`track_<sequence>.csv` at `FRAME_SOURCE=vot`, since one sweep is one invocation per sequence and the file opens `"w"`; the arm is separated by `--vot-results` instead) — gate verdict, both PSRs, peak, displacement, `resp00_over_peak`, both boxes, IoU, centre error, scale fields, and (2026-08-24+) `rails,accum_max,fch0_max,h_max`. ~60 B/frame |
 
+**THE DEFAULTS ARE THE SHIPPING CONFIGURATION as of 2026-08-28.** A bare
+`make application FRAME_SOURCE=vot` reproduces the benchmark arm's `app.flagstamp` exactly, and
+the default `aie.flagstamp` matches the flashed `a.xclbin`. Four defaults moved that day:
+`CONV_IN_CH` 1->3, `H_SHIFT` 11->15, `MOSSE_ETA` 0.125->0.05, `PSR_GATE_MIN` 7.0->5.0.
+**Grayscale is still fully supported** — pass `CONV_IN_CH=1`, and note it is what the aiesim
+scenarios `s6`/`s7` need.
+
 Artifacts land in `build/$(TARGET)/$(PATCH_ROWS)x$(PATCH_COLS)/ch$(N_CHANNELS)/`.
 
-### Shift budget — SETTLED: 4-4-4 at `H_SHIFT=11`, validated for BOTH arms
+### Shift budget — SETTLED: 4-4-4, `H_SHIFT` 14 (gray) / 15 (RGB)
 
-**Closed 2026-08-24.** gray `run_0824_1354`: `rails=0`, `accum` max 52.1%, `response` max 49.0%,
-mean IoU 0.9188. RGB `run_0824_1432`: `rails=0`, response max 38.5%. Both 200 frames,
-`BIAS_SCALE=roi`, `TRAJECTORY=1 SCALE_TRAJ=1`. **The FFT budget never moved — the fix was
-`H_SHIFT` 10 → 11.** The bias correction returned ~2.5× of signal and spent the margin
-`H_SHIFT=10` had: at 10 the corrected build railed (`run_calib.log`, `accum` 104% on f173,
-response 98% on f187, still growing at f200). `H_SHIFT` is the only knob upstream of **both** the
-accumulator and the response — `IFFT_*` reaches only the response, `FFT_SHIFT` moves it two bits
-at once — and both needed exactly one bit.
+**FFT budget closed 2026-08-24 on five 200-frame runs; `H_SHIFT` closed 2026-08-27 on real
+video (see "Shift budget on real video").** The FFT budget never moved — every fix has been
+`H_SHIFT`, the only knob upstream of **both** the accumulator and the response (`IFFT_*`
+reaches only the response, `FFT_SHIFT` moves it two bits at once).
 
-**What made it a validation and not just a passing run:** tracking came back BIT-IDENTICAL on all
-199 frames (a uniform rescale cannot move an argmax, so that was the prediction); PSR did not
-move (25.92 / 84.06 / 127.36 vs 25.92 / 84.08 / 127.41), which was written down as the falsifier
-BEFORE the run because PSR is where a quantization floor would show; and `F_ch` / `H(q15)` are
-digit-for-digit unchanged, as they must be — both are upstream of `H_SHIFT`.
+The invariant `2·FFT_SHIFT + IFFT_ROW_SHIFT + IFFT_COL_SHIFT` fixes the response scale, so
+weight moves freely between passes (holds to 1.3% across splits). `FFT_SHIFT` stays 4 rather
+than 5 because that leaves the accumulator at ~1400 instead of ~330 for the same response.
+Retired points: 4-5-5 (total 16) undershot 6-11×; 5-3-4 (17) gave 0.4%; 4-2-2 (12) peaks at 56%
+on frame 1, then rails from frame 15 and sign-flips to −32768, holding forever on
+`NEGATIVE_PEAK`; 4-2-1 was never validated past frame 1. `IFFT_ROW_SHIFT=0` is unsafe at ch16.
 
 **Do not re-centre the response in the 49-64% band.** That band came from a distribution with a
 1.30× spread; the corrected build spreads 2.07× at the converged end, so centring the TYPICAL
-frame puts the TAIL on the rail — exactly how f187 reached 98%. Size against the tail. The
-response now sits at ~28% (gray) / 22% (RGB) typically, and `calib_report.py` will call that
-UNDERSHOOT; it is advisory, and PSR is the arbiter.
-
-The invariant `2·FFT_SHIFT + IFFT_ROW_SHIFT + IFFT_COL_SHIFT` fixes the response scale, so weight
-moves freely between passes (holds to 1.3% across splits). `FFT_SHIFT` stays 4 rather than 5
-because that leaves the accumulator at ~1400 instead of ~330 for the same response.
-
-Retired points: 4-5-5 (total 16) undershot 6-11×. 5-3-4 (total 17) gave 0.4%. 4-2-2 (total 12)
-peaks at 56% on frame 1, then rails from frame 15 and sign-flips to −32768, holding forever on
-`NEGATIVE_PEAK`. 4-2-1 was never validated past frame 1. `IFFT_ROW_SHIFT=0` is unsafe at ch16.
+frame puts the TAIL on the rail. Size against the tail. The response sits at ~28% (gray) / 22%
+(RGB) and `calib_report.py` calls that UNDERSHOOT; advisory, and PSR is the arbiter.
 
 **Four rules this budget cost real time to learn:**
 1. **The response GROWS as the filter converges** — a budget validated at `ITER_CNT=2` is not
-   validated. The 08-24 rail appeared at f173 and the 98% peak at f187, so for `H_SHIFT` even
-   "≥20 frames" is not enough: use the full 200.
+   validated. The 08-24 rail appeared at f173 and the 98% peak at f187; use the full 200.
 2. **Twice an offline model set this budget and hardware overturned it.** Both times the model
-   was self-consistent and its *premise* was wrong (see the frame-buffer-seeding entry under
-   Correctness traps).
+   was self-consistent and its *premise* was wrong (see frame-buffer seeding under Correctness
+   traps).
 3. **Never size this budget against railing before checking `mean_prev` is seeded** — two budget
    hunts chased a frame-0 DC pedestal, not a scaling problem.
-4. **Do not size from early frames.** RGB's response reads ~1.03× of gray at f1-4 and 0.785× once
-   converged; the weights-derived estimate (0.685–0.790×) was right and the 4-frame read was not.
+4. **Do not size from early frames.** RGB's response reads ~1.03× of gray at f1-4 and 0.785×
+   once converged; the weights-derived estimate (0.685–0.790×) was right.
+
+A calibration run's criterion is `rails=0` plus BIT-IDENTICAL tracking (a uniform rescale cannot
+move an argmax) plus PSR not moving — PSR is where a quantization floor would show, and `F_ch` /
+`H(q15)` must be digit-for-digit unchanged since both are upstream of `H_SHIFT`.
 
 `runs/.last_cfg` is **stale and not authoritative**; `build/hw/.../aie.flagstamp` is, and
 `scripts/calib_build.sh` checks it for you.
@@ -270,46 +268,46 @@ orchestration, never core count. **`runtime<ratio>` is not utilization**: the ma
 These are the compiler's scheduled cycles — real cycles on an in-order VLIW core absent memory
 stalls, trustworthy for sizing but not a profile.
 
-## Current status (2026-08-27)
+## Current status (2026-08-28)
 
-**THE FULL VOT-STb2022 BENCHMARK IS DONE, ON HARDWARE, BOTH ARMS, ALL 62 SEQUENCES.**
-419 runs per arm, `~/vot/analysis/full62`. RGB wins accuracy, robustness and EAO and
-survives 12.8% more frames; see "Where this tracker sits" for the comparison against the
-41 published VOT-STb2022 entries, and the RGB section for the per-sequence breakdown.
+**THE SHIPPING CONFIG, and every line of it is a hardware A/B:**
 
-| arm | accuracy | robustness | EAO | frames |
+```
+CONV_IN_CH=3  H_SHIFT=15  budget 4-4-4  MOSSE_ETA=0.05  PSR_GATE_MIN=5.0
+TARGET_PADDING=2.0  SCALE_STEP=1.04  SCALE_MAX_STEP=2  HOLD_COAST=0
+```
+
+Full VOT-STb2022, 62 sequences, 419 trajectories per arm. Each row moves ONE knob:
+
+| arm | A | R | EAO | workspace |
 |---|---|---|---|---|
-| gray `H_SHIFT=14` | 0.4890 | 0.2743 | 0.1367 | 48,603 |
-| RGB `H_SHIFT=15` | 0.5043 | 0.3065 | 0.1474 | 54,813 |
+| gray `H_SHIFT=14` | 0.4890 | 0.2743 | 0.1367 | `full62` |
+| RGB `H_SHIFT=15` | 0.5043 | 0.3065 | 0.1474 | `full62` |
+| + `MOSSE_ETA=0.05` | 0.5100 | 0.3283 | 0.1600 | `eta05ab` |
+| **+ `PSR_GATE_MIN=5.0` — SHIPPING** | **0.5100** | **0.3417** | **0.1629** | `gate` |
+| + `TARGET_PADDING=3.0` — REJECTED | 0.5030 | 0.3494 | 0.1570 | `pad30ab` |
 
-The last blocker was heap, not tracking: five RGB sequences exceed the board's ~1 GB and
-died on `std::bad_alloc`. `vot::StreamBlob` (ring + prefetch thread, `--vot-stream`) closed
-it, proven by identical run-state digests in both modes. See
-`runs/vot/TODO_board_memory.md`, now CLOSED.
+`PSR_GATE_MIN=0` is a null (13-seq probe, `g0partial`). The padding arm gained R and LOST
+EAO — **EAO is the arbiter for an A/R trade**, see the feature-geometry entry under Settled.
+Every arm after the first two is HOST-ONLY: an scp, not a card swap.
 
-**Best hardware FPS: `runs/run_0821_1725.log`, 26.29 ms/frame = 38.04 FPS** —
-`MEMTILE_TRANSPOSE=1 ROI_CROP_PIPELINE=1 CMUL_SPLIT_ACCUM=1 TAIL_PARALLEL=1`. That run predates
-the `bias_acc` correction, so quote it for SPEED only; the tracking numbers below supersede it.
+**The gate's value is CONDITIONAL on the PSR scale.** 7.0 -> 5.0 is worth +0.0134 on hardware,
+and offline it is +0.006 at 128x128 against +0.056 at 64x64. Anything that moves PSR re-opens
+it — as `MOSSE_ETA=0.05` did (it dropped pre-loss PSR to 13.91 against a 7.00 threshold, which
+is why the gate arm existed at all).
 
-**CALIBRATION CLOSED, AND RGB RUNS ON HARDWARE.** Five 200-frame runs on 2026-08-24 settled
-both. All at 128×128 ch16, `BIAS_SCALE=roi`, 4-4-4, `TRAJECTORY=1 SCALE_TRAJ=1`, `VERBOSITY=1`:
+**Best hardware FPS: 26.29 ms/frame = 38.04 FPS** (`runs/run_0821_1725.log`, gray, synthetic,
+UART console). RGB is 28.58 ms. `car1` over ssh is **24.43 ms = 40.9 FPS** and is NOT
+comparable to either — the UART alone was 3.79 ms. Quote FPS only from a serial-console run.
 
-| run | arm | `H_SHIFT` | rails | mean IoU | PSR min/mean | note |
-|---|---|---|---|---|---|---|
-| `run_calib` | gray | 10 | **1** (f173) | 0.9188 | 25.92 / 84.08 | `accum` 104%, response 98% |
-| `run_0824_1354` | gray | **11** | 0 | 0.9188 | 25.92 / 84.06 | **the comparator** |
-| `run_0824_1426` | RGB | 11 | 0 | — | — | 5-frame bring-up, `SCENE_VERIFY=1` |
-| `run_0824_1432` | RGB tint | 11 | 0 | 0.9173 | **42.65 / 100.44** | colour arm |
-| `run_0824_1442` | RGB luma | 11 | 0 | 0.9188 | 25.69 / 84.83 | colour-free control |
+Heap, not tracking, was the last blocker: five RGB sequences exceed the board's ~1 GB and died
+on `std::bad_alloc`. `vot::StreamBlob` (ring + prefetch, `--vot-stream`) closed it, proven by
+identical run-state digests both ways. `runs/vot/TODO_board_memory.md`, CLOSED.
 
-Those five are `VERBOSITY=1`, so their frame times are console-bound (62.3 ms). **RGB's frame
-rate is 28.58 ms = 34.99 FPS** (`runs/run_0824_1457.log`, `VERBOSITY=0`) against gray's 38.04 —
-**a 8.0% cost for colour, not the 21% the offline model predicted.** See "RGB costs what the
-HOST pays" below.
-
-The full chain runs on real hardware at 128×128 ch16 on the real conv path: roi_crop → PatchIn →
-conv2d → B1 → row FFT → transpose → col FFT → cmul(H_SHIFT) → B2 → IFFT rows → transpose →
-IFFT cols → response → PSR gate → filter update → scale update.
+Calibration closed 2026-08-24 on five 200-frame runs; the shift-budget entry above carries the
+result. The full chain runs on hardware at 128x128 ch16 on the real conv path: roi_crop ->
+PatchIn -> conv2d -> B1 -> row FFT -> transpose -> col FFT -> cmul(H_SHIFT) -> B2 -> IFFT rows
+-> transpose -> IFFT cols -> response -> PSR gate -> filter update -> scale update.
 
 ### Performance history
 
@@ -359,48 +357,76 @@ itself: overlap 2.762 against a predicted `min(4.80, 2.89)` = 2.9, and the resid
 +1.261 against +1.17 before threading — a correction tuned merely to erase a negative number
 would have had no reason to land there.
 
-### OPEN TODO — the shift budget on real video
+### Shift budget on real video — CLOSED 2026-08-27
 
-**`runs/vot/TODO_shift_budget.md`.** `car1` over 15 anchors rails on **266 of 8434 frames** on the
-shipping 4-4-4 / `H_SHIFT=11` gray build. **The instrument gap is CLOSED (2026-08-26, host-only)
-and the rails are now ATTRIBUTED** (`runs/vot/0826_1232-attrib`, all 15 digests identical to the
-smoke run, 0 of 8434 shared columns differing — a pure re-measurement):
+`runs/vot/TODO_shift_budget.md`. `car1` railed on 266 of 8434 frames at `H_SHIFT=11`, attributed
+to BOTH `accum` and `response` — so `H_SHIFT`, the only knob upstream of both, was the lever. Two
+deliberately over-shifted arms returned the UNCENSORED distribution: over 101,564 RGB frames
+`rails_accum = rails_resp = 0`, maxima 15.6% / 10.1% of ceiling. **`H_SHIFT=13` is the
+tight-but-safe RGB budget; 12 rails.** The shipped arms stay at gray 14 / RGB 15 because
+`rails = 0` is the only hard criterion and the whole benchmark is banked on them. **Stated
+confound: the benchmark's two arms are at different `H_SHIFT`.**
 
-```
-response 1330 bins / 191 frames     accum 1055 bins / 123 frames     F_ch 0     H 0
-response only 143    accum only 75    BOTH 48
-```
+Three things not to re-derive:
+- **`accum_max = 46340 = 141.4%` IS NOT OVERSHOOT** — it is 32767·√2, the largest magnitude a
+  non-saturated cint16 bin can hold (the rail is per COMPONENT, `accum_max` is a magnitude).
+  **`rails` is the only saturation instrument.**
+- **Readings are CENSORED at the rail**, so no budget is derivable from a clipped maximum. That
+  is why the over-shifted arm had to be built.
+- Rails do NOT correlate with tracking loss (`corr = −0.025`) and do not explain the
+  `NEGATIVE_PEAK` vetoes. A budget defect, never a tracking fix.
 
-**Both buffers rail, so `H_SHIFT` — the only knob upstream of both — is the lever after all.** An
-`IFFT_*` fix reaches only the response and would leave 75 frames railing. An intermediate reading
-of a 12-frame console sample said "response only" and proposed `IFFT_COL_SHIFT`; the cheap
-host-only run killed it before the reflash, which is the whole reason it was sequenced first.
+**`H_SHIFT` is the one knob that is NOT host-only** — it reaches `AIE_FLAGS`, so it needs a graph
+rebuild, re-package and re-flash, and the sweep's xclbin guard will refuse until the card is
+updated. **Re-provision after packaging**: `v++ --package` takes `build/rootfs/rootfs_compat.ext4`,
+which `make rootfs` regenerates only when the pristine rootfs changes, so a re-package inherits
+whatever that copy holds — it did not hold the ssh key until 2026-08-25, which produces a board
+that boots unreachable and reads as a cable fault.
 
-**`accum_max = 46340 = 141.4% of the rail` IS NOT OVERSHOOT — it is 32767·√2**, the largest
-magnitude a non-saturated cint16 bin can hold (the rail is per COMPONENT, `accum_max` is a
-magnitude). Clean `rails=0` frames legitimately reach 131%. **`rails` is the only saturation
-instrument and always was.** Do not re-derive a budget from a magnitude-vs-component comparison.
+### Next, in order — ROBUSTNESS
 
-**The readings are CENSORED at the rail, so "one bit halves 46340 to 71%" is not derivable** — it
-halves a clipped number. Next step is a deliberately over-shifted arm (`H_SHIFT=14`) that cannot
-rail, which returns the true distribution; the real budget is then arithmetic, sized against the
-ACCUMULATOR (clean max 92.7% of ceiling vs the response's 70.4%). That arm needs the graph
-rebuild, re-package and re-flash.
+Localisation, the gate, quantization, saturation, pooling, feature resolution, padding and
+**init perturbations** are ALL exonerated or rejected (entries below). Ranked list and the
+supporting measurements: `runs/vot/robustness_proposals.md`. What is left is host-only:
 
-`track.csv` now carries `resp_max,rails_fch,rails_accum,rails_resp,rails_h`, and `calib_report.py`
-reports rails BY BUFFER. `resp_max` differs from `peak` on 1 of 8434 rows and changed no
-conclusion — the old "`peak` already is it" claim was correct, and is now checked rather than
-assumed. Rails are NOT correlated with tracking loss (`corr = −0.025`) and do NOT explain the
-`NEGATIVE_PEAK` vetoes; this is a budget defect, not a tracking fix.
-**`H_SHIFT` is the one knob left that is NOT host-only** — it reaches `AIE_FLAGS`, so unlike every
-arm since the automation landed it needs a graph rebuild, a re-package and a re-flash, and the
-sweep's xclbin guard will (correctly) refuse until the card is updated. **Re-provision after
-packaging**: `v++ --package` takes `build/rootfs/rootfs_compat.ext4`, which `make rootfs` only
-regenerates when the pristine rootfs changes, so a re-package inherits whatever that copy holds —
-it did not hold the ssh key until 2026-08-25, which would have produced a board that boots
-unreachable and reads as a cable fault.
+1. **A spatial mask on the filter, as a sparse-spectrum projection.** CSR-DCF's highest-priced
+   item (removing their mask: >50% EAO), and it needs NO host FFT: a separable raised-cosine
+   mask has a compact DFT — the periodic Hann's is exactly 9 bins, the identity Stage B2 is
+   built on — so `h ← m⊙h` is a 9-tap sparse 2-D convolution on the published `H`, ~2.4
+   MMAC/frame. It lands in `H`, so the AIE sees an already-masked filter and detection stays
+   consistent. **NOT `TARGET_PADDING` by another name**: padding moves the mask, px/bin, the
+   search range and the DSST extraction region at once, which is why pad30 was unattributable.
+   Expect to re-tune `PSR_GATE_MIN` on the same sweep — shrinking the filter's support moves
+   the PSR scale.
+2. **Channel reliability in Stage B3, and it needs no per-channel response map.** B3 normalises
+   by ENERGY, not discriminative power; the blocker was that `cmul_accum` sums channels before
+   the IFFT. Both halves are available in the frequency domain by Parseval:
+   `r_ch(0) = (1/N)·Σᵢ Hᵢ·conj(Fᵢ)` and `‖r_ch‖² = (1/N)·Σᵢ|Hᵢ Fᵢ|²`, i.e. two scalar
+   accumulators inside the existing per-channel loop of `filter_update_quantize` over arrays it
+   already streams. Reliability `r(0)²/‖r‖²` folds into `chscale`. CSR-DCF price theirs at −12%.
+3. **A two-filter temporal ensemble** (TCLCFcpp, the one embedded tracker at R 0.598). eta 0.125
+   and eta 0.05 already win on different sequences; run both, select per frame by PSR. Host-only,
+   +2 MB filter state, roughly doubles the ~5 ms filter tail. **Take the cheap half first**: a
+   long-term filter at eta≈0 used only as a VALIDATOR at the selected peak (one dot product per
+   channel, item 2's identity, no second AIE bank) feeding a confidence-modulated eta.
+4. **A REPLACEMENT feature bank** — not a filter over this one, which was tested and is a null.
+   HOG is orientation binning of gradient magnitudes into 31 dims; Danelljan's conv1 is 96ch 7×7
+   PCA'd to 40; this is 16×3×3 with participation ratio 7.43. A weights export plus the offline
+   loop, no re-synthesis. **It re-opens item 1 of Settled below**: fewer channels, or per-channel
+   denominators instead of the shared one, removes the structural cure that makes Bolme's init
+   perturbations a null here.
 
-### Next, in order
+**Recovery AFTER a loss is worth NOTHING to R or EAO** — VOT terminates a run 10 frames after
+failure and re-enters at the next anchor. Only not-losing, or recovering inside the grace,
+scores. That retires re-detection and search-window expansion outright, however good they look
+on mean IoU.
+
+**Score any of these on `vot analysis`, never on mean IoU** — the two have ordered arms
+oppositely on identical trajectories (`HOLD_COAST`), and the offline AR proxy
+(`vot_ar_offline.py`) has a MEASURED resolution of only ~0.02 in R and did not transfer to a
+geometry arm.
+
+### Next, in order — PERFORMANCE
 
 The APU is a **flat tail** — biggest single item 5.2 ms — so the remaining wins are structural.
 
@@ -455,53 +481,43 @@ Native g++, seconds per arm. It **reproduces the board** (the `moving` arm parks
 from f131; hardware froze at f130) and refuses to report a verdict when the premise arm fails to
 reproduce.
 
-**`SCALE_STEP=1.04` confirmed on hardware** (`runs/run_0820_1513.log`, otherwise identical to
-`run_0820_1418`): mean/worst IoU 0.807/0.579 → **0.917/0.833**, max box error 31.4% → **9.6%**,
-mean/worst centre error 2.47/11.07 px → **1.30/3.52**. **Centre error fell 3.2× from a size-only
-change** — independent confirmation that position error was downstream of the scale error.
+**`SCALE_STEP=1.04` confirmed on hardware** (`run_0820_1513`): mean/worst IoU 0.807/0.579 →
+**0.917/0.833**, max box error 31.4% → **9.6%**, mean/worst centre error 2.47/11.07 px →
+**1.30/3.52**. **Centre error fell 3.2× from a size-only change** — independent confirmation
+that position error was downstream of the scale error.
 
-**On hardware the detector proposed only −1, 0 or +1 over 199 frames** (174/13/12) — never ±2, at
-either step size, and still true on both RGB arms. The decisions overlap heavily in error (idx 0
-spans −5.3%..+9.6%), so near zero it is a noisy estimator, not a dead zone with a clean threshold.
+**On hardware the detector proposed only −1, 0 or +1 over 199 frames** (174/13/12) — but **that
+sentence describes ONE SYNTHETIC SCENE and failed twice on 2026-08-25.** On `car1` the detector
+proposed ±2 or more seven times, up to **+9**, every one on a frame whose IoU was 0.000; and in
+`scale_loop_sim` it uses ±2 *legitimately* on a smooth envelope — capping at 1 parks the
+`moving` arm for 123 of 200 frames and ends it 28.0% wrong against 1.0% uncapped. Reading ±1 as
+a property of the DETECTOR rather than of that scene is exactly what `SCALE_MAX_STEP=1` would
+have been; the sim, not the hardware observation, is the bench that decides that parameter.
 
-**That sentence describes ONE SYNTHETIC SCENE and does not generalise — it failed twice on
-2026-08-25.** On real video (`car1`) the detector proposed ±2 or more seven times, up to **+9**,
-every one on a frame whose IoU was 0.000. And in `scale_loop_sim` the detector uses ±2
-*legitimately* on a smooth envelope: capping at 1 parks the `moving` arm for 123 of 200 frames and
-ends it 28.0% wrong against 1.0% uncapped. Reading ±1 as a property of the DETECTOR rather than of
-that scene is exactly what `SCALE_MAX_STEP=1` would have been, and the sim — not the hardware
-observation — is the bench that decides that parameter.
-
-**The scale filter is ALREADY slaved to the position gate, and that is not sufficient.** The whole
-scale block runs under `if (scale.enabled() && gate.accept && scale.initialized)`, so a held frame
-never reaches it — verified on hardware (`run_0825_1314`: 577 position ACCEPTs, 577 scale
-evaluations, zero on a held frame). Frame 490 still got through because the POSITION gate accepted
-it at PSR 7.87 against a 7.00 threshold while the tracker was 227 px off target. **Do not "add"
-that slaving; it is there.** `SCALE_MAX_STEP` exists because the precondition is only ever as good
-as the PSR gate, and PSR is a weak pass criterion — see "Metrics that cannot fail a broken
-tracker".
+**The scale filter is ALREADY slaved to the position gate, and that is not sufficient.** The
+whole block runs under `if (scale.enabled() && gate.accept && scale.initialized)`, verified on
+hardware (`run_0825_1314`: 577 ACCEPTs, 577 scale evaluations, zero on a held frame). `car1`
+frame 490 still got through because the POSITION gate accepted it at PSR 7.87 while the tracker
+was 227 px off target. **Do not "add" that slaving; it is there.** `SCALE_MAX_STEP` exists
+because the precondition is only ever as good as the PSR gate.
 
 **`SCALE_CONF_MIN` blocks legitimate large corrections.** On the sim's `step` arm the detector
-proposes the correct `idx=-14` after a jump and the gate vetoes it as `LOW_CONF` for four frames;
-the box then walks at 2%/frame with a 37% peak, where bypassing the gate corrects it in ONE
-frame. **`conf` cannot distinguish "wrong proposal" from "big correct correction"** — both match
-the model poorly, for the same reason. Exonerated for smooth envelopes; it will bite on any
-abrupt scale change.
+proposes the correct `idx=-14` and the gate vetoes it as `LOW_CONF` for four frames; the box
+then walks at 2%/frame where bypassing the gate corrects it in ONE frame. **`conf` cannot
+distinguish "wrong proposal" from "big correct correction"** — both match the model poorly, for
+the same reason. Exonerated for smooth envelopes; it will bite on any abrupt scale change.
 
-**Where it stops.** `SCALE_ETA` does not help (sim at a=1.04: 8.6/10.3/9.2% at 0.025/0.05/0.1);
-`SCALE_N=65` gives 7.0% against 8.6% for **3.9× the cost**. ~8-10% box error is this filter's
-practical floor — and it is what the worst IoU frames on EVERY 2026-08-24 run are: f125 box
-54.71 vs truth 50.00 with centre error 0.06 px. The next gain needs a different estimator, not a
-tuning change.
+**Where it stops.** `SCALE_ETA` does not help (8.6/10.3/9.2% at 0.025/0.05/0.1); `SCALE_N=65`
+gives 7.0% against 8.6% for **3.9× the cost**. ~8-10% box error is this filter's practical floor
+— and it is what the worst IoU frames on every 2026-08-24 run are. The next gain needs a
+different estimator, not a tuning change.
 
 **Calibration honesty: the sim predicted a=1.04 well and a=1.02 badly** (12.6% → 8.6% predicted;
-31.4% → 9.6% measured), and it recovers when the envelope turns where hardware never did —
-**unexplained**; position error and background pan were both tested and ruled out. **Trust the
-ORDERING; do not quote the sim's absolute magnitudes as the board's.**
-
-**The truth rate matters and the test bench chose it.** `SCALE_TRAJ_AMP=0.30` over
-`SCALE_TRAJ_PERIOD=200` shrinks the target at ~0.94%/frame — under half of one 2% scale level —
-so on most frames the correct proposal rounds to 0. A slower envelope would hide this entirely.
+31.4% → 9.6% measured), and it recovers where hardware never did — **unexplained**; position
+error and background pan were both ruled out. **Trust the ORDERING; do not quote the sim's
+absolute magnitudes as the board's.** The truth rate matters and the test bench chose it:
+`SCALE_TRAJ_AMP=0.30` over 200 frames shrinks the target at ~0.94%/frame, under half of one
+scale level, so on most frames the correct proposal rounds to 0.
 
 ### hw_emu frame times — MEASURED, and they do not scale from ch1
 
@@ -552,6 +568,22 @@ Two principles that have repeatedly earned their keep: **instruments before chan
   reason. Fixed 2026-08-26 by keying on `(job, frame)`. Any per-frame reader of a
   `FRAME_SOURCE=vot` CSV has this bug until shown otherwise; `job` is a column for exactly this
   reason and a bare frame index is not a key.
+- **AN OFFLINE R CAN BE RAISED BY DEGRADING THE FILTER — DEMONSTRATED, NOT ARGUED
+  (2026-08-28).** A deliberately broken init (`--warp-mutant gsign`, G centred at `+`the crop
+  offset instead of `−`) scored `vot_ar_offline` **dR +0.0525 — 6.5× the correct arm** — while
+  tracking measurably worse by every direct measure: A −0.0975, mean IoU 0.1792 → 0.1683,
+  frames above IoU 0.5 17.3% → 15.4%. A weak, under-confident filter reports smaller
+  displacements and stays near where it started, which survives the 10-consecutive-frame rule
+  while overlapping badly throughout. **Never accept an arm on R alone: require A not to fall,
+  or price the fall.** dR > 0 with dA < −0.02 is this artifact until shown otherwise. (`dec2`
+  at dR +0.0567 / dA −0.0086 passes; the mutant at +0.0525 / −0.0975 does not, and the two are
+  otherwise the same shape.) It also did its intended job — the bench is demonstrably NOT blind
+  to warp geometry, which is what makes the init null readable.
+- **`R = 0.3435` (the gsign mutant, OFFLINE) IS NOT `R = 0.3417` (the SHIPPING ARM).** They
+  agree to three decimals by coincidence and mean opposite things. Every `vot_ar_offline`
+  number is the toolkit's RULE on SINGLE-START runs, is biased ~0.02 high in R, and is
+  comparable only between arms scored identically — so the offline baseline at R 0.2910 is
+  **not** a regression from the hardware 0.3417.
 - **Test an analysis tool against an OLD log before the run it was written for.**
   `calib_report.py` was written to parse a calibration run, then pointed at an existing board
   log: its frame regex was anchored at line start, but board logs are captured through
@@ -704,71 +736,51 @@ Two principles that have repeatedly earned their keep: **instruments before chan
 ### Correctness traps
 
 - **THE FILTER MUST BE TRAINED AGAINST A G CENTRED AT THE MEASURED DISPLACEMENT, NOT AT (0,0).**
-  Fixed 2026-08-20. The defect: `filter_update()` was passed `g_target` — the Gaussian centred at
-  (0,0) — while `g_F_all` is the patch cropped at the **pre-update** position, where the target
-  sits at `(dr,dc)`. Every accepted frame taught "a patch with the target at (dr,dc) peaks at
-  (0,0)", compounding at `eta=0.125` until the zero-shift peak won. Mean IoU 0.1708, 181 of 199
-  frames lost.
+  Fixed 2026-08-20. `filter_update()` was passed `g_target` — the Gaussian centred at (0,0) —
+  while `g_F_all` is the patch cropped at the **pre-update** position, where the target sits at
+  `(dr,dc)`. Every accepted frame taught "a patch with the target at (dr,dc) peaks at (0,0)",
+  compounding at `eta` until the zero-shift peak won. Mean IoU 0.1708, 181 of 199 frames lost.
   **The sign, derived rather than guessed.** Let `Q_t` be the patch cropped exactly ON the
   object; the patch actually held is `P_t = Q_t` shifted by `+d_t`. Correlation is shift
-  equivariant, so `resp(P_t) = resp(Q_t)` shifted by `+d_t`, and an on-target patch must peak at
-  0 ⇒ **G is centred at `+d_t`, the SAME sign as the detected peak.** Training at 0 teaches
-  `resp(Q_t) → peak at −d_t`; the next frame's contribution lands at `d_{t+1} − d_t`, which under
-  near-constant motion is exactly (0,0). That derivation **predicts analytically** the observed
-  law `resp00_over_peak ≈ 1-(1-eta)^k` (0.125/0.234/0.330/0.414/0.487/0.551 predicted vs
-  0.08/0.29/0.42/0.38/0.65/0.69 measured) — i.e. it is governed by the LEARNING RATE, not the
-  scene.
-  **Fix**: `filter_update()` gets a per-frame `g_target_shift` from
-  `gaussian_target_spectrum(..., psr_abs.dr, psr_abs.dc)`. By the shift theorem this IS "re-crop
-  at the new position", exactly and for free. `filter_init()` on frame 0 keeps the centred
-  `g_target` — that crop really is centred. The exact alternative is a real re-crop (Bolme/DSST
-  do this) at 16 more roi_crop launches ≈ 77 ms/frame; the only difference is that the Hann
-  window stays centred where the crop was taken.
-  **A SINGLE UPDATE CANNOT SEE THIS DEFECT** — `gen_filter_golden.py`'s one-shot check passed
-  throughout — which is why both regression tests are closed loops:
-  `scripts/mosse_loop_sim.py` (128×128, 60 frames: centred reaches `resp00/peak` 0.764 and ends
-  39.7 px off; shifted holds 0.207 flat, 0.00 px) and `run_training_target_tests()` in
-  `make test_host`.
+  equivariant, so an on-target patch must peak at 0 ⇒ **G is centred at `+d_t`, the SAME sign as
+  the detected peak.** That derivation **predicts analytically** the observed law
+  `resp00_over_peak ≈ 1-(1-eta)^k` — i.e. it is governed by the LEARNING RATE, not the scene.
+  **Fix**: a per-frame `g_target_shift` from `gaussian_target_spectrum(..., psr_abs.dr,
+  psr_abs.dc)`. By the shift theorem this IS "re-crop at the new position", exactly and for free.
+  `filter_init()` on frame 0 keeps the centred `g_target` — that crop really is centred. The
+  exact alternative is a real re-crop at 16 more roi_crop launches ≈ 77 ms/frame.
+  **A SINGLE UPDATE CANNOT SEE THIS DEFECT** — the one-shot golden check passed throughout —
+  which is why both regression tests are closed loops (`scripts/mosse_loop_sim.py` and
+  `run_training_target_tests()` in `make test_host`).
   **Assert the shape, not an absolute level.** In the 32×32 test both arms start at 0.39 — that
-  scene's own zero-shift autocorrelation, not a defect. The 0.3 healthy ceiling is calibrated for
-  the 128×128 ch16 geometry and does **not** transfer. What is geometry-independent is that the
+  scene's own zero-shift autocorrelation, not a defect. What is geometry-independent is that the
   defect makes the ratio GROW at the learning rate while the fix leaves it flat.
-- **Background lock was the WRONG explanation for the above** — worth keeping because the
-  measurements are real and the mechanism does exist. `fill_background()` is cached and only the
-  dirty rect is restored, so outside the target the frame repeats to the LSB, and a DCF fed a
+- **Background lock was the WRONG explanation for the above** — kept because the measurements
+  are real and the mechanism exists. `fill_background()` is cached and only the dirty rect is
+  restored, so outside the target the synthetic frame repeats to the LSB, and a DCF fed a
   perfectly repeating background correlates with it at exactly zero shift. Measured 2026-08-17:
   the static peak was worth 69-86% of the true one and won 21 of 48 frames, each win costing a
   permanent ~9.4 px offset (centre error 1.35 → 9.56 → 87 → 292 px) **while PSR read 24-35
-  throughout**.
-  **`FRAME_NOISE` is not the fix**: independent additive noise cannot decorrelate a static
-  pattern, and it inflates numerator and shared denominator alike. It appeared to work on
-  08-17 only because the frame buffer was not yet seeded and the ROI was mostly zeros.
-  **`BG_PAN` is the right instrument** and measurably works — but it changed the tracker not at
-  all, which is what refuted this explanation. **Sweep the magnitude against the texture's
-  wavelengths, not in pixels** (`scripts/bg_pan_sweep.py`, seconds, no hardware): corr@0shift is
-  +0.60 / +0.61 / +0.64 / +0.54 / +0.31 / **+0.09** / −0.25 at 0,0 / 3,5 / 7,11 / 15,23 / 23,37 /
-  **31,47** / 47,71 px per frame. The obvious guess of 3-5 px/frame is worthless — the texture's
-  shortest wavelength is 180 rows. Re-run the sweep after any change to `fill_background()`,
-  `FRAME_TEXTURE` or the ROI size.
-  **`fill_background()` rounds its frequencies to WHOLE CYCLES per frame** so the pan wraps
-  seamlessly: with continuous frequencies the row wrap is a **8.10 LSB** discontinuity against
-  0.98 LSB between interior rows, and an artificial edge is exactly what a DCF locks onto.
-  Rounded, the seam is 1.02 LSB. 31 and 47 are coprime to 1080 and 1920.
-  **This fixes the TEST BENCH, not the tracker** — do not tune the tracker against this artifact.
-  On a white-noise background a rigid pan creates a correlation peak at exactly the pan offset.
-  **Discriminating background lock from a DC pedestal** (similar look, opposite fixes): a pedestal
-  lifts every bin uniformly; background lock is a *localised blob* at the origin with sidelobe
-  mean ≈ 0.
-- **THE FRAME BUFFER WAS NEVER SEEDED WITH THE BACKGROUND. Fixed 2026-08-18** — one 2 MB `memcpy`
-  at startup, which **must** come after `rc_control_cu_probe()` (which zero-fills `frame_bo` by
-  design).
-  **The interesting part is the correction.** The measured "88.53% of the ROI never written" came
-  from an *offline replay*, which assumed the unwritten region held garbage that saturated Stage
-  A's int8 rail and inflated σ 4.3×. On hardware that region is **zeros**, so no rail, no σ
-  inflation. Hardware before/after: `F_ch` frames 0 and 1 are **unchanged** (1854→2010,
-  1893→1894) — including frame 0, the one the filter trains from — and frames 2+ rise 2.55-3.10×.
-  The fix is real and worth keeping; the predicted 9.2× response gain never existed, and the
-  shift-budget change it justified (4-3-3 → 4-5-5) was wrong.
+  throughout**. **`FRAME_NOISE` is not the fix** (independent additive noise cannot decorrelate
+  a static pattern). **`BG_PAN` is the right instrument** and measurably works — but changed the
+  tracker not at all, which is what refuted this explanation. **Sweep its magnitude against the
+  texture's wavelengths, not in pixels** (`scripts/bg_pan_sweep.py`): corr@0shift falls +0.60 →
+  **+0.09** at 31,47 px/frame; the obvious guess of 3-5 px/frame is worthless, the texture's
+  shortest wavelength being 180 rows. `fill_background()` rounds frequencies to WHOLE CYCLES per
+  frame so the pan wraps seamlessly (else an **8.10 LSB** row-wrap discontinuity, and an
+  artificial edge is exactly what a DCF locks onto); 31 and 47 are coprime to 1080 and 1920.
+  **This fixes the TEST BENCH, not the tracker** — do not tune the tracker against it.
+  **Discriminating background lock from a DC pedestal** (similar look, opposite fixes): a
+  pedestal lifts every bin uniformly; background lock is a *localised blob* at the origin with
+  sidelobe mean ≈ 0.
+- **THE FRAME BUFFER WAS NEVER SEEDED WITH THE BACKGROUND. Fixed 2026-08-18** — one 2 MB
+  `memcpy` at startup, which **must** come after `rc_control_cu_probe()` (which zero-fills
+  `frame_bo` by design). **The interesting part is the correction.** The measured "88.53% of the
+  ROI never written" came from an *offline replay*, which assumed the unwritten region held
+  garbage that saturated Stage A's int8 rail and inflated σ 4.3×. On hardware that region is
+  **zeros**. Hardware before/after: `F_ch` frames 0 and 1 are **unchanged** — including frame 0,
+  the one the filter trains from — and frames 2+ rise 2.55-3.10×. The fix is real; the predicted
+  9.2× response gain never existed, and the shift-budget change it justified was wrong.
   **The lesson: an offline replay inherits every assumption the host makes about memory it did
   not write.** Verify the premise on hardware before letting a model move a calibrated constant.
 - **`mean_prev` seeding** (`mosse_tracker.cpp`, before the first `weights_bo.sync`): seed
@@ -978,10 +990,9 @@ Two principles that have repeatedly earned their keep: **instruments before chan
   `ap_done` = **245.5 µs = 76,725 cycles** at 312.5 MHz, and `ap_done` asserts at the same
   instant as `TLAST`. PASS1 44,600 cyc, NORM 4,100, PASS2 27,900. **Two source comments in
   `roi_crop.cpp` are wrong**: PASS2 achieves **27.2 cycles/beat, not II=1** (real AIE
-  backpressure — `TREADY` gates the stream at ~87 ns/beat against conv2d's scheduled ~35 ns per
-  4-px beat), and PASS1 achieves **10.9 cycles/output-px, not II=4** (m_axi latency on the four
-  scattered bilinear taps). 128×128 recompute is 4× the pixels ≈ 1 ms, which is exactly the
-  residual `ROI_CROP_PIPELINE` leaves on channel 0.
+  backpressure), and PASS1 achieves **10.9 cycles/output-px, not II=4** (m_axi latency on the
+  four scattered bilinear taps). 128×128 recompute is 4× the pixels ≈ 1 ms, exactly the residual
+  `ROI_CROP_PIPELINE` leaves on channel 0.
 - **`roi_crop` bit-exact, 25 cases, zero tolerance** (`make test_roi_crop`, golden from
   `scripts/roi_crop_ref.py`): 17 grayscale + 8 RGB, run as two builds because `ROI_IN_CH` is
   compile-time. 16 cases execute the bilinear interpolator, which **has still never run on
@@ -995,92 +1006,73 @@ Two principles that have repeatedly earned their keep: **instruments before chan
   accidentally the same number and padding breaks both by the resample ratio — a tracker that
   localises confidently and *drifts*, invisible to `err=0 px`.
 - **`nature` IS NOT A TRACKER DEFECT — ITS PIXELS DO NOT MOVE. Measured 2026-08-25, offline.**
-  Three diagnoses of that sequence (sub-bin lag, then origin lock, then background lock) all
-  assumed the target moves and the tracker fails to follow. `scripts/vot_motion_check.py` tests
-  the premise: correlate frame f−1's box content against frame f at the position the annotation
-  moved to, and at the position it came from. **On 80% of `nature`'s frames NOT MOVING correlates
-  better** (NCC 0.940 vs 0.816). The target deforms in place — aspect 0.58 → 1.65, appearance
-  decorrelating to 0.072 by frame 50 — and the box centre moves because it is a min–max over a
-  changing shape. Corroborated two ways: the response is healthy and says zero translation
-  (frame 2, one update after init: peak at (0,0), `resp00/peak` 1.0000, PSR 33, sidelobe mean
-  +0.0001, mainlobe 16 bins vs an ideal 13), and **at `padding = 1.0`, with no background in the
-  ROI at all, it still reports (0,0) on 98% of frames** — so it is not background lock either.
-  **`nature` is 46% of the frames in the 8-sequence evidence set**, so read
-  `runs/vot/evidence_ar.md`'s per-sequence table rather than any frame-weighted aggregate, and
-  never tune against it. See `runs/vot/frozen_detector.md`.
+  Three diagnoses (sub-bin lag, origin lock, background lock) all assumed the target moves and
+  the tracker fails to follow. `scripts/vot_motion_check.py` tests the premise: **on 80% of
+  `nature`'s frames NOT MOVING correlates better** (NCC 0.940 vs 0.816). The target deforms in
+  place — aspect 0.58 → 1.65, appearance decorrelating to 0.072 by frame 50 — and the box centre
+  moves because it is a min–max over a changing shape. Corroborated twice: the response is
+  healthy and says zero translation (peak at (0,0), `resp00/peak` 1.0000, PSR 33), and at
+  `padding = 1.0`, with no background in the ROI at all, it still reports (0,0) on 98% of frames
+  — so not background lock either. **`nature` is 46% of the frames in the 8-sequence evidence
+  set**, so read per-sequence tables, never a frame-weighted aggregate, and never tune against
+  it. `runs/vot/frozen_detector.md`.
 - **`tiger`: eta / sigma / eps_rel SWEPT, and the freeze is a SYMPTOM, not the objective.**
   `SIGMA=1` and `EPS_REL=0.1` each unfreeze the detector completely (froze-while-needed 65.8% →
-  0.5% / 0.0%) and tracking does not improve — IoU stays ~0.21 and centre error gets worse. A
-  detector that moves every frame to the wrong place scores no better than one that refuses to
-  move, and it looks healthier. **Do not optimise the freeze rate.**
-  Three mechanisms were tested and killed: (1) ATTENUATION — the early trace fits it perfectly
-  (needs +21 bins, reports +8), but iterated re-cropping, which attacks exactly that and helps
-  `car1` (cerr 5.6 → 4.7 px), makes `tiger` worse (lost at 137 → 70); (2) the ONLINE UPDATE — with
-  the crop placed at groundtruth every frame the detector is still wrong by a median **17 bins**,
-  and identically so with `eta = 0`, so the filter is wrong before learning touches it (`car1`: 2
-  bins); (3) the filter INVENTING the offset — a plain NCC template search with no filter, no conv
-  features and no window puts the best match at **(−6.7, −8.9) px** from the annotation centre,
-  within 8 px on 27% of frames (`car1`: (+2.8, −0.4) px, 100%).
-  **So `tiger` is `nature`'s disease in a milder form**: the box centre is a min–max over a
-  deforming object and drifts against the appearance, ~11 px ≈ 8 bins, which the filter amplifies
-  ~1.7×. Trackable but permanently penalised. See `runs/vot/tiger.md`.
-- **`MOSSE_ETA = 0.05` is the one candidate this produced — worth a hardware A/B.** Offline over 8
-  full sequences, gray: frame-weighted mean IoU 0.2533 → 0.2599, unweighted 0.1382 → 0.1480, six
-  sequences better, two tied, one worse by 0.0017 (and that one is `nature`). **Uniform in sign,
-  which `HOLD_COAST` was not.** The sweep is not monotone — 0.025 is much worse than 0.05 — so it
-  is a shallow optimum, not a trend. Caveat: the offline model holds box size fixed (no DSST), so
-  `eta` has not been tested against a live scale filter.
+  0.5% / 0.0%) and tracking does not improve — IoU stays ~0.21, centre error gets worse. **Do
+  not optimise the freeze rate.** Three mechanisms tested and killed: ATTENUATION (iterated
+  re-cropping helps `car1`, cerr 5.6 → 4.7 px, and makes `tiger` worse); the ONLINE UPDATE (with
+  the crop at groundtruth every frame the detector is still wrong by a median **17 bins**, and
+  identically so at `eta = 0`, so the filter is wrong before learning touches it — `car1`: 2
+  bins); and the filter INVENTING the offset (a plain NCC template search with no filter and no
+  features puts the best match **(−6.7, −8.9) px** from the annotation centre). **So `tiger` is
+  `nature`'s disease in a milder form**: the box centre is a min–max over a deforming object and
+  drifts against the appearance, ~11 px ≈ 8 bins, which the filter amplifies ~1.7×. Trackable
+  but permanently penalised. `runs/vot/tiger.md`.
+- **`MOSSE_ETA = 0.05` SHIPPED — hardware R 0.3065 → 0.3283 (+7.1%), EAO +8.5%, 13.9% more
+  frames. But two of three mechanism falsifiers FIRED.** The drift model predicted the gain and
+  predicted the wrong reason: pre-loss ACCEPT share was predicted to stay ~80% and fell to
+  73.7%, and first losses land marginally EARLIER, not later. What improves is RECOVERY. Per
+  sequence it is a coin flip (R better on 28 / worse on 24 / tied 10); the pooled figure is
+  frame-weighted. **Do not build on the explanation** — and note the gain forced the
+  `PSR_GATE_MIN` re-tune, because a slower filter drops median PSR ~26% into a gate calibrated
+  for the faster one. `runs/vot/eta05.md`.
 - **PHASE CORRELATION IS THE WRONG INSTRUMENT FOR "did the target move".** It returns the
   DOMINANT motion in the window, so static background filling the box makes it read zero: it
-  reported **0.00 px on `car1`**, a car crossing the frame at 20 px/frame. It nearly produced a
-  fourth wrong diagnosis of `nature`. Ask about the target's own pixels at two named hypotheses
-  instead (`vot_motion_check.py`), which has no dominance failure mode.
-- **`rgb_vs_gray_loop.py --sequence <name>` reproduces the board's tracking failures at 3.5 s per
-  100 frames** — `nature` 38.4% frozen against hardware's 44.3%, `tiger` 65.8% against 62.4%. It
-  resolves stb2022 under `$VOT_ROOT` first, then `test-sequences/`. **Its `load_gt` used to carry
-  a polygon-only copy of the groundtruth rule**, which is correct for `test-sequences/` and
-  silently wrong for every stb2022 rectangle (the Phase 1 bug); it now single-sources
-  `vot_prepare.reduce_box`, so pointing it at stb2022 is safe.
-- **Padding 2.0 beats 1.5 on real moving video** — `car1`, 200 frames closed-loop, mean IoU
-  0.857 / 0.780 / 0.174 at padding 2.0 / 1.5 / 1.2. This is the measurement the "1.5 verdict is
-  REOPENED" note under Settled asked for: the original holdout was on a static scene where
-  background lock costs nothing. The shipping default stands.
+  reported **0.00 px on `car1`**, a car crossing the frame at 20 px/frame. Ask about the
+  target's own pixels at two named hypotheses instead (`vot_motion_check.py`).
+- **`rgb_vs_gray_loop.py --sequence <name>` reproduces the board's tracking failures at 3.5 s
+  per 100 frames** — `nature` 38.4% frozen against hardware's 44.3%, `tiger` 65.8% against
+  62.4%. Resolves stb2022 under `$VOT_ROOT` first, then `test-sequences/`. **Its `load_gt` used
+  to carry a polygon-only copy of the groundtruth rule**, correct for `test-sequences/` and
+  silently wrong for every stb2022 rectangle; it now single-sources `vot_prepare.reduce_box`.
+- **Padding 2.0 is CLOSED, three ways.** `car1` closed-loop mean IoU 0.857 / 0.780 / 0.174 at
+  2.0 / 1.5 / 1.2; all 62 offline, every value below 2.0 is worse (R 0.2251 at 1.5 vs 0.2910);
+  and on hardware 3.0 LOST EAO. The original 1.5-vs-2.0 holdout was on a static scene where
+  background lock costs nothing — that objection was valid and the answer came out the same.
 - **SUB-BIN INTERPOLATION IS A SMALL ACCURACY WIN, NOT A FIX — and the compounding-lag argument
-  for it is wrong.** The peak detector is a pure integer argmax (`PsrResult::dr/dc` are `int`,
-  no parabolic refinement anywhere), and on `nature` one bin is 1.61 × 2.78 frame px against
-  2.06 px/frame of true motion, so 86% of frames really do report (0,0). What does NOT follow is
-  that the error compounds: **the detector measures the offset that exists now, not the
-  increment**, so lag accumulates only until it crosses half a bin and the next measurement takes
-  it back. `python3 scripts/mosse_loop_sim.py --subbin` sweeps ratio 1-3 × 0.1-1.5 bins/frame
-  over 200 frames — up to 86% zero-reports, worst late/early error ratio **1.00**, error bounded
-  at ~half a bin. The same bench's `centred` arm DOES compound, so a flat result there is a
-  finding and not an insensitive instrument. Parabolic refinement does cut the bounded error at
-  large resample ratios (2.68 → 1.25 px at ratio 3), which is worth well under 1% of IoU on a
-  100 px box.
-  **The arithmetic that sold the wrong story was a conflation of mean SPEED with mean
-  DISPLACEMENT**: a tracker moving smoothly through a jittering groundtruth scores a lower mean
-  speed while its mean displacement matches exactly (`nature` row: truth +0.002, track +0.024
-  px/frame). See `runs/vot/subbin_lag.md`, whose observations all stand and whose mechanism does
-  not.
-- **The HOLD on a gated frame is NOT unconditionally correct — measured 2026-08-25.** On a gate
-  veto the host holds position, which assumes the target stays put while the filter is frozen.
-  Measured from stb2022 groundtruth alone (`scripts/vot_hold_budget.py`, no tracker, no board):
-  the **hold budget** — frames before the target's centre leaves the frozen `box × padding`
-  window, i.e. before recovery is impossible for ANY tracker — has a median of **6 frames**, is
-  **≤ 4 on 30 of 62 sequences**, and is **0 on four** (`ball3` escapes in a single frame on 75.7%
-  of frames). `car1`'s budget is 4 and its longest hold on hardware was **53**. See
-  `runs/vot/hold_policy.md`. The candidate fix is a constant-velocity coast, `HOLD_COAST`
-  (`coast_observe()`/`coast_step()` in `mosse_filter`, natively tested), and **it is OFF by
-  default because the two metrics disagree about it — see the entry below.** On hardware over 8
-  sequences and 54 runs it is +0.0296 frame-weighted mean IoU, with `car1` job 0 going from a
-  permanent loss at frame 461 to tracking all 739 frames.
-  **THE OFFLINE BUDGET MODEL PREDICTED THE OPPOSITE FOR `car1`, BECAUSE IT WAS OPEN LOOP**: it
-  treated the observed 29-frame gated run as fixed, when coasting turns frames that would have
-  been gated into accepted ones and every accept restarts the coast. Read the budget as a bound
-  on ONE uninterrupted hold, never as a prediction of tracking outcome. What the coast cannot do
-  is rescue a tracker that never acquires — `ball3` gates on 69% of frames and coasted zero
-  times, having no accept→hold transitions at all. See `runs/vot/evidence_arm_ab.md`. Note `TARGET_PADDING` is the cheapest lever here and its 1.5-vs-2.0
-  holdout was measured on a STATIC scene, where this effect cannot appear.
+  for it is wrong.** The peak detector is a pure integer argmax, and on `nature` one bin is
+  1.61 × 2.78 frame px against 2.06 px/frame of true motion, so 86% of frames really do report
+  (0,0). What does NOT follow is that the error compounds: **the detector measures the offset
+  that exists now, not the increment**, so lag accumulates only until it crosses half a bin.
+  `mosse_loop_sim.py --subbin` sweeps ratio 1-3 × 0.1-1.5 bins/frame: worst late/early error
+  ratio **1.00**, error bounded at ~half a bin — and the same bench's `centred` arm DOES
+  compound, so the flat result is a finding, not an insensitive instrument. Parabolic refinement
+  cuts the bounded error at large resample ratios (2.68 → 1.25 px at ratio 3), worth well under
+  1% of IoU on a 100 px box. **The arithmetic that sold the wrong story conflated mean SPEED
+  with mean DISPLACEMENT.** `runs/vot/subbin_lag.md`.
+- **The HOLD on a gated frame is NOT unconditionally correct — measured 2026-08-25.** From
+  stb2022 groundtruth alone (`scripts/vot_hold_budget.py`, no tracker, no board), the **hold
+  budget** — frames before the target's centre leaves the frozen `box × padding` window, i.e.
+  before recovery is impossible for ANY tracker — has a median of **6 frames**, is **≤ 4 on 30
+  of 62 sequences**, and is **0 on four**. `car1`'s budget is 4 and its longest hold on hardware
+  was **53**. The candidate fix is `HOLD_COAST` (`coast_observe()`/`coast_step()`), OFF by
+  default because the two metrics disagree about it (see the AR entry below); over 8 sequences
+  it is +0.0296 frame-weighted mean IoU. **THE OFFLINE BUDGET MODEL PREDICTED THE OPPOSITE FOR
+  `car1`, BECAUSE IT WAS OPEN LOOP**: it treated the observed 29-frame gated run as fixed, when
+  coasting turns gated frames into accepted ones and every accept restarts the coast. Read the
+  budget as a bound on ONE uninterrupted hold, never as a prediction of outcome. The coast
+  cannot rescue a tracker that never acquires — `ball3` gates on 69% of frames and coasted zero
+  times. `runs/vot/hold_policy.md`, `evidence_arm_ab.md`.
 - **MEAN IoU AND THE TOOLKIT'S AR CAN ORDER TWO ARMS OPPOSITELY, ON THE SAME RUNS —
   2026-08-25.** The `HOLD_COAST` A/B was decided on frame-weighted mean IoU (+0.0296, arm B
   wins); ingesting the identical 54 trajectory pairs into a VOT workspace
@@ -1107,11 +1099,11 @@ Two principles that have repeatedly earned their keep: **instruments before chan
   window coasts through it. Compare any such run against the shipping default (`0`) rather than
   against the 08-25 arm-B runs, and use the run-state digest to tell "unchanged" from "nearly
   unchanged".
-- **`scale_gate()`** — three vetoes reported separately for the same reason. `AT_SEARCH_RAIL` is
-  checked *before* `LOW_CONF` because it is the more specific finding when both fire. **The
-  update skip is the load-bearing half**, not the box hold. Guarded so a degenerate filter cannot
-  veto everything (`n_scales > 2`) and so "the gate never ran" is distinguished from "the gate
-  said no". 21 assertions in `make test_host`, driven by values hardware actually produced.
+- **`scale_gate()`** — three vetoes reported separately. `AT_SEARCH_RAIL` is checked *before*
+  `LOW_CONF` because it is the more specific finding when both fire. **The update skip is the
+  load-bearing half**, not the box hold. Guarded so a degenerate filter cannot veto everything
+  (`n_scales > 2`) and so "the gate never ran" is distinguished from "the gate said no". 21
+  assertions in `make test_host`, driven by values hardware actually produced.
 - **DSST 1-D scale filter** = the existing filter at `rows = 1`; `gaussian_target_spectrum(G,1,S,
   σ,0,0)` degenerates cleanly. Defaults from §6.1 except the step: S=33, η=0.025, σ_s=S/16,
   template capped at 512 px. A single application under-corrects (+3 where +5 is exact) because
@@ -1140,55 +1132,46 @@ Two principles that have repeatedly earned their keep: **instruments before chan
   written at runtime. **Verify a feature flag on a build that can actually exercise it**, and
   when a `strings` check says a feature is missing, check the loop bounds before the flags. Cost
   here: an hour of bisecting a compiler that was right.
-- **PHASE 4's TWO KNOBS ARE WORTH 1.1%, NOT 15% — THE TRANSPORT WAS THE WHOLE WIN (2026-08-25).**
-  Three `car1` runs, 8434 frames each, all 15 state digests identical, so the differences are
-  console/IO only: UART + every-frame progress + every-row flush **28.48 ms**; ssh, same knobs
-  **24.69**; ssh + `CSV_FLUSH_EVERY=200` **24.70**; ssh + `PROGRESS_EVERY=25` **24.43**. So
-  UART→ssh is **3.79 ms**, `CSV_FLUSH_EVERY` is **0.00**, `PROGRESS_EVERY` is **0.27**.
-  **The written-down prediction was ~4.0 ms for the thinning; it is 0.27.** Premise again, not
-  arithmetic: 92.5 µs/byte is the cost of a byte *at 115200*, and the run being predicted was
-  launched over ssh where a byte is nearly free — the knob targeted a cost the automation had
-  already deleted. `CSV_FLUSH_EVERY` is zero for a second reason: the sweep runs from
-  `/tmp/mosse`, and `/tmp` is **tmpfs**, so the flush is a memcpy where the old SD-card CWD made
-  it a real sync. **`car1` at 24.43 ms = 40.9 FPS is the best frame time recorded and is NOT
-  comparable to the 26.29 ms in the performance history** (UART, synthetic scene) — the UART
-  alone was 3.79 ms of it.
-- **VERIFY A FEATURE FLAG ON A BUILD THAT CAN EXERCISE IT — the check caught its own case,
-  2026-08-25.** `PROGRESS_EVERY=25` produced an ELF byte-identical to the default, i.e. the knob
-  was INERT — correctly, because the default build is `VERBOSITY=1` where the level-0 line does
-  not exist and the branch is dead-code-eliminated. At `VERBOSITY=0` the ELF differs at 10 and 25
-  and matches at 1. Read the first result as "it works" and a sweep runs with an unthinned
-  console, with the lost time showing up as a regression in something else. Same lesson as the
-  `[coast]` printf that `strings` could not find, and as `SCENE_VERIFY` silently building
-  disabled.
+- **PHASE 4's TWO KNOBS ARE WORTH 1.1%, NOT 15% — THE TRANSPORT WAS THE WHOLE WIN
+  (2026-08-25).** Three `car1` runs, 8434 frames, all 15 state digests identical: UART + every-
+  frame progress + every-row flush **28.48 ms**; ssh **24.69**; ssh + `CSV_FLUSH_EVERY=200`
+  **24.70**; ssh + `PROGRESS_EVERY=25` **24.43**. So UART→ssh is **3.79 ms**, `CSV_FLUSH_EVERY`
+  **0.00**, `PROGRESS_EVERY` **0.27** — against a written-down prediction of ~4.0 ms for the
+  thinning. Premise again: 92.5 µs/byte is the cost of a byte *at 115200*, and the run being
+  predicted was launched over ssh where a byte is nearly free. `CSV_FLUSH_EVERY` is zero for a
+  second reason: the sweep runs from `/tmp`, which is **tmpfs**. **`car1` at 24.43 ms = 40.9 FPS
+  is the best frame time recorded and is NOT comparable to the 26.29 ms in the performance
+  history** (UART, synthetic scene).
+- **VERIFY A FEATURE FLAG ON A BUILD THAT CAN EXERCISE IT — the check caught its own case.**
+  `PROGRESS_EVERY=25` produced an ELF byte-identical to the default, i.e. the knob was INERT —
+  correctly, because the default build is `VERBOSITY=1` where the level-0 line does not exist
+  and the branch is dead-code-eliminated. At `VERBOSITY=0` the ELF differs at 10 and 25 and
+  matches at 1. Read the first result as "it works" and a sweep runs with an unthinned console.
   **Two corrections were needed to make the defaults byte-identical**, both worth repeating: an
   unconditional `static` counter changes codegen even when its value is never used, so the
   default arm must be the original line TEXTUALLY (`#if N > 1 / #else`); and one inserted
   `fflush()` shifted every later offset, producing 9958 differing bytes from a single redundant
-  call (`fclose()` flushes by definition). **The control:** building the same source twice gives
-  a byte-identical ELF, so an ELF `cmp` is a valid instrument on this project.
+  call. **The control:** building the same source twice gives a byte-identical ELF, so an ELF
+  `cmp` is a valid instrument on this project.
 - **Console gating (`VERBOSITY`) details that mattered.** (1) The `VP1`/`VP2` macros are
   `if (VERBOSITY >= n)` on a compile-time constant, so format strings are **dead-code-eliminated,
-  not merely skipped** — verify with `strings` on the ELF, a stronger check than reading a log.
-  (2) `dma_accumulate_frame()` had to be split out of `dma_report_frame()`; the printer was also
-  the accumulator, so gating the print would have silently turned the CUMULATIVE report into a
-  two-frame report. (3) **Anomalies print at every level** — a railed bin, a PSR or scale HOLD, a
-  peak-definition disagreement, a negative peak. (4) `VERBOSITY=0` still prints one line per
-  frame deliberately: gating to nothing would delete the instrument `picocom | ts` needs.
+  not merely skipped** — verify with `strings` on the ELF. (2) `dma_accumulate_frame()` had to be
+  split out of `dma_report_frame()`; the printer was also the accumulator, so gating the print
+  would have silently turned the CUMULATIVE report into a two-frame report. (3) **Anomalies print
+  at every level.** (4) `VERBOSITY=0` still prints one line per frame deliberately: gating to
+  nothing would delete the instrument `picocom | ts` needs.
 - **`track.csv` carries `rails,accum_max,fch0_max,h_max` since 2026-08-24, and that retired the
   "`VERBOSITY=1` is load-bearing" rule.** The scan always ran — `report_cint16` gates the PRINT,
-  not `scan_cint16` — so the numbers were computed and discarded, and a healthy `VERBOSITY=0` run
-  yielded no amplitude data at all. **Validated by reproducing a known answer**: the
-  `VERBOSITY=0` run's CSV gives `F_ch`/`accum`/`response`/`H(q15)` digit-for-digit identical to
-  the `VERBOSITY=1` run's console, at 28.58 ms/frame instead of 62.67. `calib_report.py` falls
-  back to the CSV when a log has no `[diag]` lines and says which source it used; it distinguishes
-  "0 rails" from "no rails column", because those must never print the same word.
-  `fch0_max` is named for ch0 because `F_ch` is scanned under `if (ch == 0)` — not a bank max.
-- **DMA 4258 → 1090 tx/frame** via `FFT_ROW_WS`/`FFT_COL_WS` 2→8; 96% of the traffic was the four
-  per-invocation-chunked ports. **DMA is not a bottleneck and the fabric is at spec**: 80 µs/tx is
-  per-transaction *overhead*, not bandwidth — 64 B costs 14.4 µs and 128 KB costs 22.8 µs
-  (2048× the size for 1.6× the time). The largest transfer achieves **5.76 GB/s**, inside AMD's
-  own measured GMIO range.
+  not `scan_cint16` — so the numbers were computed and discarded. **Validated by reproducing a
+  known answer**: the `VERBOSITY=0` run's CSV gives `F_ch`/`accum`/`response`/`H(q15)`
+  digit-for-digit identical to the `VERBOSITY=1` run's console, at 28.58 ms/frame instead of
+  62.67. `calib_report.py` falls back to the CSV and says which source it used; it distinguishes
+  "0 rails" from "no rails column", because those must never print the same word. `fch0_max` is
+  named for ch0 because `F_ch` is scanned under `if (ch == 0)` — not a bank max.
+- **DMA 4258 → 1090 tx/frame** via `FFT_ROW_WS`/`FFT_COL_WS` 2→8; 96% of the traffic was the
+  four per-invocation-chunked ports. **DMA is not a bottleneck and the fabric is at spec**:
+  80 µs/tx is per-transaction *overhead*, not bandwidth — 64 B costs 14.4 µs and 128 KB costs
+  22.8 µs (2048× the size for 1.6× the time). The largest transfer achieves **5.76 GB/s**.
 - **x86sim bit-exactness harness** (`make x86sim_check`) — conv2d s6, cmul s7 and cmul_stress all
   16384/16384 identical. This verifies `simulate_conv2d`, on which the whole offline
   `phase1_sweep.py` methodology rests.
@@ -1203,75 +1186,64 @@ Two principles that have repeatedly earned their keep: **instruments before chan
 
 ## Where this tracker sits — the published VOT-STb2022 baselines
 
-**Directly comparable, and that is unusual enough to state: same dataset, same anchor-based
-multi-start protocol, and STb ground truth is axis-aligned boxes fitted to the segmentation
-masks — exactly what this harness scores against.** Source: Kristan et al., *The Tenth Visual
-Object Tracking VOT2022 Challenge Results*, ECCVW 2022, Table 12 (41 trackers, EAO 0.602 down
-to 0.195).
+**Directly comparable, which is unusual enough to state: same dataset, same anchor-based
+multi-start protocol, and STb ground truth is axis-aligned boxes fitted to segmentation masks —
+exactly what this harness scores.** Source: Kristan et al., *The Tenth VOT2022 Challenge
+Results*, ECCVW 2022, Table 12 (41 trackers, EAO 0.602 down to 0.195).
 
 | tracker | class | EAO | A | R |
 |---|---|---|---|---|
 | MixFormerL / DAMT | transformer (winners) | 0.602 | 0.831 / 0.776 | 0.859 / 0.887 |
 | DiMP | deep DCF | 0.430 | 0.689 | 0.760 |
 | ATOM | deep DCF | 0.386 | 0.668 | 0.716 |
-| TCLCFcpp | DCF | 0.267 | 0.550 | 0.598 |
+| TCLCFcpp | CF ensemble, *explicitly embedded/CPU* | 0.267 | 0.550 | 0.598 |
 | ASMS | mean-shift | 0.255 | 0.526 | 0.599 |
-| **CSRDCF** | classical DCF | 0.251 | 0.519 | 0.580 |
-| **KCF** | classical DCF | 0.239 | 0.542 | 0.532 |
+| CSRDCF | HOG/CN + spatial & channel reliability | 0.251 | 0.519 | 0.580 |
+| KCF | kernelized DCF + HOG | 0.239 | 0.542 | 0.532 |
 | LGT | part-based, last of 41 | 0.195 | 0.461 | 0.486 |
-| **this tracker, RGB `H_SHIFT=15`, ALL 62 seq** | fixed-point MOSSE/DSST | **0.147** | **0.504** | **0.307** |
-| this tracker, gray `H_SHIFT=14`, ALL 62 seq | | 0.137 | 0.489 | 0.274 |
+| **this tracker, SHIPPING (eta 0.05, gate 5.0)** | fixed-point MOSSE/DSST | **0.163** | **0.510** | **0.342** |
 
-**The split is the finding, and it is sharp: ACCURACY IS AT CLASSICAL-DCF PARITY, ROBUSTNESS
-IS NOT.** 0.541 is indistinguishable from KCF's 0.542 and above CSRDCF's 0.519 — when this
-tracker is on the target its boxes are as good as the published baselines. R = 0.334 is below
-every one of the 41, including LGT at 0.486, and EAO follows robustness because EAO is
-dominated by how long runs survive before the 10-consecutive-frame failure rule fires.
+**The split is the finding and it is sharp: ACCURACY IS INSIDE THE CLASSICAL-DCF BAND,
+ROBUSTNESS IS NOT IN THE TABLE AT ALL.** A = 0.510 sits 0.009 under CSRDCF and 0.032 under KCF,
+above ANT (0.492) and LGT (0.461) — on target, its boxes are competitive. R = 0.342 is below
+every one of the 41, and EAO follows robustness because EAO is dominated by how long runs
+survive before the 10-consecutive-frame failure rule fires. Being embedded is no excuse:
+TCLCFcpp is in exactly this niche at R = 0.598.
 
-**That is the same story `runs/vot/frozen_detector.md`, `tiger.md` and `hold_policy.md` tell
-from the inside** — deforming targets, a box centre that drifts against the appearance, 738
-`NEGATIVE_PEAK` vetoes, a hold budget with a median of 6 frames. None of those make boxes
-sloppy; they lose the target. AR says it in the challenge's own units.
+*(Only a full-62 row is quotable. A 57-sequence subset degrades A and R gracefully and its EAO
+does NOT — the five missing sequences change the subsequence-length distribution, which is why
+adding them once RAISED EAO while lowering A and R.)*
 
-**What KCF and CSR-DCF have that this does not**, in the order it probably matters:
-1. **Pooled features.** HOG is gradient-orientation histograms over cells, so it tolerates
-   deformation and small misalignment. A 3x3 conv1 kernel has no pooling and responds to an
-   exact local edge pattern. HOG is 31 dimensions; this bank's participation ratio is 4.94
-   (gray) / 7.43 (RGB).
-2. **A spatial reliability map** (CSR-DCF's whole contribution) constrains the filter to the
-   segmented object, so a large context window can be used without learning it. Here the
-   target is 27% of the ROI area at `TARGET_PADDING=2` and nothing masks the rest.
-3. **Channel reliability at detection.** Stage B3 normalises channels by ENERGY, not by
-   discriminative power.
-4. **KCF is kernelized**; this is linear ridge regression.
-5. **Neither gates.** They follow the peak every frame; this vetoes and freezes, and a hold
-   longer than the recovery budget is an unrecoverable loss by construction.
+**THE LOSS MECHANISM IS ATTRIBUTED, from the CSVs, no board time** (`runs/vot/robustness_gap.md`).
+The gate is the AFTERMATH of a loss, not its cause: 88% of vetoes are `NEGATIVE_PEAK` — which
+`PSR_GATE_MIN` cannot disable — and **95.8% land after the run is already at IoU ≤ 0.1**. In the
+5 frames BEFORE each first loss (394 losing runs) the verdict is **ACCEPT 82.0% at median PSR
+18.83**, box moving 1.88 px/frame. **It does not freeze into a loss and it does not jump — it
+walks off the target confidently.** Confirmed from the other side by `detector_gain.md`: on
+targets that genuinely translate the detector recovers 93% of the annotated motion (alpha 0.93,
+0.95–0.98 per speed bucket), and on-target hold rate is only 1.8%, flat across speed. **Do not
+spend a sweep relaxing the gate, and do not look for the fault in localisation.**
 
-Not a differentiator but worth stating for the write-up: no tracker in that table estimates
-aspect ratio either, so the axis-aligned-box penalty on deforming targets is shared and does
-not explain the gap.
+**What the baselines have that this does not**, in likely order of importance:
+1. **Pooled features.** HOG is gradient-orientation histograms over cells — 31 dims, tolerant of
+   deformation. This is 16 channels of 3x3 conv1, no pooling, participation ratio 4.94 gray /
+   7.43 RGB. **NOTE: aggregating THIS bank was tested and is a null** (see the feature-geometry
+   entry under Settled); the open question is a different bank, not a filter over this one.
+2. **A spatial reliability map** (CSR-DCF's contribution). **Its cheap stand-in was tested and
+   FAILED**: every `TARGET_PADDING` below 2.0 is worse offline, and 3.0 lost EAO on hardware. So
+   background contamination is not the binding constraint, and CSR-DCF's ">50% EAO" ablation
+   prices REMOVING a mask from a tracker built around one — not adding a crude one here.
+3. **Channel reliability at detection.** Stage B3 normalises by ENERGY, not discriminative
+   power. **Untested, host-only, and now the cheapest live candidate** (their ablation: -12%).
+4. **A temporal ensemble** (TCLCF). eta 0.125 and eta 0.05 are already a short/long pair that win
+   on different sequences; running both and selecting by PSR is host-only. Untested.
+5. **KCF is kernelized** — but its own raw-vs-HOG gap is 0.451 -> 0.728 while DCF-vs-KCF on HOG
+   is ~0.728 -> 0.732. **The gain is the features, not the kernel. Not worth the cmul path.**
+6. **Neither gates.** They follow the peak every frame; this vetoes and freezes, and a hold
+   longer than the recovery budget (median 6 frames) is an unrecoverable loss by construction.
 
-**Full 62 as of 2026-08-27** (`~/vot/analysis/full62`, 419 runs per arm), so the comparison
-against the table is exact rather than approximate. The earlier 57-sequence figures are kept
-in the history below because of what changed when the five landed:
-
-| | A | R | EAO |
-|---|---|---|---|
-| RGB, 57 seq | 0.5406 | 0.3343 | 0.1314 |
-| RGB, **all 62** | 0.5043 | 0.3065 | **0.1474** |
-
-**A and R FELL while EAO ROSE.** The five are hard sequences, so A and R dropping is expected;
-EAO rising is not a contradiction but it is a warning. EAO pools over a subsequence-LENGTH
-curve, and the five change the length distribution (`girl` 1500, `flamingo1` 1377, `nature`
-999). **So the 57-sequence EAO was not a truncated version of the 62-sequence one, and only
-the full-62 figure may be quoted.** A subset's A and R degrade gracefully; its EAO does not.
-
-**One confound to state rather than hide: the two arms are at DIFFERENT `H_SHIFT`** — gray 14,
-RGB 15 — because each was built as its own uncensored over-shift arm. Both have `rails = 0`,
-so neither saturates, and the difference is one bit of quantization headroom. The
-quantization entry under Settled questions argues that bit is immaterial here (removing
-quantization ENTIRELY makes tracking worse), but the arms are not identical builds and a
-like-for-like re-run at one `H_SHIFT` is the clean version of this table.
+Not a differentiator, but worth stating for the write-up: no tracker in that table estimates
+aspect ratio either, so the axis-aligned-box penalty on deforming targets is shared.
 
 ## Settled questions — do not reopen
 
@@ -1287,14 +1259,14 @@ like-for-like re-run at one `H_SHIFT` is the clean version of this table.
   and is why the correction sat unapplied for months. A DCF is linear in feature space; a half-wave rectifier throws away half the signal
   and the filter cannot undo it. Caveat: one patch (s6), held out by circular shift, and it
   diverges from Danelljan §3.3.
-- **Padding ≥2; recommend 2.0 — but the 1.5 verdict is REOPENED.** Held-out at target 64, budget
-  4-2-2, ch16: padding 1.5 gives PSR 18.4 / ratio 2.59 / 0.75 px; 2.0 gives 45.7 / 4.97 / 0 px;
-  2.5 and 3.0 edge it out but trigger the aliasing detector (bilinear has no prefilter) and 3.0
-  clips 3.57% of samples. 2.0 is the only value where the resample stays 1:1. **But that holdout
-  used a STATIC scene, where background lock costs nothing** — and background lock is precisely
-  what more padding buys more of (target is 27% of ROI area at 2.0, 44% at 1.5). The measurement
-  was blind to the failure mode. Re-test under `TRAJECTORY=1` with `resp00_over_peak` as the
-  metric before treating 1.5 as settled.
+- **Padding ≥2; recommend 2.0 — REOPENED 2026-08-24, and CLOSED 2026-08-28 IN FAVOUR OF 2.0.**
+  See the feature-geometry entry below: on all 62 sequences, every padding under 2.0 is WORSE
+  (R 0.2251 at 1.5 against 0.2910 at 2.0), and at two matched px/bin points padding 2.0
+  wins both. The original static-scene objection stands and the answer came out the same.
+  Historic detail: the original holdout (target 64, 4-2-2, ch16) gave PSR 18.4 at 1.5 against
+  45.7 at 2.0, and 2.0 is the only value where the resample stays 1:1. **2.5 and 3.0 trip the
+  aliasing detector (bilinear has no prefilter) and 3.0 clips 3.57% of samples** — which is the
+  standing reason not to go up, independent of the tracking result.
 - **σ stays 2.0; PSR cannot select σ.** Bolme PSR is monotone decreasing in σ all the way to
   sub-pixel (80.3 at σ=0.75 down to 19.3 at σ=5.33), so it just rewards a sharper peak. The
   tempting Stage-B2 explanation was tested with `--no-b2` and refuted — the dependence is
@@ -1324,46 +1296,88 @@ like-for-like re-run at one `H_SHIFT` is the clean version of this table.
   computes only the independent half rather than computing both and discarding one. That saves
   work instead of reconstructing it, so per-stage rounding never enters the argument.
 - **QUANTIZATION IS NOT THE CAUSE OF THE POOR ROBUSTNESS. Removing it makes tracking
-  WORSE — measured 2026-08-27, offline, 8 sequences, 2841 frames.** The question was
-  prompted by the AR comparison against the published VOT-STb2022 baselines (see "Where
-  this tracker sits" above): accuracy is at classical-DCF parity and robustness is far
-  below it, which invites "the fixed-point pipeline is eating it". It is not, and the
-  suspects are now bracketed rather than argued:
+  WORSE — measured 2026-08-27, offline, 8 sequences, 2841 frames.** The suspects are bracketed
+  rather than argued:
 
   | suspect | verdict | what settles it |
   |---|---|---|
-  | cint16 / Q1.15 / `H_SHIFT` correlation pipeline | exonerated | `rgb_vs_gray_loop.py` is **float64 downstream of the features** and reproduces the board's failures anyway (`nature` 38.4% frozen vs hardware 44.3%, `tiger` 65.8% vs 62.4%) |
-  | saturation / rails | exonerated | `corr(rail rate, mean IoU)` = **−0.025** over 15 `car1` anchors; the `H_SHIFT=15` RGB arm has **zero** accum/response rails over 101,564 frames and still scores R = 0.334 |
-  | the int8 FEATURE path | **exonerated — it HELPS** | the `gray-float` arm below |
+  | cint16 / Q1.15 / `H_SHIFT` pipeline | exonerated | `rgb_vs_gray_loop.py` is **float64 downstream of the features** and reproduces the board's failures anyway |
+  | saturation / rails | exonerated | `corr(rail rate, mean IoU)` = **−0.025**; the shipping arm has **zero** rails over 101,564 frames and still scores R = 0.307 |
+  | the int8 FEATURE path | **exonerated — it HELPS** | `--arms gray gray-float`: frame-weighted mean IoU **0.2533 → 0.2350**, **zero of eight sequences improve** |
 
-  `rgb_vs_gray_loop.py --arms gray gray-float` runs the identical loop with unquantized
-  folded-BN weights, no `out_shift`, no int16 clips and a float Hann — everything else
-  bit-for-bit the same path. Frame-weighted mean IoU **0.2533 → 0.2350**. **Zero of eight
-  sequences improve**; four tie, four get worse (`tiger` −0.0714, `nature` −0.0166, `car1`
-  −0.0126). **The control is what makes it readable**: the int8 arm reproduces the gray
-  column of the stb2022 closed-loop table under "RGB features" below, to four decimal
-  places on all eight sequences, so the float column is the only thing that moved.
+  The control: the int8 arm reproduces the recorded per-sequence table to four decimal places,
+  so the float column is the only thing that moved. **WHY float is worse** — on `tiger` it takes
+  the frozen-detector rate from 74.7% to **1.4%** and IoU from 0.1696 to 0.0982. That is the
+  third independent instance of the same rule: **the int8 grid acts as a DEADBAND**, suppressing
+  sub-threshold responses a float pipeline follows faithfully to the wrong place. *Do not
+  optimise the freeze rate*, and do not read "more precision" as "more accuracy" on a tracker
+  whose features are the binding constraint.
+  **So the robustness deficit is upstream of all arithmetic**: no pooling and a participation
+  ratio of 4.94/7.43 against HOG's 31 dims; no spatial reliability, so the filter trains on 73%
+  background; and a hold policy whose duration exceeds the recovery budget. **Corollary for the
+  write-up: the fixed-point design costs nothing in accuracy or robustness, so the frame rate is
+  bought at no algorithmic price.**
+- **INIT PERTURBATIONS (Bolme §3.4) — CLOSED 2026-08-28. The 16-CHANNEL DENOMINATOR IS
+  ALREADY THE CURE.** `mosse_tracker.cpp` carried "TODO: affine perturbations for
+  initialisation; this is the N=1 case" from the start, and the board says it matters:
+  `scripts/vot_init_anatomy.py` measures **61 of 373 losing runs (16%) failing within 10 frames
+  of init**, already at median IoU 0.571 / PSR 7.35 one frame after `filter_init()` against
+  0.915 / 36.73 for every other run. Those runs never acquire — a different mechanism from the
+  drift in `robustness_gap.md`.
+  Offline (`rgb_vs_gray_loop.py` arm suffix `-warp<N>`, 62 sequences, shipping eta/gate,
+  scored with `vot_ar_offline.py`), **four perturbation axes × three regularizer settings, and
+  nothing clears the +0.02 falsifier written down first**:
 
-  **WHY float is worse, and it is the third independent instance of a rule this project
-  already paid for.** On `tiger` the float arm takes the frozen-detector rate from 74.7%
-  to **1.4%** and IoU from 0.1696 to 0.0982, losing the target at frame 33 instead of 137;
-  on `nature` it goes 99.7% → 84.0% frozen and loses at frame 979 where the int8 arm never
-  loses at all. That is exactly `runs/vot/tiger.md`'s finding reached by a different lever
-  — `SIGMA=1` and `EPS_REL=0.1` each unfroze the detector and each made tracking worse.
-  **The int8 grid is acting as a DEADBAND**: it suppresses sub-threshold responses that a
-  float pipeline follows faithfully to the wrong place. *Do not optimise the freeze rate*,
-  and do not read "more precision" as "more accuracy" on a tracker whose features are the
-  binding constraint.
+  | axis | board cost | dR |
+  |---|---|---|
+  | translation + isotropic scale | free (`roi_crop` runtime AXI-Lite) | +0.0081 |
+  | aspect (`roi_h`/`roi_w` INDEPENDENTLY) | free | **−0.0322** |
+  | rotation 10° (host pre-rotates into `frame_bo`; `roi_crop` cannot) | ~2 ms/warp at init | +0.0146 |
 
-  **So the robustness deficit is upstream of all arithmetic**, and the candidates are
-  structural: features with no pooling and a participation ratio of 4.94 (gray) / 7.43
-  (RGB) against HOG's 31 dimensions; no spatial reliability, so at `TARGET_PADDING=2` the
-  filter trains on 73% background where CSR-DCF masks it to the object; and a hold policy
-  whose duration exceeds the recovery budget (median 6 frames, `car1` held 53 against a
-  budget of 4 — `runs/vot/hold_policy.md`). **A useful corollary for the write-up: the
-  fixed-point design costs nothing in accuracy or robustness, so the frame rate is bought
-  at no algorithmic price.**
+  Rotation is the best and is three sequences: dropping `rowing`/`singer2`/`birds2` gives
+  −0.0020. It is the only arm moving A, R and mean IoU together, so it is the one variant that
+  is not the failure-rule artifact below.
+  **WHY IT DOES NOT TRANSFER, and this is the part worth keeping.** Bolme §3.3 presents
+  regularization and perturbations as ALTERNATIVE cures for one defect — low-energy denominator
+  bins — and **his Figure 3, the whole empirical case for perturbations, is captioned "Results
+  shown without regularization"**. This design has both other cures: `eps_rel=1e-3`, and a
+  SHARED denominator summed over **16 channels** (Bolme's own "sum of the energies over more
+  images" argument, applied across the bank). The prediction that the warp gain is a function
+  of the regularizer HELD — dR +0.0081 → +0.0143 as eps falls 1e-3 → 1e-6 — and then saturates,
+  because `B` never gets that small: bins below `1e-6·mean(B)` are **0.00%** on car1/tiger/nature.
+  **Bolme's ε≈0 regime is unreachable here by lowering ε.** So: perturbations do exactly what
+  Bolme says, and this design already bought that stability structurally; the ceiling is ~+0.014
+  in R. It is a property of the FEATURE BANK, not of the fixed-point path.
+  Two things not to re-derive: translation warps are NOT algebraically degenerate (they should
+  be — `conj(G_δ)F_δ = conj(G)F` exactly — but the fixed Hann window and border inflow give
+  `rel|ΔA|` 0.19/0.30/0.51 at 2/5/10% shift, so "the jitter was too timid" is refuted); and
+  photometric warps are worthless because Stage A's log → zero-mean → unit-L2 annihilates gain
+  and contrast, leaving 7–9 LSB of quantization residue against a patch σ of ~32.
 
+- **FEATURE GEOMETRY — POOLING, RESOLUTION AND PADDING ALL TESTED, ALL REJECTED (2026-08-28).**
+  Offline (8 seq, then all 62, `rgb_vs_gray_loop.py` arms `-pool<N>/-dec<N>/-blur<N>`), then
+  hardware. `runs/vot/pooled_features.md`.
+  * **Aggregation is a NULL on both banks.** `blur2` (2x2 box average at STRIDE 1 — receptive
+    field changed, nothing else) is −0.0010 gray / −0.0012 RGB, and `pool2 <= dec2` everywhere,
+    so the averaging adds nothing over the subsampling it implies. `blur2` is the arm that
+    matters and it did not exist in the first sweep; without it the result reads "pooling loses",
+    which is true and unattributable.
+  * What moved was **px/bin**, and only on RGB. **Gray and RGB gave OPPOSITE signs for the
+    resolution half; do not generalise a feature result across banks.**
+  * **HARDWARE KILLED IT.** `runs/vot/0828_1451-pad30`, 62 seq / 419 trajectories, host-only:
+    padding 3.0 vs 2.0 gives A 0.5100 → 0.5030, R 0.3417 → **0.3494 (+0.0077 against a predicted
+    +0.088)**, and **EAO 0.1629 → 0.1570 — DOWN**. Below the +0.02 floor written before the run.
+    `TARGET_PADDING=2.0` stands and the 64x64 reflash is OFF — it rested on the same proxy.
+  * **Why the proxy failed:** the offline loop has NO DSST scale filter, and padding sets the
+    ROI `scale_extract` draws from, so the whole scale axis was invisible by construction; and it
+    is SINGLE-START, where a big search region has hundreds of frames to earn back a drift,
+    against 419 short anchored runs. Both were named as caveats and neither was priced.
+    **A caveat that is not priced is a hope.**
+  * Free corrections: **padding costs NO frame time** (it resamples to a FIXED 128x128 patch, so
+    cost is output px × 4 taps, independent of input extent), and more context makes the gate
+    LOOSER (holds 15.51% → 10.94%). **Instrument bug:** `vot_detector_gain.py` hardcodes
+    `box*2/128`, so on pad30 it reports alpha 0.442 where the corrected value is ~0.66.
+  Still NOT refuted: a REPLACEMENT bank. That is a weights export plus the same offline loop.
 - **Channel pruning is moot** with ReLU off, and doubly so at `BIAS_SCALE=roi`, which retires
   the last two structurally dead channels (ch3, ch15) outright. The real
   redundancy is the collapse: it caps the bank at **rank 9** (participation ratio 4.94) and
@@ -1371,170 +1385,94 @@ like-for-like re-run at one `H_SHIFT` is the clean version of this table.
   fix is RGB. `check_collapse.py` Q2 used to print "14 independent filters" here — that was a
   count of near-parallel GROUPS, not a rank, and it understated the problem for months.
 
-## RGB features — VALIDATED ON HARDWARE 2026-08-24
+## RGB features — SHIPPING, and it is a ROBUSTNESS win
 
-Code was complete 2026-08-23; three hardware runs on 08-24 closed it. Build with
-`make weights CONV_IN_CH=3` then `ARM=rgb scripts/calib_build.sh`. `H_SHIFT=11` / 4-4-4 carries
-both arms — no RGB-specific budget was needed.
+`CONV_IN_CH=3` is the default. Build with `make weights CONV_IN_CH=3` then
+`ARM=rgb scripts/calib_build.sh`. 4-4-4 carries both arms; no RGB-specific FFT budget.
 
-### What hardware proved, and how
+### Why RGB — CLOSED ON HARDWARE 2026-08-27
 
-Three 200-frame arms, one variable moved at a time (`run_0824_1354` / `_1432` / `_1442`):
+`~/vot/analysis/full62`, 419 runs per arm, both verified run-name-and-length against the
+dataset's anchors before analysis:
 
-| | gray (9-tap) | RGB tint | RGB replicated luma (CONTROL) |
-|---|---|---|---|
-| tracking-identical to gray | — | 121 / 199 | **199 / 199** |
-| mean IoU | 0.9188 | 0.9173 | 0.9188 |
-| **PSR min / mean** | 25.92 / 84.06 | **42.65 / 100.44** | 25.69 / 84.83 |
-| ch0 `F_ch` median | 7398 | 3834 (0.52×) | **623 (0.084×)** |
-| rails / gate holds | 0 / 0 | 0 / 0 | 0 / 0 |
+| arm | A | R | EAO | frames |
+|---|---|---|---|---|
+| gray `H_SHIFT=14` | 0.4890 | 0.2743 | 0.1367 | 48,603 |
+| **RGB `H_SHIFT=15`** | **0.5043** | **0.3065** | **0.1474** | **54,813** |
 
-**The control is what makes this conclusive, and it is stronger than the offline version.** Same
-27 taps, bias, quantization grid and joint normalization, fed three IDENTICAL luma planes: it
-reproduces grayscale's decisions **bit-for-bit on all 199 frames** and its PSR lands within 1%.
-So (a) the whole RGB datapath — 3-plane Stage A, interleaved wire format, de-interleave, 27-tap
-MAC — is validated against a known-good reference, and (b) the **1.65× PSR floor is colour, not
-bookkeeping**. This reproduces the offline finding on hardware, including its shape:
-**RGB IS A ROBUSTNESS CHANGE, NOT AN ACCURACY CHANGE** — mean IoU actually moves the wrong way
-(0.9188 → 0.9173) and the colour-free control is tied for most accurate, exactly as offline.
+R better on 37 / worse on 15 / tied on 10. Largest swings are all RGB gains and all in
+ROBUSTNESS: `car1` 0.634 → **1.000**, `book` +0.311, `lamb` +0.272. **12.8% more frames
+survive.** (Confound: the arms are at different `H_SHIFT`.)
 
-**ch0's collapse was PREDICTED to 7%.** From the exported weights alone, the input-referred gain
-for ch0 is gray 8.72 / RGB-decorrelated 10.87 / RGB-luma-replicated 0.80, i.e. the control should
-sit at 0.09× of gray. Measured 0.084×. That is the sharpest confirmation in this file that the
-weight-collapse model is right, and it makes ch0's `F_ch` the cheap on-board colour-path test
-(see the ch0-only trap under "Metrics that cannot fail a broken tracker").
+**RGB WAS NEVER AN ACCURACY CHANGE, and the shape matters more than the number.** Offline mean
+IoU over 8 stb2022 sequences is a TIE (+0.0011); the synthetic hardware arm moved the wrong way
+(0.9188 → 0.9173). Its claim was always **failures**, −18% under the supervised protocol — a
+robustness metric mean IoU structurally cannot express. **Decide a colour question on AR, never
+on mean IoU.**
 
-**Amplitudes.** RGB's converged response is **0.785× of gray on both median and max**, against a
-prediction of 0.685–0.790× computed from `‖taps‖₂ / 2^out_shift` summed over the bank. Do NOT
-size RGB from early frames: at f1-4 the ratio reads ~1.03× because the filter is barely trained,
-and trusting that over the weights model was a wrong call made on this project. `calib_report.py`
-flags RGB as UNDERSHOOT (response med 22.2%, max 38.5%) — advisory only: the band is calibrated
-for gray at `BIAS_SCALE=127`, and PSR went UP, which is the metric a quantization floor shows in.
-
-### THE SYNTHETIC SCENE IS A WEAK COLOUR STIMULUS — do not read accuracy from it
-
-`FRAME_RGB_MODE=1` tints one luma image per plane, i.e. `plane_p ≈ a_p·luma + b_p`. That is
-**rank-1 across the plane dimension**: there is no chromatic texture independent of luma, and a
-colour-opponent channel sees a scaled copy of luma rather than real chroma. Hence ch0 lands at
-0.52× (between the 0.09× replicated case and the 1.25× decorrelated case) instead of 1.25×.
-**A good IoU on this scene is NOT evidence for the VOT result below.** The offline accuracy and
-failure-rate numbers stay the claim of record until real video is fed through the board.
-
-### Why RGB — the offline evidence (still the accuracy claim of record)
-
-Reproducible from `scripts/rgb_vs_gray_*.py`:
+Supporting offline measurements (`scripts/rgb_vs_gray_*.py`):
 
 | measurement | gray | RGB |
 |---|---|---|
 | feature-bank rank / participation ratio | 9 (hard cap) / 4.94 | 16 / 7.43 |
 | held-out Bolme PSR (147 paired evals, car1) | 12.97 | 21.18 (**+1.63×**) |
 | VOT supervised failures (16 seq, 5971 frames) | 51 | **42 (−18%)** |
-| VOT supervised accuracy | 0.4484 | 0.4642 (+0.016) |
 | conv2d scheduled cycles/frame (ch16) | 4.60 ms | 9.19 ms (**2.00×**) |
 
-The offline control scores 55 failures against gray's 51 and PSR 28.67 against 33.86 — it
-reproduces gray, as the hardware control now does. Per sequence the failure delta is 6 wins /
-8 ties / 2 losses and survives dropping `tiger` (40 → 37). Read accuracy and failures together:
-RGB survives 18% longer between resets, so its accuracy is measured on harder frames.
+**Why the collapse costs anything.** A 3×3 grayscale kernel lives in 9 dimensions, so 16
+channels CANNOT be independent — the cap is structural, not a property of the pretrained
+weights. BT.601 guts the four colour-opponent channels: 0/2/9/10 keep 0.32/0.60/0.63/**0.037**
+of the per-plane norm against 1.24–1.39 for the achromatic ones, and per-channel int8 then
+renormalises that residue to full scale. ch0/ch9/ch14 sit within 2–6° of one line in gray,
+59–72° apart in RGB.
 
-**Why the collapse costs anything.** A 3×3 grayscale kernel lives in 9 dimensions, so 16 channels
-CANNOT be independent — the cap is structural, not a property of the pretrained weights. BT.601
-guts the four colour-opponent channels: 0/2/9/10 keep 0.32/0.60/0.63/**0.037** of the per-plane
-norm against 1.24–1.39 for the achromatic ones, and per-channel int8 then renormalises that
-residue to full scale. ch0/ch9/ch14 sit within 2–6° of one line in gray, 59–72° apart in RGB.
+**The 08-24 validation, kept for its method.** Three 200-frame arms, one variable each
+(`run_0824_1354`/`_1432`/`_1442`). The colour-free control — same 27 taps, bias, quantization
+grid and joint normalization, fed three IDENTICAL luma planes — reproduced grayscale's
+decisions **bit-for-bit on all 199 frames**, which validates the whole RGB datapath against a
+known-good reference AND proves the 1.65× PSR floor is colour and not bookkeeping. ch0's
+`F_ch` collapse to 0.084× of gray was PREDICTED at 0.09× from the exported weights alone —
+the sharpest confirmation in this file that the weight-collapse model is right, and what makes
+ch0's `F_ch` the cheap on-board colour-path test.
 
-**stb2022, CLOSED LOOP, 8 SEQUENCES, 2841 FRAMES — RGB IS A TIE ON MEAN IoU (2026-08-25).**
-`rgb_vs_gray_loop.py --sequence`, full sequences, gray / RGB / colour-free control:
-
-| | car1 | tiger | nature | crabs1 | book | soccer2 | animal | ball3 | frame-wtd |
-|---|---|---|---|---|---|---|---|---|---|
-| gray | 0.7131 | **0.1696** | 0.1121 | 0.0188 | **0.0187** | 0.0141 | 0.0227 | 0.0366 | 0.2533 |
-| RGB | **0.7237** | 0.1526 | 0.1121 | **0.0230** | 0.0184 | **0.0177** | **0.0257** | **0.0372** | **0.2544** |
-| control | 0.7130 | 0.1696 | 0.1101 | 0.0188 | 0.0187 | 0.0141 | 0.0227 | 0.0366 | 0.2526 |
-
-RGB wins five, loses two, ties one, for **+0.0011 frame-weighted — noise**. The colour-free
-control reproduces gray to 4 decimal places on five of eight sequences, so the comparison is
-sound and the answer really is "no difference". **This CONFIRMS rather than contradicts the
-claim of record**: RGB was never an accuracy change (mean IoU moved the wrong way on the
-synthetic hardware arm too, 0.9188 → 0.9173). Its claim is **failures**, −18% under the
-supervised protocol — a robustness metric mean IoU cannot express, since a tracker that survives
-longer is scored on harder frames. **To decide RGB on stb2022, run the supervised/AR protocol,
-not this table**; `rgb_vs_gray_vot.py` is that harness and still discovers sequences only under
-`test-sequences/`.
-
-**THAT PROTOCOL HAS NOW BEEN RUN, ON HARDWARE, OVER ALL 62 — AND RGB WINS IT (2026-08-27).**
-`~/vot/analysis/full62`, 419 runs per arm, both arms verified run-name-and-length against the
-dataset's own anchors before analysis:
-
-| arm | accuracy | robustness | EAO | frames tracked |
-|---|---|---|---|---|
-| gray `H_SHIFT=14` | 0.4890 | 0.2743 | 0.1367 | 48,603 |
-| **RGB `H_SHIFT=15`** | **0.5043** | **0.3065** | **0.1474** | **54,813** |
-
-Per sequence, robustness better on 37 / worse on 15 / tied on 10; accuracy better on 32 /
-worse on 27 / tied on 3. The largest swings are all RGB gains and all in ROBUSTNESS:
-`car1` 0.634 -> **1.000** (tracked to the end from all 15 anchors), `book` +0.311,
-`lamb` +0.272, `drone_across` +0.243.
-
-**This is the claim of record, and it is the one the offline work predicted.** RGB was never
-an accuracy change — the mean-IoU table above is a tie, the synthetic hardware arm moved the
-wrong way (0.9188 -> 0.9173), and the offline supervised protocol said **failures**, -18%.
-The board now says the same thing in the challenge's own units: **12.8% more frames survived**,
-which is exactly what a robustness win looks like and what mean IoU structurally cannot
-express. See the `H_SHIFT` confound noted under "Where this tracker sits".
-
-**Retired — "RGB is handicapped by its larger `out_shift`."** 27 taps triple `ACC_MAX_THEORY`,
-pushing mean out_shift 3.69 → 4.25 (confirmed on the shipping export). But forcing gray's shifts
-onto RGB (`--match-shift`) makes it **worse**, 42 → 53 failures, with 0.0000% saturation at all
-three clip sites — so it is not clipping. Hypothesis: the per-channel re-weighting of the shared
-denominator `B = Σ|F|²`. Not verified, and hardware did not need it.
+**THE SYNTHETIC SCENE IS A WEAK COLOUR STIMULUS.** `FRAME_RGB_MODE=1` tints one luma image per
+plane, i.e. **rank-1 across the plane dimension**: no chromatic texture independent of luma, so
+a colour-opponent channel sees a scaled copy of luma. ch0 lands at 0.52× instead of the
+decorrelated 1.25×. **A good IoU on that scene is NOT evidence for the VOT result above.**
 
 ### The datapath, end to end
 
 **The wire format is pixel-interleaved, the line buffer is planar.** roi_crop must send
 interleaved (planar would need whole planes resident); conv2d de-interleaves into three 3-row
-buffers as it unpacks, which costs index arithmetic and ~1.2 KB. Without it `load_unaligned_v`
+buffers as it unpacks, costing index arithmetic and ~1.2 KB. Without it `load_unaligned_v`
 gathers `[R G B R G B…]` and the MAC loop needs shuffles. Three int32 words carry exactly four
 RGB pixels: `R0 G0 B0 R1 | G1 B1 R2 G2 | B2 R3 G3 B3`.
 
-**`roi_crop` Stage A**, at `ROI_IN_CH=3` (driven from `CONV_IN_CH`): all three planes share one
-geometry and one set of bilinear weights — only the `+p` byte offset differs — and the frame is
-interleaved in DDR, so one source pixel's three taps are contiguous. Normalization is **JOINT**:
-one mean and one `inv_q` over all 3·pr·pc samples. Per-plane statistics would equalize the planes
-and delete exactly the chromatic contrast RGB exists for — silent, and self-defeating. This
-matches `rgb_vs_gray_holdout.stage_a_rgb`, the model the 51 → 42 result was measured with.
-Scratch buffer 16 → 48 KB. `sum_x2` peaks at 2.111e14 against `ap_uint<48>`'s 2.815e14, so **a
-fourth plane would not fit** and the reference asserts the width.
+**`roi_crop` Stage A** at `ROI_IN_CH=3`: all three planes share one geometry and one set of
+bilinear weights — only the `+p` byte offset differs — and the frame is interleaved in DDR, so
+one source pixel's three taps are contiguous. Normalization is **JOINT**: one mean and one
+`inv_q` over all 3·pr·pc samples. Per-plane statistics would equalize the planes and delete
+exactly the chromatic contrast RGB exists for — silent, and self-defeating. Scratch 16 → 48 KB.
+`sum_x2` peaks at 2.111e14 against `ap_uint<48>`'s 2.815e14, so **a fourth plane would not fit**
+and the reference asserts the width.
 
-**The host keeps the scene in LUMA and colourises on the way out.** Every scene function —
-background, pan/dirty-rect restore, target injection, noise, occluder — and `scale_extract`'s 33
-crops are single-plane and stay that way; one pass expands the touched rect into the interleaved
-buffer. At `CONV_IN_CH=1` there is no second buffer and no copy, so the shipping path pays
-nothing. `scale_extract` reads luma, so **the DSST scale filter needs no recalibration at all**.
-The invariant is that every luma write reaches `scene_touch()`; miss one and the device reads
-last frame's colour there, which looks like a slightly worse tracking result rather than a bug.
-`SCENE_VERIFY=1` re-colourises the whole frame and aborts with coordinates.
+**The host keeps the scene in LUMA and colourises on the way out.** Every scene function and
+`scale_extract`'s 33 crops are single-plane; one pass expands the touched rect into the
+interleaved buffer. At `CONV_IN_CH=1` there is no second buffer and no copy. `scale_extract`
+reads luma, so **the DSST scale filter needs no recalibration**. The invariant is that every
+luma write reaches `scene_touch()`; miss one and the device reads last frame's colour there,
+which looks like a slightly worse tracking result rather than a bug. `SCENE_VERIFY=1` catches it.
 
-**The RGB conv2d stack — fixed 2026-08-23.** `make graph CONV_IN_CH=3` used to fail at the
-link-stage stack check: `Stack size requirement of total (1344 + 0) bytes for 15_0 exceeds the
-allotted stack size of 1024 bytes`, producing NO `libadf.a`. The per-kernel *compile* succeeds
-either way, which is why the cycle schedules below were readable from a build that never linked —
-and is exactly why it went unnoticed. **Confirmed pre-existing by counterfactual**: the branch
-with its original literal weight offsets gives the identical 1344 bytes, so it was not an
-artifact of the layout refactor. Fix: `stack_size(conv2d) = CONV2D_STACK` (2048) in
-`mosse_graph.h`, applied **only** at `CONV_IN_CH=3`. No kernel arithmetic changed. **Verified
-from the linker log both ways**: the RGB build allocates `MG(15,0) size: 0x800` while every other
-node stays `0x400`; the grayscale build allocates `0x400` everywhere. The RGB schedules are
-byte-for-byte the pre-fix ones, which is the correct outcome for a memory-allocation change. The
-cause is the 27-tap chain — three planes of live vectors plus the fixed post chain (downshift /
-clip / B1 / two Hann multiplies, each an `int32 × CONV_VEC` vector) spilling where nine taps did
-not.
+**The RGB conv2d stack.** `make graph CONV_IN_CH=3` used to fail the link-stage stack check
+(1344 bytes against 1024) producing NO `libadf.a`, while the per-kernel *compile* succeeded
+either way — which is why it went unnoticed. Fix: `stack_size(conv2d) = CONV2D_STACK` (2048),
+applied **only** at `CONV_IN_CH=3`. No kernel arithmetic changed; the RGB build allocates
+`MG(15,0) size: 0x800` while every other node stays `0x400`.
 
 **The RGB branch is VECTORIZED, not scalar** — 27 `aie::mac` with `load_unaligned_v`. The
-`static_assert(CONV_IN_CH == 1, "vectorized path is grayscale-only")` guards the SEPARATE
-grayscale block, which the RGB branch returns before reaching. Reading its 27 hoisted `int8_t`
-*weight* scalars as a scalar datapath is an easy mistake and makes the 219-cycle schedule look
-far worse than it is.
+`static_assert(CONV_IN_CH == 1)` guards the SEPARATE grayscale block, which the RGB branch
+returns before reaching. Reading its 27 hoisted `int8_t` *weight* scalars as a scalar datapath
+makes the 219-cycle schedule look far worse than it is.
 
 ### Testing — and why each suite means anything
 
@@ -1547,80 +1485,60 @@ is worth nothing until it has been shown to fail.
 | `make test_scene` | interleave, Q8 gains, saturation, clipping, missed `scene_touch()` | 8 of 8 |
 | `make x86sim_check … s6rgb` | the real 27-tap kernel vs `simulate_conv2d`, 16384/16384 | de-interleave 48.4%, dropped MAC 22.8% |
 
-The survivors are informative, not gaps: `rgb_flat` survives everything (var 0 → all zeros
-regardless), and a dropped plane index survives `rgb_gray_control` because with three identical
-planes it genuinely IS a no-op. **A suite built only from replicated-luma frames would have
-caught none of that mutant** — which is why the RGB test frames use decorrelated planes.
+The survivors are informative: `rgb_flat` survives everything (var 0 → all zeros regardless),
+and a dropped plane index survives `rgb_gray_control` because with three identical planes it
+genuinely IS a no-op. **A suite built only from replicated-luma frames would have caught none of
+that mutant** — hence decorrelated planes in the RGB test frames. `s6rgb` writes to its OWN
+directory (overwriting `s6` would silently feed RGB vectors to a grayscale check) and its patch
+comes from `roi_crop_ref.stage_a_rgb`, not s6's float shortcut. **Only ONE RGB scenario exists,
+on purpose**: RGB changes conv2d and nothing downstream.
 
-`s6rgb` writes to its OWN directory: overwriting `s6` would silently feed RGB vectors to a
-grayscale check, and the two are indistinguishable from outside. Its patch comes from
-`roi_crop_ref.stage_a_rgb` — the exact integer Stage A — not from s6's float shortcut, which
-differs from the kernel on 40.9% of samples. **Only ONE RGB scenario exists, on purpose**: RGB
-changes conv2d and nothing downstream (`N_CHANNELS` is conv2d's OUTPUT count), so s0-s4 would
-test identical arithmetic with three times the stimulus.
+### Cost — RGB COSTS WHAT THE HOST PAYS, NOT WHAT conv2d COSTS
 
-The colour pass is its own translation unit (`scene_colour.{h,cpp}`, no XRT header) for the
-reason `mosse_filter` is — off-board testability. `verify()` and `colourise()` share
-`colourise_rect()`, because a verifier carrying its own copy of the rule proves only that two
-copies agree.
+**conv2d 2.00×**, from the compiler's schedules, reproduced byte-for-byte by the build that
+linked:
 
-### Cost — predicted offline, then measured on hardware
+| loop | gray | RGB | ratio |
+|---|---|---|---|
+| stream read, per 4 px | 28–31 cyc | 84–87 cyc | **3.00×** |
+| MAC + post, per 16 px | 163 cyc | 219 cyc | 1.34× |
+| per frame at ch16, 1 GHz | 4.60 ms | 9.19 ms | **2.00×** |
 
-- **conv2d 2.00×**, from the compiler's schedules. The 08-24 RGB build that actually LINKED
-  reproduces them byte-for-byte, so the figure no longer rests on a build that never linked:
+**The stream read goes from 44% of conv2d to 61%** — RGB makes the already-dominant term more
+dominant, because the patch is re-streamed once per output channel. The RGB MAC loop does NOT
+software-pipeline (`219 (exceeds -k 64) → no folding`, critical cycle 200 against gray's 24),
+so 219 is a give-up number a tuned variant could plausibly beat.
 
-  | loop | gray | RGB | ratio |
-  |---|---|---|---|
-  | stream read, per 4 px | 28–31 cyc | 84–87 cyc | **3.00×** |
-  | MAC + post, per 16 px | 163 cyc | 219 cyc | 1.34× |
-  | per frame at ch16, 1 GHz | 4.60 ms | 9.19 ms | **2.00×** |
+**Two traps in reading those schedules.** (1) `aiecompiler` reuses a cached per-kernel object
+when the preprocessed source is unchanged, so a `CONV_IN_CH=1` baseline silently reports NO
+conv2d schedule — `rm -rf $(BUILD_DIR)/Work $(BUILD_DIR)/libadf.a` first. (2) The "conv2d 140
+cyc/16px" figure in the Makefile is the `main_` WRAPPER block, and does not move when the
+arithmetic triples.
 
-  **The stream read goes from 44% of conv2d to 61%** — RGB makes the already-dominant term more
-  dominant, because the patch is re-streamed once per output channel. **The RGB MAC loop does NOT
-  software-pipeline**: `(algo 1a) -> # cycles: ..219 (exceeds -k 64) -> no folding`, critical
-  cycle 200 against gray's 24, resource floor 90. So 219 is a give-up number and a tuned variant
-  (smaller `CONV_VEC`, or splitting the 27 MACs) could plausibly beat it. Treat 2.00× as an upper
-  bound on the MAC half and a hard floor on the read half.
-- **Two traps in reading those schedules.** (1) `aiecompiler` reuses a cached per-kernel object
-  when the preprocessed source is unchanged, so a `CONV_IN_CH=1` baseline silently reports NO
-  conv2d schedule — `rm -rf $(BUILD_DIR)/Work $(BUILD_DIR)/libadf.a` first. (2) The "conv2d 140
-  cyc/16px" figure in the Makefile is the `main_` WRAPPER block, not conv2d's body: it measures
-  130/135 identically in both arms, i.e. it does not move when the arithmetic triples.
-- **Host cost, MEASURED 08-24** (`run_0824_1432` vs `run_0824_1354`): `roi_crop launch`
-  0.993 → 1.456 ms (predicted ≈ +1.1 ms for 3× the bilinear taps), `colourise RGB` 0.31 ms,
-  **GMIO unchanged at 11.23 vs 11.14 ms and the same transaction count** — RGB touches none of
-  the DMA or the CPU-bound APU tail, as predicted. `frame_bo` 2 → 6 MB.
-- **Caching the patch in conv2d's tile does not fit.** At `FFT_ROW_WS=64` the output window is
-  32 KB and its ping-pong is 64 KB — the whole tile. A 48 KB RGB patch cache would force
-  `FFT_ROW_WS` down, and 64→32 cost 10.2 ms/frame on hardware. Net loss.
-- **RGB COSTS WHAT THE HOST PAYS, NOT WHAT conv2d COSTS.** Measured `run_0824_1457` (RGB,
-  `VERBOSITY=0`) against `run_0821_1725` (gray): **28.58 ms = 34.99 FPS vs 26.29 = 38.04**, so
-  +2.29 ms. conv2d's +4.59 ms of AIE compute **does not appear in the frame at all** — `GMIO`
-  total is unchanged (11.133 vs 11.134) and the host's blocking `wait()` is unchanged (4.55 vs
-  4.51 ms). The whole +2.29 is host-side and adds up:
+Measured `run_0824_1457` vs `run_0821_1725`: **28.58 ms vs 26.29**, so +2.29 ms — and conv2d's
++4.59 ms of AIE compute **does not appear in the frame at all** (GMIO total unchanged, 11.133 vs
+11.134; blocking `wait()` unchanged, 4.55 vs 4.51). The whole +2.29 is host-side:
 
-  | stage | gray | RGB | delta |
-  |---|---|---|---|
-  | frame push (`frame_bo` 2 → 6 MB) | 0.472 | 1.385 | **+0.91** |
-  | roi_crop launch (3× bilinear taps) | 1.013 | 1.471 | +0.46 |
-  | colourise RGB (new pass) | — | 0.338 | +0.34 |
-  | `frame_bo.sync` | 0.116 | 0.304 | +0.19 |
-  | filter upd+quant | 4.806 | 5.215 | +0.41 |
-  | **frame** | **26.29** | **28.58** | **+2.29** |
+| stage | gray | RGB | delta |
+|---|---|---|---|
+| frame push (`frame_bo` 2 → 6 MB) | 0.472 | 1.385 | **+0.91** |
+| roi_crop launch (3× bilinear taps) | 1.013 | 1.471 | +0.46 |
+| colourise RGB (new pass) | — | 0.338 | +0.34 |
+| `frame_bo.sync` | 0.116 | 0.304 | +0.19 |
+| filter upd+quant | 4.806 | 5.215 | +0.41 |
+| **frame** | **26.29** | **28.58** | **+2.29** |
 
-  **The offline "~30 FPS, bracket 27-34" was arithmetically fine and its PREMISE was wrong** — it
-  costed conv2d as if AIE time were frame time. It is not: the frame is 84% CPU-bound, so the AIE
-  had slack and absorbed the doubling. Third time a self-consistent offline model has been
-  overturned by its premise on this project. **The lever for RGB speed is host memory traffic
-  (`frame push`, `colourise`), not the 27 taps.**
-- **No alignment obstacle** — the old "does not divide evenly into 16-byte beats" was false twice
-  over: the PLIO is 32-bit, and 128·128·3 = 49152 B divides exactly.
-  See [[verify-stated-blockers-arithmetically]].
+**The offline "~30 FPS" prediction was arithmetically fine and its PREMISE was wrong** — it
+costed conv2d as if AIE time were frame time. The frame is 84% CPU-bound, so the AIE had slack
+and absorbed the doubling. Third time a self-consistent offline model has been overturned by its
+premise here. **The lever for RGB speed is host memory traffic, not the 27 taps.**
 
-**Calibration is DONE** — see the hardware table above. The gray `BIAS_SCALE=roi` run went
-first deliberately (one variable against a known-good comparator); `ARM=rgb` moves the bias
-scale, the feature bank and the input scale at once, and a bad result would have been
-unattributable. That ordering is why the RGB result was readable on the first try.
+**Retired — "RGB is handicapped by its larger `out_shift`."** 27 taps triple `ACC_MAX_THEORY`
+(mean out_shift 3.69 → 4.25), but forcing gray's shifts onto RGB (`--match-shift`) makes it
+**worse**, 42 → 53 failures, with 0.0000% saturation at all three clip sites. Not clipping.
+**Caching the patch in conv2d's tile does not fit**: at `FFT_ROW_WS=64` the output window's
+ping-pong is already the whole 64 KB tile. **No alignment obstacle** — the PLIO is 32-bit and
+128·128·3 = 49152 B divides exactly. See [[verify-stated-blockers-arithmetically]].
 
 ## Weight export
 
@@ -1642,10 +1560,13 @@ this one); Q4 post-ReLU maps through conv2d's exact integer datapath (patch-spec
 ## Build commands
 
 ```bash
-make weights                       # export layer-1 INT8 weights + hanning table
+# DEFAULTS ARE THE SHIPPING ARM since 2026-08-28 (CONV_IN_CH=3 H_SHIFT=15
+# MOSSE_ETA=0.05 PSR_GATE_MIN=5.0). Pass CONV_IN_CH=1 for the grayscale arm --
+# the gray aiesim scenarios and the 17 gray roi_crop cases need it explicitly.
+make weights                       # export layer-1 INT8 weights + hanning table (RGB, 27 taps)
                                    #   BIAS_SCALE=roi by default since 2026-08-23;
                                    #   BIAS_SCALE=127 reverts to the pre-correction file
-make weights CONV_IN_CH=3          # ...as 27-tap RGB instead of the luminance collapse
+make weights CONV_IN_CH=1          # ...as the 9-tap BT.601 luminance collapse instead
 make gen_vectors                   # generate aiesim test vectors
 make graph                         # compile AIE graph only — use this to answer placement
                                    #   questions (5 min) instead of a 25-min package
@@ -1665,6 +1586,12 @@ env -u PYTHONPATH -u PYTHONHOME ./.venv/bin/python scripts/rgb_vs_gray_holdout.p
 env -u PYTHONPATH -u PYTHONHOME ./.venv/bin/python scripts/rgb_vs_gray_loop.py      # closed loop, 1 seq
 #   ... --sequence tiger   picks the sequence ($VOT_ROOT stb2022 first, then test-sequences/).
 #   Reproduces the board's frozen-detector failures at 3.5 s per 100 frames.
+#   ... --arms rgb rgb-warp8  is Bolme 3.4's N-sample init (see Settled). The warp
+#   set is restricted to what roi_crop can PRODUCE -- translation and scale; there is
+#   deliberately no rotation knob in warp_set(), and --warp-rot models the HOST
+#   pre-rotation route instead. --warp-aspect uses roi_h/roi_w independently (free on
+#   the board). --warp-mutant {gsign,noshift} are the negative controls, banner-printed
+#   and invalidating. --eps-rel reaches Bolme's unregularized regime.
 #   ... --arms gray gray-float   is the QUANTIZATION COUNTERFACTUAL: gray-float and
 #   rgb-float run the same loop with unquantized folded-BN weights, no out_shift, no
 #   int16 clips and a float Hann. Everything else is identical, and since the model is
@@ -1677,9 +1604,12 @@ env -u PYTHONPATH -u PYTHONHOME ./.venv/bin/python scripts/rgb_vs_gray_vot.py   
 #   missing DSST scale filter); the two modes BRACKET what scale handling is worth.
 #   uv sync --extra weights  installs torch/torchvision (needed for the folded weights).
 make scale_sim                     # closed-loop DSST scale sim — reproduces the f130 stall
-make test_roi_crop                 # native bit-exact roi_crop test. BOTH arms: 17 gray +
-                                   #   8 RGB cases, zero tolerance. A build matching no
-                                   #   case exits 2 rather than passing vacuously
+make test_roi_crop                 # native bit-exact roi_crop test. ROI_IN_CH is
+                                   #   COMPILE-TIME, so one build runs one arm: the default
+                                   #   runs the 8 RGB cases and skips 17, and
+                                   #   CONV_IN_CH=1 runs the 17 gray and skips 8. Zero
+                                   #   tolerance; a build matching no case exits 2 rather
+                                   #   than passing vacuously. RUN BOTH before shipping
 make test_scene                    # native test of the luma -> interleaved-RGB pass,
                                    #   including a deliberately missed scene_touch() so
                                    #   the verifier is known to fire, not assumed to
@@ -1698,14 +1628,14 @@ make test_vot_source               # native test of the VOT manifest parser, blo
 make test_vot_format               # the BOARD's trajectory writer read back by the
                                    #   toolkit's OWN reader, with the centre -> top-left
                                    #   conversion re-derived in Python. Needs the venv
-make x86sim_check KUT=conv2d SCENARIO=s6 CONV2D_MODE=0   # bit-exact kernel diff (seconds)
+make x86sim_check KUT=conv2d SCENARIO=s6 CONV2D_MODE=0 CONV_IN_CH=1   # bit-exact, gray
 make x86sim_check KUT=cmul   SCENARIO=s7                 # ...same for cmul_accum
 make x86sim_check KUT=cmul   SCENARIO=cmul_stress        # ...exercising sat16's rails
 #   cmul needs CMUL_SPLIT_ACCUM=0 here — kernel_only_graph leaves cmul.in[2]
 #   unconnected otherwise and the x86sim graph refuses to compile.
-make x86sim_check KUT=conv2d SCENARIO=s6rgb CONV_IN_CH=3 # RGB conv2d, 27 taps, bit-exact
-                                   #   needs `make weights CONV_IN_CH=3` and
-                                   #   `make gen_vectors CONV_IN_CH=3` first
+make x86sim_check KUT=conv2d SCENARIO=s6rgb              # RGB conv2d, 27 taps, bit-exact
+                                   #   needs `make weights` and `make gen_vectors` first
+                                   #   (both now default to RGB)
 make aiesim CMUL_SPLIT_ACCUM=0     # AIE simulator — bypasses PatchIn→conv2d→row-FFT
 make aiesim_plio                   # same, but forces the REAL PatchIn path
 make aiesim_plio CONV2D_MODE=2     # bisect: conv2d synthesizes output, never reads the stream
@@ -1773,53 +1703,64 @@ design/
 └── exec_scripts/run_script.sh
 scripts/  export_weights.py, gen_aiesim_vectors.py, gen_filter_golden.py,
           check_collapse.py, check_kernel_bitexact.py, phase1_sweep.py, roi_crop_ref.py,
+          gen_roi_crop_golden.py, synth_frame.py, sweep_shift.sh, fix_sd_rootfs.sh
           conv_weight_layout.py  # Python mirror of conv_weight_layout.h. EVERY reader of
                               #   layer0_weights.bin goes through it; the tag byte makes a
-                              #   layout mismatch loud instead of plausible.
-          gen_roi_crop_golden.py, synth_frame.py, sweep_shift.sh, fix_sd_rootfs.sh
-          calib_build.sh      # hardware build for a shift-budget or bring-up run: pre-flight,
-                              #   then verifies the FLAGSTAMPS against the intended config and
-                              #   records calib_cfg.txt. Budget defaults are DERIVED from the
-                              #   Makefile (print-%), never copied. ARM=gray|rgb, MODE=budget|
-                              #   bringup, H_SHIFT=, FRAME_RGB_MODE=, SCENE_VERIFY=, COMPARATOR=
-          vot_prepare.py      # VOT sequences -> board-ready blobs + manifests, and the
-                              #   verifier (mutation-tested) that says the conversion was
-                              #   faithful. THE groundtruth reduction lives here --
-                              #   rgb_vs_gray_vot.load_gt imports reduce_box from it
-          vot_roundtrip.py    # Phase 0b: toolkit result format, written and read with the
-                              #   toolkit's own writers/readers over a fake workspace
-          vot_check_trajectory.py  # the BOARD's writer against the toolkit's reader
-          board_provision.sh  # writes a static end0 address and root's authorized_keys
-                              #   into the rootfs (or into an sd_card.img's partition 2)
-                              #   with debugfs -- no root, no loop device. sshd is
-                              #   already enabled in the stock image
-          vot_sweep.sh        # drives a whole sweep from the PC over ssh: mount, push the
-                              #   ELF, guard the build, run each sequence, collect, ingest.
-                              #   --dry-run prints every remote command
-          vot_motion_check.py # does a sequence's ANNOTATED motion appear in the pixels?
-                              #   NCC of the box content at "moved" vs "still". No
-                              #   tracker, no board. Phase correlation cannot answer
-                              #   this -- it returns the window's dominant motion
-          vot_traj_anatomy.py # a board trajectory vs groundtruth, in units of the
-                              #   tracker's own BIN. Prints the one number that
-                              #   discriminates a resolution limit from a pinned
-                              #   detector: how often it reports no motion on a frame
-                              #   whose true motion exceeds a bin
-          vot_ingest.py       # board trajectories -> a toolkit workspace -> `vot analysis`.
-                              #   One directory per ARM. Re-derives every run name from the
-                              #   sequence's own anchors and checks each trajectory's LENGTH
-                              #   against the multistart order before analysing -- scan()
-                              #   only notices a MISSING file, and a wrong-length run is
-                              #   scored without complaint
-          calib_report.py     # turns a run's console+track.csv into a budget verdict
-                              #   (rails, amplitude early vs converged, IoU)
-          bg_pan_sweep.py     # picks BG_PAN_R/C from the texture spectrum, no hardware
-          mosse_loop_sim.py   # closed-loop MOSSE, centred-G vs shifted-G, no hardware
-          rgb_vs_gray_holdout.py / _loop.py / _vot.py   # gray vs RGB vs a colour-free
-                              #   control, on real VOT video. No hardware, minutes.
-                              #   _loop.py also carries the gray-float/rgb-float
-                              #   quantization counterfactual; conv_features_float
-                              #   lives in _holdout.py next to the integer one
+                              #   layout mismatch loud instead of plausible
+          calib_build.sh      # hardware build for a budget or bring-up run: pre-flight, then
+                              #   verifies the FLAGSTAMPS against the intended config. Budget
+                              #   defaults DERIVED from the Makefile (print-%), never copied
+          vot_prepare.py      # VOT sequences -> board blobs + manifests, and the
+                              #   mutation-tested verifier. THE groundtruth reduction lives
+                              #   here -- other readers import reduce_box from it
+          vot_sweep.sh        # drives a whole sweep over ssh: mount, push the ELF, guard the
+                              #   build, run, collect, ingest. --dry-run prints every command
+          vot_ingest.py       # board trajectories -> toolkit workspace -> `vot analysis`. One
+                              #   directory per ARM. Re-derives every run name from the
+                              #   sequence's anchors and checks each trajectory's LENGTH --
+                              #   scan() only notices a MISSING file, and a wrong-length run
+                              #   is scored without complaint
+          vot_roundtrip.py / vot_check_trajectory.py  # the toolkit's result format, and the
+                              #   BOARD's writer against the toolkit's reader
+          board_provision.sh  # static end0 address + root's authorized_keys into the rootfs
+                              #   (or an sd_card.img partition) with debugfs -- no root, no
+                              #   loop device. sshd is already enabled in the stock image
+          calib_report.py     # a run's console+track.csv -> a budget verdict (rails,
+                              #   amplitude early vs converged, IoU)
+  -- diagnosis, all offline, all reading existing CSVs or the dataset --
+          vot_motion_check.py # does a sequence's ANNOTATED motion appear in the PIXELS? NCC of
+                              #   the box content at "moved" vs "still". Phase correlation
+                              #   cannot answer this -- it returns the window's dominant motion
+          vot_detector_gain.py # IS THE DETECTOR THE PROBLEM? Regresses reported peak offset on
+                              #   annotated motion, per speed bucket, over accepted ON-TARGET
+                              #   frames. Answer: no, alpha 0.93 on targets that translate.
+                              #   --movers splits off sequences whose box moves while the
+                              #   pixels do not; WITHOUT that split the pooled 0.686 reads as a
+                              #   broken detector. NOTE it hardcodes padding 2.0
+          vot_loss_anatomy.py # what the tracker was DOING as it lost: gate verdict, PSR and box
+                              #   motion in the 5 frames before the first loss
+          vot_init_anatomy.py # INIT FAILURE or DRIFT? Time-to-first-loss under the toolkit's
+                              #   rule plus the IoU/PSR profile right after filter_init(). An
+                              #   init failure is visible at f1; a drifting run is not, and that
+                              #   is the whole discriminator. --drift-warning adds the
+                              #   relative-PSR reading WITH its control window. Keys on
+                              #   (job, frame)
+          vot_traj_anatomy.py # a board trajectory vs groundtruth in units of the tracker's own
+                              #   BIN -- discriminates a resolution limit from a pinned detector
+          vot_hold_budget.py  # frames before a frozen window loses the target, from groundtruth
+          vot_ar_offline.py   # VOT's failure rule applied to OFFLINE single-start runs. NOT the
+                              #   toolkit's AR -- different RUNS, same rule -- and its
+                              #   resolution is MEASURED at ~0.02 in R, including one pair it
+                              #   got BACKWARDS. Decides whether an arm deserves board time,
+                              #   never whether to accept one. Did NOT transfer on pad30
+  -- offline benches, no hardware, seconds to minutes --
+          mosse_loop_sim.py   # closed-loop MOSSE, centred-G vs shifted-G; --subbin sweeps
+                              #   resample ratio x speed
+          bg_pan_sweep.py     # picks BG_PAN_R/C from the texture spectrum
+          rgb_vs_gray_holdout.py / _loop.py / _vot.py   # gray vs RGB vs a colour-free control
+                              #   on real VOT video. _loop.py also carries the float
+                              #   quantization counterfactual, the pooling/resolution arms, and
+                              #   the -warp<N> init-perturbation arms with their mutants
 test-sequences/   VOT sequences + annotations (16 usable, 5971 frames). The annotation
                   directories are named inconsistently ("car1-annotations" but
                   "fernando - annotations"); the harness matches them loosely.

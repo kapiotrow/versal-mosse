@@ -256,7 +256,7 @@ def sat_frac():
     return SAT['clipped'] / SAT['total'] if SAT['total'] else 0.0
 
 
-def conv_features(patch, wq, bias, shift, mean_prev=None):
+def conv_features(patch, wq, bias, shift, mean_prev=None, relu=False):
     """patch: [n_in, R, C] int64. Returns (features [16,R,C] int64, per-ch mean).
 
     mean_prev=None means "this is the frame that supplies it" — B1 then uses the
@@ -281,6 +281,22 @@ def conv_features(patch, wq, bias, shift, mean_prev=None):
     SAT['clipped'] += int(np.count_nonzero((sh > 32767) | (sh < -32768)))
     SAT['total'] += int(sh.size)
     sh = np.clip(sh, -32768, 32767)
+
+    # CONV_RELU. Off in the shipping build, and the settled entry in CLAUDE.md
+    # says why: a DCF is linear in feature space, so a half-wave rectifier alone
+    # throws away half the signal and costs ~3x the peak/sidelobe ratio. It is
+    # exposed here because that argument does NOT survive adding pooling: HOG's
+    # deformation tolerance comes from aggregating a RECTIFIED signal, and
+    # averaging a signed edge map over a cell cancels the very lobes it is
+    # meant to summarise. relu+pool is the combination worth measuring; relu
+    # alone is the one already measured and rejected.
+    #
+    # Order matches the kernel exactly (conv2d_kernel.cpp): downshift -> ReLU
+    # -> subtract mean_prev -> Hann. B1 re-centres the rectified map, so the DC
+    # pedestal a rectifier introduces is removed by machinery that is already
+    # there.
+    if relu:
+        sh = np.maximum(sh, 0)
 
     own_mean = (sh.sum(axis=(1, 2)) // (R * C)).astype(np.int64)
     mp = own_mean if mean_prev is None else mean_prev

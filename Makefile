@@ -285,7 +285,19 @@ IFFT_COL_SHIFT      ?= 4
 #
 # SINGLE SOURCE OF TRUTH — reaches the AIE kernel, the host app and the vector
 # generator from this one line.
-H_SHIFT             ?= 11
+#
+# 15 is the SHIPPING value and it is deliberately OVER-shifted: it is what the
+# flashed a.xclbin was built with and what the whole VOT-STb2022 benchmark ran
+# on, with rails = 0 over 101,564 frames. The tight-but-safe RGB budget measured
+# from the uncensored distribution is 13 (12 rails); 15 sits at 44% of ceiling
+# and calib_report.py will call that UNDERSHOOT, which is advisory and intended.
+# Moving to 13 buys two bits of nothing and costs a reflash plus a full re-run of
+# both arms. Gray's equivalent over-shift arm is 14. Was 11 until 2026-08-28.
+#
+# THIS IS THE ONLY KNOB HERE THAT IS NOT HOST-ONLY — it reaches AIE_FLAGS, so
+# changing it needs a graph rebuild, re-package and re-flash, and vot_sweep.sh's
+# xclbin guard will correctly refuse until the card is updated.
+H_SHIFT             ?= 15
 
 # =========================================================
 # Paths
@@ -413,7 +425,11 @@ AIE_FLAGS  += --Xpreproc="-DCONV2D_ECHO_TEST=$(CONV2D_MODE)"
 # and VECTORIZED (27 aie::mac over CONV_VEC lanes; the static_assert on grayscale
 # guards the SEPARATE gray vectorized block, which RGB never reaches), roi_crop
 # YES, host YES. Remaining gap: gen_aiesim_vectors.py, and no hardware run.
-CONV_IN_CH ?= 1
+# 3 (RGB) is the SHIPPING arm: it wins accuracy, robustness and EAO on the full
+# 62-sequence benchmark and survives 12.8% more frames. Was 1 until 2026-08-28.
+# Grayscale is still fully supported and tested — pass CONV_IN_CH=1. Note the
+# grayscale AIESIM SCENARIOS need it explicitly (s6, not s6rgb).
+CONV_IN_CH ?= 3
 AIE_FLAGS  += --Xpreproc="-DCONV_IN_CH=$(CONV_IN_CH)"
 # conv2d's AIE stack in BYTES, applied only at CONV_IN_CH=3. The 27-tap MAC
 # chain measured 1344 against the 1024-byte default and the mapper REFUSED to
@@ -740,7 +756,11 @@ GCC_FLAGS  += -DB2_NULL_BINS=$(B2_NULL_BINS)
 # ratio that gen_aiesim_vectors.py calls PSR — different statistics, and they
 # differ by several times. No `f` suffix here: mosse_filter.h casts it, so 7, 7.0
 # and 7.5 all work.
-PSR_GATE_MIN ?= 7.0
+# 5.0 is the SHIPPING value: +0.0134 robustness on the full benchmark against
+# 7.0, on the eta=0.05 filter. Was 7.0 until 2026-08-28. ITS WORTH DEPENDS ON THE
+# PSR SCALE — a slower filter or a different feature geometry moves PSR and
+# re-opens this. 0 disables the LOW_PSR test only; it measured as a null.
+PSR_GATE_MIN ?= 5.0
 GCC_FLAGS  += -DPSR_GATE_MIN=$(PSR_GATE_MIN)
 
 # ---------------------------------------------------------------------------
@@ -959,7 +979,13 @@ GCC_FLAGS  += -DMOSSE_SIGMA=$(MOSSE_SIGMA) -DSIGMA_FACTOR=$(SIGMA_FACTOR)
 GCC_FLAGS  += -DSIGMA_FROM_TARGET=$(SIGMA_FROM_TARGET)
 
 # Learning rate. Bolme §3.3 uses 0.125; DSST §6.1 uses 0.025 for both filters.
-MOSSE_ETA      ?= 0.125
+#
+# 0.05 is the SHIPPING value: robustness 0.3065 -> 0.3283 (+7.1%), EAO +8.5%,
+# 13.9% more frames on the full benchmark. Was 0.125 until 2026-08-28. The sweep
+# is NOT monotone (0.025 is much worse), so this is a shallow optimum, not a
+# trend. Two of three mechanism falsifiers fired — the gain is real, the drift
+# explanation for it is not established. See runs/vot/eta05.md.
+MOSSE_ETA      ?= 0.05
 GCC_FLAGS  += -DMOSSE_ETA=$(MOSSE_ETA)
 
 # Background for the synthetic test frame: 1 = band-limited texture, 0 = the

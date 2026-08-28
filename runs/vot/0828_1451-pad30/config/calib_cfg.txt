@@ -1,0 +1,7 @@
+2026-08-26T15:41:41+02:00
+arm=rgb CONV_IN_CH=3 BIAS_SCALE=roi
+budget=4-4-4 total=16 H_SHIFT=15
+ITER_CNT=200 VERBOSITY=1 DUMP_BUFFERS=0
+mode=budget SCENE_VERIFY=0 FRAME_RGB_MODE=1
+weights_md5=2aa7031f1f537e1a4f073642c7d50f4a
+comparator=RGB OVER-SHIFT + DELIVERABLE ARM. H_SHIFT=15 (4 above the gray shipping 11) chosen so neither buffer can rail, so the full-62 run returns an UNCENSORED RGB amplitude distribution AND the first hardware AR report for the colour arm. Gray reference: motocross1 accum 33923 at H_SHIFT=14 (runs/vot/0826_1324-hs14survey), i.e. ~52% of rail at 15 on the gray scale; RGB's own amplitudes are UNKNOWN and are what this measures. Budget 4-4-4 unchanged. RGB accuracy claim of record is FAILURES (-18% offline), not mean IoU.
