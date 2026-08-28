@@ -464,8 +464,30 @@ in CSR-DCF is the ESTIMATION, not the masking. A per-frame mask estimated from c
 segmentation is a much larger piece of work than anything on this list and is not host-only in
 spirit even if it is in fact.
 
-**So §2 drops below §3.** The mask machinery stays in the bench behind `-mask<N>`, since an
-estimated mask would reuse all of it.
+**BUT THE BOARD-IMPLEMENTABLE MASK IS A DIFFERENT SHAPE, AND IT WINS.** The masks above are
+Tukey (flat plateau + cosine roll-off) and a plateau is a rect, so their spectra are NOT sparse —
+7 bins per axis for 99% of the energy, and truncating to 9 bins in 2D gives max error 0.30-0.50
+on a [0,1] mask. **Only a HANN-SHAPED mask (plateau 0, taper 1.0) is exactly 9 bins**, which is
+the Stage B2 identity and the only variant implementable host-side with no approximation. Swept
+separately over the same 62:
+
+```
+arm                  A        R   tracked/19903   meanIoU        dA        dR
+rgb             0.5394   0.2910            5792    0.1792
+rgb-mask50      0.5413   0.3033            6037    0.1939   +0.0020   +0.0123
+rgb-mask0       0.5048   0.3628            7221    0.2040   -0.0346   +0.0718
+```
+
+**dR +0.0718 is 3.6× the instrument's resolution and survives the symmetric trim (+0.0480)** —
+the only arm all day that does either. The `dA −0.0346` trips this file's own artifact rule and
+three checks clear it: mean IoU RISES where the mutant's fell; the hold rate moves only +0.64%
+of frames; and on the frames BOTH arms survived (identical 5563-frame set) the gap is
+**−0.0085**, i.e. three quarters of the accuracy loss is the harder frames a longer-surviving
+arm is scored on. See `runs/vot/proposed_build_mask.md`.
+
+**So §2 does NOT drop below §3 — it becomes the proposed hardware build.** The refutation above
+stands and is narrower than it first looked: it refutes the TIGHT box mask, not spatial
+reliability. The mask machinery stays in the bench behind `-mask<N>`.
 
 ## 3. Channel reliability in Stage B3 — the method it was missing
 

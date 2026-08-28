@@ -389,15 +389,48 @@ Localisation, the gate, quantization, saturation, pooling, feature resolution, p
 **init perturbations** are ALL exonerated or rejected (entries below). Ranked list and the
 supporting measurements: `runs/vot/robustness_proposals.md`. What is left is host-only:
 
-1. **A spatial mask on the filter, as a sparse-spectrum projection.** CSR-DCF's highest-priced
-   item (removing their mask: >50% EAO), and it needs NO host FFT: a separable raised-cosine
-   mask has a compact DFT — the periodic Hann's is exactly 9 bins, the identity Stage B2 is
-   built on — so `h ← m⊙h` is a 9-tap sparse 2-D convolution on the published `H`, ~2.4
-   MMAC/frame. It lands in `H`, so the AIE sees an already-masked filter and detection stays
-   consistent. **NOT `TARGET_PADDING` by another name**: padding moves the mask, px/bin, the
-   search range and the DSST extraction region at once, which is why pad30 was unattributable.
-   Expect to re-tune `PSR_GATE_MIN` on the same sweep — shrinking the filter's support moves
-   the PSR scale.
+1. **A spatial mask on the filter — MEASURED OFFLINE 2026-08-28, and it is the PROPOSED
+   HARDWARE BUILD.** `runs/vot/proposed_build_mask.md`. CSR-DCF's highest-priced item, applied
+   as a one-shot projection `h ← m⊙h` on the published `H` (`A`/`B` untouched), so the AIE sees
+   an already-masked filter and detection stays consistent. Host-only — an scp, not a card swap.
+   62 sequences, shipping eta/gate, `vot_ar_offline`:
+
+   ```
+   arm                  A        R   tracked/19903   meanIoU        dA        dR
+   rgb             0.5394   0.2910            5792    0.1792
+   rgb-mask50      0.5413   0.3033            6037    0.1939   +0.0020   +0.0123   (Tukey)
+   rgb-mask0       0.5048   0.3628            7221    0.2040   -0.0346   +0.0718   (Hann)
+   ```
+
+   **ONLY A HANN-SHAPED MASK IS EXACTLY 9 BINS, and this was written down wrong here first.**
+   The 9-bin claim comes from the Stage B2 identity and holds for a periodic Hann (3 bins per
+   axis, zero error). A **Tukey** mask — flat plateau plus roll-off — has a rect in it, and a
+   rect transforms to a sinc: 7 bins per axis for 99% of the energy, and truncating to 9 bins in
+   2D gives max error 0.30-0.50 on a mask whose range is [0,1]. So the tight-box arms that were
+   swept first are NOT board-implementable without a 49-tap convolution and its own truncation
+   study, and **the exactly-sparse shape is a much wider, smoother mask that behaves completely
+   differently.** Checking the claim is what found the result.
+   **dR +0.0718 is 3.6× the instrument's measured resolution and survives a symmetric trim
+   (+0.0480)** — the only arm of that day's twelve to do either. `dA −0.0346` trips the
+   failure-rule artifact test below and three checks clear it: mean IoU RISES where the `gsign`
+   mutant's fell; the hold rate moves only +0.64% of frames; and **on the frames BOTH arms
+   survived the gap is −0.0085** (see the selection-effect rule under Measurement methodology).
+   **The board is still required and not as a formality**: EAO is not computable offline and EAO
+   is the arbiter for an A/R trade (pad30 lost EAO while gaining R), and this is SINGLE-START
+   where the toolkit is 419 anchored runs — a mask concentrates its effect in a filter's early
+   life, so the protocol may cut either way. Median per-sequence dR is 0.0000: 35 of 62 are
+   untouched and the gain lives in 18.
+   **Two things measured before the arm, both load-bearing.** The filter's energy is centred at
+   the **PATCH CENTRE** (peak of `Σ|h|²` at (64,64); a corner-wrapped 64×64 box holds 8-12%),
+   even though `resp[0,0]` is the zero-displacement bin — masking at the response origin deletes
+   the filter and reads as "masking hurts". And a centred 64×64 box, exactly the target box at
+   padding 2, holds only **51.6% (`car1`) / 54.9% (`tiger`)** of the filter's energy, which is
+   CSR-DCF's complaint quantified on this design.
+   **NOT `TARGET_PADDING` by another name**: padding moves the mask, px/bin, the search range and
+   the DSST extraction region at once, which is why pad30 was unattributable. **Expect to re-tune
+   `PSR_GATE_MIN` on a second sweep** — masking moves the PSR scale (car1 mean PSR 48.2 → 36.7),
+   and the gate's worth is conditional on that scale. One variable at a time: mask first at the
+   inherited gate, then the gate.
 2. **Channel reliability in Stage B3, and it needs no per-channel response map.** B3 normalises
    by ENERGY, not discriminative power; the blocker was that `cmul_accum` sums channels before
    the IFFT. Both halves are available in the frequency domain by Parseval:
@@ -579,6 +612,14 @@ Two principles that have repeatedly earned their keep: **instruments before chan
   at dR +0.0567 / dA −0.0086 passes; the mutant at +0.0525 / −0.0975 does not, and the two are
   otherwise the same shape.) It also did its intended job — the bench is demonstrably NOT blind
   to warp geometry, which is what makes the init null readable.
+- **ACCURACY IS AVERAGED OVER TRACKED FRAMES, SO A LONGER-SURVIVING ARM IS SCORED ON HARDER
+  ONES — score A on the COMMON survived prefix before calling an accuracy drop real.** The
+  spatial-mask arm reads `dA = −0.0346` pooled, which trips the artifact test above; on the
+  frames BOTH arms survived (identical 5563-frame set) it is **−0.0085**, so three quarters of
+  the "loss" is the extra 24.7% of harder frames it reached. The same structural point is
+  already made about RGB ("a tracker that survives longer is scored on harder frames"), but it
+  was never turned into a control. It is one `min(progress(x), progress(y))` per sequence, and
+  without it a robustness win looks like an accuracy regression.
 - **`R = 0.3435` (the gsign mutant, OFFLINE) IS NOT `R = 0.3417` (the SHIPPING ARM).** They
   agree to three decimals by coincidence and mean opposite things. Every `vot_ar_offline`
   number is the toolkit's RULE on SINGLE-START runs, is biased ~0.02 high in R, and is
