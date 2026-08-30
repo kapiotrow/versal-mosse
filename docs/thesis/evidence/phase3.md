@@ -176,7 +176,7 @@ and tracks 411 frames of its own history — and fails at the same instant. That
 rules out accumulated drift and filter degradation as the cause and points at
 the scene: dataset frames 457-461 move 31.0, 49.0, 29.4, 23.8, **48.0** px
 against a box of ~93 px, i.e. roughly half the box per frame, twice, inside five
-frames. `car1`'s hold budget is 4 frames (`runs/vot/hold_policy.md`); this is
+frames. `car1`'s hold budget is 4 frames (`docs/thesis/evidence/hold_policy.md`); this is
 the event that spends it.
 
 **One anchor was a hypothesis; two independent anchors failing at the same frame

@@ -1,0 +1,8 @@
+# The +2.29 ms of RGB, all host-side. conv2d's +4.59 ms of AIE compute does not appear at all.
+stage,gray_ms,rgb_ms,delta_ms
+frame push (frame_bo 2 -> 6 MB),0.472,1.385,0.913
+roi_crop launch (3x bilinear taps),1.013,1.471,0.458
+colourise RGB (new pass),0.000,0.338,0.338
+frame_bo.sync,0.116,0.304,0.188
+filter update + quantize,4.806,5.215,0.409
+frame,26.29,28.58,2.29

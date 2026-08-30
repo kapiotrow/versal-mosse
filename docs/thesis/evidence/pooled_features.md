@@ -17,7 +17,7 @@
 
 ## Why it was worth running
 
-`runs/vot/detector_gain.md` exonerated localisation (alpha = 0.93 on targets that
+`docs/thesis/evidence/detector_gain.md` exonerated localisation (alpha = 0.93 on targets that
 translate) and left the feature bank as the ranking suspect: 16 channels of 3x3 conv at
 stride 1 is a 3-pixel receptive field on a ~73 px target, participation ratio 4.94 (gray) /
 7.43 (RGB). The literature prices this highest of anything cheap — KCF raw pixels -> HOG

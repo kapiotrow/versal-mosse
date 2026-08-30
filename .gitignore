@@ -43,3 +43,13 @@ runs/vot/0826_1324-hs14survey/
 runs/vot/0827_1313-streamA/
 runs/vot/0827_1318-streamB/
 runs/vot/0826_1346-rgbtest/
+# --- thesis hygiene (2026-08-30) ---
+# Vitis writes a timestamped copy of every tool log into the repo root.
+v++_*.backup.log
+_ide/workspace_journal_*.py
+Work/
+xcd.log
+AIECompiler.log
+# Generated figures are build products; the scripts in scripts/figs/ are the source.
+docs/thesis/figures/*.pdf
+docs/thesis/figures/*.png

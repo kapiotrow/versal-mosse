@@ -10,7 +10,7 @@
  * order scores as a tracker that runs backwards; a trajectory one entry short
  * scores as a tracker that stopped early; a blob read one frame short shifts
  * every frame after it. Phase 1 already lost every groundtruth box in 62
- * manifests to exactly this shape of bug (see runs/vot/phase1.md).
+ * manifests to exactly this shape of bug (see docs/thesis/evidence/phase1.md).
  *
  * MUTATION-TESTED, for the reason every RGB suite is: a passing test on a path
  * with no prior coverage is worth nothing until it has been shown to FAIL. Each

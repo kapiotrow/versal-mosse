@@ -54,7 +54,7 @@ image and the wrong answer to the benchmark.
 
 **So `nature` is a task mismatch, and it is 46% of the frames in the 8-sequence
 evidence set.** Any frame-weighted mean over that set is dominated by a sequence
-this tracker cannot be right about. Read `runs/vot/evidence_ar.md`'s per-sequence
+this tracker cannot be right about. Read `docs/thesis/evidence/evidence_ar.md`'s per-sequence
 table, not the aggregate, and do not tune anything against `nature`.
 
 **Phase correlation was the wrong instrument and nearly produced a fourth wrong

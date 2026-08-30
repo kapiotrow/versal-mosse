@@ -244,7 +244,7 @@ def run(arm, n_frames, vel, seed=0, verbose=True, ratio=1.0, subbin=False):
 def subbin_experiment(frames, quiet):
     """Does sub-bin motion compound into unbounded lag? MEASURED: no.
 
-    The hypothesis (runs/vot/subbin_lag.md) was that a target moving less than
+    The hypothesis (docs/thesis/evidence/subbin_lag.md) was that a target moving less than
     one patch bin per frame is reported as (0,0), the filter is then trained
     against a G centred at that (0,0), and the lag compounds forever. The first
     half is true and the second is not, and the reason is structural: the

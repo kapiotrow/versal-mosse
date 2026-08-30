@@ -1,0 +1,9 @@
+# VEK280 xcve2802-vsvh1760-2MP-e-S, measured on the 128x128 ch1 build. AIE core clock 1 GHz.
+# NOTE: runtime<ratio> is NOT utilization; the mapper's Utilization column shows declared budgets.
+resource,available,used,percent
+AIE-ML cores,304,6,2.0
+AIE-ML memory tiles,76,1,1.3
+BRAM18,1200,10,0.8
+DSP,1312,44,3.4
+LUT,520704,7694,1.5
+FF,1041408,7539,0.7

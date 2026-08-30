@@ -46,7 +46,7 @@
 #                    force one mode for every sequence in the sweep -- that is
 #                    the MODE-EQUIVALENCE TEST: streaming changes no arithmetic,
 #                    so the same sequence run both ways must come back with
-#                    IDENTICAL run-state digests. See runs/vot/TODO_board_memory.md
+#                    IDENTICAL run-state digests. See docs/thesis/evidence/TODO_board_memory.md
 #   --elf PATH       host ELF to push           (default: the hw build's)
 #   --out DIR        logs + config              (default: runs/vot/<date>-<arm>)
 #   --board HOST     (default 192.168.10.2)
@@ -135,7 +135,7 @@ if [[ -d "$RESDIR" ]] && compgen -G "$RESDIR/*.txt" >/dev/null; then
         echo "ERROR: $RESDIR already holds trajectories." >&2
         echo "       Pass --resume to continue that sweep, or pick another --arm." >&2
         echo "       (An arm silently overwriting another is a real, already-observed" >&2
-        echo "        failure -- see runs/vot/evidence_arm0.md.)" >&2
+        echo "        failure -- see docs/thesis/evidence/evidence_arm0.md.)" >&2
         exit 1
     fi
     echo "  resuming into $RESDIR ($(ls "$RESDIR"/*.txt 2>/dev/null | wc -l) trajectories present)"
@@ -186,9 +186,24 @@ fi
 
 # --- record what is about to run -------------------------------------------
 # Beside the results, not in a shared file that a later run can rewrite.
-for f in aie.flagstamp app.flagstamp crop.flagstamp calib_cfg.txt; do
-    [[ -f "$BUILD_DIR/$f" ]] && cp "$BUILD_DIR/$f" "$OUT/config/"
+# An unstamped run cannot be stamped after the fact: its numbers are unciteable
+# and the only repair is to sweep it again. So a missing flagstamp is FATAL here,
+# not a silent skip. calib_cfg.txt is advisory -- it only exists for builds made
+# through calib_build.sh -- so that one warns instead.
+for f in aie.flagstamp app.flagstamp crop.flagstamp; do
+    if [[ ! -f "$BUILD_DIR/$f" ]]; then
+        echo "FATAL: $BUILD_DIR/$f is missing -- this run would be unciteable." >&2
+        echo "       Rebuild through scripts/calib_build.sh, or delete $OUT and" >&2
+        echo "       accept that the arm cannot go in the thesis." >&2
+        exit 1
+    fi
+    cp "$BUILD_DIR/$f" "$OUT/config/"
 done
+if [[ -f "$BUILD_DIR/calib_cfg.txt" ]]; then
+    cp "$BUILD_DIR/calib_cfg.txt" "$OUT/config/"
+else
+    echo "  WARNING: no calib_cfg.txt (build did not come through calib_build.sh)"
+fi
 {
     echo "date       $(date -Is)"
     echo "arm        $ARM"

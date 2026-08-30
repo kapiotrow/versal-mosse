@@ -81,7 +81,7 @@ trap 'rm -rf "$TMP"' EXIT
 cp "$KEY" "$TMP/authorized_keys"
 cat > "$TMP/10-board.network" <<NET
 # Written by scripts/board_provision.sh — static, point-to-point, no DHCP.
-# The PC side is the other half of this link; see runs/vot/phase0a.md.
+# The PC side is the other half of this link; see docs/thesis/evidence/phase0a.md.
 [Match]
 Name=$IFACE
 

@@ -689,6 +689,107 @@ void filter_update(FilterState &st, const cfloat *F_all,
     st.initialized = true;
 }
 
+// -----------------------------------------------------------------------
+// FILTER_MASK — h <- m (.) h as a circular 3-tap separable convolution on H
+// -----------------------------------------------------------------------
+// See the header for the derivation. In short: DFT of a period-n raised cosine
+// is {n/2, -n/4, -n/4} on bins {0,+1,-1}, the mask is separable, and every
+// constant cancels against the transform pair's 1/(rows*cols), leaving
+//
+//     H <- D_row(D_col(H)) / 16,   D(X)[i] = 2X[i] - X[i-1] - X[i+1] circular.
+//
+// Two passes rather than one fused pass, because each output reads its two
+// neighbours along the axis and an in-place single pass would consume values it
+// has already overwritten. `scratch` holds the intermediate; one channel's map
+// is 128 KB at 128x128, inside the A72's 1 MB L2.
+void filter_mask_project(cfloat *H, int rows, int cols)
+{
+    // An axis shorter than 3 bins has no distinct neighbours: the circular D
+    // would read X[-1] == X[+1] == X[0] and return 2X - X - X = 0, deleting the
+    // filter rather than masking it. Skip that axis; a 1-D FilterState (the
+    // DSST scale filter) therefore passes through the column pass only.
+    const bool do_rows = (rows >= 3);
+    const bool do_cols = (cols >= 3);
+    if (!do_rows && !do_cols) return;
+
+    const size_t n = (size_t)rows * (size_t)cols;
+    static thread_local std::vector<cfloat> scratch;
+    if (scratch.size() < n) scratch.resize(n);
+
+    // Pass 1 — along the COLUMN index, within each row.
+    if (do_cols) {
+        for (int r = 0; r < rows; ++r) {
+            const cfloat *src = H + (size_t)r * cols;
+            cfloat       *dst = scratch.data() + (size_t)r * cols;
+            for (int c = 0; c < cols; ++c) {
+                const int cm = (c == 0)        ? cols - 1 : c - 1;
+                const int cp = (c == cols - 1) ? 0        : c + 1;
+                dst[c] = 2.0f * src[c] - src[cm] - src[cp];
+            }
+        }
+    } else {
+        for (size_t i = 0; i < n; ++i) scratch[i] = H[i];
+    }
+
+    // Pass 2 — along the ROW index, and fold in the 1/16.
+    //
+    // The scale is (rows/2)*(cols/2)/(rows*cols) = 1/4 per axis pair, i.e. 1/4
+    // for each D that ran. An axis that was SKIPPED contributed no D and no
+    // factor, so the divisor tracks which passes actually happened — getting
+    // this wrong would rescale H uniformly, which an argmax cannot see and the
+    // Q1.15 renormalisation would hide completely.
+    const float inv = 1.0f / (float)((do_rows ? 4 : 1) * (do_cols ? 4 : 1));
+    if (do_rows) {
+        for (int r = 0; r < rows; ++r) {
+            const int rm = (r == 0)        ? rows - 1 : r - 1;
+            const int rp = (r == rows - 1) ? 0        : r + 1;
+            const cfloat *s0 = scratch.data() + (size_t)r  * cols;
+            const cfloat *sm = scratch.data() + (size_t)rm * cols;
+            const cfloat *sp = scratch.data() + (size_t)rp * cols;
+            cfloat       *dst = H + (size_t)r * cols;
+            for (int c = 0; c < cols; ++c)
+                dst[c] = (2.0f * s0[c] - sm[c] - sp[c]) * inv;
+        }
+    } else {
+        for (size_t i = 0; i < n; ++i) H[i] = scratch[i] * inv;
+    }
+}
+
+double filter_box_energy_fraction(const cfloat *H_all, int channels,
+                                  int rows, int cols,
+                                  int box_rows, int box_cols)
+{
+    if (channels <= 0 || rows <= 0 || cols <= 0) return 0.0;
+    if (box_rows <= 0 || box_cols <= 0)          return 0.0;
+    if (box_rows > rows) box_rows = rows;
+    if (box_cols > cols) box_cols = cols;
+
+    // Centred at the PATCH CENTRE, matching the mask — NOT at the response
+    // origin. The filter's energy peaks at (rows/2, cols/2); a corner-wrapped
+    // box holds 8-12% and would read as "masking destroyed the filter".
+    const int r0 = rows / 2 - box_rows / 2;
+    const int c0 = cols / 2 - box_cols / 2;
+
+    // double, not float: this sums channels*rows*cols squared magnitudes and the
+    // in-box term is a difference of two large sums.
+    double total = 0.0, inbox = 0.0;
+    const size_t n = (size_t)rows * (size_t)cols;
+    for (int ch = 0; ch < channels; ++ch) {
+        const cfloat *h = H_all + (size_t)ch * n;
+        for (int r = 0; r < rows; ++r) {
+            const bool r_in = (r >= r0 && r < r0 + box_rows);
+            for (int c = 0; c < cols; ++c) {
+                const cfloat v = h[(size_t)r * cols + c];
+                const double m2 = (double)v.real() * v.real()
+                                + (double)v.imag() * v.imag();
+                total += m2;
+                if (r_in && c >= c0 && c < c0 + box_cols) inbox += m2;
+            }
+        }
+    }
+    return (total > 0.0) ? (inbox / total) : 0.0;
+}
+
 void filter_update_quantize(FilterState &st, const cfloat *F_all,
                             const cfloat *G, float eta,
                             const double *energy, float eps_rel,
@@ -774,12 +875,29 @@ void filter_update_quantize(FilterState &st, const cfloat *F_all,
         for (size_t i = 0; i < n; ++i)
             a[i] = eta * std::conj(G[i]) * f[i] + keep * a[i];
 
+#if FILTER_MASK
+        // MASKED: form, project, THEN scan — the scan cannot run first, because
+        // the projection moves max|H| and max|H| is what sets the ONE global
+        // Q1.15 scale. Scanning the unmasked filter would leave the masked one
+        // scaled by a peak that is no longer in it.
+        for (size_t i = 0; i < n; ++i)
+            hs[i] = a[i] * (cs / (st.B[i] + eps));
+
+        filter_mask_project(hs, st.rows, st.cols);
+
+        for (size_t i = 0; i < n; ++i) {
+            const cfloat h  = hs[i];
+            const float  m2 = h.real() * h.real() + h.imag() * h.imag();
+            if (m2 > max_norm) { max_norm = m2; h_max = h; }
+        }
+#else
         for (size_t i = 0; i < n; ++i) {
             const cfloat h = a[i] * (cs / (st.B[i] + eps));
             hs[i] = h;
             const float m2 = h.real() * h.real() + h.imag() * h.imag();
             if (m2 > max_norm) { max_norm = m2; h_max = h; }
         }
+#endif
     }
     st.initialized = true;
 
@@ -849,6 +967,33 @@ void filter_quantize_q15(const FilterState &st, const double *energy,
     // same time by making every float operation in the file unsafe.
     float  max_norm = 0.0f;
     cfloat h_max(0.0f, 0.0f);
+#if FILTER_MASK
+    // FRAME 0'S PATH, AND IT IS NOT OPTIONAL. filter_init() publishes through
+    // here, and under the anchored protocol that is 419 inits per arm —
+    // vot_init_anatomy.py puts 16% of all losses within 10 frames of one. A
+    // mask applied only to the fused path would leave every anchor's first
+    // published filter unmasked, precisely where a mask is theorised to pay.
+    //
+    // H must be MATERIALISED here where the unmasked path recomputes it: the
+    // projection reads each bin's neighbours, so the write-out pass below
+    // cannot re-derive a masked H bin from A and B alone. One channels*n
+    // buffer, on frame 0 only, against the unmasked path's zero — the fused
+    // path pays nothing extra because it already owns h_scratch.
+    std::vector<cfloat> hq((size_t)st.channels * n);
+    for (int ch = 0; ch < st.channels; ++ch) {
+        const cfloat *a  = st.A.data() + (size_t)ch * n;
+        const float   cs = chscale[(size_t)ch];
+        cfloat       *hd = hq.data() + (size_t)ch * n;
+        for (size_t i = 0; i < n; ++i)
+            hd[i] = a[i] * (cs / (st.B[i] + eps));
+        filter_mask_project(hd, st.rows, st.cols);
+        for (size_t i = 0; i < n; ++i) {
+            const float m2 = hd[i].real() * hd[i].real()
+                           + hd[i].imag() * hd[i].imag();
+            if (m2 > max_norm) { max_norm = m2; h_max = hd[i]; }
+        }
+    }
+#else
     for (int ch = 0; ch < st.channels; ++ch) {
         const cfloat *a = st.A.data() + (size_t)ch * n;
         const float   cs = chscale[(size_t)ch];
@@ -858,6 +1003,7 @@ void filter_quantize_q15(const FilterState &st, const double *energy,
             if (m2 > max_norm) { max_norm = m2; h_max = h; }
         }
     }
+#endif
     const float max_abs = (max_norm > 0.0f) ? std::abs(h_max) : 0.0f;
 
     // Always normalize to the FULL int16 range, independent of CMUL_H_SHIFT.
@@ -881,11 +1027,21 @@ void filter_quantize_q15(const FilterState &st, const double *energy,
     const float scale = (max_abs > 0.0f) ? (Q15_FULL_SCALE / max_abs) : 0.0f;
 
     for (int ch = 0; ch < st.channels; ++ch) {
+#if FILTER_MASK
+        const cfloat *hd = hq.data() + (size_t)ch * n;
+#else
         const cfloat *a = st.A.data() + (size_t)ch * n;
         const float   cs = chscale[(size_t)ch];
+#endif
         int16_t      *o = out + (size_t)ch * n * 2;
         for (size_t i = 0; i < n; ++i) {
+#if FILTER_MASK
+            // Same intermediate the fused path scales, so the two agree BITWISE
+            // and run_fusion_tests() keeps checking that with the mask on.
+            const cfloat h = hd[i] * scale;
+#else
             const cfloat h = a[i] * (cs / (st.B[i] + eps)) * scale;
+#endif
             float re = std::nearbyint(h.real());
             float im = std::nearbyint(h.imag());
             // Clamped to -32767, NOT -32768. cmul_accum computes

@@ -1,0 +1,16 @@
+# Frame time history. Every row was accepted on a bit-identical-tracking test.
+date,change,frame_ms,fps,log,arm
+,baseline (console at 115200),880,1.14,,gray-synth
+2026-08-20,console gating (VERBOSITY),180.6,5.54,runs/run_0820_1528.log,gray-synth
+2026-08-20,BO copy pattern + int64 energy,143.3,6.98,runs/run_0820_1554.log,gray-synth
+2026-08-20,scene generated on the host,134.6,7.43,runs/run_0820_1604.log,gray-synth
+2026-08-20,-O3 -mcpu=cortex-a72,132.2,7.56,runs/run_0820_1610.log,gray-synth
+2026-08-20,hypot fix + -fcx-limited-range,127.7,7.83,,gray-synth
+2026-08-20,FFT_ROW_WS 8->64,60.7,16.48,runs/run_0820_1807.log,gray-synth
+2026-08-21,scale-extract real DFT + fused filter update/quantize,45.60,21.93,runs/run_0821_1109.log,gray-synth
+2026-08-21,memory-tile transpose,35.58,28.14,runs/run_0821_1348.log,gray-synth
+2026-08-21,software-pipelined roi_crop,31.48,31.81,runs/run_0821_1402.log,gray-synth
+2026-08-21,CMUL_SPLIT_ACCUM,29.61,33.77,runs/run_0821_1452.log,gray-synth
+2026-08-21,blocked unpack_spectrum,28.64,34.92,runs/run_0821_1635.log,gray-synth
+2026-08-21,tail split onto core 1 (TAIL_PARALLEL),26.23,38.15,runs/run_0821_1712.log,gray-synth
+2026-08-24,RGB (CONV_IN_CH=3) — cost is host memory not conv2d,28.58,34.99,runs/run_0824_1457.log,rgb-synth

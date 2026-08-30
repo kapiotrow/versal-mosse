@@ -69,7 +69,7 @@ PSR_GATE_MIN = 7.0     # Bolme 3.5
 # with no tolerance for the target changing shape underneath it. HOG, which the
 # published classical baselines use, is gradient histograms over 4x4 or 8x8
 # CELLS: the same fine measurement, aggregated over a neighbourhood, which is
-# what makes it survive deformation. `runs/vot/detector_gain.md` says that is
+# what makes it survive deformation. `docs/thesis/evidence/detector_gain.md` says that is
 # where this tracker's remaining deficit is: on targets that genuinely
 # translate the detector already recovers 93% of the annotated motion, and 69%
 # of on-target frames are targets whose appearance the filter cannot follow by
@@ -103,6 +103,37 @@ def split_mask(name):
     """
     m = re.match(r'^(.*?)-mask(\d+)$', name)
     return (m.group(1), int(m.group(2)) / 100.0) if m else (name, None)
+
+
+def split_rand(name):
+    """'rgb-rand0' -> ('rgb', 0).  'rgb' -> ('rgb', None).  The number is a SEED.
+
+    THE NEGATIVE CONTROL FOR THE FEATURE BANK. Replaces the pretrained conv1
+    weights with random Gaussian taps of the SAME per-channel row norms -- so
+    the int8 grid, out_shift and bias_acc all see a comparable scale and the
+    only thing that changed is which 16 directions of the 27-dim tap space the
+    bank spans.
+
+    WHY IT IS WORTH RUNNING. "Would a better network help?" is answered by how
+    much the PRETRAINING is worth, and at layer 1 that is measurable directly.
+    Held-out Bolme PSR (scripts, 2026-08-29, 4 sequences, RGB path) says random
+    matches pretrained -- car1 36.09 vs 37.25 at dt=1, tiger 31.22 vs 30.99,
+    nature 83.07 vs 75.51, bolt1 19.29 vs 18.89 -- but held-out PSR is not AR,
+    and this project decides feature questions on AR. This arm is that check.
+
+    It doubles as a control on the BENCH: a bench that cannot tell a pretrained
+    bank from noise cannot rank two pretrained banks either, so a null here is
+    informative in one direction only and a large loss is what validates the
+    instrument.
+
+    NOT the same as `participation ratio`, which is why that statistic is not
+    the objective: random Gaussian 16x27 scores PR 10.69 against the shipping
+    bank's 7.43, and a random ORTHONORMAL basis scores the theoretical maximum
+    16.00. PR is maximised by noise, in weight space and (1.99 vs 1.43) on real
+    activations too.
+    """
+    m = re.match(r'^(.*?)-rand(\d+)$', name)
+    return (m.group(1), int(m.group(2))) if m else (name, None)
 
 
 def split_warp(name):
@@ -323,7 +354,7 @@ def rotate_window(planes, cy, cx, ang_deg, r0, c0, h, w):
 # a raised cosine has a compact DFT, so h <- m*h is a sparse 2-D convolution on
 # the published H -- the same identity Stage B2 is built on. That is why the
 # window below is separable even though numpy would not care.
-def spatial_mask(rows, cols, plateau_frac, taper_frac):
+def spatial_mask(rows, cols, plateau_frac, taper_frac, centre='board'):
     """Separable raised-cosine mask, centred at the PATCH CENTRE.
 
     plateau_frac: width of the flat top as a fraction of the patch. 0.5 is
@@ -331,15 +362,71 @@ def spatial_mask(rows, cols, plateau_frac, taper_frac):
     taper_frac:   width of the cosine roll-off, same units. 0 gives a hard box,
                   whose DFT is a sinc and therefore NOT sparse -- it is available
                   for offline comparison but is not the board-implementable one.
+                  **1.0 IS THE ONLY EXACTLY-9-BIN CASE and is NOT the default of
+                  --mask-taper**; at the 0.25 default `mask0` has 99 non-zero
+                  bins per axis and is not board-implementable.
+    centre:       'board' centres the axis at n/2, giving EXACTLY the periodic
+                  Hann sin^2(pi i / n) -- hanning_<N>.h's table, whose DFT is
+                  {n/2, -n/4, -n/4} and REAL. 'bench' centres at (n-1)/2, which
+                  is what this function did before 2026-08-29 and what
+                  runs/vot/0828_offline-mask/mask62_hann9bin.json was swept with.
+
+    WHY THE CENTRING IS AN OPTION AND NOT A DETAIL. Half a sample, max|dm| =
+    0.0123 -- and NOT benign per sequence: on `tiger` the bench centring gives
+    mean IoU 0.1715 (lost f107) against 0.2813 (lost f360). Over all 62 the
+    aggregate holds (dR +0.0718 bench, +0.0601 board) but individual sequences
+    are chaotically sensitive to it. 'board' is the DEFAULT because scoring a
+    window the hardware cannot produce is how a proxy stops transferring.
     """
+    if centre not in ('board', 'bench'):
+        raise SystemExit(f"--mask-center must be 'board' or 'bench', got {centre!r}")
+
     def axis(n):
-        x = np.abs(np.arange(n) - (n - 1) / 2.0) / n      # 0 at centre, 0.5 at edge
+        if centre == 'board' and plateau_frac == 0.0 and taper_frac >= 1.0:
+            # The exact periodic Hann. Written as the closed form rather than
+            # as a limit of the general expression below so it is provably the
+            # same table conv2d and Stage B2 use.
+            return np.sin(np.pi * np.arange(n) / n) ** 2
+        off = (n / 2.0) if centre == 'board' else ((n - 1) / 2.0)
+        x = np.abs(np.arange(n) - off) / n                # 0 at centre, 0.5 at edge
         p, t = plateau_frac / 2.0, taper_frac / 2.0
         if t <= 0:
             return (x <= p).astype(np.float64)
         r = np.clip((x - p) / t, 0.0, 1.0)
         return np.cos(0.5 * np.pi * r) ** 2
     return np.outer(axis(rows), axis(cols))
+
+
+def box_energy_fraction(H, box_rows, box_cols):
+    """Fraction of SUM|h|^2 inside a CENTRED box of box_rows x box_cols BINS.
+
+    THE MECHANISM CHECK for the spatial mask (proposed_build_mask.md 4): "the
+    fraction of the filter's energy inside the target box should rise from the
+    measured 51.6% (car1) / 54.9% (tiger). If EAO moves while that does not, the
+    gain is not the mask." Those two numbers lived only in a COMMENT above --
+    nothing computed them -- so the falsifier had no instrument on either side.
+
+    This is the OFFLINE half; the board's is filter_box_energy_fraction() in
+    mosse_filter.cpp, and the pair is the point: it gives the hardware run a
+    PREDICTED value to hit rather than only a direction.
+
+    Centred at the PATCH CENTRE, matching the mask and matching the board. The
+    filter's energy peaks there, not at resp[0,0]; scoring at the response
+    origin reads 8-12% and looks like a destroyed filter.
+
+    H is (channels, rows, cols) in the FREQUENCY domain -- the same array the
+    detector uses -- so it is transformed here rather than by the caller.
+    """
+    h = np.fft.ifft2(H, axes=(1, 2))
+    e = np.abs(h) ** 2
+    rows, cols = e.shape[1], e.shape[2]
+    br = max(0, min(int(round(box_rows)), rows))
+    bc = max(0, min(int(round(box_cols)), cols))
+    total = float(e.sum())
+    if total <= 0.0 or br == 0 or bc == 0:
+        return 0.0
+    r0, c0 = rows // 2 - br // 2, cols // 2 - bc // 2
+    return float(e[:, r0:r0 + br, c0:c0 + bc].sum()) / total
 
 
 def make_patch(arm, planes, lum, roi_row, roi_col, roi_h, roi_w):
@@ -356,7 +443,7 @@ def run_arm(arm, wq, bias, shift, gt, n_frames, oracle_scale, verbose,
             eta=ETA, psr_min=PSR_GATE_MIN, n_warps=1,
             warp_shift=0.05, warp_scale=0.05, warp_mutant='none',
             warp_aspect=0.0, warp_rot=0.0, eps_rel=EPS_REL,
-            mask_plateau=None, mask_taper=0.25):
+            mask_plateau=None, mask_taper=0.25, mask_centre='board'):
     # float_conv = (w_float, b_fold) runs the UNQUANTIZED conv instead of the
     # int8 one, everything else identical. See conv_features_float's docstring:
     # this arm exists to answer whether quantization causes the tracker's poor
@@ -381,11 +468,11 @@ def run_arm(arm, wq, bias, shift, gt, n_frames, oracle_scale, verbose,
     # while the target moves several bins -- invisible in IoU or PSR, which both
     # look healthy while it happens.
     rec = {'iou': [], 'cerr': [], 'psr': [], 'holds': 0, 'lost_at': None,
-           'step': [], 'resp00': []}
+           'step': [], 'resp00': [], 'ebox': []}
     # Built once: the mask is fixed in PATCH coordinates, so it does not move
     # with the box. Its fixedness is the whole reason it is host-only and free.
     mask = (None if mask_plateau is None
-            else spatial_mask(fr, fc, mask_plateau, mask_taper))
+            else spatial_mask(fr, fc, mask_plateau, mask_taper, mask_centre))
 
     for f in range(1, n_frames + 1):
         if oracle_scale:
@@ -492,6 +579,12 @@ def run_arm(arm, wq, bias, shift, gt, n_frames, oracle_scale, verbose,
             # question. Testing the approximation before the idea would confound
             # the two.
             H = np.fft.fft2(np.fft.ifft2(H, axes=(1, 2)) * mask[None], axes=(1, 2))
+        # The mechanism check, on the SAME H the detector is about to use -- so
+        # it reflects the mask if one is applied and the baseline if not. The
+        # box is measured in bins from THIS frame's resample ratio, so it tracks
+        # the box size instead of assuming the initial one.
+        rec['ebox'].append(box_energy_fraction(H, bh * fr / roi_h, bw * fc / roi_w))
+
         resp = np.real(np.fft.ifft2(np.sum(F * np.conj(H), axis=0)))
         idx, peak, bolme, _ratio = metrics_rc(resp, fr, fc, excl)
         dr, dc = wrap(idx[0], fr), wrap(idx[1], fc)
@@ -607,6 +700,13 @@ def main():
                          'a fraction of the patch (default 0.25). 0 is a HARD\n'
                          'box, whose DFT is a sinc and therefore not sparse --\n'
                          'offline-only, not board-implementable.')
+    ap.add_argument('--mask-center', default='board', choices=['board', 'bench'],
+                    help="where the -mask<N> axis is centred (default board).\n"
+                         "board = n/2, the EXACT periodic Hann and the only\n"
+                         "window the hardware can apply; bench = (n-1)/2, what\n"
+                         "this script did before 2026-08-29 and what\n"
+                         "mask62_hann9bin.json was swept with. Worth mean IoU\n"
+                         "0.1715 vs 0.2813 on `tiger` -- see spatial_mask().")
     ap.add_argument('--eps-rel', type=float, default=EPS_REL,
                     help='filter regularizer, RELATIVE to mean(B) (default\n'
                          '%g). BOLME 3.3 PRESENTS REGULARIZATION AND INIT\n'
@@ -669,6 +769,7 @@ def main():
         print(f"  running {a} ...", flush=True)
         stem, n_warps = split_warp(a)
         stem, mask_plateau = split_mask(stem)
+        stem, rand_seed = split_rand(stem)
         base, pool, mode = parse_arm(stem)
         if base not in W:
             sys.exit(f"unknown arm '{a}' (base '{base}'): "
@@ -676,7 +777,24 @@ def main():
                      f"-pool<N> / -dec<N> / -warp<N> suffix")
         if pool > 1 and (R % pool or C % pool):
             sys.exit(f"{a}: pool {pool} does not divide the {R}x{C} patch")
-        out[a] = run_arm(stem, *W[base], gt, n, args.oracle_scale, args.verbose,
+        # The random bank is built HERE, per arm, so the pretrained arm in the
+        # same invocation is untouched and both see identical frames.
+        if rand_seed is None:
+            bank = W[base]
+        else:
+            src = w_gray if base.startswith('gray') else w_rgb
+            rng = np.random.default_rng(rand_seed)
+            rw = rng.standard_normal(src.shape)
+            # MATCH THE PER-CHANNEL ROW NORMS. Without this the arm also moves
+            # out_shift and bias_acc, and a loss would be unattributable
+            # between "the weights are random" and "the fixed-point scale moved".
+            n_src = np.linalg.norm(src.reshape(src.shape[0], -1), axis=1)
+            n_rw = np.linalg.norm(rw.reshape(rw.shape[0], -1), axis=1)
+            rw *= (n_src / n_rw)[:, None, None, None]
+            bank = quantize(rw, b_fold)
+            print(f"    *** RANDOM BANK, seed {rand_seed}: pretrained conv1 "
+                  f"REPLACED by Gaussian taps of matched row norms ***")
+        out[a] = run_arm(stem, *bank, gt, n, args.oracle_scale, args.verbose,
                          float_conv=FLOATW.get(base),
                          sigma=args.sigma if args.sigma else SIGMA,
                          eta=args.eta, psr_min=args.psr_min, n_warps=n_warps,
@@ -684,7 +802,8 @@ def main():
                          warp_mutant=args.warp_mutant,
                          warp_aspect=args.warp_aspect, warp_rot=args.warp_rot,
                          eps_rel=args.eps_rel, mask_plateau=mask_plateau,
-                         mask_taper=args.mask_taper)
+                         mask_taper=args.mask_taper,
+                         mask_centre=args.mask_center)
 
     print()
     print(f"{'arm':<13} {'frozen, truth>=1bin':>20} {'frozen, <1bin':>14} "
@@ -716,8 +835,9 @@ def main():
 
     print()
     print(f"{'arm':<13} {'mean IoU':>9} {'worst':>7} {'>=0.5':>7} "
-          f"{'cerr mean':>10} {'cerr max':>9} {'PSR mean':>9} {'holds':>6} {'lost at':>8}")
-    print("-" * 86)
+          f"{'cerr mean':>10} {'cerr max':>9} {'PSR mean':>9} {'holds':>6} {'lost at':>8}"
+          f" {'e_box':>7}")
+    print("-" * 94)
     for a in args.arms:
         r = out[a]
         iou = np.array(r['iou']); ce = np.array(r['cerr'])
@@ -726,7 +846,10 @@ def main():
               f"{100*np.mean(iou >= 0.5):6.1f}% "
               f"{ce.mean():10.2f} {ce.max():9.2f} {np.nanmean(psr):9.2f} "
               f"{r['holds']:6d} "
-              f"{(str(r['lost_at']) if r['lost_at'] else 'never'):>8}")
+              f"{(str(r['lost_at']) if r['lost_at'] else 'never'):>8}"
+              # e_box: filter energy inside the target box. The MECHANISM CHECK
+              # for a -mask arm -- it must RISE, or the gain is not the mask.
+              f" {np.mean(r['ebox']) if r['ebox'] else float('nan'):7.4f}")
 
     if args.json:
         import json
@@ -736,7 +859,12 @@ def main():
             with open(args.json) as fh:
                 blob = json.load(fh)
         for a in args.arms:
-            blob[f"{seq}|{a}"] = {'iou': [float(x) for x in out[a]['iou']]}
+            # 'ebox' is ADDITIVE -- every existing reader selects 'iou' by key,
+            # and the stored sweeps that predate it simply lack it. It is the
+            # mask's mechanism check and has to be persistable, or the board run
+            # has a direction to hit and no value.
+            blob[f"{seq}|{a}"] = {'iou': [float(x) for x in out[a]['iou']],
+                                  'ebox': [float(x) for x in out[a]['ebox']]}
         with open(args.json, 'w') as fh:
             json.dump(blob, fh)
         print(f"\nwrote {len(args.arms)} run(s) for '{seq}' to {args.json}")

@@ -632,7 +632,7 @@ GCC_FLAGS  += "-DIMPULSE_DC=($(IMPULSE_DC))"
 # roi_crop's AXI-Lite registers per sequence. Phase 1 checked all 62 stb2022
 # sequences against this bound -- none exceeds it, and birds2/zebrafish1/frisbee
 # sit EXACTLY at it, so the margin is zero and a new dataset needs the check
-# re-run rather than assumed (runs/vot/phase1.md).
+# re-run rather than assumed (docs/thesis/evidence/phase1.md).
 GCC_FLAGS  += -DFRAME_ROWS=1080
 GCC_FLAGS  += -DFRAME_COLS=1920
 # WHERE FRAMES COME FROM.
@@ -676,7 +676,7 @@ RESET_MUTANT    ?= 0
 #
 # The board maps 2 GB of the VEK280's 12 GB and 512 MB of that is CMA, so usable
 # heap is ~0.9-1.2 GB -- not the 12 GB the resource table records, which is the
-# PART's capacity (runs/vot/TODO_board_memory.md). At CONV_IN_CH=3 five stb2022
+# PART's capacity (docs/thesis/evidence/TODO_board_memory.md). At CONV_IN_CH=3 five stb2022
 # sequences exceed it and the 2026-08-26 full-62 RGB sweep lost exactly those
 # five to std::bad_alloc and the OOM killer.
 #
@@ -762,6 +762,59 @@ GCC_FLAGS  += -DB2_NULL_BINS=$(B2_NULL_BINS)
 # re-opens this. 0 disables the LOW_PSR test only; it measured as a null.
 PSR_GATE_MIN ?= 5.0
 GCC_FLAGS  += -DPSR_GATE_MIN=$(PSR_GATE_MIN)
+
+# ---------------------------------------------------------------------------
+# FILTER_MASK — spatial reliability (CSR-DCF's item), as a one-shot projection
+# h <- m (.) h on the published H. HOST-ONLY: it lands before pack_filter(), so
+# the AIE sees an already-masked filter and the flashed xclbin is untouched.
+# An scp, not a card swap.
+# ---------------------------------------------------------------------------
+# THE WINDOW IS THE PERIODIC HANN, sin^2(pi i / n) -- hanning_<N>.h's table, the
+# same one conv2d puts on the patch. Its DFT is exactly {n/2, -n/4, -n/4} on
+# bins {0,+1,-1} and REAL, so the projection is a separable circular 3-tap
+# convolution needing NO FFT and, once the constants cancel, no multiplies:
+#     H <- D_row(D_col(H)) / 16,   D(X)[i] = 2X[i] - X[i-1] - X[i+1].
+# There is no taps/width knob because there is no choice to make: any other
+# shape has a non-sparse spectrum and is not implementable this way.
+#
+# EVIDENCE (docs/thesis/evidence/proposed_build_mask.md, 62 sequences, vot_ar_offline, in
+# the BOARD form of the window): dR +0.0601 -- 3.0x the instrument's measured
+# resolution -- surviving a symmetric trim at +0.0409, mean IoU 0.1792 -> 0.2016,
+# 20.7% more frames tracked. The bench's own (n-1)/2 centring reads +0.0718; the
+# half-sample difference is worth mean IoU 0.1715 vs 0.2813 on `tiger`, which is
+# why the board form was swept separately and is the one built here.
+#
+# NOT `TARGET_PADDING` BY ANOTHER NAME. Padding moves the mask, the px/bin, the
+# search range and the DSST extraction region at once -- which is exactly why
+# docs/thesis/evidence/pooled_features.md could not attribute pad30's hardware result. This
+# holds all four fixed.
+#
+# EXPECT TO RE-TUNE PSR_GATE_MIN ON A SECOND SWEEP. Masking moves the PSR scale
+# (car1 mean PSR 48.2 -> 36.7 offline) and the gate's worth is CONDITIONAL on
+# that scale, as MOSSE_ETA=0.05 already demonstrated. One variable at a time:
+# mask first at the inherited gate of 5.0, then the gate.
+#
+# AT 0 THE ELF IS NOT BYTE-IDENTICAL AND THAT IS EXPECTED, NOT A REGRESSION: the
+# two new functions have external linkage, so they are emitted uncalled and every
+# later address relocates. `cmp` -- the PROGRESS_EVERY inertness check -- cannot
+# answer this one. Verified instead by comparing per-symbol instruction streams
+# with addresses normalised: 245 functions in both builds, 0 differing (2026-08-29).
+# See mosse_filter.h for the method and its control.
+FILTER_MASK ?= 0
+GCC_FLAGS  += -DFILTER_MASK=$(FILTER_MASK)
+
+# FILTER_MASK_STAT logs the fraction of the filter's energy inside a centred box
+# the size of the target, as a trailing `mask_ebox` column in track.csv and a
+# VERBOSITY>=1 line. It is THE MECHANISM CHECK for the arm above: if EAO moves
+# while this does not, the gain is not the mask (proposed_build_mask.md 4).
+# Measured offline at 51.6% (car1) / 54.9% (tiger) with no mask.
+#
+# INDEPENDENT of FILTER_MASK on purpose -- the baseline arm has to be measurable
+# with the SAME instrument, or the comparison is a number against a memory.
+# -1 on frames where H was not re-formed (frame 0 and every held frame); do not
+# average that in as a zero.
+FILTER_MASK_STAT ?= 0
+GCC_FLAGS  += -DFILTER_MASK_STAT=$(FILTER_MASK_STAT)
 
 # ---------------------------------------------------------------------------
 # Run instrumentation. HOST-ONLY, like PSR_GATE_MIN above.
@@ -984,7 +1037,7 @@ GCC_FLAGS  += -DSIGMA_FROM_TARGET=$(SIGMA_FROM_TARGET)
 # 13.9% more frames on the full benchmark. Was 0.125 until 2026-08-28. The sweep
 # is NOT monotone (0.025 is much worse), so this is a shallow optimum, not a
 # trend. Two of three mechanism falsifiers fired — the gain is real, the drift
-# explanation for it is not established. See runs/vot/eta05.md.
+# explanation for it is not established. See docs/thesis/evidence/eta05.md.
 MOSSE_ETA      ?= 0.05
 GCC_FLAGS  += -DMOSSE_ETA=$(MOSSE_ETA)
 
@@ -1678,6 +1731,7 @@ test_host:
 	    -DTARGET_PADDING=$(TARGET_PADDING) \
 	    -DSCALE_N=$(SCALE_N) -DSCALE_STEP=$(SCALE_STEP) -DSCALE_ETA=$(SCALE_ETA) \
 	    -DSCALE_SIGMA_FACTOR=$(SCALE_SIGMA_FACTOR) -DSCALE_TMPL_AREA=$(SCALE_TMPL_AREA) \
+	    -DFILTER_MASK=$(FILTER_MASK) \
 	    $(HOST_APP_SRC)/mosse_filter.cpp $(TEST_HOST_DIR)/test_mosse_filter.cpp \
 	    -o $(BUILD_DIR)/test_host
 	$(BUILD_DIR)/test_host $(TEST_HOST_DIR)/golden
@@ -1698,6 +1752,7 @@ test_host:
 	    -DTARGET_PADDING=$(TARGET_PADDING) \
 	    -DSCALE_N=$(SCALE_N) -DSCALE_STEP=$(SCALE_STEP) -DSCALE_ETA=$(SCALE_ETA) \
 	    -DSCALE_SIGMA_FACTOR=$(SCALE_SIGMA_FACTOR) -DSCALE_TMPL_AREA=$(SCALE_TMPL_AREA) \
+	    -DFILTER_MASK=$(FILTER_MASK) \
 	    $(HOST_APP_SRC)/mosse_filter.cpp $(TEST_HOST_DIR)/test_mosse_filter.cpp \
 	    -o $(BUILD_DIR)/test_host_fma
 	$(BUILD_DIR)/test_host_fma $(TEST_HOST_DIR)/golden
@@ -2054,3 +2109,13 @@ endif
 # -------------------------------------------------------
 cleanall:
 	rm -rf build/
+
+# --- thesis figures -------------------------------------------------------
+# Regenerates docs/thesis/figures/ from docs/thesis/results/*.csv. See scripts/figs/README.md.
+# The Vitis env masks the venv (PYTHONHOME points python at Vivado build, no _ctypes).
+figures:
+	@for f in scripts/figs/fig_*.py; do \
+		echo "  $$f"; \
+		env -u PYTHONPATH -u PYTHONHOME ./.venv/bin/python $$f || exit 1; \
+	done
+.PHONY: figures

@@ -34,7 +34,7 @@ TWO THINGS THIS GETS RIGHT THAT AN EYEBALL DOES NOT
 AND ONE CONFOUND IT MUST CONTROL FOR, WHICH IS THE WHOLE POINT OF --movers.
 On sequences like `nature`, `girl` and `wiper` the annotated box centre moves
 because the box is a min-max over a DEFORMING shape, while the object's pixels
-stay put (`runs/vot/frozen_detector.md` measured this directly). There, alpha
+stay put (`docs/thesis/evidence/frozen_detector.md` measured this directly). There, alpha
 near 0 is the correct behaviour of a correlation filter, not a defect. Pooling
 those together with genuinely translating targets produces a low alpha and an
 entirely wrong conclusion. Pass --movers to split them.

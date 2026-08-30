@@ -1,0 +1,8 @@
+# Per-frame AIE compute at 128x128 ch16, from aiecompiler.log schedules, post-vectorization.
+# Compiler-scheduled cycles: real cycles on an in-order VLIW core absent memory stalls.
+# Trustworthy for sizing, NOT a profile. FFT/IFFT trip counts are inferred, not logged.
+kernel,ms_per_frame,band_low,band_high,note
+conv2d,4.1,,,"37 -> 8.75 cyc/px; stream-read loop is now 44% of it"
+cmul_accum,0.13,,,"30 -> 2 cyc/element, pipelined"
+FFT + IFFT chain,2.2,1.3,3.5,trip counts inferred
+total,6.4,,,from ~21.6 before vectorization

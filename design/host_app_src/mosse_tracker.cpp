@@ -350,9 +350,9 @@ static inline void det_hash_bytes(const void *p, size_t n)
 // rather than time to unrecoverable, and at car1's three hold onsets it gave
 // freeze 10/0/0 against coast 1/1/1 — i.e. it predicted no rescue. Hardware over
 // 8 sequences and 54 runs said otherwise on mean IoU
-// (runs/vot/evidence_arm_ab.md): 0.2709 -> 0.3005 frame-weighted, nothing worse
+// (docs/thesis/evidence/evidence_arm_ab.md): 0.2709 -> 0.3005 frame-weighted, nothing worse
 // than -0.0042, car1 job 0 tracking all the way out. Then the SAME 54
-// trajectory pairs were scored by the toolkit (runs/vot/evidence_ar.md) and the
+// trajectory pairs were scored by the toolkit (docs/thesis/evidence/evidence_ar.md) and the
 // ordering reversed: accuracy 0.638 -> 0.616, robustness 0.309 -> 0.288, EAO
 // 0.208 -> 0.194. AR is the metric of record, so the default follows it.
 //
@@ -2160,6 +2160,31 @@ struct FrameDiag {
 };
 static FrameDiag g_fdiag;
 
+// FILTER_MASK_STAT — the mechanism check for the spatial mask, and the only way
+// a mask run can answer its own falsifier.
+//
+// docs/thesis/evidence/proposed_build_mask.md 4: "the fraction of the filter's energy inside
+// the target box should rise from the measured 51.6% (car1) / 54.9% (tiger). If
+// EAO moves while that does not, the gain is not the mask and the result is
+// unattributable." Those two numbers existed only as a COMMENT in
+// rgb_vs_gray_loop.py — nothing computed them, on the host or offline — so the
+// falsifier had no instrument until this.
+//
+// Independent of FILTER_MASK on purpose: the baseline arm has to be measurable
+// with the SAME instrument, or the comparison is between a number and a memory.
+// Default 0, so the shipping ELF is untouched.
+#ifndef FILTER_MASK_STAT
+#  define FILTER_MASK_STAT 0
+#endif
+#if FILTER_MASK_STAT
+// Fraction of SUM|h|^2 inside a centred box the size of the target, or -1 on a
+// frame where the filter was NOT re-formed (frame 0's filter_init path and every
+// held frame). -1 rather than the previous frame's value: a stale reading that
+// looks live is exactly the failure this project keeps paying for, and a reader
+// that averages a mask statistic over held frames is measuring the hold rate.
+static double g_mask_ebox = -1.0;
+#endif
+
 static void csv_open(void)
 {
 #if CSV_LOG
@@ -2242,7 +2267,14 @@ static void csv_open(void)
             // the buffer the rail detector reads.
             //
             // rails_*: which buffer railed. See FrameDiag.
-            "resp_max,rails_fch,rails_accum,rails_resp,rails_h\n");
+            "resp_max,rails_fch,rails_accum,rails_resp,rails_h"
+#if FILTER_MASK_STAT
+            // Added 2026-08-29. TRAILING, like job/anchor, so every reader that
+            // selects by header name is unaffected. -1 means "not re-formed this
+            // frame" and must not be averaged in as a zero.
+            ",mask_ebox"
+#endif
+            "\n");
     fflush(g_csv);
     printf("[csv] per-frame log -> %s\n", path);
 #endif
@@ -2262,7 +2294,11 @@ static void csv_row(int frame, bool occluded, bool evaluated,
             "%d,%d,%d,%d,%s,%.4f,%.4f,%ld,%d,%d,%.4f,"
             "%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.2f,%.4f,%.2f,%d,"
             "%d,%.4f,%s,%d,%.0f,%.0f,%.0f,%d,%d,"
-            "%.0f,%d,%d,%d,%d\n",
+            "%.0f,%d,%d,%d,%d"
+#if FILTER_MASK_STAT
+            ",%.4f"
+#endif
+            "\n",
             frame, occluded ? 1 : 0, evaluated ? 1 : 0, gate.accept ? 1 : 0,
             mosse::gate_reason_tag(gate.reason),
             p.psr, p.ratio, p.peak, p.dr, p.dc, resp00_over_peak,
@@ -2279,7 +2315,11 @@ static void csv_row(int frame, bool occluded, bool evaluated,
             g_fdiag.rails, g_fdiag.accum, g_fdiag.fch, g_fdiag.h,
             g_csv_job, g_csv_anchor,
             g_fdiag.resp, g_fdiag.rails_fch, g_fdiag.rails_accum,
-            g_fdiag.rails_resp, g_fdiag.rails_h);
+            g_fdiag.rails_resp, g_fdiag.rails_h
+#if FILTER_MASK_STAT
+            , g_mask_ebox
+#endif
+            );
     // Per ROW by default: the point is surviving a power cut, and one really did
     // happen mid-sweep. CSV_FLUSH_EVERY > 1 trades that tail for frame time on a
     // run that is measuring frame time.
@@ -2945,6 +2985,7 @@ static void pack_filter(const int16_t *rowmajor, int16_t *dst_bo)
 }
 
 static std::vector<mosse::cfloat> g_h_scratch;
+
 
 // Q1.15 scale/peak produced by filter_update_quantize. GLOBAL rather than local
 // because with TAIL_PARALLEL the producer is a different thread from the
@@ -4383,7 +4424,7 @@ int main(int argc, char **argv)
     //
     // EVERY piece of state that survives a run is reset here, and the list is
     // not obvious — each entry has caused a documented failure somewhere in this
-    // project. See runs/vot/phase3.md. The determinism test (job A, job B, job A
+    // project. See docs/thesis/evidence/phase3.md. The determinism test (job A, job B, job A
     // in one process, A's two trajectories byte-identical) is the instrument
     // that can actually see a miss; nothing else here can.
     for (size_t job_i = 0; job_i < n_jobs; ++job_i) {
@@ -5509,6 +5550,13 @@ int main(int argc, char **argv)
         }
 
         bool published = false;
+#if FILTER_MASK_STAT
+        // Cleared EVERY frame, before anything can set it. filter_init()'s path
+        // does not fill g_h_scratch and a held frame does not re-form H, so
+        // without this the column would repeat the last computed value and read
+        // as a filter that never changes.
+        g_mask_ebox = -1.0;
+#endif
 #if TAIL_PARALLEL
         // JOIN POINT for the translation-filter update started before the scale
         // block. See the launch site for the dependency argument.
@@ -5602,6 +5650,22 @@ int main(int argc, char **argv)
             AP_T(AP_PUBLISH,
                  publish_packed(filter_bo, filter_scratch, g_q15_scale, g_q15_max));
             published = true;
+#if FILTER_MASK_STAT
+            // g_h_scratch holds H for this frame's publish — masked already, if
+            // FILTER_MASK=1, because filter_update_quantize() projects BEFORE
+            // the max scan. Read after the join, so the helper's writes are
+            // visible; this is on the main thread and the helper is finished.
+            //
+            // The box is measured in PATCH BINS, from the same roi geometry the
+            // crop used, so it tracks the DSST scale filter frame by frame
+            // rather than assuming the initial size. A hardcoded box*2/128 is
+            // the bug vot_detector_gain.py still has.
+            g_mask_ebox = mosse::filter_box_energy_fraction(
+                g_h_scratch.data(), N_CHANNELS, PATCH_ROWS, PATCH_COLS,
+                (int)llround(mosse::target_h_in_patch(box, roi)),
+                (int)llround(mosse::target_w_in_patch(box, roi)));
+            VP1("  filter: energy in target box %.4f\n", g_mask_ebox);
+#endif
         } else {
             // publish_filter is skipped as well as filter_update, and that is a
             // CORRECTNESS requirement, not an optimization: filter_quantize_q15

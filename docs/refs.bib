@@ -1,0 +1,81 @@
+% Thesis bibliography. Every PDF in docs/papers/ has an entry here and vice versa.
+% Add an entry the day you read the paper, not the week the thesis is due.
+
+@inproceedings{bolme2010mosse,
+  author    = {Bolme, David S. and Beveridge, J. Ross and Draper, Bruce A. and Lui, Yui Man},
+  title     = {Visual Object Tracking using Adaptive Correlation Filters},
+  booktitle = {IEEE Conference on Computer Vision and Pattern Recognition (CVPR)},
+  year      = {2010},
+  pages     = {2544--2550},
+  doi       = {10.1109/CVPR.2010.5539960},
+  note      = {docs/papers/bolme2010\_mosse.pdf. Eq. 10--12 are the filter update;
+               \S3.4 the init perturbations (refuted here, claim N-02);
+               \S3.5 the PSR gate; Fig. 4 the regularizer sweep (does not transfer,
+               his $\varepsilon$ is absolute, ours relative to mean(B))}
+}
+
+@inproceedings{danelljan2015convfeatures,
+  author    = {Danelljan, Martin and H{\"a}ger, Gustav and Khan, Fahad Shahbaz and Felsberg, Michael},
+  title     = {Convolutional Features for Correlation Filter Based Visual Tracking},
+  booktitle = {IEEE International Conference on Computer Vision Workshops (ICCVW)},
+  year      = {2015},
+  pages     = {621--629},
+  doi       = {10.1109/ICCVW.2015.84},
+  note      = {docs/papers/danelljan2015\_convfeatures.pdf. Source of the shared-denominator
+               filter form and of the conv1-as-features argument; \S3.3 is where this design
+               diverges (ReLU off, claim N-16)}
+}
+
+@article{danelljan2017fdsst,
+  author  = {Danelljan, Martin and H{\"a}ger, Gustav and Khan, Fahad Shahbaz and Felsberg, Michael},
+  title   = {Discriminative Scale Space Tracking},
+  journal = {IEEE Transactions on Pattern Analysis and Machine Intelligence},
+  volume  = {39},
+  number  = {8},
+  pages   = {1561--1575},
+  year    = {2017},
+  doi     = {10.1109/TPAMI.2016.2609928},
+  note    = {arXiv:1609.06141. docs/papers/danelljan2017\_fdsst.pdf.
+             Table 1 is the argument for a 1-D scale filter over exhaustive search;
+             \S6.1 gives the defaults, of which the step 1.02 is the one this work
+             overturns on hardware (claim A-09); the PCA compression is rejected here
+             (claim P-11)}
+}
+
+@inproceedings{danilowicz2022embedded,
+  author    = {Danilowicz, Michal and Kryjak, Tomasz},
+  title     = {Real-time Embedded Object Tracking with Discriminative Correlation
+               Filters using Convolutional Features},
+  booktitle = {Computer Vision Systems (ICVS)},
+  year      = {2022},
+  note      = {docs/papers/danilowicz2022\_embedded\_dcf.pdf. The closest prior work:
+               same problem, same class of platform. THE comparison to position this
+               thesis against}
+}
+
+@inproceedings{kristan2022vot,
+  author    = {Kristan, Matej and others},
+  title     = {The Tenth {VOT2022} Challenge Results},
+  booktitle = {European Conference on Computer Vision Workshops (ECCVW)},
+  year      = {2022},
+  note      = {Table 12 is the 41-tracker VOT-STb2022 baseline table reproduced in
+               docs/thesis/results/baselines.csv. TODO: complete the author list and
+               page numbers from the official proceedings}
+}
+
+@inproceedings{lukezic2017csrdcf,
+  author    = {Luke{\v{z}}i{\v{c}}, Alan and Vojir, Tomas and
+               {\v{C}}ehovin Zajc, Luka and Matas, Ji{\v{r}}i and Kristan, Matej},
+  title     = {Discriminative Correlation Filter with Channel and Spatial Reliability},
+  booktitle = {IEEE Conference on Computer Vision and Pattern Recognition (CVPR)},
+  year      = {2017},
+  note      = {The source of claims O-01 (spatial mask) and O-02 (channel reliability).
+               TODO: verify the ablation percentages quoted in claims.md against the paper}
+}
+
+@misc{xilinx_xd073,
+  title  = {Versal AI Engine 2D-FFT Tutorial (XD073)},
+  author = {{AMD/Xilinx}},
+  year   = {2025},
+  note   = {The tutorial this design extends. TODO: pin the exact revision used}
+}

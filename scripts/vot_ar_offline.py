@@ -11,7 +11,7 @@ backward, and a run that fails is simply over -- 419 runs per arm on the board.
 here are computed with the toolkit's RULE on a different set of RUNS, and they
 are not comparable to `~/vot/analysis/*` or to the published VOT-STb2022 table.
 
-Why it is still worth computing. `runs/vot/evidence_ar.md` showed mean IoU and
+Why it is still worth computing. `docs/thesis/evidence/evidence_ar.md` showed mean IoU and
 AR ordering two arms OPPOSITELY on identical trajectories: the failure rule
 discards everything after 10 consecutive frames at overlap <= 0.1, so a short
 excursion outweighs hundreds of good frames, and mean IoU cannot see the TIMING

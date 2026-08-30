@@ -378,6 +378,94 @@ void filter_init(FilterState &st, const cfloat *F_all,
 void filter_update(FilterState &st, const cfloat *F_all,
                    const cfloat *G, float eta);
 
+// -----------------------------------------------------------------------
+// FILTER_MASK — spatial reliability, as a one-shot projection h <- m (.) h
+// -----------------------------------------------------------------------
+// HOST-ONLY. The mask lands on H before pack_filter(), so the AIE sees an
+// already-masked filter and detection and training stay consistent with no
+// graph change: an scp, not a card swap. aie.flagstamp must come back unchanged.
+//
+// AT FILTER_MASK=0 THE ELF IS *NOT* BYTE-IDENTICAL, AND EXPECTING IT TO BE IS A
+// MISREADING WORTH WRITING DOWN. Every call site is #if'd out, but the two
+// functions below have EXTERNAL LINKAGE and are emitted whether or not anything
+// calls them, so the image grows and every later address relocates. `cmp` on the
+// ELF — this project's usual inertness check, per PROGRESS_EVERY — therefore
+// reports a difference that means nothing.
+//
+// The check that does mean something, and it was run (2026-08-29): disassemble
+// both builds, group by symbol, and compare each function's instruction stream
+// with addresses and immediates normalised. Result: 245 functions in both,
+// **0 differing**; the FILTER_MASK=0 build adds exactly filter_mask_project,
+// filter_box_energy_fraction and one PLT entry (__cxa_thread_atexit, for the
+// thread_local scratch) and changes NO existing code path. Control first: the
+// same source built twice IS byte-identical, so the instrument is sound.
+#ifndef FILTER_MASK
+#  define FILTER_MASK 0
+#endif
+
+// CSR-DCF's contribution and the literature's highest-priced item on the
+// robustness list. At TARGET_PADDING=2 the target is 27% of the ROI area and
+// nothing masks the rest, so the filter trains on background every accepted
+// frame — measured, a centred 64x64 box (exactly the target box at padding 2)
+// holds only 51.6% (car1) / 54.9% (tiger) of SUM|h|^2. That is
+// filter_box_energy_fraction() below, and it is this build's mechanism check.
+//
+// EVIDENCE: docs/thesis/evidence/proposed_build_mask.md. 62 sequences, shipping eta/gate,
+// vot_ar_offline: dR +0.0601 in the BOARD form of the window (3.0x the
+// instrument's measured resolution), surviving a symmetric trim at +0.0409,
+// mean IoU 0.1792 -> 0.2016, 20.7% more frames tracked.
+//
+// THE WINDOW IS THE PERIODIC HANN, and it must be the one centred at n/2 —
+// i.e. hanning_<N>.h's sin^2(pi i / n), the SAME window conv2d applies to the
+// patch. The offline bench centres its axis at (n-1)/2 instead; half a sample,
+// max|dm| = 0.0123, and worth mean IoU 0.1715 vs 0.2813 on `tiger`. The board
+// form is the one that was swept and is the one to build.
+//
+// WHY IT NEEDS NO FFT, AND WHY IT NEEDS NO MULTIPLIES EITHER.
+// Multiplying by m in the spatial domain is circular convolution by DFT(m) in
+// the frequency domain, and a raised cosine of period n has a THREE-BIN
+// spectrum: {n/2, -n/4, -n/4} at bins {0, +1, -1}, REAL — the identical rule
+// already written down in apply_dc_correction()'s subtract branch. The mask is
+// separable, so the 2-D convolution factors into two 1-D ones, and both
+// constants cancel against the 1/(rows*cols) of the transform pair:
+//
+//     h <- m (.) h    ==    H <- D_row(D_col(H)) / 16
+//     with  D(X)[i] = 2*X[i] - X[i-1] - X[i+1]     (CIRCULAR on that axis)
+//
+// Verified against an exact FFT round-trip to 8e-16. So it is 8 complex ADDS
+// per bin and one scaling — not the 9 complex MACs a naive reading of "9 bins"
+// suggests, and not the 2.4 MMAC/frame the proposal first costed it at.
+//
+// WHERE IT GOES IS MEASURED, NOT ASSUMED. resp[0,0] is the zero-displacement
+// bin, but h's ENERGY is centred at the PATCH CENTRE (peak of SUM|h|^2 at
+// (64,64); a corner-wrapped 64x64 box holds 8-12%). The convolution form above
+// carries that convention for free — DFT(m) is taken about the same origin as
+// H — which is exactly why it is expressed as a convolution and not as an
+// index-space window.
+//
+// AXES SHORTER THAN 3 BINS ARE SKIPPED, NOT WRAPPED. At rows == 1 the circular
+// D would read X[-1] == X[+1] == X[0] and return 2X - X - X = ZERO, i.e. it
+// would silently delete the filter. FilterState is also the DSST scale
+// filter's type at rows == 1, so this is a live trap and not a hypothetical.
+//
+// In place on `H`, one channel's map. The intermediate is a function-local
+// `static thread_local` vector, grown once: TAIL_PARALLEL runs the fused path on
+// core 1 and the frame-0 path on core 0, so a plain file-static would be a
+// shared buffer across two threads for no gain. 128 KB per thread at 128x128.
+void filter_mask_project(cfloat *H, int rows, int cols);
+
+// Fraction of the filter's energy inside a centred box of box_rows x box_cols
+// BINS — the mechanism check for FILTER_MASK, and the only way this build can
+// answer its own falsifier. Without it "EAO moved" is unattributable to the
+// mask. `H_all` is channels * rows * cols, channel-major, UNQUANTISED (the
+// h_scratch the fused path already holds), so this costs one pass and no
+// device traffic. Returns 0 when the box or the geometry is degenerate.
+//
+// Centred at the PATCH CENTRE (rows/2, cols/2), matching the mask.
+double filter_box_energy_fraction(const cfloat *H_all, int channels,
+                                  int rows, int cols,
+                                  int box_rows, int box_cols);
+
 // H_ch = A_ch / (B + eps), scaled per channel by 1/sqrt(energy[ch]) (Stage B3),
 // then quantised to Q1.15 with ONE global scale so that the largest |H| bin
 // across all channels maps to full scale.

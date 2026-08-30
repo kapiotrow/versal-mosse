@@ -140,7 +140,10 @@ void check_float(const char *what, const std::vector<float> &got,
 // The quantized filter is the thing the hardware actually consumes, so it is
 // checked in absolute LSB, not relatively. Both sides round the same way; 1 LSB
 // covers float32-vs-float64 accumulation order only.
-void check_q15(const std::vector<int16_t> &got, const std::vector<int16_t> &exp)
+// maybe_unused: at FILTER_MASK=1 the only caller is #if'd out (the golden is the
+// unmasked filter), and this file is built -Wall -Wextra.
+[[maybe_unused]] void check_q15(const std::vector<int16_t> &got,
+                                const std::vector<int16_t> &exp)
 {
     if (got.size() != exp.size()) {
         printf("  %-10s FAIL — size %zu vs %zu\n", "H_q15", got.size(), exp.size());
@@ -1245,6 +1248,178 @@ std::vector<double> loop(bool shifted, int frames, int vr, int vc,
 // before/after comparison unreadable. That property is cheap to keep (the fused
 // loop is textually the two original loops) and worthless unless it is checked,
 // so this compares raw bytes — memcmp, not a tolerance.
+// -----------------------------------------------------------------------
+// FILTER_MASK — the spatial-reliability projection h <- m (.) h
+// -----------------------------------------------------------------------
+// THE ONE NEW THING THAT CAN BE SILENTLY WRONG. filter_mask_project() claims a
+// 3-tap circular convolution on H is exactly a Hann multiply in the spatial
+// domain. If the constant, an axis, or the wrap is wrong the result is still a
+// plausible filter — a slightly rescaled or slightly shifted one — and the
+// board would report a number nobody could attribute. So the reference here is
+// an INDEPENDENT naive DFT written in this file, not mosse_filter.cpp's own
+// transform, and the assertion is made in the SPATIAL domain where the claim
+// actually lives: ifft(project(H)) must equal ifft(H) * m, elementwise.
+//
+// These run at every FILTER_MASK setting, because filter_mask_project() is
+// compiled unconditionally — only its CALL SITES are #if'd. A projection that
+// is only tested in the arm that uses it is tested exactly when it is too late.
+namespace maskref {
+
+// Naive O(n^2) per axis. 16x16 makes that 2*16*256 = 8192 complex MACs, i.e.
+// instant, and being naive is the point: it shares no code with the thing under
+// test.
+void idft2(const std::vector<cfloat> &X, std::vector<cfloat> &x, int R, int C)
+{
+    x.assign((size_t)R * C, cfloat(0.0f, 0.0f));
+    const double tau = 6.283185307179586;
+    for (int r = 0; r < R; ++r)
+        for (int c = 0; c < C; ++c) {
+            std::complex<double> acc(0.0, 0.0);
+            for (int u = 0; u < R; ++u)
+                for (int v = 0; v < C; ++v) {
+                    const double th = tau * ((double)u * r / R + (double)v * c / C);
+                    const std::complex<double> w(std::cos(th), std::sin(th));
+                    const cfloat Xv = X[(size_t)u * C + v];
+                    acc += w * std::complex<double>(Xv.real(), Xv.imag());
+                }
+            acc /= (double)(R * C);
+            x[(size_t)r * C + c] = cfloat((float)acc.real(), (float)acc.imag());
+        }
+}
+
+// The window the BOARD applies: the periodic Hann sin^2(pi i / n), centred at
+// n/2 — hanning_<N>.h's table, and the same window conv2d puts on the patch.
+// NOT the offline bench's (n-1)/2 centring; that half-sample difference is
+// worth mean IoU 0.1715 vs 0.2813 on `tiger` and is why this is spelled out.
+double hann(int i, int n)
+{
+    const double s = std::sin(3.14159265358979323846 * (double)i / (double)n);
+    return s * s;
+}
+
+std::vector<cfloat> random_H(int R, int C, unsigned seed)
+{
+    std::vector<cfloat> H((size_t)R * C);
+    unsigned s = seed;
+    auto nxt = [&s]() {
+        s = s * 1664525u + 1013904223u;
+        return (float)((double)(s >> 8) / 16777216.0) - 0.5f;
+    };
+    for (auto &v : H) v = cfloat(nxt(), nxt());
+    return H;
+}
+
+}  // namespace maskref
+
+void run_filter_mask_tests()
+{
+    printf("\n--- FILTER_MASK spatial projection ---\n");
+    const int R = 16, C = 16;
+
+    // (1) THE CLAIM ITSELF, in the spatial domain.
+    {
+        std::vector<cfloat> H = maskref::random_H(R, C, 12345u);
+        std::vector<cfloat> h_before, h_after;
+        maskref::idft2(H, h_before, R, C);
+
+        std::vector<cfloat> P = H;
+        mosse::filter_mask_project(P.data(), R, C);
+        maskref::idft2(P, h_after, R, C);
+
+        std::vector<cfloat> expect((size_t)R * C);
+        for (int r = 0; r < R; ++r)
+            for (int c = 0; c < C; ++c) {
+                const float m = (float)(maskref::hann(r, R) * maskref::hann(c, C));
+                expect[(size_t)r * C + c] = h_before[(size_t)r * C + c] * m;
+            }
+        check_cfloat("h<-m.h", h_after, expect, 2e-5f);
+    }
+
+    // (2) THE CONSTANT. A wrong 1/16 rescales H uniformly, which an argmax
+    // cannot see and the Q1.15 renormalisation hides completely — so it is
+    // invisible everywhere except here. Pinned against a hand-computed bin: a
+    // DC-only H is spatially constant, and multiplying a constant by the Hann
+    // leaves DC scaled by mean(m) = 0.25 and bins (0,+-1),(+-1,0),(+-1,+-1)
+    // at the outer product of {1/2,-1/4,-1/4} with itself.
+    {
+        std::vector<cfloat> H((size_t)R * C, cfloat(0.0f, 0.0f));
+        H[0] = cfloat(1.0f, 0.0f);
+        std::vector<cfloat> P = H;
+        mosse::filter_mask_project(P.data(), R, C);
+        check_double("mask DC gain", (double)P[0].real(), 0.25, 1e-6);
+        check_double("mask (0,1) gain",
+                     (double)P[1].real(), -0.125, 1e-6);
+        check_double("mask (1,1) gain",
+                     (double)P[(size_t)C + 1].real(), 0.0625, 1e-6);
+        double off = 0.0;
+        for (int r = 2; r < R - 1; ++r)
+            for (int c = 2; c < C - 1; ++c)
+                off = std::max(off, (double)std::abs(P[(size_t)r * C + c]));
+        check_true("mask spectrum is 9 bins", off < 1e-7,
+                   "everything outside {0,+-1}^2 is zero");
+    }
+
+    // (3) THE DEGENERATE-AXIS TRAP, and it is a live one. FilterState is also
+    // the DSST scale filter's type at rows == 1, where a circular D would read
+    // X[-1] == X[+1] == X[0] and return 2X - X - X = ZERO — deleting the filter
+    // instead of masking it. The row axis must be SKIPPED, not wrapped.
+    {
+        std::vector<cfloat> H = maskref::random_H(1, C, 777u);
+        std::vector<cfloat> P = H;
+        mosse::filter_mask_project(P.data(), 1, C);
+        double mag = 0.0;
+        for (const auto &v : P) mag = std::max(mag, (double)std::abs(v));
+        check_true("rows==1 not zeroed", mag > 1e-3, "1-D state survives");
+
+        // and it must be exactly the column-only projection, 1/4 not 1/16.
+        std::vector<cfloat> ref((size_t)C);
+        for (int c = 0; c < C; ++c) {
+            const int cm = (c == 0) ? C - 1 : c - 1;
+            const int cp = (c == C - 1) ? 0 : c + 1;
+            ref[(size_t)c] = (2.0f * H[(size_t)c] - H[(size_t)cm] - H[(size_t)cp])
+                           * 0.25f;
+        }
+        check_cfloat("rows==1 1-D", P, ref, 1e-6f);
+    }
+
+    // (4) THE ENERGY INSTRUMENT — the build's mechanism falsifier. If this is
+    // wrong the run cannot tell "the mask worked" from "something else did".
+    {
+        const int Rb = 8, Cb = 8;
+        std::vector<cfloat> h((size_t)Rb * Cb, cfloat(0.0f, 0.0f));
+        // A delta AT THE PATCH CENTRE must read 1.0: the filter's energy is
+        // centred there, not at the response origin, and getting that backwards
+        // is the error that reads as "masking hurts".
+        h[(size_t)(Rb / 2) * Cb + (Cb / 2)] = cfloat(3.0f, 4.0f);
+        check_double("energy frac, centre",
+                     mosse::filter_box_energy_fraction(h.data(), 1, Rb, Cb, 4, 4),
+                     1.0, 1e-9);
+
+        // The same delta at the ORIGIN must read 0.0 — the discriminator
+        // between the two conventions, and the whole reason this is asserted.
+        std::vector<cfloat> h0((size_t)Rb * Cb, cfloat(0.0f, 0.0f));
+        h0[0] = cfloat(3.0f, 4.0f);
+        check_double("energy frac, origin",
+                     mosse::filter_box_energy_fraction(h0.data(), 1, Rb, Cb, 4, 4),
+                     0.0, 1e-9);
+
+        // Uniform energy over 2 channels: the fraction is the AREA ratio, which
+        // catches an off-by-one in either box extent.
+        std::vector<cfloat> hu((size_t)2 * Rb * Cb, cfloat(1.0f, 0.0f));
+        check_double("energy frac, uniform",
+                     mosse::filter_box_energy_fraction(hu.data(), 2, Rb, Cb, 4, 4),
+                     16.0 / 64.0, 1e-9);
+
+        // A full-patch box is the identity; a degenerate box is 0, not a crash.
+        check_double("energy frac, full box",
+                     mosse::filter_box_energy_fraction(hu.data(), 2, Rb, Cb, Rb, Cb),
+                     1.0, 1e-9);
+        check_double("energy frac, zero box",
+                     mosse::filter_box_energy_fraction(hu.data(), 2, Rb, Cb, 0, 4),
+                     0.0, 1e-9);
+    }
+}
+
 void run_fusion_tests()
 {
     using namespace mosse;
@@ -1648,7 +1823,22 @@ int main(int argc, char **argv)
     std::vector<int16_t> H(n_all * 2);
     float scale = 0.0f, max_abs = 0.0f;
     mosse::filter_quantize_q15(st, energy.data(), eps_rel, H.data(), &scale, &max_abs);
+#if FILTER_MASK
+    // The NumPy golden is the UNMASKED filter, so this one comparison cannot
+    // hold here — and regenerating it against the mask would make the golden
+    // and the implementation share the projection, which is precisely the
+    // "self-consistent test on corrupted data" failure this project has already
+    // paid for once. The projection is checked instead by
+    // run_filter_mask_tests(), against an independent DFT and six mutants.
+    //
+    // Everything ABOVE this line is upstream of the mask and still checked
+    // against the golden: G, A_init, B_init, A_upd, B_upd all hold unchanged.
+    (void)read_pod<int16_t>("H_q15.bin", n_all * 2);
+    printf("  %-10s SKIP — FILTER_MASK=1: golden is the unmasked filter "
+           "(see run_filter_mask_tests)\n", "H_q15");
+#else
     check_q15(H, read_pod<int16_t>("H_q15.bin", n_all * 2));
+#endif
     printf("  %-10s scale %.6g, max|H| %.6g\n", "quantize", (double)scale, (double)max_abs);
 
     // The quantized filter must actually reach full scale, or the response comes
@@ -1690,6 +1880,7 @@ int main(int argc, char **argv)
     run_box_tests();
     run_scale_tests();
     run_training_target_tests();
+    run_filter_mask_tests();
     run_fusion_tests();
     run_scale_reuse_tests();
     run_real_dft_tests();

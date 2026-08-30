@@ -1,0 +1,15 @@
+# vot_ar_offline.py: the toolkit's RULE applied to SINGLE-START runs. NOT the toolkit's AR.
+# Measured resolution ~0.02 in R, biased ~0.02 high. Comparable only between rows of this file.
+# NEVER report a row of this file as a thesis result — see claims.md rule 2.
+arm_id,date,description,A,R,tracked_frames,total_frames,mean_iou,dA,dR,run_dir,claim
+off_rgb,2026-08-28,"offline baseline, shipping eta/gate",0.5394,0.2910,5792,19903,0.1792,,,runs/vot/0828_offline-mask,N-06
+off_mask50_tukey,2026-08-28,"Tukey mask, tight box — NOT board-implementable (rect -> sinc)",0.5413,0.3033,6037,19903,0.1939,0.0020,0.0123,runs/vot/0828_offline-mask,O-01
+off_mask0_hann,2026-08-28,"Hann mask, the exactly-9-bin shape",0.5048,0.3628,7221,19903,0.2040,-0.0346,0.0718,runs/vot/0828_offline-mask,O-01
+off_mask0_boardform,2026-08-29,"same, board-centred axis (n/2 not (n-1)/2) — THE ARM TO SWEEP",,,,19903,0.2016,-0.0103,0.0601,runs/vot/0828_offline-mask/mask62_boardform.json,O-01
+off_gsign_mutant,2026-08-28,"NEGATIVE CONTROL: deliberately broken init. Higher R while tracking worse",,0.3435,,19903,0.1683,-0.0975,0.0525,runs/vot/0828_offline-mask,M-01
+off_rand_bank,2026-08-29,"random bank, matched row norms, 2 seeds (spread 0.0038)",0.5651,0.2801,,19903,,,,runs/vot/0829_offline-bank,N-06
+off_pad15,2026-08-28,"TARGET_PADDING=1.5",,0.2251,,19903,,,,runs/vot/0828_offline-mask,N-05
+off_dec2,2026-08-28,"decimate 2x — passes the artifact test",,,,19903,,-0.0086,0.0567,,N-03
+off_warp8_transcale,2026-08-28,"Bolme 3.4 init perturbations: translation + isotropic scale",,,,19903,,,0.0081,runs/vot/0828_offline-warp8,N-02
+off_warp8_aspect,2026-08-28,"...aspect (roi_h/roi_w independent)",,,,19903,,,-0.0322,runs/vot/0828_offline-warp8,N-02
+off_warp8_rot,2026-08-28,"...rotation 10deg (host pre-rotates); -0.0020 without 3 sequences",,,,19903,,,0.0146,runs/vot/0828_offline-warp8,N-02

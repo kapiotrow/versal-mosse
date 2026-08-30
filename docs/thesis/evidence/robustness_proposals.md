@@ -395,7 +395,7 @@ existing filter tail. Because it lands in `H`, the AIE sees an already-masked fi
 
 This is *not* `TARGET_PADDING` by another name, and that distinction is the reason to run it
 after pad30 failed: padding moves the mask, the px/bin, the search range and the DSST
-extraction region at once, which is exactly why `runs/vot/pooled_features.md` could not
+extraction region at once, which is exactly why `docs/thesis/evidence/pooled_features.md` could not
 attribute its own hardware result. The mask holds every one of those fixed.
 
 Known coupling, from this project's own history: shrinking the filter's support moves the
@@ -471,6 +471,20 @@ on a [0,1] mask. **Only a HANN-SHAPED mask (plateau 0, taper 1.0) is exactly 9 b
 the Stage B2 identity and the only variant implementable host-side with no approximation. Swept
 separately over the same 62:
 
+**THE INVOCATION IS PART OF THE RESULT.** `--mask-taper` DEFAULTS TO 0.25, and `mask0` at the
+default taper is a narrow raised cosine that reaches zero at 12.5% of the patch — 99 non-zero
+bins per axis, only 47% of the energy in the 3 that survive truncation. The arm below needs
+`--mask-taper 1.0` EXPLICITLY, which is the full-patch Hann and the only exactly-9-bin case.
+Verified 2026-08-29 by re-running `surfing` both ways against the stored trajectories: taper 1.0
+reproduces `mask62_hann9bin.json` with maxdiff 0.0, taper 0.25 does not (mean IoU 0.2546 against
+0.1087). Re-running from a command line without the flag silently scores a different,
+NOT-board-implementable arm.
+
+```bash
+env -u PYTHONPATH -u PYTHONHOME ./.venv/bin/python scripts/rgb_vs_gray_loop.py \
+    --arms rgb rgb-mask0 --sequence <seq> --eta 0.05 --psr-min 5.0 --mask-taper 1.0
+```
+
 ```
 arm                  A        R   tracked/19903   meanIoU        dA        dR
 rgb             0.5394   0.2910            5792    0.1792
@@ -483,7 +497,15 @@ the only arm all day that does either. The `dA −0.0346` trips this file's own 
 three checks clear it: mean IoU RISES where the mutant's fell; the hold rate moves only +0.64%
 of frames; and on the frames BOTH arms survived (identical 5563-frame set) the gap is
 **−0.0085**, i.e. three quarters of the accuracy loss is the harder frames a longer-surviving
-arm is scored on. See `runs/vot/proposed_build_mask.md`.
+arm is scored on. See `docs/thesis/evidence/proposed_build_mask.md`.
+
+**AND THE WINDOW THE BOARD WILL ACTUALLY RUN IS NOT QUITE THIS ONE.** `spatial_mask()` centres
+the axis at `(n-1)/2`; the exact periodic Hann — `hanning_128.h`, the only one whose DFT is
+REAL — is centred at `n/2`. Half a sample, `max|Δm| = 0.0123`, and on `tiger` it is worth mean
+IoU 0.1715 (lost f107) against 0.2813 (lost f360). Re-swept over all 62 in the board form:
+**dR +0.0601, trim +0.0409, common-prefix dA −0.0103, hold rate +0.71%** — the arm survives the
+swap, at about 16% less gain. `docs/thesis/evidence/proposed_build_mask.md` §2 carries the table; the
+trajectories are `mask62_boardform.json`.
 
 **So §2 does NOT drop below §3 — it becomes the proposed hardware build.** The refutation above
 stands and is narrower than it first looked: it refutes the TIGHT box mask, not spatial
@@ -536,7 +558,16 @@ host and use it **only as a validator** — one dot product per channel at the a
 peak, per §3's identity — feeding §4's eta modulation. Most of the anti-drift value at ~0 ms.
 Run the expensive half only if the validator's signal turns out to be strong.
 
-## 6. A replacement feature bank — ranked BELOW where CLAUDE.md puts it
+## 6. A replacement feature bank — ranked BELOW where CLAUDE.md puts it, and NARROWED 2026-08-29
+
+**Before reading this section: `docs/thesis/evidence/feature_bank.md` closes the cheap half of it.** Swapping
+which network conv1 comes from is worth ~0.011-0.015 in R — below this bench's resolution, not
+surviving a symmetric trim, and a RANDOM bank of matched row norms ties the pretrained one on
+held-out PSR. "PCA a wider net to 16 better features" is worse: its objective, participation
+ratio, is maximised by noise (random Gaussian 10.69 vs the shipping bank's 7.43). What survives
+is the GEOMETRY argument below — channels, kernel, stride — which is an AIE rebuild.
+**And the bench cannot separate pretrained from random, so it cannot rank two banks either.**
+
 
 The receptive field is hard-wired at 3x3 stride 1 in the AIE kernel. Aggregation over that
 map is refuted on both banks (`pooled_features.md`), so a weights export cannot buy HOG's
