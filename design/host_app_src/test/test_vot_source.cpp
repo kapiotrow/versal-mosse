@@ -24,6 +24,10 @@
  * bump g_failures, and never abort, so one broken case cannot hide the others.
  *
  * Build/run:  make test_vot_source
+ *
+ * @thesis subsec:weryfikacja | R-08,M-06 | The mutation suite: 19
+ *   manifest/blob/trajectory mutants plus 7 for the streaming ring, each of which must be
+ *   REJECTED.
  */
 
 #include <cstdio>

@@ -1,0 +1,21 @@
+# Per-stage APU cost, and what each measurement MOTIVATED. This is the detail behind
+# perf.csv's one-line-per-optimisation history, and it is what sec:wydajnoscZasoby's
+# "latencja poszczegolnych etapow przetwarzania" needs.
+#
+# NOT ONE ARM. Every row carries its own date and source, because these were measured on
+# different builds as the frame shrank from 880 ms to 26. Summing a column would be the
+# interleaved-group error this project has made four times -- see claim M-05.
+stage,ms_per_frame,date,source,status,motivated,claim,stage_pl
+publish filter (hypot scan),12.16,2026-08-20,mosse_filter.cpp comment,superseded,std::abs on a complex is hypot(); ran 262144x/frame,P-01,publikacja filtra (skanowanie z hypot)
+filter_quantize_q15 (before hypot fix),8.71,2026-08-20,CLAUDE.md perf history,superseded,scan on re^2+im^2 then ONE sqrt,P-01,filter_quantize_q15 (przed poprawką)
+filter_quantize_q15 (after hypot fix),1.88,2026-08-20,CLAUDE.md perf history,current,4.6x,P-01,filter_quantize_q15 (po poprawce)
+filter update,10.18,2026-08-20,runs/run_0820_1807.log,superseded,fused update+quantize,P-01,aktualizacja filtra
+publish filter,5.60,2026-08-20,runs/run_0820_1807.log,superseded,fused update+quantize,P-01,publikacja filtra
+four standalone cint16 scans,1.19,2026-08-20,runs/run_0820_1807.log,removed,folded into unpack_spectrum's existing read,P-01,cztery osobne przebiegi skanujące cint16
+unpack_spectrum (naive transpose),2.9,2026-08-21,181 us/call = 11 ns/element,superseded,blocked BLK=16; 4.66x on x86 but 1.63x on the A72,P-05,unpack_spectrum (transpozycja naiwna)
+cmul packing (BO->BO memcpy),2.871,2026-08-21,tracker comment,removed,CMUL_SPLIT_ACCUM gives accum_prev its own port; 2 MB at 696 MB/s,P-05,pakowanie cmul (kopiowanie BO->BO)
+roi_crop launch (before memtile transpose),0.067,2026-08-21,tracker comment,superseded,,P-05,uruchomienie roi_crop (przed transpozycją w kafelku)
+roi_crop launch (exposed by deleting the drain),5.196,2026-08-21,tracker comment,superseded,ROI_CROP_PIPELINE,P-05,uruchomienie roi_crop (po usunięciu drenażu)
+roi_crop launch (pipelined),1.020,2026-08-21,CLAUDE.md,current,,P-05,uruchomienie roi_crop (potokowane)
+scale extract,9.44,2026-08-21,mosse_filter.cpp comment,superseded,real-input DFT,P-11,ekstrakcja skali
+scale extract (real-input DFT),2.138,2026-08-21,4730 -> 2138 us/call,current,3.11x; the transform alone 3819 -> 1228 us,P-11,ekstrakcja skali (DFT rzeczywista)

@@ -12,7 +12,10 @@
  * seen. Pass 1 resamples into a BRAM scratch buffer and accumulates Σx and Σx²;
  * pass 2 re-reads the buffer and emits normalized int8.
  *
- * MEASURED COST (hw_emu VCD probe, 64×64, recompute=1, 312.5 MHz, 2026-08-17).
+ * ---------------------------------------------------------------------------
+ * COST — MEASURED, not scheduled: an hw_emu VCD probe at 64×64, recompute=1,
+ * 312.5 MHz, 2026-08-17. hw_emu WALL time is meaningless, but hw_emu SIMULATED
+ * PL CYCLES are RTL-accurate and transfer directly. Claims A-05, P-03.
  * These supersede the II=1 claim this comment used to make, which was the
  * pragma's request rather than what the loops achieve:
  *
@@ -33,11 +36,31 @@
  * completion latency in the PL. Do not optimise this file for frame rate until
  * that is fixed. See "Frame time" in CLAUDE.md.
  *
+ *   interface     m_axi to the DDR frame buffer; a 32-bit AXIS to the PatchIn
+ *                 PLIO; all geometry over AXI-Lite at RUN TIME, so a ROI or box
+ *                 change needs no rebuild of anything but the host ELF. Driven
+ *                 as a user-managed CU (ROI_CROP_USER_MANAGED=1) because a KDS
+ *                 launch costs ~503 ms on this platform — claim P-03.
+ *   memory        one BRAM scratch patch (16 KB at ROI_IN_CH=1, 48 KB at 3).
+ *                 sum_x2 peaks at 2.111e14 against ap_uint<48>'s 2.815e14, so a
+ *                 FOURTH plane would not fit; the reference model asserts the width.
+ *   PL resources  BRAM18 10 of 1200, DSP 44 of 1312, LUT 7694, FF 7539 for the
+ *                 whole design. docs/thesis/results/resources.csv.
+ *   bilinear      Still NEVER EXERCISED ON HARDWARE: every build to date has
+ *                 roi_h == patch_rows, which collapses the interpolator to a copy.
+ *                 Real ground-truth boxes would activate it for the first time.
+ *                 Bit-exactness (make test_roi_crop, 25 cases, zero tolerance)
+ *                 says nothing about timing — that suite passed throughout the
+ *                 period when the launch path cost 98% of the frame.
+ *
  * HLS notes:
  * - The only divisions are the two step computations and the mean, all outside
  *   any pipeline, so no divider is instantiated in the datapath.
  * - The reciprocal of sigma is computed once per patch in float and converted
  *   to Q16.16, so pass 2 uses integer multiplies only.
+ *
+ * @thesis sec:architekturaSystemu | A-01,A-05 | The PL half of the split: DDR frame -> bilinear
+ *   resample -> Stage A preprocessing -> int8 -> AXIS to the AIE array.
  */
 
 #include "roi_crop.h"
@@ -201,6 +224,8 @@ void roi_crop(
     // would need source-row line buffers or a wider/split AXI port; revisit only
     // if the frame ever gets close to 33 ms, and re-measure first.
     // ---------------------------------------------------------------------
+// @thesis subsec:przetwarzanieWstepne | A-05 | The bilinear resample and the two reduction passes;
+//   measured cycle counts for each pass are in the file header.
 PASS1_ROW:
     for (int r = 0; r < patch_rows; ++r) {
         const int    sy  = base_y + r * step_y;
@@ -275,6 +300,9 @@ PASS1_ROW:
     const ap_uint<48> ex2     = sum_x2 / n_samples;
     const ap_uint<48> var     = (ex2 > mean_sq) ? (ap_uint<48>)(ex2 - mean_sq) : (ap_uint<48>)0;
 
+// @thesis subsec:przetwarzanieWstepne | A-05 | Stage A's normalization: one mean and one inverse sigma in
+//   Q16.16, joint over all planes at ROI_IN_CH=3 -- per-plane statistics would delete the
+//   chromatic contrast RGB exists for.
     // inv_q = ROI_NORM_Q / σ in Q16.16.
     int inv_q;
     if (var == 0) {

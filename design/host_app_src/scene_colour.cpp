@@ -5,6 +5,10 @@
  * Integer only. No float appears anywhere in the colour path, so there is no
  * FMA-contraction question here and no need for the second -ffp-contract build
  * that make test_host runs for mosse_filter.
+ *
+ * @thesis subsec:kosztTransferow | P-04 | The luma-to-interleaved-RGB pass, incremental over
+ *   the touched rect: colourising the whole 2.07 Mpx frame every frame is what RGB would
+ *   otherwise cost.
  */
 
 #include "scene_colour.h"

@@ -11,6 +11,7 @@ paragraphs in three files.
 | `perf.csv` | frame-time history, one row per accepted optimisation | yes |
 | `frame_budget.csv`, `frame_budget_rgb_delta.csv` | where the frame goes | yes |
 | `resources.csv`, `aie_compute.csv` | device utilisation and scheduled AIE cycles | yes |
+| `apu_stages.csv` | per-stage APU cost and what each measurement motivated | yes, per row |
 
 ## The `provenance` column in `arms.csv`
 
@@ -29,5 +30,11 @@ rather than guessing.
 2. Offline and hardware numbers never appear in the same table. `R = 0.3435` (offline mutant)
    and `R = 0.3417` (shipping, hardware) agree to three decimals by coincidence and mean
    opposite things.
-3. A 57-sequence subset is not quotable: the five missing sequences change the subsequence-length
+3. `apu_stages.csv` is **not one arm** — every row carries its own date and source, because
+   they were measured on different builds as the frame shrank from 880 ms to 26. Summing a
+   column would be the interleaved-group error of claim M-05.
+4. `make check-docs` keeps the source comments honest about these values: a comment that
+   repeats a number from this directory has to say so, or it goes stale the next time an arm
+   is re-swept.
+5. A 57-sequence subset is not quotable: the five missing sequences change the subsequence-length
    distribution, so EAO does not degrade gracefully.

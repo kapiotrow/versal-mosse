@@ -56,7 +56,8 @@ static_assert(CMUL_H_SHIFT >= 0 && CMUL_H_SHIFT <= 30, "CMUL_H_SHIFT out of rang
 // WHY. The packing is a host memcpy of 128 KB per channel, 2 MB/frame, and both
 // sources are xrt::bo mappings — which are write-combining, so the READ side runs
 // at 696 MB/s (startup probe). 2 MB at 696 MB/s is 3.01 ms; the `cmul packing`
-// slot measures 2.871. It is not a copy that happens to be slow, it IS the
+// slot measures 2.871 (docs/thesis/results/apu_stages.csv, claim P-05). It is not a
+// copy that happens to be slow, it IS the
 // uncached read, and splitting the port deletes it outright rather than
 // optimising it.
 //

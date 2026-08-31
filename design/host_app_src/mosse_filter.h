@@ -45,6 +45,10 @@
  * This file and mosse_filter.cpp include NO XRT and NO ADF header, on purpose:
  * `make test_host` compiles them with the system g++ and checks them against a
  * NumPy golden in seconds. The alternative is a ~90 min hw_emu frame.
+ *
+ * @thesis subsec:aktualizacjaFiltra | A-03,B-06 | The filter contract: Bolme eq. 10-12 with a
+ *   SHARED denominator, why no FFT is needed on the host, and the conjugation convention that
+ *   is silent when wrong.
  */
 
 #pragma once
@@ -157,6 +161,9 @@ constexpr float DEFAULT_PADDING = (float)(TARGET_PADDING);
 // magnitude depends on the shift budget and the feature scale, so an absolute
 // epsilon would silently become either a no-op or a dominant term after any
 // recalibration.
+// @thesis sec:dyskusjaWynikow | N-19 | eps_rel is SETTLED at 1e-3 and is not a
+//   tuning knob: the response has a closed form R = G*B/(B+eps), and the sweep peaks here.
+//   Bolme Fig. 4's flat curve does not transfer -- his eps is absolute, this one relative.
 constexpr float DEFAULT_EPS_REL = 1e-3f;
 
 // Half-width of the excluded window around the peak, Bolme §3.5's 11x11.
@@ -410,10 +417,14 @@ void filter_update(FilterState &st, const cfloat *F_all,
 // holds only 51.6% (car1) / 54.9% (tiger) of SUM|h|^2. That is
 // filter_box_energy_fraction() below, and it is this build's mechanism check.
 //
-// EVIDENCE: docs/thesis/evidence/proposed_build_mask.md. 62 sequences, shipping eta/gate,
-// vot_ar_offline: dR +0.0601 in the BOARD form of the window (3.0x the
-// instrument's measured resolution), surviving a symmetric trim at +0.0409,
-// mean IoU 0.1792 -> 0.2016, 20.7% more frames tracked.
+// EVIDENCE: docs/thesis/evidence/proposed_build_mask.md, claim O-01, and the rows
+// `off_rgb` / `off_mask0_boardform` in docs/thesis/results/arms_offline.csv -- which is
+// where these figures live and where they get corrected if the arm is re-swept.
+// 62 sequences, shipping eta/gate, vot_ar_offline: dR +0.0601 in the BOARD form of the
+// window (3.0x the instrument's measured resolution), surviving a symmetric trim at
+// +0.0409, mean IoU 0.1792 -> 0.2016, 20.7% more frames tracked.
+// NOTE these are OFFLINE single-start numbers and are not comparable to the hardware
+// arms in arms.csv -- see claims.md rule 2.
 //
 // THE WINDOW IS THE PERIODIC HANN, and it must be the one centred at n/2 —
 // i.e. hanning_<N>.h's sin^2(pi i / n), the SAME window conv2d applies to the
@@ -514,7 +525,8 @@ void filter_update_quantize(FilterState &st, const cfloat *F_all,
 // WHY A SEPARATE 1-D FILTER RATHER THAN AN EXHAUSTIVE MULTI-RESOLUTION SEARCH.
 // Danelljan's ICCV'15 paper applies the translation filter at several
 // resolutions; DSST Table 1 shows the separate filter beats that on BOTH axes
-// (OP 67.7 vs 65.2, 25.4 vs 16.9 FPS). On THIS hardware the gap is wider than
+// (OP 67.7 vs 65.2, 25.4 vs 16.9 FPS — THEIR numbers, docs/papers/danelljan2017_fdsst.pdf,
+// not measurements of this design). On THIS hardware the gap is wider than
 // the paper's, for a reason specific to the fixed-point pipeline: an exhaustive
 // search pushes patches resampled by +/-30% through roi_crop -> conv2d -> FFT
 // every frame, which moves |F| and therefore the accumulator scale and therefore

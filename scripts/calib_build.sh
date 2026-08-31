@@ -38,6 +38,10 @@
 #   DRY_RUN=1 scripts/calib_build.sh       # pre-flight only, build nothing
 #   COMPARATOR=runs/run_calib.log H_SHIFT=11 scripts/calib_build.sh
 #
+
+# @thesis subsec:narzedziaBudowanie | B-07,M-06 | The hardware build with pre-flight checks: it
+#   verifies the FLAGSTAMPS against the intended config, because a flag-only change has silently
+#   reused a stale libadf.a.
 set -euo pipefail
 cd "$(dirname "$0")/.."
 
@@ -117,7 +121,8 @@ COMPARATOR=${COMPARATOR:-"runs/run_0824_1354.log (gray/roi/4-4-4/H_SHIFT=11: mea
 ITER_CNT=${ITER_CNT:-200}
 # VERBOSITY=1 so the per-frame block carries `rails`, which track.csv does NOT.
 # This run is NOT an FPS measurement and its frame time is not comparable to the
-# 38.04 FPS figure, which was taken at VERBOSITY=0.
+# 38.04 FPS figure, which was taken at VERBOSITY=0 (docs/thesis/results/perf.csv,
+# run_0821_1725, claim P-01).
 VERBOSITY=${VERBOSITY:-1}
 # 1216 KB and ~2 s per frame. Never on for a 200-frame run.
 DUMP_BUFFERS=${DUMP_BUFFERS:-0}

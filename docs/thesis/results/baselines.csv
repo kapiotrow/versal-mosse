@@ -1,14 +1,14 @@
 # Kristan et al., The Tenth VOT2022 Challenge Results, ECCVW 2022, Table 12 (41 trackers).
 # Directly comparable: same dataset, same anchor-based multi-start protocol, axis-aligned boxes.
-tracker,class,EAO,A,R,source
-MixFormerL,transformer (winner),0.602,0.831,0.859,kristan2022vot
-DAMT,transformer,0.602,0.776,0.887,kristan2022vot
-DiMP,deep DCF,0.430,0.689,0.760,kristan2022vot
-ATOM,deep DCF,0.386,0.668,0.716,kristan2022vot
-TCLCFcpp,CF ensemble (embedded/CPU),0.267,0.550,0.598,kristan2022vot
-ASMS,mean-shift,0.255,0.526,0.599,kristan2022vot
-CSRDCF,HOG/CN + spatial & channel reliability,0.251,0.519,0.580,kristan2022vot
-KCF,kernelized DCF + HOG,0.239,0.542,0.532,kristan2022vot
-ANT,part-based,,0.492,,kristan2022vot
-LGT,part-based (last of 41),0.195,0.461,0.486,kristan2022vot
-this-work,fixed-point MOSSE/DSST on Versal,0.163,0.510,0.342,arms.csv:rgb_eta05_gate5
+tracker,class,EAO,A,R,source,class_pl
+MixFormerL,transformer (winner),0.602,0.831,0.859,kristan2022vot,transformer (zwycięzca)
+DAMT,transformer,0.602,0.776,0.887,kristan2022vot,transformer
+DiMP,deep DCF,0.430,0.689,0.760,kristan2022vot,głęboki DCF
+ATOM,deep DCF,0.386,0.668,0.716,kristan2022vot,głęboki DCF
+TCLCFcpp,CF ensemble (embedded/CPU),0.267,0.550,0.598,kristan2022vot,"zespół filtrów CF (wbudowany, CPU)"
+ASMS,mean-shift,0.255,0.526,0.599,kristan2022vot,mean-shift
+CSRDCF,HOG/CN + spatial & channel reliability,0.251,0.519,0.580,kristan2022vot,"HOG i barwa, niezawodność przestrzenna i kanałowa"
+KCF,kernelized DCF + HOG,0.239,0.542,0.532,kristan2022vot,"DCF z funkcją jądra, HOG"
+ANT,part-based,,0.492,,kristan2022vot,oparty na częściach
+LGT,part-based (last of 41),0.195,0.461,0.486,kristan2022vot,oparty na częściach (ostatni z 41)
+this-work,fixed-point MOSSE/DSST on Versal,0.163,0.510,0.342,arms.csv:rgb_eta05_gate5,"MOSSE i filtr skali, arytmetyka stałoprzecinkowa, Versal"

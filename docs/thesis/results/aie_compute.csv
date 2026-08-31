@@ -6,3 +6,7 @@ conv2d,4.1,,,"37 -> 8.75 cyc/px; stream-read loop is now 44% of it"
 cmul_accum,0.13,,,"30 -> 2 cyc/element, pipelined"
 FFT + IFFT chain,2.2,1.3,3.5,trip counts inferred
 total,6.4,,,from ~21.6 before vectorization
+conv2d (gray arm),4.60,,,"CONV_IN_CH=1, ch16, 1 GHz; stream read 28-31 cyc/4px, MAC+post 163 cyc/16px"
+conv2d (RGB arm),9.19,,,"CONV_IN_CH=3; stream read 84-87 cyc/4px (3.00x), MAC+post 219 cyc/16px (1.34x), no software pipelining"
+total before vectorization,21.6,,,"the same chain with scalar conv2d and cmul kernels"
+cmul_accum (scalar),7.9,,,"pre-vectorization: 30 cyc/complex element, not pipelined, 64 invocations x 16 channels"

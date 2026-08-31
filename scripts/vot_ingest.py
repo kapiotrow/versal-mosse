@@ -26,6 +26,9 @@ Usage
 -----
   env -u PYTHONPATH -u PYTHONHOME ./.venv/bin/python scripts/vot_ingest.py \
       --results /srv/vot/results --out $VOT_ROOT/analysis/0825
+
+@thesis sec:metodykaBadan | R-04,M-03 | Board trajectories into a VOT workspace for `vot
+  analysis`. It re-derives every run name from the anchors and checks each trajectory's LENGTH.
 """
 
 import argparse

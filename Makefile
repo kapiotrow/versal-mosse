@@ -2119,3 +2119,22 @@ figures:
 		env -u PYTHONPATH -u PYTHONHOME ./.venv/bin/python $$f || exit 1; \
 	done
 .PHONY: figures
+
+# Regenerates docs/thesis/code_map.md from the @thesis tags in design/ and scripts/.
+# Validates every tag against the thesis labels and docs/thesis/claims.md.
+code-map:
+	@python3 scripts/thesis_index.py
+.PHONY: code-map
+
+# Reports comments whose measured numbers duplicate docs/thesis/results/*.csv without
+# citing anything, and measurements that no CSV records. --strict fails on the first class.
+check-docs:
+	@python3 scripts/check_doc_numbers.py
+.PHONY: check-docs
+
+# Generates docs/thesis/tables/*.tex (booktabs bodies) from docs/thesis/results/*.csv.
+# Copy them into the thesis repo by hand, or opt in with:
+#   python3 scripts/csv2tex.py --overleaf [PATH]
+thesis-tables:
+	@python3 scripts/csv2tex.py
+.PHONY: thesis-tables

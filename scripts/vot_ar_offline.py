@@ -56,6 +56,10 @@ Usage
 -----
   python3 scripts/vot_ar_offline.py <runs.json> [armA armB ...]
 where <runs.json> maps "<sequence>|<arm>" -> {"iou": [...per frame...]}.
+
+@thesis sec:metodykaBadan | M-01,N-04 | The offline A/R proxy: the toolkit's RULE on
+  single-start runs. Resolution ~0.02 in R, biased high, and it did NOT transfer on the padding
+  arm.
 """
 import json, sys, statistics as st
 

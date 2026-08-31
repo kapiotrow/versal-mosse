@@ -36,6 +36,10 @@ Usage
 -----
   env -u PYTHONPATH -u PYTHONHOME ./.venv/bin/python scripts/rgb_vs_gray_loop.py
   ... --oracle-scale --frames 400
+
+@thesis sec:metodykaBadan | N-01,N-02,N-03 | The closed-loop offline bench: float64 downstream
+  of the features, 3.5 s per 100 frames, and the home of the quantization, pooling and
+  init-perturbation arms.
 """
 
 import argparse
@@ -237,7 +241,8 @@ def box_iou(a, b):
 # It matters here far more than in a single-start benchmark. The board runs the
 # ANCHORED multi-start protocol -- 419 runs per arm, so 419 inits -- and
 # `scripts/vot_init_anatomy.py` measures 61 of the 373 losing runs (16%) failing
-# within 10 frames of init, already at median IoU 0.571 and PSR 7.35 one frame
+# (claim N-02, docs/thesis/evidence/) within 10 frames of init, already at median
+# IoU 0.571 and PSR 7.35 one frame
 # after filter_init() against 0.915 and 36.73 for every other run. Those runs do
 # not drift off the target; they never acquire it.
 #

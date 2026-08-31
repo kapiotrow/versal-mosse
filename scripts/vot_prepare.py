@@ -46,6 +46,9 @@ Usage
       convert --root test-sequences --out $VOT_ROOT/data
   ... verify --out $VOT_ROOT/data
   ... verify --out $VOT_ROOT/data --mutate all      # prove verify can FAIL
+
+@thesis sec:zbioryTestowe | R-08 | VOT sequences to board blobs and manifests. THE groundtruth
+  reduction lives here; every other reader imports reduce_box from it.
 """
 
 import argparse

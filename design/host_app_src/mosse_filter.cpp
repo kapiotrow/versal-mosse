@@ -261,6 +261,9 @@ void gaussian_target_spectrum(cfloat *G, int rows, int cols,
     gaussian_target_spectrum(G, rows, cols, sigma, sigma, dr, dc);
 }
 
+// @thesis subsec:aktualizacjaFiltra | A-03 | The target spectrum in closed form: the DFT of a
+//   circularly wrapped Gaussian is another Gaussian, so no forward transform is ever needed for
+//   G.
 void gaussian_target_spectrum(cfloat *G, int rows, int cols,
                               float sigma_r, float sigma_c, int dr, int dc)
 {
@@ -355,6 +358,9 @@ void dft_with_table(const cfloat *in, cfloat *out, int n,
     }
 }
 
+// @thesis subsec:fftAie | P-10 | Hermitian symmetry pays HERE, on the host's
+//   own real-input DFT, and NOT on the AIE spectrum: the fixed-point FFT leaves 95.8% of bins
+//   differing from their conjugate partner, so the 2-D filter cannot be halved the same way.
 // REAL-INPUT forward transform, exploiting Hermitian symmetry. Same table, same
 // summation order, same accumulator type as dft_with_table() — so for a purely
 // real input the bins it computes are BITWISE what the complex routine produced.
@@ -374,6 +380,9 @@ void dft_with_table(const cfloat *in, cfloat *out, int n,
 // The mirror out[n-k] = conj(out[k]) is exact given a conjugate-symmetric
 // twiddle table — see twiddle_table(). The `n - k > kmax` guard is for even n,
 // where k = n/2 is its own mirror and must not be overwritten.
+// @thesis subsec:filtrSkali | P-11 | The real-input DFT that replaced the complex one
+//   in scale extraction: 3.11x offline and 3.11x on the board, where fDSST's PCA compression
+//   was not worth it.
 void real_dft_with_table(const float *in, cfloat *out, int n,
                          const std::vector<cfloat> &w)
 {
@@ -481,6 +490,8 @@ void scale_filter_config(ScaleFilter &sf, int n_scales, float step,
     sf.initialized = false;
 }
 
+// @thesis subsec:filtrSkali | A-08 | DSST scale extraction: 33 resampled patches reduced to one
+//   feature vector per level, with the real-input DFT that replaced the complex one.
 void scale_extract(const ScaleFilter &sf, const uint8_t *frame,
                    int frame_rows, int frame_cols,
                    double row, double col, double box_h, double box_w,
@@ -553,6 +564,8 @@ void scale_extract(const ScaleFilter &sf, const uint8_t *frame,
                             F_out + (size_t)l * S, S, w);
 }
 
+// @thesis subsec:filtrSkali | A-08,A-10 | Scale detection: the 1-D filter is the translation
+//   filter at rows=1, and a single application deliberately under-corrects.
 ScaleResult scale_detect(const ScaleFilter &sf, const cfloat *Z, float eps_rel)
 {
     ScaleResult res;
@@ -702,6 +715,8 @@ void filter_update(FilterState &st, const cfloat *F_all,
 // neighbours along the axis and an in-place single pass would consume values it
 // has already overwritten. `scratch` holds the intermediate; one channel's map
 // is 128 KB at 128x128, inside the A72's 1 MB L2.
+// @thesis subsec:aktualizacjaFiltra | O-01 | The spatial-mask projection h <- m*h, reduced to 8
+//   complex adds per bin because only a periodic Hann mask has an exactly sparse spectrum.
 void filter_mask_project(cfloat *H, int rows, int cols)
 {
     // An axis shorter than 3 bins has no distinct neighbours: the circular D
@@ -790,6 +805,9 @@ double filter_box_energy_fraction(const cfloat *H_all, int channels,
     return (total > 0.0) ? (inbox / total) : 0.0;
 }
 
+// @thesis subsec:aktualizacjaFiltra | A-03,P-01 | The fused update+quantize: A, B and the Q1.15
+//   export in one pass over the 8 MB of filter state, channel-major so the A72 prefetcher sees
+//   one stream.
 void filter_update_quantize(FilterState &st, const cfloat *F_all,
                             const cfloat *G, float eta,
                             const double *energy, float eps_rel,
@@ -857,6 +875,10 @@ void filter_update_quantize(FilterState &st, const cfloat *F_all,
         cfloat       *hs = h_scratch.data() + (size_t)ch * n;
         const float   cs = chscale[(size_t)ch];
 
+        // @thesis subsec:optymalizacjaOdrzucona | P-07 | Why the filter update is NOT split
+        //   across cores internally: GCC's FMA contraction is sensitive to INLINING CONTEXT,
+        //   so every formulation was 1 ulp off under -ffp-contract=fast, and 1 ulp of A is
+        //   carried frame to frame. Parallelise across FUNCTIONS instead (TAIL_PARALLEL).
         // TWO LOOPS, NOT ONE, AND THAT IS THE POINT. Interleaving the two
         // statements in a single loop body is what a first cut does, and it is
         // measurably wrong: GCC contracts mul+add into FMA per expression, and
@@ -924,6 +946,9 @@ void filter_update_quantize(FilterState &st, const cfloat *F_all,
     if (out_max_abs) *out_max_abs = max_abs;
 }
 
+// @thesis subsec:arytmetyka | B-06,P-01 | Q1.15 export: the max-|H| scan runs on re^2+im^2 and
+//   takes ONE square root, because std::abs on a complex is hypot() and this ran 262144x per
+//   frame.
 void filter_quantize_q15(const FilterState &st, const double *energy,
                          float eps_rel, int16_t *out,
                          float *out_scale, float *out_max_abs)
@@ -954,7 +979,8 @@ void filter_quantize_q15(const FilterState &st, const double *energy,
     //
     // std::abs() on a std::complex is hypot() — a libm call with its own scaling
     // and overflow handling — and this loop ran it channels*n = 262144 times per
-    // frame. Measured 2026-08-20: `publish filter` was 12.16 ms/frame on the A72
+    // frame. Measured 2026-08-20 (docs/thesis/results/apu_stages.csv, claim P-01):
+    // `publish filter` was 12.16 ms/frame on the A72
     // (9.83 with -O3), and a native x86 benchmark put filter_quantize_q15 at
     // 9.63 ms of which -ffast-math removed 7.6 — i.e. essentially all of it was
     // the transcendental.
@@ -1067,6 +1093,9 @@ void filter_quantize_q15(const FilterState &st, const double *energy,
 // -----------------------------------------------------------------------
 // Scale-update gating — see the header for the hardware data behind it
 // -----------------------------------------------------------------------
+// @thesis subsec:filtrSkali | N-17,N-18 | The scale gate: three vetoes reported separately, the
+//   update skip being the load-bearing half. SCALE_MAX_STEP is a rate limit, MIN_REL/MAX_REL a
+//   drift bound.
 ScaleDecision scale_gate(const ScaleResult &sr, int n_scales,
                          double cur_h, double cur_w, double h0, double w0,
                          float conf_min, double min_rel, double max_rel,

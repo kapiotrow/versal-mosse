@@ -34,6 +34,39 @@
  *   [0 .. N-1]   : H_ch* (filter)
  *   [N .. 2N-1]  : prev accumulator
  * Both halves come from the same GMIO-backed buffer (one lock pair).
+ *
+ * ---------------------------------------------------------------------------
+ * COST — per frame at 128x128, ch16, 1 GHz. docs/thesis/results/aie_compute.csv.
+ * Claims A-04, P-05.
+ *
+ *   compute       0.13 ms. Four multiplies and two adds per bin, so this kernel
+ *                 is ~2% of the AIE total and is NOT where to look for time.
+ *   vectorization 30 -> 2 cyc/element AND it now pipelines; the scalar loop did
+ *                 not, which is what made it 7.9 ms and the second-largest
+ *                 compute cost in the design. BIT-IDENTICAL, checked by
+ *                 make x86sim_check KUT=cmul SCENARIO=s7 / cmul_stress.
+ *   tile memory   flt_local + acc_local, 2 x CMUL_N cint16 = 2 x PATCH_COLS x
+ *                 FFT_COL_WS x 4 B — 8 KB at the shipping FFT_COL_WS=8. Both are
+ *                 alignas(32): x86sim does NOT enforce alignment, so omitting it
+ *                 passes every bit-exactness check and then misbehaves on hardware.
+ *   interface     Two input ports at CMUL_SPLIT_ACCUM=1 (H on gmio_cmul_in,
+ *                 the running sum on gmio_accum_in) instead of one packed buffer.
+ *                 That deletes 2 MB/frame of host BO->BO memcpy outright rather
+ *                 than optimising it; see docs/thesis/results/apu_stages.csv.
+ *   accumulator   In DDR, 128x128 cint16 = 64 KB. On-tile does not work as usually
+ *                 stated: it is a read-modify-write by ONE kernel across
+ *                 invocations, so as a shared_buffer it is a graph CYCLE whose
+ *                 required delay is CMUL_N_CHUNKS (16) invocations, not 1.
+ *   caveat        This kernel is SCHEDULE-FRAGILE. A branching sat16 slowed it
+ *                 enough to blow the aiesim wall clock, and chess_prepare_for_
+ *                 pipelining has put the assembler into OOM here. Re-measure the
+ *                 arithmetic loop's reported cycles after any edit.
+ *                 `make aiesim` needs CMUL_SPLIT_ACCUM=0 (a 2025.2 aiesim
+ *                 deadlock); hardware is fine either way.
+ *
+ * @thesis subsec:operacjeCzestotliwosc | A-01,A-04 | Complex multiply against the conjugated
+ *   filter plus cross-channel accumulation; the accumulator lives in DDR, and the file header
+ *   explains why an on-tile version is a graph cycle.
  */
 
 #include "cmul_accum_kernel.h"
@@ -56,6 +89,8 @@ static constexpr int CMUL_N = PATCH_COLS * FFT_COL_WS;  // 256
 // biases every negative bin of the spectrum by up to one LSB in the same
 // direction — a systematic DC offset in the response, not just noise. One add
 // per product removes it, and it is branchless so the do-loop stays tight.
+// @thesis subsec:arytmetyka | B-02,B-03 | H_SHIFT applied here: the one knob upstream of BOTH
+//   the accumulator and the response, and the only non-host-only parameter in the build table.
 static constexpr int32_t CMUL_RND = (CMUL_H_SHIFT > 0) ? (1 << (CMUL_H_SHIFT - 1)) : 0;
 
 // Saturating narrow to int16.
@@ -84,6 +119,9 @@ static constexpr int32_t CMUL_RND = (CMUL_H_SHIFT > 0) ? (1 << (CMUL_H_SHIFT - 1
 // The min/max form compiles to two conditional selects with no branches, so the
 // hardware do-loop stays tight. Compare the reported cycles for the arithmetic
 // loop in aiecompiler.log against the branching version's 26.
+// @thesis subsec:arytmetyka | B-04 | Saturating int32->int16: the rail is per COMPONENT, which
+//   is why a magnitude of 46340 = 32767*sqrt(2) is not overshoot and why `rails` is the only
+//   saturation instrument.
 static inline int16_t sat16(int32_t v)
 {
     v = (v >  32767) ?  32767 : v;
@@ -143,7 +181,8 @@ void cmul_accum_kernel(
     //
     // The scalar loop cost 30 cycles per complex element and was NOT pipelined
     // (see the note below about the assembler OOM), which at 64 invocations x 16
-    // channels made this kernel ~7.9 ms/frame — the second-largest compute cost
+    // channels made this kernel ~7.9 ms/frame (docs/thesis/results/aie_compute.csv,
+    // row `cmul_accum (scalar)`) — the second-largest compute cost
     // in the design after conv2d, for four multiplies and two adds.
     //
     // Why this is exactly equal to the scalar code, not merely close:

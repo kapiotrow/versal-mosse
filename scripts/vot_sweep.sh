@@ -57,6 +57,10 @@
 #   --ingest         run scripts/vot_ingest.py over the results when done
 #   --dry-run        print every remote command instead of running it
 
+# @thesis sec:metodykaBadan | B-07,R-09 | One sweep, one command: mount, push, guard the build
+#   against the board's xclbin, run, collect, ingest -- and record the flagstamps beside the
+#   results.
+
 set -euo pipefail
 cd "$(dirname "$0")/.."
 

@@ -38,6 +38,10 @@
  *   make scale_sim && build/.../scale_loop_sim              # all arms
  *   build/.../scale_loop_sim --arm moving --frames 200 -v   # per-frame trace
  *   build/.../scale_loop_sim --arm moving --eta 0.1         # sweep the fix
+ *
+ * @thesis subsec:filtrSkali | A-09,N-17 | The closed-loop scale bench that reproduces the
+ *   board's f130 stall and that decided SCALE_STEP and SCALE_MAX_STEP. Trust its ordering, not
+ *   its absolute magnitudes.
  */
 #include "mosse_filter.h"
 

@@ -20,6 +20,24 @@
  * The col shift was determined empirically to make round-trip FFT→IFFT of a unit impulse give 1.
  *
  * fft_graph.h must be included before this file (provides point-size macros).
+ *
+ * ---------------------------------------------------------------------------
+ * COST — counted with the forward chain; see fft_graph.h's COST block, which
+ * carries the whole 2.2 ms/frame figure and its caveat. Claim A-01.
+ *
+ *   shift budget  IFFT_ROW_SHIFT and IFFT_COL_SHIFT reach only the RESPONSE,
+ *                 not the accumulator. The invariant that fixes the response
+ *                 scale is 2*FFT_SHIFT + IFFT_ROW_SHIFT + IFFT_COL_SHIFT, so
+ *                 weight moves freely between the passes (holds to 1.3% across
+ *                 splits). Settled at 4-4-4; IFFT_ROW_SHIFT=0 is unsafe at ch16.
+ *                 Claims B-01, B-02.
+ *
+ * @thesis subsec:arytmetyka | B-01,B-02 | The shift-budget invariant lives here:
+ *   2*FFT_SHIFT + IFFT_ROW_SHIFT + IFFT_COL_SHIFT fixes the response scale, so weight moves
+ *   freely between passes; IFFT_* reach only the response, never the accumulator.
+ *
+ * @thesis subsec:fftAie | A-01 | The inverse pass, same structure, fed from the accumulated
+ *   correlation spectrum in DDR.
  */
 
 #pragma once

@@ -20,6 +20,36 @@
  * Row FFT point size = PATCH_COLS
  * Col FFT point size = PATCH_ROWS
  * Both equal for square patches (default 128×128).
+ *
+ * ---------------------------------------------------------------------------
+ * COST — the forward and inverse chains together are ~2.2 ms/frame (band
+ * 1.3-3.5) at 128x128, ch16. docs/thesis/results/aie_compute.csv. Claim A-01.
+ *
+ *   caveat        THE TRIP COUNTS ARE INFERRED, NOT LOGGED. Every other row of
+ *                 that table is read off a compiler schedule; this one is not,
+ *                 and the band is the honest uncertainty. Do not quote 2.2 as
+ *                 though it were measured.
+ *   windowing     FFT_ROW_WS rows and FFT_COL_WS cols per invocation — the DMA
+ *                 transaction-count knob, which took total traffic from 4258 to
+ *                 1090 tx/frame. FFT_ROW_WS=64 is exhausted. FFT_COL_WS=32 is a
+ *                 9.57 ms LOSS and must not be raised (claim P-08).
+ *                 A windowing result from one port does NOT generalise to
+ *                 another: the identical change was 7x better on one GMIO and 4x
+ *                 worse on its sibling.
+ *   memory tiles  1 of 76 used, for the transpose between the row and column
+ *                 passes (MEMTILE_TRANSPOSE=1, which also deleted four GMIO
+ *                 ports). A ONE-SIDED flag is a board deadlock, not a compile
+ *                 error. docs/thesis/results/resources.csv.
+ *   numerics      DSPLib's cint16 FFT loss is ADDITIVE, not a gain factor: each
+ *                 pass subtracts ~21 from a summed DC bin, independent of
+ *                 amplitude. So row_dc = PATCH_COLS*c - 21 and accum0 =
+ *                 PATCH_ROWS*row_dc - 21; any "expected = N" calculation is
+ *                 wrong. The fixed-point transform is also NOT Hermitian for
+ *                 real input (claim P-10) — 95.8% of bins differ from their
+ *                 conjugate partner, so the host filter cannot be halved.
+ *
+ * @thesis subsec:fftAie | A-01 | Forward 2-D FFT: PATCH_COLS-point row FFT, memory-tile
+ *   transpose, PATCH_ROWS-point column FFT, built on DSPLib fft_ifft_dit_1ch.
  */
 
 #pragma once
@@ -55,6 +85,9 @@ namespace dsplib = xf::dsp::aie;
 #  define FFT_COL_CASCADE_LEN  1
 #endif
 
+// @thesis sec:wydajnoscZasoby | P-08 | FFT_COL_WS=32 was built and measured: a
+//   9.57 ms LOSS. The window that wins on one GMIO port loses on its sibling, so a windowing
+//   result does not generalise without a hardware run.
 // Window sizes: process FFT_ROW_WS rows / FFT_COL_WS cols per kernel invocation
 #ifndef FFT_ROW_WS
 #  define FFT_ROW_WS  2

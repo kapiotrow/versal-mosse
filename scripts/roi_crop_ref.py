@@ -83,6 +83,9 @@ Each row is a real trap, not a hypothetical. Line numbers are roi_crop.cpp.
 All integer arithmetic is done in int64 / Python int. The kernel's ap_uint widths
 are asserted rather than emulated, so a geometry that would overflow them fails
 loudly here instead of wrapping silently there.
+
+@thesis subsec:weryfikacja | A-05 | The bit-exact NumPy model of roi_crop, and the source
+  of the 25 golden cases. THE groundtruth for Stage A.
 """
 
 from __future__ import annotations

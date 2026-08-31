@@ -22,12 +22,51 @@
  *   and cols 0 and PATCH_COLS-1, so the MAC is still performed but the output
  *   is guaranteed zero for those samples.
  *
- * Memory footprint on AIE tile
- * ----------------------------
- *   line buffer:    3 × (PATCH_COLS+2)  =  390 bytes
- *   weight scalars: 9 int8 + 1 int8 shift + 4 int32 bias  =  ~20 bytes
- *   Hanning table:  128 × 2 bytes  =  256 bytes  (in hanning_128.h, const)
- *   Total ≪ 64 KB tile data memory.
+ * ---------------------------------------------------------------------------
+ * COST — per frame at 128x128, ch16, 1 GHz. Source: the aiecompiler.log
+ * schedules of the build that linked; tabulated in
+ * docs/thesis/results/aie_compute.csv. Claims P-04, R-01.
+ *
+ *   compute       4.60 ms gray (CONV_IN_CH=1) / 9.19 ms RGB (CONV_IN_CH=3).
+ *                 The bank is processed serially, one channel per invocation,
+ *                 so this is 16 x the per-channel schedule.
+ *   vectorization 37 -> 8.75 cyc/px. aie::mac with aie::downshift, BIT-IDENTICAL
+ *                 to the scalar path (CONV_VECTORIZE=0) and checked, not assumed:
+ *                 make x86sim_check KUT=conv2d SCENARIO=s6 / s6rgb.
+ *   pipelining    gray: MAC+post folds, 163 cyc / 16 px, critical cycle 24.
+ *                 RGB: 219 cyc / 16 px and NO folding — the compiler reports
+ *                 "219 (exceeds -k 64) -> no folding" against a critical cycle
+ *                 of 200. 219 is therefore a give-up number, not a floor.
+ *   what dominates the STREAM READ, not the arithmetic: 44% of the kernel at
+ *                 CONV_IN_CH=1 and 61% at 3, because the patch is re-streamed
+ *                 once per output channel. RGB makes the already-dominant term
+ *                 more dominant. Optimise the read before the taps.
+ *   tile memory   line buffer 3 x (PATCH_COLS+2) = 390 B at CONV_IN_CH=1;
+ *                 3 planes x 3 rows with the same padding at CONV_IN_CH=3.
+ *                 Weight scalars ~20 B; Hanning table 128 x 2 B = 256 B (const,
+ *                 in hanning_128.h). All of it far under the 64 KB tile.
+ *   stack         1024 B default is NOT enough at CONV_IN_CH=3: the 27-tap chain
+ *                 needs 1344, so CONV2D_STACK=2048 is applied at RGB only. Get
+ *                 this wrong and the LINK stage refuses to emit libadf.a while
+ *                 the per-kernel compile succeeds either way — which is why it
+ *                 went unnoticed.
+ *   interface     PatchIn, a 32-bit PLIO carrying 4 packed int8 per word. Not
+ *                 128-bit: that delivered one beat per readincr and starved this
+ *                 kernel. `weights` is an input_buffer, so ADF re-acquires it
+ *                 EVERY firing — the driver must supply PATCH_ELEMS/CONV_OUT_CHUNK
+ *                 buffers per channel and must start the patch flowing first,
+ *                 or the graph deadlocks.
+ *   caveat        These are compiler-SCHEDULED cycles: real cycles on an in-order
+ *                 VLIW core absent memory stalls. Trustworthy for sizing, not a
+ *                 profile. Two traps when re-reading them: aiecompiler reuses a
+ *                 cached object when the preprocessed source is unchanged, so
+ *                 `rm -rf $(BUILD_DIR)/Work $(BUILD_DIR)/libadf.a` before
+ *                 comparing arms; and the "140 cyc/16px" figure in the Makefile
+ *                 is the main_ WRAPPER block, which does not move when the
+ *                 arithmetic triples.
+ *   NOT frame time. conv2d's +4.59 ms from RGB does not appear in the frame at
+ *                 all: the frame is 84% CPU-bound and the AIE had the slack.
+ *                 See docs/thesis/results/frame_budget_rgb_delta.csv.
  */
 
 #include "conv2d_kernel.h"
@@ -71,6 +110,8 @@
 // HTAB aliases the size-specific symbol. Generate a table with: make weights PATCH_COLS=<n>
 #if   PATCH_COLS == 128
 #  include "hanning_128.h"
+// @thesis subsec:przetwarzanieWstepne | A-06 | The Hanning table: PERIODIC sin^2(pi*i/N), not symmetric.
+//   Its 2-D DFT has exactly 9 non-zero bins, which is what makes the Stage B2 correction exact.
 #  define HTAB HANNING_128
 #elif PATCH_COLS == 64
 #  include "hanning_64.h"
@@ -168,6 +209,8 @@ void conv2d_kernel(
 //     layout has 27 taps overrunning ALL FOUR of those fields, which is why the
 //     offsets stopped being hand-written in four files.
 // ====================================================================
+// @thesis subsec:wyborSieci | R-01 | The RGB datapath: 27 vectorized taps over three
+//   de-interleaved planes. This is the branch the shipping arm takes.
 #elif CONV_IN_CH == 3
 
     const int8_t *wb = weights.data();
@@ -191,6 +234,8 @@ void conv2d_kernel(
     bias |= (int32_t)(uint8_t)wb[CONV_W_OFF_BIAS + 2] << 16;
     bias |= (int32_t)(uint8_t)wb[CONV_W_OFF_BIAS + 3] << 24;
 
+// @thesis subsec:kwantyzacjaImpl | B-08 | The per-channel quantization parameters as the kernel
+//   consumes them: out_shift, bias_acc, and mean_prev for Stage B1.
     int32_t mean_prev;
     mean_prev  = (int32_t)(uint8_t)wb[CONV_W_OFF_MEAN + 0];
     mean_prev |= (int32_t)(uint8_t)wb[CONV_W_OFF_MEAN + 1] << 8;
@@ -301,6 +346,8 @@ void conv2d_kernel(
             // the cycle measurement is meant to show.
             aie::vector<int32_t, CONV_VEC> sh =
                 aie::downshift(a.to_vector<int32_t>(0), out_shift);
+// @thesis subsec:wyborSieci | N-16 | ReLU, compiled out by default: a DCF is linear in feature
+//   space, so half-wave rectification costs ~3x the peak/sidelobe ratio.
 #if CONV_RELU
             aie::vector<int32_t, CONV_VEC> r = aie::min(aie::max(sh, 0), 32767);
 #else

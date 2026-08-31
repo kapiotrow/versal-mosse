@@ -50,6 +50,10 @@
  *
  * No <adf.h> here on purpose: the AIE kernel, the PS host and roi_crop must all
  * be able to include this.
+ *
+ * @thesis subsec:kwantyzacjaImpl | B-08 | The single-sourced weight-buffer layout, derived from
+ *   CONV_IN_CH, plus the layout tag byte that makes a gray/RGB mismatch loud instead of
+ *   plausible.
  */
 
 #pragma once

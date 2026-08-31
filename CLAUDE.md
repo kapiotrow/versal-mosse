@@ -10,6 +10,48 @@ sweep finishes: append a row to `results/arms.csv`, update `claims.md`, write th
 `evidence/TEMPLATE.md`. This file keeps the operational half — environment, build parameters,
 traps, commands.
 
+**`@thesis` tags bind code to thesis sections.** A site a thesis section describes carries
+
+```
+// @thesis <label> | <claim>[,<claim>] | <one line on what this site contributes>
+```
+
+where `<label>` is the thesis's own `\label` and `<claim>` is an id from `claims.md`.
+`make code-map` (or `python3 scripts/thesis_index.py`) regenerates
+`docs/thesis/code_map.md` — section → source, and the reverse. It VALIDATES both fields: an
+unknown claim id, a label the thesis does not define, and a label the thesis defines twice are
+each reported. Add a tag when you add a site a chapter will describe; do not tag every function.
+**Documentation in this repo is English-only**, including these tags — the thesis is Polish and
+`docs/thesis/glossary.md` is the bridge: table A is terminology `teoria.tex`/`przeglad.tex`
+already fixed and must be reused verbatim, table B is proposed implementation vocabulary to
+accept or amend there, and table D lists four pairs that must not share a Polish word.
+
+**Every kernel and graph header carries a `COST` block.** Eight of them: `conv2d_kernel.cpp`,
+`cmul_accum_kernel.cpp`, `fft_graph.h`, `ifft_graph.h`, `mosse_graph.h` (whole design),
+`roi_crop.cpp`, `roi_crop.h` and `camera_capture.cpp`. Fixed fields — compute, vectorization,
+pipelining, tile/BRAM memory, interface, caveat — each citing the CSV or the log it was read
+off, so `sec:wydajnoscZasoby` can be written from the headers. **The caveat field is
+load-bearing**: AIE figures are compiler-SCHEDULED cycles and not a profile, the FFT chain's
+2.2 ms is INFERRED rather than logged, and `roi_crop`'s are the only MEASURED cycle counts in
+the set (an hw_emu VCD probe — hw_emu wall time is meaningless, but its simulated PL cycles are
+RTL-accurate). AIE compute is not frame time: the frame is 84% CPU-bound.
+
+**The thesis's tables are generated.** `make thesis-tables` turns `docs/thesis/results/*.csv`
+into booktabs `tabular` bodies in `docs/thesis/tables/` (gitignored -- the CSV is the source).
+The chapter `\input`s one inside its own float and keeps the caption, the label and the
+placement; Polish row labels live in the CSV's `*_pl` columns so neither a regeneration nor an
+Overleaf edit can clobber them. Copying into the thesis repo is MANUAL by default;
+`python3 scripts/csv2tex.py --overleaf [PATH]` opts in and only writes files -- it never adds,
+commits or pushes. `--check` exits 1 when a table is out of date.
+
+**A measured number in a comment must say where it came from.** `make check-docs`
+(`scripts/check_doc_numbers.py`) reports two things: a decimal that duplicates a value in
+`results/*.csv` while citing nothing — the drift risk, since a re-swept arm silently makes that
+comment a lie — and a frame-time or tracking figure that no CSV records and nothing sources.
+A claim id, a `results/`/`docs/` path, or the `.log` it was read off all count as citations.
+**The number itself usually stays**: deleting "8.71 -> 1.88 ms, 4.6x" from the comment that
+explains the hypot fix makes the code worse. Both classes are at zero as of 2026-08-30.
+
 MOSSE correlation-filter tracker with CNN features on Versal VEK280. Extends the AIE 2D-FFT
 tutorial (XD073) with a full object-tracking pipeline. Papers in `docs/papers/` (Bolme MOSSE,
 Danelljan DSST); section numbers below refer to them.
@@ -162,7 +204,7 @@ AIE (single instances, serial per-channel; both custom kernels vectorized)
 ### PLIO (1 port)
 
 `PatchIn` — roi_crop → conv2d, **32-bit** (one int32 = 4 packed int8 pixels). It is 32-bit, not
-128-bit: `mosse_graph.h:121` uses `plio_32_bits` because a 128-bit PLIO delivered one beat per
+128-bit: `mosse_graph.h`'s `input_plio::create("PatchIn", ...)` uses `plio_32_bits` because a 128-bit PLIO delivered one beat per
 `readincr`, starving the kernel. The name must match between `mosse_graph.h` and `mosse_x1.cfg`
 (`stream_connect=roi_crop_0.patch_out:ai_engine_0.PatchIn`).
 
@@ -780,7 +822,8 @@ Two principles that have repeatedly earned their keep: **instruments before chan
   peaked, just in the wrong place. **IoU is the only metric in the harness that can fail a
   confidently-wrong tracker.** Read `track.csv`, not the console.
 - **`[diag] F_ch` IS CHANNEL 0 ONLY, not a bank maximum.** It is printed under `if (ch == 0)`
-  (`mosse_tracker.cpp:3966`), while `accum` and `response` are bank-wide. So "F_ch looks
+  (in `mosse_tracker.cpp`, under the per-channel `if (ch == 0)`), while `accum` and `response`
+  are bank-wide. So "F_ch looks
   comfortable" says nothing about the other 15 channels, and a hot channel elsewhere is
   invisible. It matters most at `CONV_IN_CH=3`: **ch0 is one of the four colour-opponent
   channels** (0/2/9/10), so its amplitude is the one number in the console that discriminates a

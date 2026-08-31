@@ -53,3 +53,5 @@ AIECompiler.log
 # Generated figures are build products; the scripts in scripts/figs/ are the source.
 docs/thesis/figures/*.pdf
 docs/thesis/figures/*.png
+# Generated LaTeX tables: the CSVs in docs/thesis/results/ are the source.
+docs/thesis/tables/*.tex

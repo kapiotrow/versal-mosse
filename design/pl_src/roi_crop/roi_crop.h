@@ -138,8 +138,9 @@ void roi_crop(
  * quantized int8 patch in the on-chip buffer. recompute=0 skips straight to
  * streaming that buffer out.
  *
- * COST, corrected 2026-08-17 from a hw_emu VCD probe (the previous figures here
- * were estimates and both were low). Scaling the 64×64 measurement to 128×128:
+ * COST — the CACHE argument, from the same hw_emu VCD probe that roi_crop.cpp's
+ * COST block reports; corrected 2026-08-17 (the previous figures here were
+ * estimates and both were low). Scaling the 64×64 measurement to 128×128:
  *
  *   Stage A (PASS1 + NORM)  ~195k cycles   once per frame     (was estimated 81k)
  *   stream-out (PASS2)      ~112k cycles   EVERY channel      (was estimated  4k)

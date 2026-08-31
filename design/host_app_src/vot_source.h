@@ -20,6 +20,10 @@
 //   mosse::TargetBox uses. The toolkit's x,y,w,h top-left form appears in
 //   exactly one place — Trajectory::write() — and nowhere else.
 // ---------------------------------------------------------------------------
+//
+// @thesis subsec:zrodlaObrazu | R-08 | Manifest, blob and trajectory bookkeeping for
+//   FRAME_SOURCE=vot. Pure bookkeeping, so every failure mode is a plausible-but-invalid AR
+//   report -- hence the mutation suite.
 #pragma once
 
 #include <condition_variable>
@@ -143,6 +147,9 @@ class Blob {
 // THE ARITHMETIC IS UNCHANGED, so the acceptance test is free and exact: a
 // sequence that fits in heap must produce an IDENTICAL run-state digest in both
 // modes. `--vot-stream always` exists to make that comparison runnable on car1.
+// @thesis subsec:zrodlaObrazu | R-08 | StreamBlob: the prefetched ring that let five RGB
+//   sequences run in ~1 GB of usable heap. Access is strictly sequential; out-of-order is an
+//   error, not a seek.
 class StreamBlob {
   public:
     StreamBlob() = default;

@@ -294,6 +294,9 @@ static int g_frames_total = 0;
 // that agree here agree bit-for-bit on the datapath, not merely on their
 // conclusions.
 //
+// @thesis subsec:weryfikacja | M-04,R-09 | The run-state digest. A byte-identical trajectory is
+//   NOT a bit-identical run -- a box comes from an integer argmax, so a 0.1% response
+//   difference never reaches it.
 // FNV-1a, because it needs to be reproducible across builds and is not
 // security-relevant. Its cost is measured in its own AP slot.
 static uint64_t g_det_hash = 1469598103934665603ULL;
@@ -389,6 +392,8 @@ static inline void det_hash_bytes(const void *p, size_t n)
 
 #if FRAME_SOURCE_VOT
 // -----------------------------------------------------------------------
+// @thesis subsec:zrodlaObrazu | R-08,R-09 | The VOT run: one sequence, one job, the
+//   anchor-based run order, and the reset between jobs that the determinism test exercises.
 // THE VOT RUN — one sequence, one job (Phase 2). Everything here happens
 // OUTSIDE the frame loop: a manifest parse and one sequential blob read per
 // sequence, and one trajectory write at the end. Nothing in this block runs
@@ -406,6 +411,8 @@ static inline void det_hash_bytes(const void *p, size_t n)
 #ifndef VOT_JOB
 #  define VOT_JOB         0
 #endif
+// @thesis subsec:weryfikacja | M-04,R-09 | RESET_MUTANT: the determinism test's ability to FAIL
+//   is demonstrated, not assumed. It passed with the mutant active until the digest existed.
 // DELIBERATELY BREAK ONE PIECE OF run_reset(), to prove the determinism test can
 // FAIL. A reset test that has never been shown to fail is worth nothing on a
 // path with no prior coverage — the same rule every RGB suite was built to.
@@ -803,6 +810,8 @@ constexpr int    CONV_OUT_CHUNK    = PATCH_ROWS * FFT_ROW_WS;
 constexpr int    CONV_INVOCATIONS  = (int)PATCH_ELEMS / CONV_OUT_CHUNK;
 
 // -----------------------------------------------------------------------
+// @thesis sec:przeplywDanych | A-01,P-06 | GMIO drain granularity: aie2gm_nb moves ONE kernel
+//   invocation per call, so every output port needs an ordered async/wait pair per invocation.
 // AIE→DDR GMIO drain granularity
 // -----------------------------------------------------------------------
 // aie2gm_nb() moves ONE producing-kernel invocation per call — NOT the byte
@@ -837,6 +846,9 @@ static_assert(ROW_CHUNKS == CONV_INVOCATIONS,
               "row-FFT drain count must match conv2d firing count");
 
 // -----------------------------------------------------------------------
+// @thesis sec:przeplywDanych | P-06 | The DMA instrumentation that priced a transaction: 80
+//   us/tx is per-transaction OVERHEAD, not bandwidth, and the largest transfer reaches 5.76
+//   GB/s.
 // GMIO transaction cost instrumentation
 // -----------------------------------------------------------------------
 // The open question this answers: the per-frame async/wait count is ~6500 at 16
@@ -925,7 +937,7 @@ static void dma_reset_frame(void)
 // WHY THIS EXISTS. Timestamped console capture on 2026-08-17 put 478.7 ms x 16
 // channels = 7.66 s in the interval between the "weights sent + row-FFT drained"
 // and "roi_crop done" prints — 94% of an 8.18 s frame, against a design budget
-// of 0.7 ms/frame for this kernel. That interval contained exactly one
+// of 0.7 ms/frame for this kernel (a BUDGET, not a measurement; claim P-03). That interval contained exactly one
 // statement, crop_run.wait(), and nothing timed it.
 //
 // It is NOT the kernel's datapath, proven three ways:
@@ -1021,6 +1033,9 @@ static unsigned long g_rc_n_total[RC_N];
 // a fixed tick looks like. Per-call values make the tick visible directly, as
 // clustering at multiples of a base interval.
 // -----------------------------------------------------------------------
+// @thesis sec:metodykaBadan | P-02,M-05 | The APU per-frame cost breakdown. Measure the total
+//   and print the RESIDUAL: a profiler that does not account for the whole frame lets you
+//   conclude confidently and wrongly.
 // APU-side per-frame cost — the ~90 ms nobody has ever measured
 // -----------------------------------------------------------------------
 // WHY. After console gating the frame is 177 ms (runs/run_0820_1513.log) of
@@ -1190,6 +1205,8 @@ static void ap_report_frame(int frame, double dma_us, double rc_us)
 }
 
 // -----------------------------------------------------------------------
+// @thesis sec:metodykaBadan | P-09 | Console verbosity is part of the measured system: at
+//   115200 the console was 15% of the frame, and 58% on one sequence.
 // CONSOLE VERBOSITY — and the console is not a cosmetic concern here.
 //
 // MEASURED 2026-08-20, 198 frames of runs/run_0820_1244.log at DUMP_BUFFERS=0:
@@ -1218,6 +1235,8 @@ static void ap_report_frame(int frame, double dma_us, double rc_us)
 #endif
 
 // -----------------------------------------------------------------------
+// @thesis subsec:kosztTransferow | P-05 | The GMIO drain-depth probe: XRT allows ONE
+//   outstanding async per port, so there is no pipeline to deepen.
 // Row-FFT drain pipeline depth — THE GMIO PROBE
 // -----------------------------------------------------------------------
 // gmio_fft_row_out costs 286 us/tx against 17.7-19.6 for its sibling AIE->DDR
@@ -1283,7 +1302,8 @@ static inline int drain_depth_for_frame(int frame)
 //
 // The comment above prices that line at "~4 ms against an ~87 ms floor, 4%".
 // Both halves of that were true in 2026-08-20 terms and the floor has since
-// moved: the frame is 26.29 ms, so the same line is now 15% of it, and on a
+// moved: the frame is 26.29 ms (docs/thesis/results/perf.csv, run_0821_1725, claims
+// P-01 and P-09), so the same line is now 15% of it, and on a
 // gate-heavy sequence like `animal` the console is 58% of the frame
 // (correlation(gated%, unattributed) = 0.963 over the 8-sequence sweep).
 //
@@ -1566,6 +1586,8 @@ static void rc_report_timeline(int frame)
 }
 
 // -----------------------------------------------------------------------
+// @thesis subsec:petlaSterowania | P-03 | roi_crop driven as a user-managed CU through xrt::ip:
+//   the host writes AXI-Lite and polls the CU's own ap_done. Worth 20.6x on frame rate.
 // roi_crop as a USER-MANAGED CU — the fix for the 503 ms completion cost
 // -----------------------------------------------------------------------
 // WHY THIS EXISTS. The instrumentation above localised roi_crop's ~505 ms per
@@ -1696,6 +1718,8 @@ private:
 #endif  // ROI_CROP_USER_MANAGED
 
 // -----------------------------------------------------------------------
+// @thesis subsec:petlaSterowania | P-03 | The control-CU probe: a kernel with no AXIS port paying
+//   the same 512 ms is what turned 'roi_crop is slow' into 'any KDS completion is slow'.
 // Control CU probe (item 7)
 // -----------------------------------------------------------------------
 // NOTE: with ROI_CROP_USER_MANAGED=1 this probe becomes a WITHIN-RUN CONTROL
@@ -1949,6 +1973,9 @@ static void report_psr(const mosse::PsrResult &a,   // argmax|re| — what we ac
 }
 
 // -----------------------------------------------------------------------
+// @thesis sec:metodykaBadan | R-06 | The PSR gate control path, Bolme 3.5. Four veto reasons
+//   reported separately, because 88% of vetoes are NEGATIVE_PEAK, which the threshold cannot
+//   disable.
 // Update gating — Bolme §3.5 (the control path; the policy is mosse::psr_gate)
 // -----------------------------------------------------------------------
 // "when PSR drops to around 7.0 it is an indication that the object is occluded
@@ -2093,6 +2120,9 @@ static void dump_buffer(const char *tag, int frame, const void *p, size_t bytes)
 }
 
 // -----------------------------------------------------------------------
+// @thesis sec:metodykaBadan | M-07 | track.csv, the run's actual product. Any per-frame reader
+//   must key on (job, frame): a bare frame index collides across anchors and once
+//   under-reported rails 66x.
 // Per-frame CSV — the run's actual product
 // -----------------------------------------------------------------------
 // One row per frame, ~40 B, flushed every row. The three things it exists for:
@@ -2414,6 +2444,8 @@ static Cint16Scan scan_cint16(const int16_t *b, int n)
 // scan_cint16), so these four numbers were being computed and thrown away.
 // Recording them makes a VERBOSITY=0 run fully diagnosable.
 //
+// @thesis subsec:arytmetyka | B-04,B-07 | The saturation instrument: rails and accum_max are
+//   scanned every frame regardless of console verbosity and land in track.csv.
 // Single-threaded by construction: with TAIL_PARALLEL all four scans and
 // csv_row() run on the main thread AFTER g_filter_thr.join(), so no lock.
 // `fch` is CHANNEL 0 ONLY — report_cint16_scan("F_ch", ...) is called under
@@ -2548,6 +2580,8 @@ static bool load_conv_weights(const char *path, uint8_t *dst, size_t bytes)
 }
 
 // -----------------------------------------------------------------------
+// @thesis subsec:operacjeCzestotliwosc | A-05 | Stage B2: the 9-bin frequency-domain mean
+//   correction on the APU, exact only because the window is a periodic Hann.
 // Stage B — feature-map normalization (see conv2d_kernel.h for the rationale)
 // -----------------------------------------------------------------------
 
@@ -2617,6 +2651,8 @@ static int32_t measure_window_mean(const int16_t *row_fft, int32_t mean_prev)
 #endif  // !MEMTILE_TRANSPOSE
 
 // -----------------------------------------------------------------------
+// @thesis subsec:operacjeCzestotliwosc | A-05,P-05 | Stage B1's mean and Stage B3's per-channel
+//   energy recovered from F_ch -- the non-obvious cost of deleting gmio_fft_row_out.
 // MEMTILE_TRANSPOSE: recovering Stage B1's mean and Stage B3's energy from F_ch
 // -----------------------------------------------------------------------
 // THE NON-OBVIOUS COST OF DELETING gmio_fft_row_out. measure_window_mean() and
@@ -2751,7 +2787,8 @@ which ignores residual_mean entirely."
 // ap_done, so the CU's PL execution overlaps the host's APU work instead of
 // being spun on. Only meaningful with MEMTILE_TRANSPOSE — on the DDR path the
 // row-FFT drain already covers the CU, which is exactly why RC_POLL read
-// 0.067 ms/frame there and 5.196 once the drain was deleted.
+// 0.067 ms/frame there and 5.196 once the drain was deleted
+// (docs/thesis/results/apu_stages.csv, claim P-05).
 #ifndef ROI_CROP_PIPELINE
 #  define ROI_CROP_PIPELINE 1
 #endif
@@ -2938,7 +2975,8 @@ static void unpack_spectrum(const int16_t *src, mosse::cfloat *dst,
     // destination stride is PATCH_COLS * sizeof(cfloat) = 1024 B, so the naive
     // form issues 16384 scattered 8-byte stores, each landing on its own cache
     // line, against a 128 KB destination that does not fit in L1 or stay in L2.
-    // It measured 181 us/call = 11 ns/element, ~2.9 ms/frame over 16 channels.
+    // It measured 181 us/call = 11 ns/element, ~2.9 ms/frame over 16 channels
+    // (docs/thesis/results/apu_stages.csv, claim P-05).
     //
     // With BLK = 16 the working set per tile is 16 destination rows x 128 B plus
     // 16 source columns x 64 B — about 3 KB, comfortably L1-resident — so each
@@ -2994,6 +3032,8 @@ static float g_q15_scale = 0.0f, g_q15_max = 0.0f;
 // AP_FILTER's accumulator at the moment the helper was launched, so the join can
 // recover the helper's own elapsed time by difference.
 static double g_ap_filter_at_launch = 0.0;
+// @thesis subsec:petlaSterowania | P-05 | TAIL_PARALLEL: a whole function moves to core 1, not a
+//   loop split. Everything the helper reads must already be written when it starts.
 #if TAIL_PARALLEL
 static std::thread g_filter_thr;
 #endif
@@ -3007,6 +3047,9 @@ static void filter_update_work(void)
 {
     AP_T(AP_FILTER,
          mosse::filter_update_quantize(g_filter, g_F_all.data(),
+// @thesis subsec:aktualizacjaFiltra | A-03 | THE TRAINING TARGET: G is centred at the MEASURED
+//   displacement, not at (0,0). Centring it teaches the filter that an off-target patch peaks
+//   at zero shift.
                                        g_target_shift.data(),
                                        mosse::DEFAULT_ETA,
                                        g_energy, mosse::DEFAULT_EPS_REL,
@@ -3157,6 +3200,9 @@ static void fill_background(uint8_t *frame_buf, int rows, int cols)
 }
 
 // -----------------------------------------------------------------------
+// @thesis subsec:zrodlaObrazu | N-12 | The synthetic scene: static background with dirty-rect
+//   restore. It repeats to the LSB outside the target, which is a test-bench property, not a
+//   tracker one.
 // Scene generation: static background + dirty-rect restore
 // -----------------------------------------------------------------------
 // fill_background() runs six sinusoids per pixel over 1080x1920 — 12.4 M sin()
@@ -3204,6 +3250,9 @@ static void scene_init(int rows, int cols)
 }
 
 // -----------------------------------------------------------------------
+// @thesis subsec:zrodlaObrazu | N-12 | Background pan: the instrument that refuted
+//   background lock as the explanation. It measurably decorrelates the background and changed
+//   the tracker not at all.
 // Background pan — camera motion, and the actual fix for background lock
 // -----------------------------------------------------------------------
 // WHY NOISE IS NOT THE FIX. `FRAME_NOISE` was introduced against a background
@@ -3441,6 +3490,8 @@ static void scene_add_noise(uint8_t *frame_buf, int rows, int cols,
 }
 
 // -----------------------------------------------------------------------
+// @thesis subsec:zrodlaObrazu | N-12 | The scripted trajectory and size envelope: absolute ground
+//   truth, so drift becomes measurable where the legacy scheme made err=0 px self-fulfilling.
 // Scripted target trajectory and size envelope
 // -----------------------------------------------------------------------
 // TRAJECTORY=0 reproduces the legacy behaviour exactly: the target is injected at
@@ -3624,6 +3675,8 @@ static void inject_checkerboard_frame(uint8_t *frame_buf, int rows, int cols, in
 }
 
 // -----------------------------------------------------------------------
+// @thesis subsec:petlaSterowania | A-01 | The per-frame orchestration loop: the APU drives
+//   every GMIO port, per channel, and owns the whole control path.
 // Main tracking loop
 // -----------------------------------------------------------------------
 int main(int argc, char **argv)
@@ -3701,6 +3754,8 @@ int main(int argc, char **argv)
     auto row_bo     = xrt::bo(device, FFT_BYTES,
                                xrt::bo::flags::normal, 0);
     // Partial accumulator (cint16, 64 KB)
+// @thesis sec:przeplywDanych | A-04 | The DDR accumulator BO. Never compute on a BO mapping:
+//   reads run at 696 MB/s against 7359 on the heap.
     auto accum_bo   = xrt::bo(device, ACCUM_BYTES,
                                xrt::bo::flags::normal, 0);
     // Combined cmul input: [filter_chunk | accum_chunk] interleaved per kernel invocation
@@ -4305,6 +4360,7 @@ int main(int argc, char **argv)
     //   g_energy        filter_quantize_q15 reads it; stale values mis-scale H
     //   g_target_shift  the exact variable the first TAIL_PARALLEL attempt read
     //                   stale, taking mean IoU 0.9188 -> 0.4794
+    //                   (runs/run_0821_1706.log, claim P-05)
     //   coast           NEW 2026-08-25: run B would coast on A's velocity
     //   counters        a run that inherits them reports a plausible summary
     //                   for a run that did not happen
@@ -4856,7 +4912,8 @@ int main(int argc, char **argv)
             // advance: "the CU finishes inside the drain loop. If the drain ever
             // shrinks the spin will start spinning for real." The memtile deleted
             // that drain outright and the spin duly started spinning — RC_POLL
-            // went 0.067 -> 5.196 ms/frame, 325 us/channel. This puts the CU back
+            // went 0.067 -> 5.196 ms/frame, 325 us/channel (apu_stages.csv, claim
+            // P-05). This puts the CU back
             // under cover, without the DDR round trip that used to provide it.
             //
             // Ordering safety: conv2d cannot run ahead of the memtile's
@@ -4920,7 +4977,8 @@ int main(int argc, char **argv)
 #if CMUL_SPLIT_ACCUM
             // NO PACKING. accum_prev has its own port, so H comes straight from
             // filter_bo and the running sum straight from accum_bo — the 2 MB of
-            // BO->BO memcpy that `cmul packing` measured (2.871 ms/frame, which
+            // BO->BO memcpy that `cmul packing` measured (2.871 ms/frame — see
+            // docs/thesis/results/apu_stages.csv, claim P-05 — which
             // is exactly 2 MB at the probe's 696 MB/s uncached BO read rate) is
             // simply not performed.
             //
@@ -5636,7 +5694,8 @@ int main(int argc, char **argv)
             // filter_quantize_q15, which recomputes the same 262144 divides on
             // both passes. filter_update_quantize() forms H in the pass that
             // writes A and keeps it, so the write-out is a scalar multiply.
-            // Measured cost before the fusion: 10.18 + 5.60 = 15.78 ms of a
+            // Measured cost before the fusion (docs/thesis/results/apu_stages.csv,
+            // claim P-01): 10.18 + 5.60 = 15.78 ms of a
             // 62.7 ms frame. BIT-IDENTICAL output, asserted by memcmp in
             // run_fusion_tests() at BOTH -O2 and -ffp-contract=fast — the first
             // cut was not, and only the contraction build could see it.

@@ -10,6 +10,24 @@
  *
  * Frame layout: linear array of uint8 pixels (no RGB interleave for now).
  * Total size: frame_rows * frame_cols (not 3× for RGB channels).
+ *
+ * ---------------------------------------------------------------------------
+ * COST — ~6 us of work: a zero-fill of the frame buffer, no AXIS port, no
+ * datapath to speak of. Claim P-03.
+ *
+ *   why it matters anyway  That is exactly what makes it the KNOWN-GOOD
+ *                 COMPARATOR in the launch-cost probe. A kernel with ~6 us of
+ *                 work paying the same ~503 ms per KDS launch is what turned
+ *                 "roi_crop is slow" into "any CU completion is slow" — and,
+ *                 after the fix, the same probe still paying 503 ms in the same
+ *                 run is what proves the fix is the fix. CONTROL_CU_RUNS keeps
+ *                 it in the shipping build for that reason, not for its output.
+ *   ordering      It zero-fills frame_bo BY DESIGN, so anything seeding that
+ *                 buffer (the background memcpy) must run AFTER it.
+ *
+ * @thesis sec:architekturaSystemu | A-01 | The second PL kernel, a frame-buffer stub standing
+ *   in for MIPI RX; it also serves as the known-good comparator in the KDS launch-cost probe
+ *   (P-03).
  */
 
 #include "camera_capture.h"

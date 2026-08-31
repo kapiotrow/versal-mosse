@@ -42,6 +42,10 @@ Usage
 
 Q1 needs torch/torchvision; Q2-Q4 need only design/aie_src/weights/layer0_weights.bin
 (run `make weights`). Q4 additionally needs an aiesim scenario directory.
+
+@thesis subsec:wyborSieci | A-07,N-15,N-16 | The four offline checks that decide the feature
+  bank: collapse convention, linear diversity (the structural rank-9 cap), bias_acc/out_shift
+  sanity, and the post-ReLU map.
 """
 
 import struct

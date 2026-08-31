@@ -37,6 +37,10 @@
  * cmul_accum_kernel.h documents why, and keeping the harness's wiring identical
  * to production is the point — a harness that wires it differently is testing a
  * different kernel.
+ *
+ * @thesis subsec:weryfikacja | B-07 | The x86sim single-kernel harness behind make
+ *   x86sim_check -- bit-exactness against the NumPy model, which is what the whole offline
+ *   methodology rests on.
  */
 
 #pragma once

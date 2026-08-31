@@ -46,6 +46,38 @@
  *
  * Hardware (VEK280 AIE-ML): 32 input + 32 output GMIO available.
  * Using 10 total — well within budget.
+ *
+ * ---------------------------------------------------------------------------
+ * COST — the whole design, per frame at 128x128, ch16. AIE core clock 1 GHz, PL
+ * 312.5 MHz. docs/thesis/results/{aie_compute,resources,frame_budget}.csv.
+ * Claims A-01, A-02, P-01, P-02.
+ *
+ *   AIE compute   ~6.4 ms/frame total, from ~21.6 before the kernels were
+ *                 vectorized. conv2d is 4.1 of it, cmul_accum 0.13, the FFT and
+ *                 IFFT chains ~2.2 (inferred).
+ *   frame time    26.29 ms gray / 28.58 ms RGB on hardware. AIE COMPUTE IS NOT
+ *                 FRAME TIME: the frame is 84% CPU-bound, only 41% of GMIO
+ *                 blocks, and RGB's +4.59 ms of conv2d does not appear in the
+ *                 frame at all. Size host work first.
+ *   utilisation   6 of 304 AIE-ML cores (2%), 1 of 76 memory tiles, BRAM18 10 of
+ *                 1200, DSP 44 of 1312, LUT 7694 of 520704, FF 7539 of 1041408.
+ *                 Check any "we cannot afford it on AIE" claim against that: the
+ *                 binding constraints here have always been TILE MEMORY (64 KB)
+ *                 and host DMA orchestration, never core count. Note that the
+ *                 mapper's Utilization column reports DECLARED budgets —
+ *                 runtime<ratio> is not occupancy.
+ *   DMA           1090 tx/frame after windowing (from 4258). 80 us/tx is
+ *                 per-transaction OVERHEAD, not bandwidth: 64 B costs 14.4 us
+ *                 and 128 KB costs 22.8 us, i.e. 2048x the payload for 1.6x the
+ *                 time, and the largest transfer reaches 5.76 GB/s. DMA is not
+ *                 the bottleneck. Claim P-06.
+ *   host cost     6.6 ms/frame of XRT descriptor work: the two 256-tx ports cost
+ *                 11.0 us of host CPU per async(). The only lever is fewer,
+ *                 larger transactions.
+ *
+ * @thesis sec:architekturaSystemu | A-01,A-02 | The top-level AIE graph: 1 PLIO in, 7 GMIO
+ *   ports, conv2d + FFT2D + cmul_accum + IFFT2D, one instance each, reused serially across the
+ *   16 feature channels.
  */
 
 #pragma once
@@ -135,10 +167,15 @@ public:
         // 32-bit width so conv2d's input_stream<int32> reads are 1:1 with PLIO
         // beats (a 128-bit PLIO delivered one 128-bit beat per readincr, starving
         // conv2d 4:1). roi_crop emits 32-bit AXIS beats (4 packed int8 each).
+// @thesis sec:przeplywDanych | A-01 | PatchIn is 32-bit, not 128-bit: a 128-bit PLIO delivered
+//   one beat per readincr and starved conv2d.
         patch_in = input_plio::create("PatchIn", plio_32_bits, "patch_in.txt");
 
         // --- GMIO (burst_length = 64 bytes, bandwidth = 1000 MB/s estimate) ---
         gmio_weights     = input_gmio::create("gmio_weights",      64, 1000);
+// @thesis subsec:fftAie | A-01,P-05 | MEMTILE_TRANSPOSE: the transposes move into AIE-ML memory
+//   tiles and four GMIO ports disappear. A one-sided flag is a board deadlock, not a compile
+//   error.
 #if !MEMTILE_TRANSPOSE
         gmio_fft_row_out = output_gmio::create("gmio_fft_row_out", 64, 1000);
         gmio_fft_col_in  = input_gmio::create("gmio_fft_col_in",   64, 1000);
@@ -259,6 +296,7 @@ public:
         // gmio_cmul_in → cmul.in[1] (H only), gmio_accum_in → cmul.in[2] (prev_Σ).
         // Splitting them deletes the host's 2 MB/frame packing memcpy, which the
         // startup probe shows IS an uncached BO read: 2.871 ms measured against
+        // (docs/thesis/results/apu_stages.csv, claim P-05)
         // 3.01 predicted at 696 MB/s. Same bytes on the wire, one fewer touch of
         // them. See cmul_accum_kernel.h for why the packed form existed at all.
         adf::connect<>(gmio_cmul_in.out[0], cmul.in[1]);

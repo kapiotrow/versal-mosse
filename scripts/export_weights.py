@@ -177,6 +177,10 @@ Usage
 Dependencies (install once):
   uv add --optional weights torch torchvision
   or:  pip install torch torchvision
+
+@thesis subsec:wyborSieci | A-07,B-08 | Donor network and layer choice: torchvision
+  mobilenet_v3_small conv1, BatchNorm folded, then either the BT.601 luminance collapse or all
+  27 RGB taps.
 """
 
 import argparse

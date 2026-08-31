@@ -1,7 +1,7 @@
-arm_id,date,platform,description,A,R,EAO,frames,trajectories,sequences,run_dir,workspace,provenance,claim
-gray_h14,2026-08-26,hw,"grayscale CONV_IN_CH=1, H_SHIFT=14, eta 0.125, gate 7.0",0.4890,0.2743,0.1367,48603,419,62,runs/vot/0826_1336-hs14full,full62,config,R-01
-rgb_h15,2026-08-26,hw,"RGB CONV_IN_CH=3, H_SHIFT=15, eta 0.125, gate 7.0",0.5043,0.3065,0.1474,54813,419,62,runs/vot/0826_1550-rgb15+0827_1326-rgb15stream,full62,config,R-01
-rgb_eta05,2026-08-27,hw,"+ MOSSE_ETA=0.05 (host-only A/B)",0.5100,0.3283,0.1600,62436,419,62,runs/vot/0827_1441-eta05,eta05ab,config,R-02
-rgb_eta05_gate5,2026-08-27,hw,"+ PSR_GATE_MIN=5.0 — SHIPPING",0.5100,0.3417,0.1629,,419,62,runs/vot/0827_1642-eta05_g5p0,gate,config,R-04
-rgb_pad30,2026-08-28,hw,"+ TARGET_PADDING=3.0 — REJECTED (EAO down)",0.5030,0.3494,0.1570,,419,62,runs/vot/0828_1451-pad30,pad30ab,config,N-04
-rgb_gate0,2026-08-27,hw,"PSR_GATE_MIN=0 — null, 13-sequence probe only, NOT QUOTABLE",,,,,,13,runs/vot/0827_1824-eta05_g0,g0partial,config,R-03
+arm_id,date,platform,description,A,R,EAO,frames,trajectories,sequences,run_dir,workspace,provenance,claim,label_pl
+gray_h14,2026-08-26,hw,"grayscale CONV_IN_CH=1, H_SHIFT=14, eta 0.125, gate 7.0",0.4890,0.2743,0.1367,48603,419,62,runs/vot/0826_1336-hs14full,full62,config,R-01,"skala szarości, H_SHIFT=14"
+rgb_h15,2026-08-26,hw,"RGB CONV_IN_CH=3, H_SHIFT=15, eta 0.125, gate 7.0",0.5043,0.3065,0.1474,54813,419,62,runs/vot/0826_1550-rgb15+0827_1326-rgb15stream,full62,config,R-01,"RGB, H_SHIFT=15"
+rgb_eta05,2026-08-27,hw,+ MOSSE_ETA=0.05 (host-only A/B),0.5100,0.3283,0.1600,62436,419,62,runs/vot/0827_1441-eta05,eta05ab,config,R-02,"+ MOSSE_ETA=0,05"
+rgb_eta05_gate5,2026-08-27,hw,+ PSR_GATE_MIN=5.0 — SHIPPING,0.5100,0.3417,0.1629,,419,62,runs/vot/0827_1642-eta05_g5p0,gate,config,R-04,"+ PSR_GATE_MIN=5,0 --- konfiguracja docelowa"
+rgb_pad30,2026-08-28,hw,+ TARGET_PADDING=3.0 — REJECTED (EAO down),0.5030,0.3494,0.1570,,419,62,runs/vot/0828_1451-pad30,pad30ab,config,N-04,"+ TARGET_PADDING=3,0 --- odrzucone"
+rgb_gate0,2026-08-27,hw,"PSR_GATE_MIN=0 — null, 13-sequence probe only, NOT QUOTABLE",,,,,,13,runs/vot/0827_1824-eta05_g0,g0partial,config,R-03,"PSR_GATE_MIN=0 (13 sekwencji, niecytowalne)"

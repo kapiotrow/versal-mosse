@@ -1,10 +1,10 @@
 # Where the frame goes. VERBOSITY=0, serial console, synthetic scene.
 # gray = run_0821_1725, RGB = run_0824_1457. Quote FPS only from a serial-console run.
-stage,gray_ms,rgb_ms,note
-APU subtotal,15.639,17.442,
-of which overlapped on core 1,-2.762,-2.746,ran concurrently
-APU wall,12.876,14.696,what the frame actually spent
-GMIO total,11.134,11.133,"async 6.6 / wait 4.5 — UNCHANGED by RGB"
-roi_crop launch,1.013,1.471,"channel 0 Stage A, structurally exposed"
-unattributed,1.261,1.284,"residual — printed, not hidden"
-frame total,26.29,28.58,
+stage,gray_ms,rgb_ms,note,stage_pl
+APU subtotal,15.639,17.442,,suma czasów APU
+of which overlapped on core 1,-2.762,-2.746,ran concurrently,w tym wykonane równolegle na rdzeniu 1
+APU wall,12.876,14.696,what the frame actually spent,rzeczywisty czas APU
+GMIO total,11.134,11.133,async 6.6 / wait 4.5 — UNCHANGED by RGB,GMIO łącznie
+roi_crop launch,1.013,1.471,"channel 0 Stage A, structurally exposed",uruchomienie roi_crop
+unattributed,1.261,1.284,"residual — printed, not hidden",nieprzypisane
+frame total,26.29,28.58,,klatka łącznie
