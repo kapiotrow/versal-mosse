@@ -469,10 +469,22 @@ void filter_mask_project(cfloat *H, int rows, int cols);
 // BINS — the mechanism check for FILTER_MASK, and the only way this build can
 // answer its own falsifier. Without it "EAO moved" is unattributable to the
 // mask. `H_all` is channels * rows * cols, channel-major, UNQUANTISED (the
-// h_scratch the fused path already holds), so this costs one pass and no
-// device traffic. Returns 0 when the box or the geometry is degenerate.
+// h_scratch the fused path already holds).
+//
+// `H_all` IS IN THE FREQUENCY DOMAIN AND IS TRANSFORMED HERE, NOT BY THE CALLER
+// — the same contract as the offline half (rgb_vs_gray_loop.py's
+// box_energy_fraction), and the caller has nothing else to give it. Sum|h|^2 is
+// a SPATIAL quantity. The first cut squared H directly: self-consistent, five
+// green unit tests, and 0.0000 on every frame of the first hardware run,
+// because a centred box in the frequency domain holds the high frequencies.
+// So this is NOT one pass any more — it is an inverse FFT per channel, which is
+// why the caller subsamples frames (FILTER_MASK_STAT_EVERY).
 //
 // Centred at the PATCH CENTRE (rows/2, cols/2), matching the mask.
+//
+// Returns 0 when the box or the geometry is degenerate, and NEGATIVE when the
+// axes are not powers of two, i.e. when the value could not be measured rather
+// than measured as zero. Readers must exclude a negative, never average it in.
 double filter_box_energy_fraction(const cfloat *H_all, int channels,
                                   int rows, int cols,
                                   int box_rows, int box_cols);

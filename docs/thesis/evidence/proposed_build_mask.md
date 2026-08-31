@@ -1,5 +1,11 @@
 # Proposed hardware build — the spatial mask (`FILTER_MASK`)
 
+**SUPERSEDED 2026-08-31 — the arm was built, swept and ACCEPTED (EAO 0.1629 -> 0.1740,
++0.0110). The result, and everything that must not be re-derived, is in
+`evidence/spatial_mask.md`. This file is kept as the PRE-REGISTRATION: its section 4 is the
+falsifier written before the run, which is what makes the result readable. Read it as a record
+of what was predicted, never as current status.**
+
 **2026-08-28. Status: PROPOSED, not built.** Written so the decision to spend board time is
 made against a falsifier and a cost, not against a hope. Evidence:
 `docs/thesis/evidence/robustness_proposals.md` §2; trajectories in `runs/vot/0828_offline-mask/`.

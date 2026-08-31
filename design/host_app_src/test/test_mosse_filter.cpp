@@ -1389,39 +1389,121 @@ void run_filter_mask_tests()
 
     // (4) THE ENERGY INSTRUMENT — the build's mechanism falsifier. If this is
     // wrong the run cannot tell "the mask worked" from "something else did".
+    //
+    // EVERY CASE BELOW FEEDS A FREQUENCY-DOMAIN H, BUILT BY FORWARD-TRANSFORMING
+    // THE SPATIAL PATTERN THE CASE IS ABOUT. That is the whole correction: the
+    // first version of these tests handed the function the SPATIAL array
+    // directly, which is self-consistent with a function that does no transform
+    // and agrees with the caller about nothing. The caller only ever has
+    // frequency-domain H, and on hardware that mismatch read 0.0000 on every
+    // frame while all five of these were green.
     {
         const int Rb = 8, Cb = 8;
-        std::vector<cfloat> h((size_t)Rb * Cb, cfloat(0.0f, 0.0f));
+        const size_t N = (size_t)Rb * Cb;
+
+        // Spatial pattern -> H, with the naive forward DFT in this file. Shares
+        // no code with the radix-2 transform under test.
+        auto to_freq = [&](const std::vector<cfloat> &sp) {
+            std::vector<cfloat> H(sp.size());
+            const int nch = (int)(sp.size() / N);
+            for (int ch = 0; ch < nch; ++ch)
+                tt::dft2(sp.data() + (size_t)ch * N, H.data() + (size_t)ch * N,
+                     Rb, Cb, -1);
+            return H;
+        };
+
         // A delta AT THE PATCH CENTRE must read 1.0: the filter's energy is
         // centred there, not at the response origin, and getting that backwards
         // is the error that reads as "masking hurts".
+        std::vector<cfloat> h(N, cfloat(0.0f, 0.0f));
         h[(size_t)(Rb / 2) * Cb + (Cb / 2)] = cfloat(3.0f, 4.0f);
         check_double("energy frac, centre",
-                     mosse::filter_box_energy_fraction(h.data(), 1, Rb, Cb, 4, 4),
-                     1.0, 1e-9);
+                     mosse::filter_box_energy_fraction(to_freq(h).data(), 1,
+                                                       Rb, Cb, 4, 4),
+                     1.0, 1e-5);
 
         // The same delta at the ORIGIN must read 0.0 — the discriminator
         // between the two conventions, and the whole reason this is asserted.
-        std::vector<cfloat> h0((size_t)Rb * Cb, cfloat(0.0f, 0.0f));
+        std::vector<cfloat> h0(N, cfloat(0.0f, 0.0f));
         h0[0] = cfloat(3.0f, 4.0f);
         check_double("energy frac, origin",
-                     mosse::filter_box_energy_fraction(h0.data(), 1, Rb, Cb, 4, 4),
-                     0.0, 1e-9);
+                     mosse::filter_box_energy_fraction(to_freq(h0).data(), 1,
+                                                       Rb, Cb, 4, 4),
+                     0.0, 1e-5);
 
         // Uniform energy over 2 channels: the fraction is the AREA ratio, which
         // catches an off-by-one in either box extent.
-        std::vector<cfloat> hu((size_t)2 * Rb * Cb, cfloat(1.0f, 0.0f));
+        std::vector<cfloat> hu((size_t)2 * N, cfloat(1.0f, 0.0f));
         check_double("energy frac, uniform",
-                     mosse::filter_box_energy_fraction(hu.data(), 2, Rb, Cb, 4, 4),
-                     16.0 / 64.0, 1e-9);
+                     mosse::filter_box_energy_fraction(to_freq(hu).data(), 2,
+                                                       Rb, Cb, 4, 4),
+                     16.0 / 64.0, 1e-5);
 
         // A full-patch box is the identity; a degenerate box is 0, not a crash.
         check_double("energy frac, full box",
-                     mosse::filter_box_energy_fraction(hu.data(), 2, Rb, Cb, Rb, Cb),
-                     1.0, 1e-9);
+                     mosse::filter_box_energy_fraction(to_freq(hu).data(), 2,
+                                                       Rb, Cb, Rb, Cb),
+                     1.0, 1e-5);
         check_double("energy frac, zero box",
-                     mosse::filter_box_energy_fraction(hu.data(), 2, Rb, Cb, 0, 4),
+                     mosse::filter_box_energy_fraction(to_freq(hu).data(), 2,
+                                                       Rb, Cb, 0, 4),
                      0.0, 1e-9);
+
+        // THE CASE THE OLD SUITE COULD NOT HAVE: a frequency-domain H whose
+        // energy is NOT at the spatial centre reads well below 1.0, and the
+        // SAME array read without a transform reads ~0. A function that forgot
+        // the transform passes every case above that happens to be symmetric;
+        // this one is the direct assertion that the transform is there.
+        std::vector<cfloat> hs(N, cfloat(0.0f, 0.0f));
+        hs[0] = cfloat(1.0f, 0.0f);              // delta at the spatial ORIGIN
+        const std::vector<cfloat> Hs = to_freq(hs);
+        const double got = mosse::filter_box_energy_fraction(Hs.data(), 1,
+                                                             Rb, Cb, 4, 4);
+        check_double("energy frac, transform is applied", got, 0.0, 1e-5);
+        // ... and |H| is FLAT for that delta, so a no-transform implementation
+        // would return the area ratio 0.25. Assert the two are distinguishable,
+        // which is exactly what the hardware run found the hard way.
+        check_true("no-transform would differ", std::fabs(got - 0.25) > 0.2,
+                   "|H| is flat for a spatial delta, so no transform gives 0.25");
+
+        // The non-power-of-two axis reports NOT MEASURED (negative), never 0.
+        check_true("energy frac, npot axis is negative",
+                   mosse::filter_box_energy_fraction(Hs.data(), 1, 6, 6, 4, 4) < 0.0,
+                   "not measured, never measured as zero");
+    }
+
+    // (5) THE INVERSE TRANSFORM ITSELF, against the naive DFT in this file.
+    // filter_box_energy_fraction() only exposes a scalar ratio, which can hide a
+    // wrong transform that happens to preserve total energy. This asserts the
+    // map element by element.
+    {
+        const int R = 16, C = 16;
+        std::vector<cfloat> H((size_t)R * C);
+        unsigned s = 12345u;
+        auto rnd = [&]() { s = s * 1664525u + 1013904223u;
+                           return (float)((int)(s >> 16) % 2000 - 1000) / 1000.0f; };
+        for (size_t i = 0; i < H.size(); ++i) H[i] = cfloat(rnd(), rnd());
+
+        std::vector<cfloat> ref;
+        maskref::idft2(H, ref, R, C);            // naive, independent, O(n^2)
+
+        // The board's path, reached through the only entry point that uses it:
+        // a full-box fraction is 1.0 for ANY transform, so instead compare the
+        // ratio on a sub-box against the same ratio computed from `ref`.
+        const int br = 6, bc = 6;
+        const int r0 = R / 2 - br / 2, c0 = C / 2 - bc / 2;
+        double tot = 0.0, in = 0.0;
+        for (int r = 0; r < R; ++r)
+            for (int c = 0; c < C; ++c) {
+                const cfloat v = ref[(size_t)r * C + c];
+                const double m2 = (double)v.real() * v.real()
+                                + (double)v.imag() * v.imag();
+                tot += m2;
+                if (r >= r0 && r < r0 + br && c >= c0 && c < c0 + bc) in += m2;
+            }
+        check_double("ifft2 matches the naive DFT (box ratio)",
+                     mosse::filter_box_energy_fraction(H.data(), 1, R, C, br, bc),
+                     in / tot, 1e-5);
     }
 }
 

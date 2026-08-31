@@ -398,3 +398,69 @@ assumes `TARGET_PADDING=2.0`. Pointed at the pad30 CSVs it reports alpha 0.442 a
 ~0.66, essentially unchanged. **Any per-bin instrument in this repo carries the padding
 assumption until shown otherwise** — the same class of defect as the multi-start CSV keyed on
 frame index. Not fixed here; recorded so the next reader does not trust that column.
+
+# MAX POOLING IS THE SAME NULL AS AVERAGE — and px/bin is confirmed as the only axis
+
+**2026-08-31.** Prompted by Danilowicz & Kryjak 2022 (`docs/papers/danilowicz2022_embedded_dcf.pdf`),
+whose deepDCF stem is VGG11 conv1 **including ReLU and 2x2 MAXPOOL** — i.e. the aggregation the
+DCF literature actually ships, and one this file had never tested. Every pooling arm above is
+an AVERAGE, and averaging a SIGNED edge map cancels lobes (`pool2` PSR 30.4 -> 13.4). That is a
+property of the average, not of pooling, so the null above was arguably measured on the wrong
+operator. `-mpool<N>` (max) and `-relumpool<N>` (ReLU then max) were added to test it.
+
+62 sequences, RGB, **shipping eta 0.05 / gate 5.0**, `vot_ar_offline.py`. Baseline re-run in the
+same invocation and it reproduces the recorded board-form control EXACTLY (A 0.5394 / R 0.2910 /
+5792 tracked), so the arms are readable.
+
+```
+arm                  A        R   tracked        dR        dA
+rgb             0.5394   0.2910      5792                        <- control
+rgb-dec2        0.5005   0.3981      7923   +0.1071   -0.0389    subsample, NO aggregation
+rgb-mpool2      0.4976   0.3971      7904   +0.1061   -0.0418    MAX
+rgb-pool2       0.4977   0.3970      7901   +0.1060   -0.0417    AVERAGE
+rgb-relumpool2  0.5393   0.3294      6557   +0.0384   -0.0001    ReLU + MAX
+```
+
+**MAX, AVERAGE AND NO AGGREGATION AT ALL AGREE TO 0.001.** The hypothesis was that max on a
+rectified map would behave differently from an average on a signed one; the arithmetic is right
+(2x2 of `[[-4,1],[2,3]]` gives avg 0.5, max 3.0, dec -4.0) and the tracking consequence is nil.
+**The aggregation operator is irrelevant; px/bin is doing all of the work**, which is what the
+section above concluded and what this was written to falsify. Danilowicz's maxpool is not why
+their pipeline works.
+
+`relumpool2` is the one arm that differs, and not in a useful way: accuracy is pinned at the
+baseline (0.5393 vs 0.5394) for a third of the robustness. It tracks 6557 frames against the
+other pooled arms' ~7900 — a more conservative tracker scored on an easier prefix, i.e. the
+selection effect, not better boxes.
+
+## THE RESOLUTION ARM SURVIVES EVERY STABILITY TEST THE SPATIAL MASK FAILED
+
+The same trim/bootstrap applied to the hardware mask arm (`spatial_mask.md`), per sequence:
+
+```
+arm               mean dR   median    trim3  drop-top3            95% CI   P(dR<=0)
+rgb-dec2          +0.0826  +0.0000  +0.0648    +0.0503  [+0.0312, +0.1403]    0.000
+rgb-mpool2        +0.0842  +0.0000  +0.0662    +0.0521  [+0.0354, +0.1406]    0.000
+rgb-pool2         +0.0876  +0.0000  +0.0704    +0.0557  [+0.0343, +0.1461]    0.000
+rgb-relumpool2    +0.0623  +0.0000  +0.0499    +0.0291  [+0.0131, +0.1169]    0.005
+(shipped spatial mask, k=1, same instrument)
+                  +0.0330  +0.0000  +0.0231    +0.0101                        --
+```
+
+**The bootstrap CI excludes zero, and it survives dropping the top-3 gainers at +0.050 — five
+times the mask's +0.010 and still above this bench's own 0.02 resolution.** It is the first arm
+measured here that is not carried by a handful of sequences. The median is still 0.0000, so it
+is a tail effect like everything else on this bench; the difference is the size of the tail.
+
+**Read the magnitude with the standing discount.** This instrument over-predicted the spatial
+mask 3x (+0.0601 offline against +0.0192 on hardware) and `TARGET_PADDING=3.0` by ~11x. What is
+different here is that the pad30 failure had a NAMED cause — the offline loop has no DSST scale
+filter and padding sets the ROI `scale_extract` draws from — and **this arm holds padding at
+2.0, so that specific blindness does not apply.** It remains single-start against 419 anchored
+runs.
+
+**It is a RESOLUTION change, not a pooling change.** Plain `dec2` scores as well as either
+pooled variant, so nothing needs to aggregate: the arm is `PATCH_ROWS=PATCH_COLS=64` at
+`TARGET_PADDING=2.0`, i.e. px/bin = box/32. That is also exactly the geometry Danilowicz ships
+(128x128 ROI -> 64x64 filter) and their 8-channel row scores EAO 0.183 against DSST/KCF HOG at
+0.17 — though on VOT2015 with an inverted R, so no value there is comparable to ours.

@@ -199,6 +199,7 @@ implies.
 | R-07 | On targets that genuinely translate the detector recovers 93% of annotated motion — localisation is not the fault | accepted-offline | `evidence/detector_gain.md` | — | `sec:dyskusjaWynikow` |
 | R-08 | The board's usable heap is ~0.9–1.2 GB, not 12 GB; streaming (`VOT_STREAM_RING`) recovered the five RGB sequences that died on `std::bad_alloc`, with identical digests both ways | accepted-hw | `evidence/TODO_board_memory.md` | `0827_1313-streamA/B` | `subsec:zrodlaObrazu` |
 | R-09 | Multi-start determinism: two runs of the same job return byte-identical trajectories, and `RESET_MUTANT` proves the test can fail | accepted-hw | `evidence/phase3.md` | — | `subsec:weryfikacja` |
+| R-10 | The spatial mask: EAO 0.1629 → 0.1740 (+0.0110) and A is **+0.0179** on the common survived prefix — but **the gain is carried by 3 sequences of 62 (top-3 = 133% of it), the per-sequence median dR is 0.0000 and the bootstrap CI includes zero (P(dR≤0)=0.22). NOT distinguishable from a null**, and the mechanism is refuted: init failures 61 → 60 despite the largest `mask_ebox` edge | **weak-hw** | `evidence/spatial_mask.md` | `0831_1528-mask` vs `0831_1340-base_stat` | `sec:jakoscSledzenia` |
 
 ## N — Refuted, and the reason the obvious explanation was wrong
 
@@ -206,7 +207,8 @@ implies.
 |---|---|---|---|---|
 | N-01 | Quantization causes the poor robustness | **refuted — removing it makes tracking worse** (mean IoU 0.2533 → 0.2350, 0 of 8 sequences improve) | GAP — **write this; it is the thesis's strongest single result** | `sec:dyskusjaWynikow` |
 | N-02 | Bolme §3.4 init perturbations would help | refuted — the 16-channel shared denominator is already the cure; Bolme's Fig. 3 is captioned "without regularization" | GAP (`0828_offline-warp8`) | `sec:dyskusjaWynikow` |
-| N-03 | Pooling / lower feature resolution would help | refuted — `blur2` is a null on both banks; `pool2 ≤ dec2` everywhere | `evidence/pooled_features.md` | `sec:dyskusjaWynikow` |
+| N-03 | POOLING would help | refuted — `blur2` is a null on both banks, and MAX pooling is the same null as average (`dec2` 0.3981 / `mpool2` 0.3971 / `pool2` 0.3970, agreeing to 0.001), so the aggregation OPERATOR is irrelevant | `evidence/pooled_features.md` | `sec:dyskusjaWynikow` |
+| N-03b | LOWER FEATURE RESOLUTION would help — **NOT refuted, and the strongest offline arm measured**: 64×64 map at padding 2.0 gives dR +0.1071, survives drop-top-3 at +0.050 and a bootstrap CI excluding zero. Offline only; needs an AIE rebuild. **PRE-REGISTERED: `evidence/proposed_build_res64.md`** | open-offline | `evidence/pooled_features.md`, `evidence/proposed_build_res64.md` | `sec:dalszePrace` |
 | N-04 | `TARGET_PADDING=3.0` (predicted +0.088 R) | refuted on hardware — R +0.0077 and **EAO down**; the offline proxy had no scale filter and was single-start | `evidence/pooled_features.md` | `sec:dyskusjaWynikow` |
 | N-05 | Padding below 2.0 | refuted — every value worse (R 0.2251 at 1.5) | `evidence/pooled_features.md` | `sec:dyskusjaWynikow` |
 | N-06 | A better pretrained feature bank would help | refuted — at layer 1 pretraining is worth ~0.011–0.015 R, below the bench's resolution; a random bank of matched row norms ties it | `evidence/feature_bank.md` | `sec:dyskusjaWynikow` |
@@ -236,6 +238,7 @@ implies.
 | M-06 | Verify a feature flag on a build that can exercise it; `strings` on the ELF can report a false absence | `evidence/phase4.md` |
 | M-07 | A multi-start CSV collides on frame index — keyed by frame alone it under-reported rails 66× next to a confident wrong verdict | GAP |
 | M-08 | Write predictions and falsifiers down before the run; two of three fired on the arm that shipped anyway | `evidence/eta05.md` |
+| M-11 | An aggregate rate can invert when split by the state it depends on: the mask's `NEGATIVE_PEAK` drop (15.4% → 10.2%) is a RISE on the frames that matter (3.07% → 3.87% on target) | `evidence/spatial_mask.md` |
 | M-09 | Benchmark a host-side change on the host — the *ordering* did not transfer, not just the magnitude, because the working set crossed a cache boundary | GAP |
 | M-10 | A caveat that is not priced is a hope | `evidence/pooled_features.md` |
 
@@ -243,7 +246,7 @@ implies.
 
 | id | item | state | evidence |
 |---|---|---|---|
-| O-01 | Spatial mask on the filter (`FILTER_MASK=1`) | built, not swept on hardware; offline dR +0.0601 in board form | `evidence/proposed_build_mask.md` |
+| O-01 | Spatial mask on the filter (`FILTER_MASK=1`) | **SWEPT 2026-08-31 — see R-10; EAO rose but the arm is NOT separable from a null** (EAO +0.0110). No longer open; the id is kept because `@thesis` tags bind to it. The predicted `PSR_GATE_MIN` re-tune is NOT supported by the hardware data (the gate's bite did not move: `LOW_PSR` 0.10% → 0.09%); what remains open is whether the mask helps AT ALL on 62 sequences (bootstrap CI includes zero) — and the CSR-DCF mechanism is refuted here: it is a PROJECTION not a constraint, `A`/`B` are untouched so it cannot compound, and the unmasked filter self-concentrates (e_box 0.60 → 0.86 unaided) | `evidence/spatial_mask.md`, `evidence/proposed_build_mask.md` |
 | O-02 | Channel reliability in Stage B3 | untested; both halves available by Parseval inside the existing loop | `evidence/robustness_proposals.md` |
 | O-03 | Two-filter temporal ensemble (short/long eta) | untested, host-only | `evidence/robustness_proposals.md` |
 | O-04 | Feature-bank **geometry** (16ch / 3×3 / stride 1) — not the weights | not refuted; an AIE rebuild | `evidence/feature_bank.md` |

@@ -816,6 +816,17 @@ GCC_FLAGS  += -DFILTER_MASK=$(FILTER_MASK)
 FILTER_MASK_STAT ?= 0
 GCC_FLAGS  += -DFILTER_MASK_STAT=$(FILTER_MASK_STAT)
 
+# The statistic costs an inverse FFT per channel (9.4 ms/call at ch16 128x128 on
+# an x86 -O3 host, i.e. more than a whole frame once it is on the A72), because
+# Sum|h|^2 is SPATIAL and the array the fused path holds is the FREQUENCY-domain
+# H. So it is sampled, not computed every frame: the first WARM frames of each
+# run plus every EVERY-th frame after. Unsampled frames log -1, exactly as a held
+# frame does. These defaults are matched to vot_mask_stat.py's PROFILE_FRAMES.
+FILTER_MASK_STAT_WARM  ?= 5
+FILTER_MASK_STAT_EVERY ?= 20
+GCC_FLAGS  += -DFILTER_MASK_STAT_WARM=$(FILTER_MASK_STAT_WARM)
+GCC_FLAGS  += -DFILTER_MASK_STAT_EVERY=$(FILTER_MASK_STAT_EVERY)
+
 # ---------------------------------------------------------------------------
 # Run instrumentation. HOST-ONLY, like PSR_GATE_MIN above.
 # ---------------------------------------------------------------------------

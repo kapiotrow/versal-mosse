@@ -151,15 +151,25 @@ def split_warp(name):
 
 
 def parse_arm(name):
-    """'rgb-pool2' -> ('rgb', 2, 'avg').  'gray' -> ('gray', 1, 'avg')."""
-    m = re.match(r'^(.*?)-(relupool|relublur|relu|pool|blur|dec)(\d+)?$', name)
+    """'rgb-pool2' -> ('rgb', 2, 'avg').  'gray' -> ('gray', 1, 'avg').
+
+    MAX pooling (`-mpool`, `-relumpool`) was added 2026-08-31 after reading
+    Danilowicz & Kryjak 2022: their deepDCF stem is VGG11 conv1 INCLUDING ReLU
+    AND 2x2 MAXPOOL, i.e. the aggregation the DCF literature actually ships. Every
+    pooling arm in this file before then was an AVERAGE, and averaging a SIGNED
+    edge map cancels the lobes (pool2 PSR 30.4 -> 13.4) -- which is a property of
+    the average, not of pooling. Max on a rectified map cannot cancel, so
+    `relumpool` is the arm that tests the literature's actual choice.
+    """
+    m = re.match(r'^(.*?)-(relumpool|relupool|relublur|relu|mpool|pool|blur|dec)(\d+)?$', name)
     if not m:
         return name, 1, 'avg'
     kind = m.group(2)
     n = int(m.group(3)) if m.group(3) else 1
     return m.group(1), n, {'pool': 'avg', 'dec': 'dec', 'blur': 'blur',
                            'relupool': 'reluavg', 'relu': 'reluavg',
-                           'relublur': 'relublur'}[kind]
+                           'relublur': 'relublur',
+                           'mpool': 'max', 'relumpool': 'relumax'}[kind]
 
 
 def pool_features(ft, n, mode):
@@ -185,6 +195,13 @@ def pool_features(ft, n, mode):
     ch, r, c = ft.shape
     if mode == 'dec':
         return ft[:, ::n, ::n]
+    if mode in ('max', 'relumax'):
+        # MAX over the cell. On a SIGNED map this is not a symmetric operation --
+        # it keeps positive lobes and discards negative ones, which is why it is
+        # only meaningful paired with the rectification the literature applies
+        # first (relumax). `mpool` without ReLU is kept as the control that
+        # separates "max" from "max of a rectified map".
+        return ft.reshape(ch, r // n, n, c // n, n).max(axis=(2, 4))
     return ft.reshape(ch, r // n, n, c // n, n).mean(axis=(2, 4))
 
 
@@ -195,7 +212,8 @@ def arm_doc(name):
                f"{'ReLU + ' if mode.startswith('relu') else ''}"
                + ('ReLU only' if n == 1 else
                   ('subsample' if mode == 'dec' else
-                   'box blur (stride 1)' if mode.endswith('blur') else 'average')
+                   'box blur (stride 1)' if mode.endswith('blur') else
+                   'MAX' if mode.endswith('max') else 'average')
                   + f" {n}x{n} -> "
                   + (f"{R}x{C}" if mode.endswith('blur') else f"{R//n}x{C//n}"))))
 
@@ -448,7 +466,8 @@ def run_arm(arm, wq, bias, shift, gt, n_frames, oracle_scale, verbose,
             eta=ETA, psr_min=PSR_GATE_MIN, n_warps=1,
             warp_shift=0.05, warp_scale=0.05, warp_mutant='none',
             warp_aspect=0.0, warp_rot=0.0, eps_rel=EPS_REL,
-            mask_plateau=None, mask_taper=0.25, mask_centre='board'):
+            mask_plateau=None, mask_taper=0.25, mask_centre='board',
+            mask_power=1):
     # float_conv = (w_float, b_fold) runs the UNQUANTIZED conv instead of the
     # int8 one, everything else identical. See conv_features_float's docstring:
     # this arm exists to answer whether quantization causes the tracker's poor
@@ -476,8 +495,18 @@ def run_arm(arm, wq, bias, shift, gt, n_frames, oracle_scale, verbose,
            'step': [], 'resp00': [], 'ebox': []}
     # Built once: the mask is fixed in PATCH coordinates, so it does not move
     # with the box. Its fixedness is the whole reason it is host-only and free.
+    # mask_power k: the mask is m**k. THIS IS A REAL, BOARD-IMPLEMENTABLE WIDTH
+    # KNOB, and the docs said there was none. A single periodic Hann is forced
+    # (only it has an exactly sparse spectrum), but m**k is ALSO exactly sparse
+    # -- 2k+1 bins per axis, since sin^2 raised to k is a cosine polynomial of
+    # degree k -- and multiplying by m**k is EXACTLY applying the board's
+    # existing projection k times. Verified against an exact FFT to 4.9e-16, so
+    # k costs 8k complex adds per bin, no multiplies, and NO NEW BOARD CODE.
+    # Effective width, fraction of mask energy in the centred 64x64 box:
+    # k=1 0.6695, k=2 0.8544, k=3 0.9347.
     mask = (None if mask_plateau is None
-            else spatial_mask(fr, fc, mask_plateau, mask_taper, mask_centre))
+            else spatial_mask(fr, fc, mask_plateau, mask_taper, mask_centre)
+                 ** mask_power)
 
     for f in range(1, n_frames + 1):
         if oracle_scale:
@@ -502,7 +531,7 @@ def run_arm(arm, wq, bias, shift, gt, n_frames, oracle_scale, verbose,
                                              mean_prev=mp)
             else:
                 ft, om = conv_features(patch, wq, bias, shift, mean_prev=mp,
-                                       relu=pool_mode in ('reluavg', 'relublur'))
+                                       relu=pool_mode in ('reluavg', 'relublur', 'relumax'))
             ft = pool_features(ft.astype(np.float64), pool, pool_mode)
             return np.fft.fft2(ft, axes=(1, 2)), om
 
@@ -705,6 +734,10 @@ def main():
                          'a fraction of the patch (default 0.25). 0 is a HARD\n'
                          'box, whose DFT is a sinc and therefore not sparse --\n'
                          'offline-only, not board-implementable.')
+    ap.add_argument('--mask-power', type=int, default=1,
+                    help='apply the mask m**k, i.e. the board projection k times.\n'
+                         'Exactly sparse for every k (2k+1 bins per axis), so k is\n'
+                         'a board-implementable WIDTH knob needing no new code.')
     ap.add_argument('--mask-center', default='board', choices=['board', 'bench'],
                     help="where the -mask<N> axis is centred (default board).\n"
                          "board = n/2, the EXACT periodic Hann and the only\n"
@@ -808,7 +841,8 @@ def main():
                          warp_aspect=args.warp_aspect, warp_rot=args.warp_rot,
                          eps_rel=args.eps_rel, mask_plateau=mask_plateau,
                          mask_taper=args.mask_taper,
-                         mask_centre=args.mask_center)
+                         mask_centre=args.mask_center,
+                         mask_power=args.mask_power)
 
     print()
     print(f"{'arm':<13} {'frozen, truth>=1bin':>20} {'frozen, <1bin':>14} "

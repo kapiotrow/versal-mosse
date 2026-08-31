@@ -100,8 +100,9 @@ the `dsp` subdirectory (the Makefile appends `/dsp`).
 | `VOT_RESIDENT_MAX_MB` / `VOT_STREAM_RING` | `700` / `8` | Blob+sidecar size above which a sequence STREAMS from the NFS mount through a prefetched ring, and the ring depth. Exists because usable heap is ~0.9-1.2 GB, not 12 GB: five RGB sequences died on `std::bad_alloc` while 57 completed. Ring < 2 is REFUSED, not clamped. `--vot-stream auto|always|never`; `always` is the MODE-EQUIVALENCE TEST — streaming changes no arithmetic, so digests must be IDENTICAL both ways. Host-only |
 | `SCENE_VERIFY` | `0` | Re-colourise the whole frame each push and abort on a mismatch. O(frame)/frame — for a short `MODE=bringup` run only (`calib_build.sh` refuses otherwise). It was a bare `#ifndef` before 2026-08-24, so `SCENE_VERIFY=1` silently built it DISABLED. Host-only |
 | `B2_NULL_BINS` | `1` | 1 = null the 9 low-frequency bins, 0 = subtract µ·W |
-| `FILTER_MASK` | `0` | Spatial reliability: the projection `h ← m⊙h` on the published `H`, i.e. CSR-DCF's item. The window is FORCED — only the periodic Hann has an exactly sparse spectrum — so there is no width knob, and once forced the constants collapse to `H ← D_row(D_col(H))/16` with `D(X)[i]=2X[i]−X[i−1]−X[i+1]` circular: **8 complex adds/bin, no multiplies**, verified against an exact FFT to 8e-16. Applied in BOTH publish paths (the fused one AND `filter_quantize_q15`, which is frame 0's) and BEFORE the max-\|H\| scan, since it moves the Q1.15 scale. Host-only. Offline: dR +0.0601. **`cmp` cannot check its inertness** — see `docs/thesis/evidence/proposed_build_mask.md` §3 |
-| `FILTER_MASK_STAT` | `0` | Logs `mask_ebox`, the fraction of `Σ\|h\|²` inside a centred target-sized box, as a trailing `track.csv` column. THE mechanism check for the above, and independent of it so the baseline is measurable with the same instrument. **51.6%/54.9% are AT-INIT values and the fraction RISES as the filter converges** (car1 0.514→0.741 unmasked); comparing a run's mean against them would confirm the mechanism on an unmasked arm. `-1` where H was not re-formed — do not average as zero. Host-only |
+| `FILTER_MASK` | `0` | Spatial reliability: the projection `h ← m⊙h` on the published `H`, i.e. CSR-DCF's item. The window is FORCED — only the periodic Hann has an exactly sparse spectrum — so there is no width knob, and once forced the constants collapse to `H ← D_row(D_col(H))/16` with `D(X)[i]=2X[i]−X[i−1]−X[i+1]` circular: **8 complex adds/bin, no multiplies**, verified against an exact FFT to 8e-16. Applied in BOTH publish paths (the fused one AND `filter_quantize_q15`, which is frame 0's) and BEFORE the max-\|H\| scan, since it moves the Q1.15 scale. Host-only. **SWEPT AND ACCEPTED 2026-08-31: EAO 0.1629 → 0.1740 (+0.0110), R +0.3417 → 0.3608, 16.6% more frames tracked; A −0.0187 pooled but **+0.0179 on the common survived prefix**, i.e. the accuracy loss is a selection effect. Offline over-predicted the gain 3× (dR +0.0601 vs +0.0192). `docs/thesis/evidence/spatial_mask.md`, claim R-10.** The DEFAULT IS STILL `0` pending the `PSR_GATE_MIN` re-tune the mask forces. **`cmp` cannot check its inertness** — see `evidence/proposed_build_mask.md` §3 |
+| `FILTER_MASK_STAT` | `0` | Logs `mask_ebox`, the fraction of `Σ\|h\|²` inside a centred target-sized box, as a trailing `track.csv` column. THE mechanism check for the above, and independent of it so the baseline is measurable with the same instrument. **51.6%/54.9% are AT-INIT values and the fraction RISES as the filter converges** (car1 0.514→0.741 unmasked); comparing a run's mean against them would confirm the mechanism on an unmasked arm. **`-1` is NOT MEASURED, and at the shipped schedule that is 94.6% of rows — do not average as zero and do not read it as a hold rate.** Sampled, not per-frame: the statistic is an inverse FFT per channel (30.1 ms/call on the A72, more than a whole frame), so see `FILTER_MASK_STAT_WARM`/`_EVERY`. Host-only |
+| `FILTER_MASK_STAT_WARM` / `FILTER_MASK_STAT_EVERY` | `5` / `20` | Sampling schedule for `mask_ebox`: the first WARM frames of each run plus every EVERY-th after. **Matched to `vot_mask_stat.py`'s `PROFILE_FRAMES` (1, 5, 20, 40)** — move either and that reader's per-frame columns silently thin out. Host-only |
 | `PSR_GATE_MIN` | `5.0` | +0.0134 R against 7.0 on the full benchmark. **Its worth depends on the PSR scale**, so anything moving PSR re-opens it. Bolme §3.5. Below it the host HOLDS position and skips `filter_update` + `publish_filter`. `0` disables the threshold test only (structural vetoes remain). Host-only |
 | `TARGET_H` / `TARGET_W` | `64` | Target box size, frame px. Host-only |
 | `TARGET_PADDING` | `2` | Settled at 2.0 three ways; 1.5 and 3.0 both measured worse. `roi = box × padding`. At 64/2 the ROI is 128 ⇒ resample is 1:1. Host-only |
@@ -338,6 +339,7 @@ Full VOT-STb2022, 62 sequences, 419 trajectories per arm. Each row moves ONE kno
 | + `MOSSE_ETA=0.05` | 0.5100 | 0.3283 | 0.1600 | `eta05ab` |
 | **+ `PSR_GATE_MIN=5.0` — SHIPPING** | **0.5100** | **0.3417** | **0.1629** | `gate` |
 | + `TARGET_PADDING=3.0` — REJECTED | 0.5030 | 0.3494 | 0.1570 | `pad30ab` |
+| + `FILTER_MASK=1` — EAO up, but NOT SEPARABLE FROM A NULL | 0.4913 | 0.3608 | 0.1740 | `0831_mask` |
 
 `PSR_GATE_MIN=0` is a null (13-seq probe, `g0partial`). The padding arm gained R and LOST
 EAO — **EAO is the arbiter for an A/R trade**, see the feature-geometry entry under Settled.
@@ -441,10 +443,41 @@ Localisation, the gate, quantization, saturation, pooling, feature resolution, p
 **init perturbations** are ALL exonerated or rejected (entries below). Ranked list and the
 supporting measurements: `docs/thesis/evidence/robustness_proposals.md`. What is left is host-only:
 
-1. **A spatial mask on the filter — BUILT 2026-08-29, NOT YET SWEPT.** `FILTER_MASK=1
-   FILTER_MASK_STAT=1`; both publish paths, `make test_host` green at both `-O2` and
-   `-ffp-contract=fast`, six mutants caught, `aie.flagstamp` unchanged. Next action is
-   `scripts/calib_build.sh` then `scripts/vot_sweep.sh --arm mask --ingest`.
+1. **THE NEXT BUILD: the 64x64 feature map (`PATCH_ROWS=PATCH_COLS=64`) — PROPOSED 2026-08-31,
+   `docs/thesis/evidence/proposed_build_res64.md`, claim N-03b.** The first arm whose offline
+   signal survives a symmetric trim AND a bootstrap: dR **+0.1071**, drop-top-3 **+0.050**,
+   P(dR<=0) = 0.000, against the shipped spatial mask's +0.0330 / +0.0101 on the same
+   instrument. A RESOLUTION change, not a pooling one (`dec2` alone scores it). **Buys frame
+   time too** — 0.25x the host work, ~15 ms/frame predicted against 28.58. Most of the build is
+   free: `roi_crop` takes `patch_rows` as a RUNTIME AXI-Lite arg and its `.xo` is stamp-verified
+   reusable, `hanning_64.h` already exists, `BUILD_DIR` is already keyed on geometry. **The real
+   price is the shift budget** — the FFT gain falls ~4x at 64 points but Stage A renormalises
+   over 4x fewer samples, so the net is NOT derivable; budget one 200-frame calibration run.
+   Falsifier has TWO parts this time (dEAO >= +0.005 AND survives drop-top-3), because the mask
+   cleared a one-part bar and was still not separable from a null.
+
+2. **A spatial mask on the filter — SWEPT 2026-08-31. EAO ROSE, AND THE ARM IS STILL NOT
+   DISTINGUISHABLE FROM A NULL.** `docs/thesis/evidence/spatial_mask.md`, claim R-10, `results/arms.csv` row
+   `rgb_mask`. **EAO 0.1629 → 0.1740 (+0.0110), against a +0.005 bar written before the run.**
+   **But the gain is carried by 3 sequences of 62 — the top 3 are 133% of it, dropping them FLIPS the sign to −0.0030, the per-sequence median dR is 0.0000 and the bootstrap CI is [−0.0135, +0.0318] with P(dR≤0)=0.22.** EAO cannot be bootstrapped (one value per tracker), so the arbiter has no stability estimate. **Quote it with that caveat, never as a clean win.** R 0.3417 → 0.3608, 16.6% more frames tracked, and the pooled A drop (−0.0187) is a SELECTION
+   effect: on the common survived prefix A goes **0.5319 → 0.5499, i.e. +0.0179**. Mechanism
+   confirmed by `mask_ebox`, which separates the arms at init 0.6049 → 0.9500 with
+   non-overlapping quartiles. Control: the paired baseline's 419 trajectories are BYTE-IDENTICAL
+   to the stored shipping arm, so `FILTER_MASK=0` is inert on hardware and the instrument
+   perturbs nothing. **Offline over-predicted the gain 3× (dR +0.0601 against +0.0192) — quote
+   the hardware delta.** **THE PREDICTED `PSR_GATE_MIN` RE-TUNE IS NOT SUPPORTED BY THE HARDWARE DATA — do
+   not spend a 100-minute sweep on it.** Masking DID move the PSR scale, by half what offline
+   predicted (median 30.87 → 27.18, −12%, against a predicted −24%), but **the gate's BITE did
+   not move**: `LOW_PSR` is 0.10% of evaluated frames on the baseline and 0.09% under the mask,
+   and the fraction below 7 FELL (1.56% → 1.32%). The threshold has almost no lever left —
+   moving it 5.0 → 3.0 flips 161 frames (0.09% of evaluated), 5.0 → 7.0 flips 1966 (1.09%).
+   99.1% of vetoes are `NEGATIVE_PEAK`, which `PSR_GATE_MIN` cannot disable. (Those flip counts
+   are OPEN-LOOP — a flipped decision changes every later frame — so read them as how much room
+   the knob has, not as a predicted outcome.)
+   **`calib_build.sh` CANNOT build either arm** — it accepts only `ARM=gray|rgb`, never passes
+   `FILTER_MASK`, and would print `BUILD VERIFIED` on a build that silently omitted it. Use
+   `make application` with the flags spelled out; see `evidence/spatial_mask.md`.
+   *(The pre-sweep entry follows; its numbers are OFFLINE predictions, not results.)*
    **The window swept on 08-28 is NOT the one the board runs** — the bench centred its axis at
    `(n-1)/2`, the hardware's periodic Hann at `n/2`; half a sample, worth mean IoU 0.1715 vs
    0.2813 on `tiger`. Re-swept over all 62 in the board form: **dR +0.0601** (was +0.0718),
@@ -495,18 +528,18 @@ supporting measurements: `docs/thesis/evidence/robustness_proposals.md`. What is
    `PSR_GATE_MIN` on a second sweep** — masking moves the PSR scale (car1 mean PSR 48.2 → 36.7),
    and the gate's worth is conditional on that scale. One variable at a time: mask first at the
    inherited gate, then the gate.
-2. **Channel reliability in Stage B3, and it needs no per-channel response map.** B3 normalises
+3. **Channel reliability in Stage B3, and it needs no per-channel response map.** B3 normalises
    by ENERGY, not discriminative power; the blocker was that `cmul_accum` sums channels before
    the IFFT. Both halves are available in the frequency domain by Parseval:
    `r_ch(0) = (1/N)·Σᵢ Hᵢ·conj(Fᵢ)` and `‖r_ch‖² = (1/N)·Σᵢ|Hᵢ Fᵢ|²`, i.e. two scalar
    accumulators inside the existing per-channel loop of `filter_update_quantize` over arrays it
    already streams. Reliability `r(0)²/‖r‖²` folds into `chscale`. CSR-DCF price theirs at −12%.
-3. **A two-filter temporal ensemble** (TCLCFcpp, the one embedded tracker at R 0.598). eta 0.125
+4. **A two-filter temporal ensemble** (TCLCFcpp, the one embedded tracker at R 0.598). eta 0.125
    and eta 0.05 already win on different sequences; run both, select per frame by PSR. Host-only,
    +2 MB filter state, roughly doubles the ~5 ms filter tail. **Take the cheap half first**: a
    long-term filter at eta≈0 used only as a VALIDATOR at the selected peak (one dot product per
    channel, item 2's identity, no second AIE bank) feeding a confidence-modulated eta.
-4. **A REPLACEMENT feature bank — NARROWED SHARPLY 2026-08-29, see `docs/thesis/evidence/feature_bank.md`.**
+5. **A REPLACEMENT feature bank — NARROWED SHARPLY 2026-08-29, see `docs/thesis/evidence/feature_bank.md`.**
    **Swapping the donor network is close to a null: at layer 1 the pretraining is worth
    ~0.011-0.015 in R, below the offline bench's own resolution, and it does not survive a
    symmetric trim.** A RANDOM bank of matched row norms ties the pretrained one on held-out PSR
@@ -778,6 +811,24 @@ Two principles that have repeatedly earned their keep: **instruments before chan
   conv2d returns at the top: no MAC, no ReLU, no B1, **no Hanning window** (so B2's 9-bin
   identity does not hold), and all 16 channels are bit-identical (so the accumulator sums 16
   coherent copies and every amplitude and PSR figure is inflated).
+- **NEVER KILL A BOARD RUN MID-SEQUENCE — THE NEXT PROCESS STALLS, AND KILLING THE LEFTOVER DOES
+  NOT CLEAR IT.** Interrupting a sweep leaves the free-running AIE graph and the XRT device
+  context inconsistent. The next run then hangs: both threads in `clock_nanosleep`, ~33% of one
+  core, `roi_crop`'s CU reading `0x20E` (`ap_done=1 ap_idle=1`, so the CU is NOT the blocker),
+  and ZERO frames produced for 14 minutes on a sequence that takes 14 SECONDS. `vot_sweep.sh`'s
+  own leftover-kill ran first and the fresh process stalled anyway — **a reboot is the only
+  clear**. Two things hide it and neither is a fault: the board's stdout is block-buffered at
+  4 KB, and `CSV_FLUSH_EVERY=200` holds the rows, so a healthy long sequence and a hung one look
+  identical from the log. **Watch the TRAJECTORY COUNT.** Cost: one aborted 62-sequence arm.
+- **A CROSS-IMPLEMENTATION CHECK IS THE ONLY THING THAT CATCHES A CONTRACT MISMATCH.**
+  `filter_box_energy_fraction()` (board) and `box_energy_fraction()` (offline) were described as
+  "written against the same definition"; the board half omitted the inverse transform, so it
+  measured a spatial statistic on a frequency-domain array and read **0.0000 on every frame of a
+  whole sweep**. Five unit tests were green throughout, because they fed it SPATIAL arrays —
+  self-consistent with the bug and agreeing with the caller about nothing.
+  `scripts/check_ebox_crosscheck.py` runs BOTH implementations on the SAME H and is
+  mutation-tested (5 mutants, all caught). Same family as the `generate_scenario` trap below:
+  zero-tolerance comparison proves nothing when both sides share an assumption.
 - **LAUNCHING OVER SSH CHANGES THE FRAME-TIME MEASUREMENT.** `scripts/vot_sweep.sh` drives the
   board over ssh, which moves the ELF's stdout off the 115200 console. That console is itself a
   distortion — 15% of the frame at `VERBOSITY=0`, **58% on `animal`** — so ssh frame times are
@@ -1345,6 +1396,18 @@ targets that genuinely translate the detector recovers 93% of the annotated moti
 0.95–0.98 per speed bucket), and on-target hold rate is only 1.8%, flat across speed. **Do not
 spend a sweep relaxing the gate, and do not look for the fault in localisation.**
 
+**THE MASK'S `NEGATIVE_PEAK` REDUCTION IS NOT A MECHANISM — checked 2026-08-31 and refuted.**
+Aggregate `NEGATIVE_PEAK` falls 15.42% → 10.22% of evaluated frames under `FILTER_MASK=1`, which
+looks like the lever the gate never had. Split by whether the tracker was ON TARGET it inverts:
+on-target 3.07% → **3.87%** (the mask makes anti-correlation MORE common where it matters), lost
+frames 25.03% → 16.13%, and in the 5 frames before the first loss it is also worse
+(13.05% → 15.06%). The fall is 90% a rate change rather than composition, but that rate change
+lives inside frames the run had already lost. Consistent with `robustness_gap.md` — the veto is
+the aftermath of a loss. **And the mask does not prevent losses either**: 373 → 369 losing runs
+of 419, median time-to-first-loss unchanged at 54 frames, later on 129 runs and earlier on 109.
+What moves is the TAIL — mean time-to-loss 119.4 → 141.4 (+18%). The arm ships on EAO and its
+explanation is open. `docs/thesis/evidence/spatial_mask.md`.
+
 **What the baselines have that this does not**, in likely order of importance:
 1. **Pooled features.** HOG is gradient-orientation histograms over cells — 31 dims, tolerant of
    deformation. This is 16 channels of 3x3 conv1, no pooling, participation ratio 4.94 gray /
@@ -1480,9 +1543,23 @@ aspect ratio either, so the axis-aligned-box penalty on deforming targets is sha
 - **FEATURE GEOMETRY — POOLING, RESOLUTION AND PADDING ALL TESTED, ALL REJECTED (2026-08-28).**
   Offline (8 seq, then all 62, `rgb_vs_gray_loop.py` arms `-pool<N>/-dec<N>/-blur<N>`), then
   hardware. `docs/thesis/evidence/pooled_features.md`.
-  * **Aggregation is a NULL on both banks.** `blur2` (2x2 box average at STRIDE 1 — receptive
-    field changed, nothing else) is −0.0010 gray / −0.0012 RGB, and `pool2 <= dec2` everywhere,
-    so the averaging adds nothing over the subsampling it implies. `blur2` is the arm that
+  * **Aggregation is a NULL on both banks, and MAX POOLING IS THE SAME NULL (2026-08-31).**
+    `blur2` (2x2 box average at STRIDE 1) is −0.0010 gray / −0.0012 RGB, and `pool2 <= dec2`
+    everywhere. Prompted by Danilowicz & Kryjak 2022, whose stem is VGG11 conv1 **with ReLU and
+    2x2 MAXPOOL**, `-mpool`/`-relumpool` were added: `dec2` R 0.3981, `mpool2` 0.3971, `pool2`
+    0.3970 — **max, average and NO aggregation agree to 0.001.** The operator is irrelevant; the
+    hypothesis that averaging a SIGNED map cancelled the lobes is arithmetically true and
+    trackingwise nil. `relumpool2` pins accuracy at baseline (0.5393 vs 0.5394) for a third of
+    the robustness — a conservative tracker on an easier prefix.
+  * **RESOLUTION IS NOT REFUTED, AND IT IS THE STRONGEST OFFLINE ARM MEASURED HERE.** A 64x64
+    map at `TARGET_PADDING=2.0` (px/bin box/32) gives **dR +0.1071**, survives dropping the
+    top-3 gainers at **+0.050** and a bootstrap CI excluding zero (P(dR<=0)=0.000) — against the
+    shipped spatial mask's +0.0330 / +0.0101 on the same instrument. It is a RESOLUTION change,
+    not a pooling one (`dec2` alone scores it), and it is the geometry Danilowicz ships. **It
+    costs 0.25x the host work (~15 ms/frame) — robustness AND frame rate.** Standing discount:
+    this bench over-predicted the mask 3x and pad30 ~11x; unlike pad30 it holds padding at 2.0,
+    so the missing-scale-filter blindness that broke that prediction does not apply. Claim
+    N-03b, `docs/thesis/evidence/pooled_features.md`. `blur2` is the arm that
     matters and it did not exist in the first sweep; without it the result reads "pooling loses",
     which is true and unattributable.
   * What moved was **px/bin**, and only on RGB. **Gray and RGB gave OPPOSITE signs for the
@@ -1871,6 +1948,16 @@ scripts/  export_weights.py, gen_aiesim_vectors.py, gen_filter_golden.py,
           vot_traj_anatomy.py # a board trajectory vs groundtruth in units of the tracker's own
                               #   BIN -- discriminates a resolution limit from a pinned detector
           vot_hold_budget.py  # frames before a frozen window loses the target, from groundtruth
+          vot_mask_stat.py    # reads the `mask_ebox` column -- THE mechanism check for
+                              #   FILTER_MASK. Keyed on (sequence, job, frame); excludes the -1
+                              #   rows rather than averaging them as zeros; reports at-init and
+                              #   per-frame-index, never a pooled mean, because the fraction
+                              #   RISES as the filter converges. Paired mode scores the frames
+                              #   valid in BOTH arms
+          check_ebox_crosscheck.py  # the board's filter_box_energy_fraction against the
+                              #   offline box_energy_fraction on the SAME H, plus 5 injected
+                              #   mutants (-DEBOX_MUTANT). Exists because the two disagreed
+                              #   silently and every unit test stayed green
           vot_ar_offline.py   # VOT's failure rule applied to OFFLINE single-start runs. NOT the
                               #   toolkit's AR -- different RUNS, same rule -- and its
                               #   resolution is MEASURED at ~0.02 in R, including one pair it

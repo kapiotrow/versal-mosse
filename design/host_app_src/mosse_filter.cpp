@@ -770,31 +770,183 @@ void filter_mask_project(cfloat *H, int rows, int cols)
     }
 }
 
+// -----------------------------------------------------------------------
+// A radix-2 inverse FFT, for the energy instrument ONLY
+// -----------------------------------------------------------------------
+// THE DATAPATH STILL HAS NO FFT LIBRARY AND THIS DOES NOT GIVE IT ONE. `F_ch`
+// arrives already transformed over gmio_fft_col_out and `G` has a closed form,
+// which is why KissFFT was never needed; nothing below is on the per-frame
+// filter path. It exists because filter_box_energy_fraction() measures a
+// SPATIAL-domain quantity from a FREQUENCY-domain array and there is no
+// shortcut: Parseval gives the total energy, not its distribution, so the box
+// fraction genuinely requires the inverse transform.
+//
+// WHY THIS EXISTS AT ALL. The first cut of the instrument squared `H` directly.
+// It is self-consistent, it passed five unit tests, and on hardware it read
+// 0.0000 on every frame of every sequence -- a centred box in the FREQUENCY
+// domain holds the high frequencies, and for this filter that is under 5e-5.
+// The offline half (rgb_vs_gray_loop.py's box_energy_fraction) transforms first
+// and its docstring says so; the two halves were described as "written against
+// the same definition" while one of them dropped the transform. A statistic
+// that is silently zero looks exactly like a filter with no energy in the box,
+// which is the reading the mask arm is supposed to produce.
+//
+// Naive O(n^2) per axis is not an option here the way it is in the test file:
+// 16 channels x 2 axes x 128 transforms of 128 points would be ~67M complex
+// multiplies per frame against a 26 ms frame. Radix-2 makes it ~1.8M
+// butterflies, and the caller subsamples frames on top of that.
+static bool is_pow2(int n) { return n > 0 && (n & (n - 1)) == 0; }
+
+// Twiddles for the INVERSE transform (positive exponent), w[j] = exp(+2*pi*i*j/n)
+// for j < n/2. Cached per thread and per n: the table is rebuilt only when n
+// changes, because building 64 cos/sin pairs inside each of the 4096 1-D
+// transforms a frame needs would cost more than the transform.
+//
+// thread_local, not file-static, for the reason filter_mask_project()'s scratch
+// is: TAIL_PARALLEL runs the fused path on core 1 while core 0 may be in the
+// frame-0 path, and a shared table is a data race for no gain.
+static const std::vector<std::complex<double> > &twiddles_inverse(int n)
+{
+    static thread_local std::vector<std::complex<double> > tw;
+    static thread_local int tw_n = 0;
+    if (tw_n != n) {
+        const double tau = 6.283185307179586;
+        tw.resize((size_t)(n / 2));
+#if EBOX_MUTANT == 4
+        const double sgn = -1.0;       // mutant: forward, not inverse
+#else
+        const double sgn = 1.0;
+#endif
+        for (int j = 0; j < n / 2; ++j)
+            tw[(size_t)j] = std::complex<double>(std::cos(tau * j / n),
+                                                 sgn * std::sin(tau * j / n));
+        tw_n = n;
+    }
+    return tw;
+}
+
+// Iterative Cooley-Tukey, in place, UNNORMALISED. `n` must be a power of two.
+//
+// The twiddle comes from the table rather than from a running w *= wl product.
+// The recurrence drifts over the 7 stages at 128 points and this is the
+// reference the naive DFT in the test file is compared against -- a tolerance
+// widened to accommodate avoidable drift is a tolerance that stops catching
+// anything.
+static void ifft_radix2(cfloat *x, int n)
+{
+    if (n < 2) return;
+    for (int i = 1, j = 0; i < n; ++i) {          // bit-reversal permutation
+        int bit = n >> 1;
+        for (; j & bit; bit >>= 1) j ^= bit;
+        j ^= bit;
+        if (i < j) std::swap(x[i], x[j]);
+    }
+    const std::vector<std::complex<double> > &tw = twiddles_inverse(n);
+    for (int len = 2; len <= n; len <<= 1) {
+        const int half = len >> 1;
+        const int step = n / len;
+        for (int i = 0; i < n; i += len) {
+            for (int k = 0; k < half; ++k) {
+                const std::complex<double> &w = tw[(size_t)k * step];
+                const cfloat a = x[i + k];
+                const cfloat b = x[i + k + half];
+                const cfloat bw((float)(b.real() * w.real() - b.imag() * w.imag()),
+                                (float)(b.real() * w.imag() + b.imag() * w.real()));
+                x[i + k]        = a + bw;
+                x[i + k + half] = a - bw;
+            }
+        }
+    }
+}
+
+// 2-D inverse transform of one channel, in place and NORMALISED by 1/(rows*cols),
+// so this is a true IFFT and can be compared element-wise against the naive
+// reference. The 1/(rows*cols) cancels in the box RATIO, but an unnormalised
+// helper is one that cannot be tested directly.
+//
+// Rows are contiguous; columns are gathered into a buffer and written back.
+// Returns false on a non-power-of-two axis rather than transforming it wrongly.
+// EBOX_MUTANT deliberately breaks ONE property of this instrument, so that
+// scripts/check_ebox_crosscheck.py can demonstrate its ability to FAIL rather
+// than assume it. Same precedent, and same reason, as RESET_MUTANT in
+// mosse_tracker.cpp. Never non-zero in a shipped build; the cross-check builds
+// its own binaries.
+#ifndef EBOX_MUTANT
+#  define EBOX_MUTANT 0
+#endif
+
+static bool ifft2_inplace(cfloat *x, int rows, int cols)
+{
+    if (!is_pow2(rows) || !is_pow2(cols)) return false;
+    for (int r = 0; r < rows; ++r) ifft_radix2(x + (size_t)r * cols, cols);
+#if EBOX_MUTANT == 3
+    return true;                       // mutant: column pass skipped (1-D only)
+#endif
+    if (rows > 1) {
+        std::vector<cfloat> col((size_t)rows);
+        for (int c = 0; c < cols; ++c) {
+            for (int r = 0; r < rows; ++r) col[(size_t)r] = x[(size_t)r * cols + c];
+            ifft_radix2(col.data(), rows);
+            for (int r = 0; r < rows; ++r) x[(size_t)r * cols + c] = col[(size_t)r];
+        }
+    }
+    const float inv = 1.0f / (float)((double)rows * (double)cols);
+    for (size_t i = 0, n = (size_t)rows * (size_t)cols; i < n; ++i) x[i] *= inv;
+    return true;
+}
+
 double filter_box_energy_fraction(const cfloat *H_all, int channels,
                                   int rows, int cols,
                                   int box_rows, int box_cols)
 {
     if (channels <= 0 || rows <= 0 || cols <= 0) return 0.0;
     if (box_rows <= 0 || box_cols <= 0)          return 0.0;
+    // NOT 0.0: a geometry this routine cannot transform must not be reported as
+    // "no energy in the box". The caller logs a negative as "not measured" and
+    // every reader excludes it, so this degrades to a missing sample instead of
+    // a wrong one.
+    if (!is_pow2(rows) || !is_pow2(cols))        return -1.0;
     if (box_rows > rows) box_rows = rows;
     if (box_cols > cols) box_cols = cols;
 
     // Centred at the PATCH CENTRE, matching the mask — NOT at the response
     // origin. The filter's energy peaks at (rows/2, cols/2); a corner-wrapped
     // box holds 8-12% and would read as "masking destroyed the filter".
+#if EBOX_MUTANT == 5
+    box_rows += 1; box_cols += 1;      // mutant: box extent off by one
+    if (box_rows > rows) box_rows = rows;
+    if (box_cols > cols) box_cols = cols;
+#endif
+#if EBOX_MUTANT == 2
+    const int r0 = 0, c0 = 0;          // mutant: box at the origin
+#else
     const int r0 = rows / 2 - box_rows / 2;
     const int c0 = cols / 2 - box_cols / 2;
+#endif
 
     // double, not float: this sums channels*rows*cols squared magnitudes and the
     // in-box term is a difference of two large sums.
     double total = 0.0, inbox = 0.0;
     const size_t n = (size_t)rows * (size_t)cols;
+
+    // H_all is the FREQUENCY-domain filter -- the array the detector uses and
+    // the one the fused path already holds. |h|^2 is a SPATIAL quantity, so each
+    // channel is transformed into scratch first. Grown once per thread, like
+    // filter_mask_project()'s.
+    static thread_local std::vector<cfloat> scratch;
+    if (scratch.size() < n) scratch.resize(n);
+
     for (int ch = 0; ch < channels; ++ch) {
-        const cfloat *h = H_all + (size_t)ch * n;
+        std::memcpy(scratch.data(), H_all + (size_t)ch * n, n * sizeof(cfloat));
+#if EBOX_MUTANT != 1                   // mutant 1: no transform (the shipped bug)
+        if (!ifft2_inplace(scratch.data(), rows, cols)) return -1.0;
+#else
+        (void)ifft2_inplace;           // keep the symbol referenced under the mutant
+#endif
         for (int r = 0; r < rows; ++r) {
             const bool r_in = (r >= r0 && r < r0 + box_rows);
             for (int c = 0; c < cols; ++c) {
-                const cfloat v = h[(size_t)r * cols + c];
+                const cfloat v = scratch[(size_t)r * cols + c];
                 const double m2 = (double)v.real() * v.real()
                                 + (double)v.imag() * v.imag();
                 total += m2;

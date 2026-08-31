@@ -66,6 +66,54 @@ def discover(root: Path):
     return arms
 
 
+def select_arms(arms, wanted):
+    """Which arms to analyse, and over which sequences.
+
+    NOT "every directory under the results root", which is what this used to be
+    and what broke it. The export accumulates arms forever, and many are partial
+    on purpose -- a one-sequence probe, an interrupted sweep, a control run.
+    `sequences` was the UNION over all arms, so `vot analysis` was asked to score
+    a car1-only probe over 62 sequences and died on the first one it lacked:
+
+        Failed task (...AccuracyRobustness, 'baseline', 'attrib', 'agility'):
+        Missing results
+
+    One stale probe therefore made every complete arm unanalysable, and the
+    failure named the probe rather than the rule it broke.
+
+    Default: take the widest coverage found, and keep only the arms that cover
+    ALL of it. Excluded arms are NAMED with their coverage -- an arm silently
+    dropped is how a sweep gets reported as complete when it is not.
+
+    With --arms, the caller's list wins and the sequence set is the INTERSECTION
+    of those arms, so an explicit comparison is always scored on ground both
+    arms actually cover. Sequences dropped that way are named too.
+
+    Returns (selected_arms, sequences, excluded, dropped).
+    """
+    if wanted:
+        names = [w.strip() for w in wanted.split(',') if w.strip()]
+        missing = [n for n in names if n not in arms]
+        if missing:
+            raise SystemExit(
+                f"--arms names {missing}, which have no trajectories under the "
+                f"results root. Present: {sorted(arms)}")
+        sel = {n: arms[n] for n in names}
+        seqs = set.intersection(*(set(r) for r in sel.values()))
+        if not seqs:
+            raise SystemExit(
+                "the named arms share no sequence, so there is nothing to "
+                "compare them on")
+        dropped = {n: sorted(set(sel[n]) - seqs) for n in names
+                   if set(sel[n]) - seqs}
+        return sel, sorted(seqs), {}, dropped
+
+    widest = max((set(r) for r in arms.values()), key=len)
+    sel = {a: r for a, r in arms.items() if set(r) >= widest}
+    excluded = {a: len(r) for a, r in arms.items() if a not in sel}
+    return sel, sorted(widest), excluded, {}
+
+
 def build_workspace(ws: Path, seq_src: Path, sequences, arms):
     """Workspace skeleton: sequences (symlinked), stack, config, trackers.ini."""
     if ws.exists():
@@ -109,11 +157,19 @@ def build_workspace(ws: Path, seq_src: Path, sequences, arms):
         for a in arms))
 
 
-def stage(ws: Path, arms):
-    """Copy trajectories + their .value sidecars into results/<arm>/baseline/<seq>/."""
+def stage(ws: Path, arms, sequences):
+    """Copy trajectories + their .value sidecars into results/<arm>/baseline/<seq>/.
+
+    Restricted to the sequences being analysed: staging an arm's extra sequences
+    puts results in the workspace that list.txt does not mention, which reads as
+    a workspace that disagrees with its own dataset.
+    """
+    keep = set(sequences)
     n = 0
     for arm, runs in arms.items():
         for seq, byanchor in runs.items():
+            if seq not in keep:
+                continue
             dst = ws / "results" / arm / "baseline" / seq
             dst.mkdir(parents=True, exist_ok=True)
             for anchor, src in byanchor.items():
@@ -124,7 +180,7 @@ def stage(ws: Path, arms):
     return n
 
 
-def verify(ws: Path, arms):
+def verify(ws: Path, arms, sequences=None):
     """Re-derive every run from the sequence's own anchors and check LENGTH.
 
     Returns a list of problem strings; empty means the workspace agrees with the
@@ -139,6 +195,19 @@ def verify(ws: Path, arms):
 
     problems = []
     seqdir = ws / "sequences"
+
+    # COVERAGE, checked before anchors. The anchor checks below only look inside
+    # the sequences an arm HAS, so an arm missing a sequence outright passed
+    # verification and then failed inside `vot analysis` -- the toolkit's
+    # "Missing results", raised after the workspace was declared to agree with
+    # the dataset. Selection should already prevent it; this asserts it, because
+    # the guarantee is what the analysis depends on.
+    if sequences is not None:
+        for arm, runs in sorted(arms.items()):
+            for miss in sorted(set(sequences) - set(runs)):
+                problems.append(f"{arm}: sequence '{miss}' has no trajectories, "
+                                f"but it is in the analysed set")
+
     plan = {}
     for s in sorted({s for runs in arms.values() for s in runs}):
         seq = load_sequence(str(seqdir / s))
@@ -232,6 +301,10 @@ def main():
     ap.add_argument('--out', default=None, help="workspace to build")
     ap.add_argument('--sequences', default=None,
                     help="dataset directory (default $VOT_ROOT/workspace/sequences)")
+    ap.add_argument('--arms', default=None,
+                    help="comma-separated arms to analyse, scored on the "
+                         "sequences they share. Default: every arm with the "
+                         "widest coverage found, partial arms excluded by name")
     args = ap.parse_args()
 
     root = os.environ.get('VOT_ROOT')
@@ -244,18 +317,30 @@ def main():
     arms = discover(Path(args.results))
     if not arms:
         raise SystemExit(f"no arm directories with trajectories under {args.results}")
-    sequences = sorted({s for runs in arms.values() for s in runs})
+    arms, sequences, excluded, dropped = select_arms(arms, args.arms)
 
     print(f"workspace: {ws}\nsequences: {seq_src}\n")
     for a, runs in arms.items():
-        print(f"  arm {a:<10} {sum(len(v) for v in runs.values()):3d} runs over "
+        print(f"  arm {a:<12} {sum(len(v) for v in runs.values()):3d} runs over "
               f"{len(runs)} sequences")
+    if excluded:
+        print(f"\n  EXCLUDED as partial (they do not cover all "
+              f"{len(sequences)} analysed sequences):")
+        for a, n_seq in sorted(excluded.items()):
+            print(f"    {a:<12} {n_seq} sequence(s)")
+        print("    Pass --arms to analyse a partial arm on the ground it covers.")
+    if dropped:
+        print("\n  sequences dropped to the arms' common ground:")
+        for a, seqs in sorted(dropped.items()):
+            print(f"    {a:<12} {len(seqs)} not shared: {', '.join(seqs[:6])}"
+                  f"{' ...' if len(seqs) > 6 else ''}")
+    print(f"\n  analysing {len(arms)} arm(s) over {len(sequences)} sequences")
 
     build_workspace(ws, seq_src, sequences, arms)
-    n = stage(ws, arms)
-    print(f"\n  staged {n} trajectories")
+    n = stage(ws, arms, sequences)
+    print(f"  staged {n} trajectories")
 
-    problems, _plan = verify(ws, arms)
+    problems, _plan = verify(ws, arms, sequences)
     if problems:
         for p in problems[:40]:
             print("   ", p)

@@ -2206,6 +2206,16 @@ static FrameDiag g_fdiag;
 #ifndef FILTER_MASK_STAT
 #  define FILTER_MASK_STAT 0
 #endif
+// The sampling schedule for the statistic above. Defaults chosen against
+// vot_mask_stat.py's PROFILE_FRAMES (1, 5, 20, 40): 1 and 5 fall inside WARM,
+// 20 and 40 are multiples of EVERY. Move either and that reader's per-frame
+// columns thin out silently, which is why both are named here and there.
+#ifndef FILTER_MASK_STAT_WARM
+#  define FILTER_MASK_STAT_WARM 5
+#endif
+#ifndef FILTER_MASK_STAT_EVERY
+#  define FILTER_MASK_STAT_EVERY 20
+#endif
 #if FILTER_MASK_STAT
 // Fraction of SUM|h|^2 inside a centred box the size of the target, or -1 on a
 // frame where the filter was NOT re-formed (frame 0's filter_init path and every
@@ -5719,11 +5729,31 @@ int main(int argc, char **argv)
             // crop used, so it tracks the DSST scale filter frame by frame
             // rather than assuming the initial size. A hardcoded box*2/128 is
             // the bug vot_detector_gain.py still has.
-            g_mask_ebox = mosse::filter_box_energy_fraction(
-                g_h_scratch.data(), N_CHANNELS, PATCH_ROWS, PATCH_COLS,
-                (int)llround(mosse::target_h_in_patch(box, roi)),
-                (int)llround(mosse::target_w_in_patch(box, roi)));
-            VP1("  filter: energy in target box %.4f\n", g_mask_ebox);
+            //
+            // SUBSAMPLED, and that is not a nicety. Sum|h|^2 is a SPATIAL
+            // quantity read off a FREQUENCY-domain H, so the call carries an
+            // inverse FFT per channel: 9.4 ms on an x86 -O3 host at ch16 /
+            // 128x128, i.e. more than a whole 26 ms frame once it is on the
+            // A72. Every frame would make the instrument cost more than the
+            // tracker it is instrumenting, and frame time is a reported number.
+            //
+            // The schedule is the first FILTER_MASK_STAT_WARM frames of each
+            // run (at-init and the early profile, which is where the mask is
+            // theorised to act) plus every FILTER_MASK_STAT_EVERY-th frame
+            // after. Unsampled frames log -1, the same value a held frame logs,
+            // and every reader already excludes it.
+            //
+            // vot_mask_stat.py's PROFILE_FRAMES must stay inside WARM or land on
+            // a multiple of EVERY, or its per-frame columns silently thin out.
+            if (frame <= FILTER_MASK_STAT_WARM
+                || (FILTER_MASK_STAT_EVERY > 0
+                    && frame % FILTER_MASK_STAT_EVERY == 0)) {
+                g_mask_ebox = mosse::filter_box_energy_fraction(
+                    g_h_scratch.data(), N_CHANNELS, PATCH_ROWS, PATCH_COLS,
+                    (int)llround(mosse::target_h_in_patch(box, roi)),
+                    (int)llround(mosse::target_w_in_patch(box, roi)));
+                VP1("  filter: energy in target box %.4f\n", g_mask_ebox);
+            }
 #endif
         } else {
             // publish_filter is skipped as well as filter_update, and that is a
