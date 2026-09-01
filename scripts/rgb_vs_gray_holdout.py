@@ -224,15 +224,20 @@ def quantize(w_float, b_fold):
     entry in CLAUDE.md. out_shift then follows from the tap count, which is the
     only place the two arms legitimately diverge: 9 taps vs 27.
     """
-    n_in = w_float.shape[1]
-    acc_max_theory = n_in * KSIZE * KSIZE * 127 * 127
-    flat = w_float.reshape(N_OUT, -1)
+    # Shape comes from the BANK. A 7x7 stride-2 Layer-1 bank has 147 taps, not
+    # 27, and running it through an out_shift derived from KSIZE=3 would
+    # saturate the accumulator silently -- the arm would then be measuring
+    # clipping, not features.
+    n_out, n_in, ksize = w_float.shape[0], w_float.shape[1], w_float.shape[2]
+    acc_max_theory = n_in * ksize * ksize * 127 * 127
+    flat = w_float.reshape(n_out, -1)
     scale = np.abs(flat).max(axis=1) / 127.0
+    scale = np.where(scale > 0, scale, 1.0)
     wq = np.clip(np.round(w_float / scale[:, None, None, None]), -127, 127)
     bias = np.round(b_fold * ROI_NORM_Q / scale).astype(np.int64)
     shift = np.array([int(np.ceil(np.log2(max(
         (abs(int(bias[oc])) + acc_max_theory) / 32767.0, 1.0))))
-        for oc in range(N_OUT)], dtype=np.int64)
+        for oc in range(n_out)], dtype=np.int64)
     return wq.astype(np.int64), bias, shift
 
 
@@ -256,7 +261,19 @@ def sat_frac():
     return SAT['clipped'] / SAT['total'] if SAT['total'] else 0.0
 
 
-def conv_features(patch, wq, bias, shift, mean_prev=None, relu=False):
+def _hann_q15(n):
+    """Periodic Hann in Q1.15, the hardware's convention (sin^2(pi i / n)).
+
+    hanning_<N>.h is generated per patch size; a strided feature map needs the
+    table for ITS size, and generating it here keeps the offline path from
+    depending on which header happens to have been exported last.
+    """
+    i = np.arange(n)
+    return np.round(32767.0 * np.sin(np.pi * i / n) ** 2).astype(np.int64)
+
+
+def conv_features(patch, wq, bias, shift, mean_prev=None, relu=False, rect=None,
+                  stride=1):
     """patch: [n_in, R, C] int64. Returns (features [16,R,C] int64, per-ch mean).
 
     mean_prev=None means "this is the frame that supplies it" — B1 then uses the
@@ -264,14 +281,27 @@ def conv_features(patch, wq, bias, shift, mean_prev=None, relu=False):
     the caller passes the TRAINING frame's means, mirroring the hardware, where
     Stage B1 always subtracts the previous frame's mean.
     """
+    # GEOMETRY COMES FROM THE BANK, not from the module constants. KSIZE/N_OUT
+    # are the shipping 3x3/16 and stay the defaults, but a Layer-1-shaped bank
+    # (7x7, stride 2, 32 channels -- Danelljan 2015 Table 1) has to run through
+    # the SAME integer datapath or the comparison is between two code paths
+    # rather than two banks.
     n_in = patch.shape[0]
-    pad = np.zeros((n_in, R + 2, C + 2), dtype=np.int64)
-    pad[:, 1:-1, 1:-1] = patch
+    n_out, ksize = wq.shape[0], wq.shape[2]
+    p = ksize // 2
+    pad = np.zeros((n_in, R + 2 * p, C + 2 * p), dtype=np.int64)
+    pad[:, p:p + R, p:p + C] = patch
 
-    acc = np.zeros((N_OUT, R, C), dtype=np.int64)
-    for kr in range(KSIZE):
-        for kc in range(KSIZE):
-            tile = pad[:, kr:kr + R, kc:kc + C]                # [n_in, R, C]
+    # STRIDE IS TAKEN IN THE SLICE, not after the accumulate: the two are
+    # identical (`x[a:b][::s] == x[a:b:s]`) and this one does not compute the
+    # 3 of 4 output pixels a stride-2 map throws away. Worth 4x on a Layer-1
+    # bank, where the einsum runs 49 kernel positions over 32 channels.
+    rr = len(range(0, R, stride))
+    cc = len(range(0, C, stride))
+    acc = np.zeros((n_out, rr, cc), dtype=np.int64)
+    for kr in range(ksize):
+        for kc in range(ksize):
+            tile = pad[:, kr:kr + R:stride, kc:kc + C:stride]   # [n_in, rr, cc]
             acc += np.einsum('oi,irc->orc', wq[:, :, kr, kc], tile)
     acc += bias[:, None, None]
 
@@ -295,17 +325,32 @@ def conv_features(patch, wq, bias, shift, mean_prev=None, relu=False):
     # -> subtract mean_prev -> Hann. B1 re-centres the rectified map, so the DC
     # pedestal a rectifier introduces is removed by machinery that is already
     # there.
-    if relu:
+    # `rect` generalises the switch. 'abs' is the FULL-wave rectifier -- the
+    # nonlinearity HOG actually uses (unsigned orientation), and the one the
+    # "throws away half the signal" objection does not apply to. Paired with a
+    # sign-symmetric bank, ReLU spans {linear, abs}: (max(v,0), max(-v,0)) has
+    # sum |v| and difference v.
+    if rect is None and relu:
+        rect = 'relu'
+    if rect == 'relu':
         sh = np.maximum(sh, 0)
+    elif rect == 'abs':
+        sh = np.abs(sh)
+    elif rect is not None:
+        raise ValueError(f"unknown rect '{rect}'")
 
-    own_mean = (sh.sum(axis=(1, 2)) // (R * C)).astype(np.int64)
+    fr, fc = sh.shape[1], sh.shape[2]
+    own_mean = (sh.sum(axis=(1, 2)) // (fr * fc)).astype(np.int64)
     mp = own_mean if mean_prev is None else mean_prev
     b1 = sh - mp[:, None, None]
     SAT['clipped_b1'] += int(np.count_nonzero((b1 > 32767) | (b1 < -32768)))
     cen = np.clip(b1, -32768, 32767)
 
-    w1 = (cen * HANN[None, :, None]) >> 15
-    h2 = (w1 * HANN[None, None, :]) >> 15
+    # The window is the FEATURE MAP's, so it follows the stride.
+    hann = HANN if fr == R else _hann_q15(fr)
+    hann_c = HANN if fc == C else _hann_q15(fc)
+    w1 = (cen * hann[None, :, None]) >> 15
+    h2 = (w1 * hann_c[None, None, :]) >> 15
     SAT['clipped_hann'] += int(np.count_nonzero((h2 > 32767) | (h2 < -32768)))
     out = np.clip(h2, -32768, 32767)
     return out, own_mean

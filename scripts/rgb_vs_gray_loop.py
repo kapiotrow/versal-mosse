@@ -140,6 +140,113 @@ def split_rand(name):
     return (m.group(1), int(m.group(2))) if m else (name, None)
 
 
+def split_chrel(name):
+    """'rgb-chrel10' -> ('rgb', 1.0).  'rgb-chrelneg' -> ('rgb', -1.0).  else (name, None).
+
+    CHANNEL RELIABILITY IN STAGE B3 -- CSR-DCF's third contribution, and the one
+    `baselines.md` prices at -12% in their ablation while this tracker has never
+    tested it. B3 today normalises each channel to UNIT ENERGY
+    (`chscale = 1/sqrt(sum|F|^2)`), i.e. by how LOUD a channel is and not by how
+    well it discriminates. A channel whose response is diffuse or peaks in the
+    wrong place is weighted identically to one that spikes on the target.
+
+    THE STATISTIC, and why it is free. Per channel, with P = F .* conj(H):
+
+        r_c(0)   = (1/N) SUM_k P_c(k)                 response AT the target
+        ||r_c||^2 = (1/N) SUM_k |P_c(k)|^2            total response energy   (Parseval)
+        rho_c    = |SUM P|^2 / (N * SUM |P|^2)        fraction of energy on target
+
+    Both are single accumulations over a spectrum the loop ALREADY walks -- one
+    complex sum and one magnitude-squared sum per bin, no inverse FFT. That is
+    what "free by Parseval" means in the roadmap: the per-channel inverse FFT
+    the direct measurement would need is 30.1 ms (the FILTER_MASK_STAT note).
+
+    rho is SCALE-INVARIANT in H, so weighting by rho^gamma does not change rho:
+    there is no fixed point to solve and no circularity.
+
+    The weights are normalised to mean 1 so the arm does not also move the global
+    response scale -- that would shift PSR and the gate with it, and a confounded
+    arm is not an arm. gamma = 0 is exactly today's behaviour, i.e. the null is
+    built in; `-chrelneg` (gamma = -1) is the ANTI-RELIABILITY MUTANT and must
+    LOSE, or the statistic is inert and the weighting is doing something else.
+    """
+    m = re.match(r'^(.*?)-chrel(neg|\d+)$', name)
+    if not m:
+        return name, None
+    tok = m.group(2)
+    return m.group(1), (-1.0 if tok == 'neg' else int(tok) / 10.0)
+
+
+L1_KINDS = ('l1lin', 'l1relu', 'l1lin16', 'l1relu16',
+            'l5lin', 'l5relu', 'l5lin16', 'l5relu16',
+            'danlin', 'danrelu',
+            'gablin', 'gabrelu', 'gabrelublur')
+
+
+def split_l1(name):
+    """'rgb-l1relu' -> ('rgb', 'l1relu').  else (name, None).
+
+    DANELLJAN'S LAYER 1, on this datapath. His Table 1 fixes the geometry --
+    224x224 -> 109x109 at 96 channels is a 7x7 kernel at STRIDE 2 -- and 3.3
+    says the activations are taken AFTER the ReLU. Figure 2 puts Layer 0 (the
+    raw preprocessed RGB image) at ~45% OP against Layer 1's ~61%.
+
+    WHY THIS IS THE ARM. With CONV_RELU=0 and 16 channels over a 27-dim tap
+    space, this tracker IS his Layer 0: the conv is a linear lift the online
+    filter absorbs (see feature_bank.md, and the `-eye` control that ties it).
+    Pointwise ReLU on the 3x3 bank is refuted, but a 3x3 has no orientation
+    selectivity to rectify -- the nonlinearity only has something to encode once
+    the kernel is large enough to be oriented. So kernel, stride, channel count
+    and the rectifier have to move TOGETHER, and each arm here has its own
+    linear twin so the rectifier is isolated AT the new geometry.
+
+    THE CONTROL THAT MATTERS IS `rgb-dec2`, not `rgb`. MOSSE_SIGMA is in BINS
+    and the target spans patch/padding bins, so a stride-2 map halves the bin
+    count and DOUBLES sigma/target onto the 1/16 optimum -- the free win that
+    turned out to be all of the res64 result (sec.25 of proposed_build_res64.md).
+    Scoring these against the 128x128 baseline would hand them that win a second
+    time. `dec2` is the geometry-matched Layer 0.
+    """
+    m = re.match(r'^(.*?)-(' + '|'.join(L1_KINDS) + r')$', name)
+    return (m.group(1), m.group(2)) if m else (name, None)
+
+
+def split_bank(name):
+    """'rgb-eye' -> ('rgb', 'eye').  'rgb-orth3' -> ('rgb', 'orth3').  else (name, None).
+
+    THE LINEARITY CONTROLS. `CONV_RELU=0` ships, so conv2d is
+    `saturate(acc >> out_shift)` and nothing else: the bank is a FIXED LINEAR
+    LIFT of the 27-dim (3x3x3) tap space, and the detector the tracker can
+    express is
+
+        y = sum_c h_c * (w . sum_k W_ck u_k) = sum_k (sum_c W_ck h_c) * (w . u_k)
+
+    i.e. an element of the ROW SPACE of W and nothing else. The online MOSSE
+    filter does the discriminative learning and absorbs any change of basis
+    within that span. That predicts `-rand<N>` matching pretrained (measured,
+    feature_bank.md) and it makes two sharper predictions these arms test:
+
+      -eye    ONE-HOT taps: no network at all, just 16 of the 27 raw lifted
+              planes. If this matches, the conv layer contributes only a choice
+              of basis and "CNN features" overstates what the datapath does.
+      -orth<N> random ORTHONORMAL rows: the BEST-CONDITIONED lift of the same
+              dimension. Basis-invariance is broken only by conditioning terms
+              -- the DSST shared denominator, eps_rel, Stage B3's per-channel
+              energy normalisation, and per-channel int8 quantization -- so if
+              anything beats pretrained it should be this.
+
+    Both match the pretrained PER-CHANNEL ROW NORMS, for the same reason
+    `-rand<N>` does: otherwise the arm also moves out_shift and bias_acc and a
+    difference is unattributable.
+
+    NOTE the one-hot bank quantizes EXACTLY (a single tap per channel goes to
+    +-127), so it carries no quantization penalty. That favours it, and it is
+    the right way round: this arm is trying to show the network is unnecessary.
+    """
+    m = re.match(r'^(.*?)-(eye|orth\d+|crelu|half8|abs)$', name)
+    return (m.group(1), m.group(2)) if m else (name, None)
+
+
 def split_warp(name):
     """'rgb-warp8' -> ('rgb', 8).  'rgb' -> ('rgb', 1).
 
@@ -467,7 +574,8 @@ def run_arm(arm, wq, bias, shift, gt, n_frames, oracle_scale, verbose,
             warp_shift=0.05, warp_scale=0.05, warp_mutant='none',
             warp_aspect=0.0, warp_rot=0.0, eps_rel=EPS_REL,
             mask_plateau=None, mask_taper=0.25, mask_centre='board',
-            mask_power=1):
+            mask_power=1, rect=None, chrel_gamma=None, stride=1, blur_n=1,
+            pool_n=1, pool_mode_ov=None):
     # float_conv = (w_float, b_fold) runs the UNQUANTIZED conv instead of the
     # int8 one, everything else identical. See conv_features_float's docstring:
     # this arm exists to answer whether quantization causes the tracker's poor
@@ -483,6 +591,13 @@ def run_arm(arm, wq, bias, shift, gt, n_frames, oracle_scale, verbose,
     _base, pool, pool_mode = parse_arm(arm)
     fr, fc = ((R, C) if pool_mode in ('blur', 'relublur')
               else (R // pool, C // pool))
+    if stride > 1:                       # a strided conv shrinks the map
+        fr, fc = fr // stride, fc // stride
+    if blur_n > 1:                       # aggregation at stride 1: size unchanged
+        pool, pool_mode = blur_n, 'blur'
+    if pool_mode_ov is not None:         # a real pool: it shrinks the map again
+        pool, pool_mode = pool_n, pool_mode_ov
+        fr, fc = fr // pool_n, fc // pool_n
     excl = 5                       # sidelobe exclusion, BINS (11x11 at pool1)
     row, col, bh, bw = gt[0]
     A = B = None
@@ -531,7 +646,8 @@ def run_arm(arm, wq, bias, shift, gt, n_frames, oracle_scale, verbose,
                                              mean_prev=mp)
             else:
                 ft, om = conv_features(patch, wq, bias, shift, mean_prev=mp,
-                                       relu=pool_mode in ('reluavg', 'relublur', 'relumax'))
+                                       relu=pool_mode in ('reluavg', 'relublur', 'relumax'),
+                                       rect=rect, stride=stride)
             ft = pool_features(ft.astype(np.float64), pool, pool_mode)
             return np.fft.fft2(ft, axes=(1, 2)), om
 
@@ -606,6 +722,17 @@ def run_arm(arm, wq, bias, shift, gt, n_frames, oracle_scale, verbose,
         energy = np.sum(np.abs(F)**2, axis=(1, 2))
         chscale = np.where(energy > 0, 1.0 / np.sqrt(np.maximum(energy, 1e-300)), 0.0)
         H = A * chscale[:, None, None] / (B + eps_rel * B.mean())[None]
+        if chrel_gamma is not None:
+            # Stage B3 channel reliability. See split_chrel(): rho is the
+            # fraction of each channel's response energy sitting AT the target,
+            # both terms Parseval sums over the spectrum this loop already has.
+            P = F * np.conj(H)
+            num = np.abs(P.sum(axis=(1, 2))) ** 2
+            den = (np.abs(P) ** 2).sum(axis=(1, 2)) * float(P[0].size)
+            rho = np.where(den > 0, num / np.maximum(den, 1e-300), 0.0)
+            w = np.power(np.maximum(rho, 1e-12), chrel_gamma)
+            w /= w.mean()          # keep the global response scale, and the gate with it
+            H = H * w[:, None, None]
         if mask is not None:
             # h <- m*h. EXACT FFTs here on purpose: offline answers "does the
             # projection help at all", and the 9-bin sparse-spectrum form is a
@@ -808,6 +935,12 @@ def main():
         stem, n_warps = split_warp(a)
         stem, mask_plateau = split_mask(stem)
         stem, rand_seed = split_rand(stem)
+        stem, bank_kind = split_bank(stem)
+        stem, chrel_gamma = split_chrel(stem)
+        stem, l1_kind = split_l1(stem)
+        rect = None
+        stride, blur_n = 1, 1
+        pool_n, pool_mode_ov = 1, None
         base, pool, mode = parse_arm(stem)
         if base not in W:
             sys.exit(f"unknown arm '{a}' (base '{base}'): "
@@ -817,7 +950,97 @@ def main():
             sys.exit(f"{a}: pool {pool} does not divide the {R}x{C} patch")
         # The random bank is built HERE, per arm, so the pretrained arm in the
         # same invocation is untouched and both see identical frames.
-        if rand_seed is None:
+        if l1_kind is not None:
+            import l1_banks
+            if l1_kind.startswith('dan'):
+                # DANILOWICZ & KRYJAK's stem: 3x3 conv, ReLU, 2x2 MAXPOOL --
+                # NOT a 7x7. Their Table 1 (docs/papers/danilowicz2022_embedded_dcf.pdf,
+                # VOT2015 -- NOT comparable to this project's STb2022 numbers)
+                # reaches EAO 0.184 with it at exactly
+                # this project's 128x128 ROI / 64x64 map, and 8 channels ties
+                # 32. So the kernel does not have to grow for the nonlinearity
+                # to have something to act on; the maxpool is what makes the
+                # rectified map useful, and an AVERAGE over a signed map (this
+                # project's `blur2`) is the one aggregation that cannot work.
+                fw, bf = l1_banks.vgg16_conv1_pca(16)
+                label = 'vgg16 conv1 3x3 -> 16ch (VGG11 stand-in) + 2x2 MAXPOOL'
+                stride, pool_n, pool_mode_ov = 1, 2, 'max'
+            elif l1_kind.startswith('l5'):
+                # 5x5 STRIDE 1: the map stays 128x128, the geometry hardware
+                # prefers. Needs MOSSE_SIGMA=4 to hold sigma/target at 1/16 --
+                # pass --sigma 4, or the arm is scored at half the mainlobe and
+                # the comparison is against the wrong control.
+                n_ch = 16 if l1_kind.endswith('16') else 32
+                fw, bf = l1_banks.resnet18_conv1_5x5(n_ch)
+                label = f'resnet18 conv1 -> 5x5 CENTRE CROP, stride 1, {n_ch}ch'
+                stride, pool_n, pool_mode_ov = 1, 1, None
+            elif l1_kind.startswith('l1'):
+                n_ch = 16 if l1_kind.endswith('16') else 32
+                fw, bf = l1_banks.resnet18_conv1_pca(n_ch)
+                label = f'resnet18 conv1 7x7/2, 64 -> {n_ch} by weight PCA'
+                stride, pool_n, pool_mode_ov = l1_banks.STRIDE, 1, None
+            else:
+                fw, bf = l1_banks.gabor_bank()
+                label = ('analytic GABOR 7x7/2, 16 filters + negations = 32 ch'
+                         ' -- DIAGNOSTIC ONLY, hand-crafted taps are outside'
+                         ' this project\'s conv-feature requirement')
+                stride, pool_n, pool_mode_ov = l1_banks.STRIDE, 1, None
+            rect = 'relu' if 'relu' in l1_kind else None
+            blur_n = 2 if l1_kind.endswith('blur') else 1
+            bank = quantize(fw, bf)
+            print(f"    *** LAYER-1 BANK: {label}, stride {stride}, "
+                  f"rect={rect}, blur={blur_n} ***")
+        elif bank_kind is not None:
+            src = w_gray if base.startswith('gray') else w_rgb
+            n_src = np.linalg.norm(src.reshape(src.shape[0], -1), axis=1)
+            nout, ntap = src.shape[0], int(np.prod(src.shape[1:]))
+            if bank_kind in ('crelu', 'half8', 'abs'):
+                # THE NONLINEARITY ARMS. `-abs` keeps the pretrained bank and
+                # swaps the rectifier. `-crelu` is 8 filters AND THEIR
+                # NEGATIONS, so the existing half-wave rectifier emits both
+                # halves and the map spans {linear, |.|} at 8 directions
+                # instead of 16 -- and it is board-implementable as a WEIGHTS
+                # file plus CONV_RELU=1, no graph change. `-half8` is its
+                # control: the same 8 directions, DUPLICATED rather than
+                # negated, and no rectifier, so it prices the span 16->8 loss
+                # on its own. Without it a crelu result is unreadable between
+                # "the nonlinearity helped" and "halving the bank hurt".
+                if bank_kind == 'abs':
+                    fw, bf, rect = src.copy(), b_fold.copy(), 'abs'
+                    label = 'pretrained bank, FULL-WAVE rectifier (abs)'
+                else:
+                    h = nout // 2
+                    sgn = -1.0 if bank_kind == 'crelu' else 1.0
+                    fw = np.concatenate([src[:h], sgn * src[:h]], axis=0)
+                    bf = np.concatenate([b_fold[:h], sgn * b_fold[:h]])
+                    rect = 'relu' if bank_kind == 'crelu' else None
+                    label = ('8 filters + THEIR NEGATIONS, ReLU on (CReLU)'
+                             if bank_kind == 'crelu' else
+                             '8 filters DUPLICATED, no rectifier (span-8 control)')
+                bank = quantize(fw, bf)
+                print(f"    *** BANK REPLACED: {label} ***")
+            elif bank_kind == 'eye':
+                # Cycle the colour planes fastest so the 16 chosen coordinates
+                # are not all one plane: tap index = spatial*in_ch + plane.
+                flat = np.zeros((nout, ntap))
+                order = [sp * src.shape[1] + pl
+                         for sp in range(src.shape[2] * src.shape[3])
+                         for pl in range(src.shape[1])]
+                for i in range(nout):
+                    flat[i, order[i % ntap]] = 1.0
+                label = 'ONE-HOT (identity lift, no network)'
+            else:
+                seed = int(bank_kind[4:])
+                q, _ = np.linalg.qr(np.random.default_rng(seed)
+                                    .standard_normal((ntap, nout)))
+                flat = q.T                      # orthonormal ROWS, 16 x 27
+                label = f'random ORTHONORMAL, seed {seed}'
+            if bank_kind not in ('crelu', 'half8', 'abs'):
+                flat *= n_src[:, None] / np.linalg.norm(flat, axis=1)[:, None]
+                bank = quantize(flat.reshape(src.shape), b_fold)
+                print(f"    *** BANK REPLACED: {label}, per-channel row norms "
+                      f"matched to the pretrained bank ***")
+        elif rand_seed is None:
             bank = W[base]
         else:
             src = w_gray if base.startswith('gray') else w_rgb
@@ -842,7 +1065,9 @@ def main():
                          eps_rel=args.eps_rel, mask_plateau=mask_plateau,
                          mask_taper=args.mask_taper,
                          mask_centre=args.mask_center,
-                         mask_power=args.mask_power)
+                         mask_power=args.mask_power, rect=rect,
+                         chrel_gamma=chrel_gamma, stride=stride, blur_n=blur_n,
+                         pool_n=pool_n, pool_mode_ov=pool_mode_ov)
 
     print()
     print(f"{'arm':<13} {'frozen, truth>=1bin':>20} {'frozen, <1bin':>14} "

@@ -139,3 +139,203 @@ python3 scripts/vot_ar_offline.py out.json rgb rgb-rand0
 `-rand<N>` is a SEED. The bank is Gaussian with per-channel row norms matched to the pretrained
 one — without that match the arm also moves `out_shift` and `bias_acc`, and a loss would be
 unattributable between "the weights are random" and "the fixed-point scale moved".
+
+---
+
+# WHY random matches pretrained: THE BANK IS A LINEAR LIFT AND ONLY ITS SPAN MATTERS
+
+**2026-09-01.** §2/§3 above measured a null and read it as "at layer 1 the specific weights
+barely matter", which is the known literature result. There is a sharper reason, it is specific
+to THIS datapath, and it makes predictions that were then tested.
+
+## The derivation
+
+`CONV_RELU=0` ships. `conv2d_kernel.cpp` computes `out = saturate_int16(acc >> out_shift)` and
+then applies the separable Hann window — **there is no nonlinearity in the feature extractor at
+all**, only saturation and a shift. So with `u_k` (k = 1..27) the raw lifted patch planes (3x3
+spatial shifts x 3 colour planes), `W` the 16x27 bank, `w` the window (IDENTICAL for every
+channel), and `h_c` the learned per-channel filter:
+
+```
+y = SUM_c h_c * ( w . SUM_k W_ck u_k )  =  SUM_k ( SUM_c W_ck h_c ) * ( w . u_k )
+```
+
+The detector the tracker can express is `g_k = SUM_c W_ck h_c` — **an element of the ROW SPACE of
+W and nothing else.** The online MOSSE filter does the discriminative learning and absorbs any
+change of basis inside that span. Pretraining picks one 16-dim subspace of a 27-dim space; a
+random draw picks another; both capture most of it. The null in §3 is not a surprise, it is
+forced.
+
+**Basis-invariance is not exact, and the exceptions name themselves:** the DSST shared
+denominator couples channels, `eps_rel` is applied in that basis, Stage B3 normalises
+PER-CHANNEL ENERGY, and conv outputs are quantized per channel. All four are CONDITIONING terms.
+A residual of the size §3 measured (0.011-0.015 R, below resolution) is what that predicts.
+
+## It retro-explains three recorded results
+
+- **`blur2` is an exact null** (-0.0010 gray / -0.0012 RGB, `pooled_features.md`). A box average
+  of a linear map is another linear map with the same span. It CANNOT do anything. That file
+  read it as a fact about aggregation; it is a fact about linearity.
+- **The gray rank cap.** Gray's 16 channels live in 9 dimensions — the ENTIRE gray patch space.
+  The gray bank is already an identity lift up to conditioning, which is why the cap is
+  "structural" and why RGB (16 of 27) had room to help.
+- **`-rand` losing slightly** rather than tying exactly: a random Gaussian basis is worse
+  CONDITIONED than the trained one, and conditioning is the only channel through which the bank
+  can act.
+
+## The two controls this predicts — RUN, 62 sequences, `runs/vot/0901_offline-bank/`
+
+`rgb_vs_gray_loop.py` arms `-eye` (one-hot taps: 16 of the 27 raw planes, NO network at all) and
+`-orth<N>` (random ORTHONORMAL rows via QR: the best-conditioned lift of the same dimension).
+Both match the pretrained per-channel row norms, as `-rand<N>` does. Shipping eta 0.05 / gate 5.0.
+**Control: the `rgb` arm reproduces the stored baseline 0.5394 / 0.2910 / 5792 exactly.**
+
+```
+arm             A        R    tracked      dR       dA    trim-3   trim-5   better/worse/tied
+rgb        0.5394   0.2910       5792                                       (control)
+rgb-eye    0.5386   0.2963       5898  +0.0053  -0.0008  +0.0105  -0.0007      19 /  9 / 34
+rgb-orth0  0.5642   0.3017       6004  +0.0107  +0.0248  +0.0105  -0.0051      14 /  5 / 43
+rgb-orth1  0.5605   0.2974       5919  +0.0064  +0.0211  -0.0027  -0.0124      16 /  8 / 38
+```
+
+**1. THE IDENTITY LIFT TIES THE NETWORK.** `-eye` has no network in it — 16 one-hot taps — and
+scores R +0.0053 pooled with a common-survived-prefix accuracy of **0.5833 against 0.5832, a tie
+to four decimals over 4724 frames**. 34 of 62 sequences are EXACTLY tied. The prediction holds:
+**at this geometry, with ReLU off, the conv layer contributes a choice of basis and nothing
+else.** Calling these "CNN features" overstates what the datapath does. (The one-hot bank also
+quantizes exactly — one tap per channel at +-127 — so it carries no quantization penalty; that
+favours the arm, which is the right way round for a control trying to show the network is
+unnecessary.)
+
+**2. ORTHONORMAL IS THE BEST OF THE THREE, AND ONLY ON ACCURACY.** Both seeds beat pretrained on
+A by +0.021/+0.025, and **it survives the selection-effect check**: unlike the `-rand` arms of §3
+(higher A while tracking FEWER frames), these track MORE frames and still gain, +0.0070/+0.0056
+on the common survived prefix. Ordering across all five banks is
+`random Gaussian < pretrained < orthonormal`, exactly the conditioning story. **On R it is a
+null** — trim-5 negative on both seeds, seed 1 already negative at trim-3.
+
+**3. NOTHING HERE IS SEPARABLE FROM A NULL ON R**, `-eye` included: every arm's pooled dR
+collapses under a symmetric trim and 34-43 of 62 sequences never move. Same pattern as §3, and
+the same standing limit — this bench could not tell trained from noise, so it can only FAIL a
+bank arm, never confirm one.
+
+## What this settles, and what it opens
+
+**Settles: the weights axis is closed, and now for a structural reason rather than an empirical
+one.** Not "a better donor is unlikely to help" but "with ReLU off, ANY 16x27 bank of comparable
+conditioning is the same tracker". More channels only walks toward 27 = the full space, i.e.
+toward MOSSE on 3x3-lifted RGB pixels — a bounded ceiling, and the literature's raw-pixels ->
+HOG jump (0.451 -> 0.728 precision) says it is a low one.
+
+**Opens, in order:**
+1. **ReLU deserves re-examination IN THIS FRAME.** It was switched off because it costs ~25% of
+   peak/sidelobe — a CONDITIONING statistic — but this derivation says the nonlinearity is the
+   only thing that would make the bank more than a basis. That is a different question from the
+   one asked when it was disabled, and it is host-... no: `CONV_RELU` reaches `AIE_FLAGS`, so it
+   is a rebuild. Screen it offline first (`--arms rgb rgb-relu`, already implemented).
+2. **Stage B3 channel reliability** is one of the four terms that BREAKS basis-invariance, so it
+   is one of the few places the representation can still matter. Independent argument, same
+   recommendation as `baselines.md` item 3.
+3. **Geometry** (kernel size, stride, receptive field) stays the untouched axis — claim O-04.
+   Aggregation over this map is refuted twice over, now including "because it is linear".
+
+**An orthonormal bank is free to adopt** (`make weights` + a 1 KB copy) if the accuracy edge is
+ever worth having, but it is inside the bench's resolution on R and must not be shipped on this
+evidence alone.
+
+---
+
+# THE NONLINEARITY AXIS — ReLU RE-EXAMINED ON AR, AND CLOSED. CReLU TOO
+
+**2026-09-01, `runs/vot/0901_offline-relu/relu62.json`.** The section above makes ReLU the GATE
+on the whole weights axis: with it off the bank is a linear lift and every bank of comparable
+conditioning is the same tracker. So the standing rejection had to be re-checked, and it needed
+re-checking on its own merits — `settled.md` rejected ReLU on **held-out peak/max-sidelobe,
+ONE patch (s6), by its own caveat**, and this project has three separate records of PSR-family
+statistics ranking nothing. **`rgb-relu` alone had never been AR-scored on 62 sequences**; the
+only 62-sequence ReLU data was `relumpool2`, which confounds it with max pooling.
+
+Five arms, 62 sequences, 19,903 frames, shipping eta 0.05 / gate 5.0, `vot_ar_offline.py`.
+**Control: `rgb` reproduces the stored baseline 0.5394 / 0.2910 / 5792 exactly.**
+
+```
+arm             A        R    tracked        dR (pooled)   per-seq dR   trim-3
+rgb        0.5394   0.2910       5792                                          (control)
+rgb-relu   0.5556   0.2578       5131          -0.0332       +0.0063   -0.0129
+rgb-abs    0.5501   0.2678       5330          -0.0232       +0.0102   -0.0187
+rgb-crelu  0.5564   0.2930       5831          +0.0020       +0.0227   -0.0080
+rgb-half8  0.5587   0.2685       5343          -0.0225       -0.0106   -0.0226
+```
+
+`-abs` is the FULL-WAVE rectifier (the nonlinearity HOG actually uses); `-crelu` is 8 filters
+AND THEIR NEGATIONS with ReLU on, so the rectifier emits both halves and the map spans
+{linear, |.|}; `-half8` is its control — the same 8 directions DUPLICATED, no rectifier — which
+prices the span 16->8 loss on its own.
+
+## The decomposition, and it is clean
+
+```
+span 16 -> 8, no nonlinearity      half8 vs linear      -0.0225
+add the sign pairing + ReLU        crelu vs half8       +0.0245   (trim-3 +0.0007)
+                                   ------------------------------
+net                                crelu vs linear      +0.0020
+```
+
+**The nonlinearity buys back exactly the span it costs, and nothing more.** That is the whole
+result. `crelu` is the only rectified arm that ties the linear baseline, and it is the one that
+KEEPS THE LINEAR PART — consistent with the derivation above rather than an exception to it.
+
+The ordering across all five arms is coherent and matches the mechanism: **relu < abs ~ half8 <
+linear ~ crelu.** Half-wave (throws away half the signal) is worse than full-wave (keeps the
+magnitude, loses the sign), which is level with simply having fewer directions.
+
+**The accuracy column is the selection effect and the standard check says so.** Every rectified
+arm shows higher pooled A while tracking FEWER frames (5131-5831 against 5792). On the common
+survived prefix the differences vanish: `-relu` +0.0017, `-abs` -0.0006, `-crelu` -0.0021,
+`-half8` -0.0039.
+
+## Verdict against the pre-registered falsifier
+
+The bar was **dR >= +0.02 with trim-3 surviving AND `crelu - half8` positive.** The contrast is
+positive (+0.0245) but `crelu` versus the actual baseline is **+0.0020**, an order of magnitude
+under the bar, and every arm's per-sequence mean collapses or goes negative under a symmetric
+trim with 37-46 of 62 sequences exactly tied. **REJECTED. `CONV_RELU=0` stays, and no board time
+is spent.**
+
+## What this settles
+
+**The old verdict survives, but the evidence under it is now the right kind.** "ReLU off"
+was a one-patch peak/sidelobe result that diverged from Danelljan §3.3; it is now a
+62-sequence AR result with the mechanism decomposed. The `settled.md` reasoning — "a DCF is
+linear in feature space; a half-wave rectifier throws away half the signal and the filter cannot
+undo it" — is confirmed, AND the obvious repair (sign-paired channels, which does not throw
+anything away) is measured and is a null.
+
+**SCOPE — what is closed is POINTWISE rectification, not "nonlinearity".** The literature's
+nonlinearity is not this. Deep trackers put it INSIDE a stack trained end to end (Danelljan's
+conv1 is his shallowest and weakest layer, used ALONGSIDE deeper ones, never alone), and HOG
+decomposes as |grad| -> ORIENTATION BINNING (a soft argmax ACROSS channels) -> BLOCK
+NORMALISATION (divisive, over a local spatial neighbourhood). **Only the first of those three is
+in the arms above** (`-abs`). Cross-channel competition and local contrast normalisation are a
+different class and are UNTESTED. What this project already has is global (Stage A's z-score),
+per-channel mean removal (B1) and the window; what it lacks is the LOCAL and the CROSS-CHANNEL
+DISCRIMINATIVE forms.
+
+**Two axes reachable without a rebuild are closed:**
+
+- the WEIGHTS (any 16x27 bank of comparable conditioning is the same tracker — the one-hot
+  control ties it),
+- POINTWISE rectification (relu, abs, and crelu are a loss, a loss and a tie).
+
+**`basketball` is an unexplained outlier and is recorded as one:** `crelu` survives 295 frames
+longer on it and scores dA +0.343, the single largest per-sequence movement in the set. The
+pooled A +0.0170 is that sequence and `rowing`; the MEDIAN sequence moves by 0.0000 and the
+common-prefix dA is -0.0021. **It is NOT the selection effect** — corr(dA, d tracked) = +0.111,
+i.e. this arm is not being scored on an easier prefix, which is how the other rectified arms and
+the `-rand` banks earned their apparent accuracy. Anything revisiting this should start there.
+
+What remains is **GEOMETRY — kernel size, stride, receptive field (claim O-04)** — which is an
+AIE rebuild and has no offline evidence yet, and **CONDITIONING**, i.e. the four terms that break
+basis-invariance: the DSST shared denominator, `eps_rel`, per-channel quantization, and **Stage
+B3's per-channel energy normalisation**. B3 is the only one of the four that is host-only and
+untested, which is the third independent argument for putting channel reliability next.

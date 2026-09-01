@@ -37,6 +37,8 @@
 #   H_SHIFT=11 scripts/calib_build.sh      # accumulator headroom, FFT budget unchanged
 #   DRY_RUN=1 scripts/calib_build.sh       # pre-flight only, build nothing
 #   COMPARATOR=runs/run_calib.log H_SHIFT=11 scripts/calib_build.sh
+#   PATCH_ROWS=64 PATCH_COLS=64 ARM=rgb FFT_SHIFT=4 IFFT_ROW_SHIFT=3 \
+#     IFFT_COL_SHIFT=3 H_SHIFT=13 scripts/calib_build.sh   # the 64x64 arm
 #
 
 # @thesis subsec:narzedziaBudowanie | B-07,M-06 | The hardware build with pre-flight checks: it
@@ -82,6 +84,20 @@ BIAS_SCALE=${BIAS_SCALE:-$(mk BIAS_SCALE)}
 # in its own provenance.
 H_SHIFT=${H_SHIFT:-$(mk H_SHIFT)}
 
+# FEATURE-MAP GEOMETRY. Derived from the Makefile like every other default, and
+# passed to make EXPLICITLY, because BUILD_DIR is keyed on it: a script that
+# hardcoded 128x128 would build build/hw/64x64/ch16 and then verify the stamps
+# of the 128x128 build sitting next to it — reporting BUILD VERIFIED for a
+# binary it never looked at. That is the same class as the stale libadf.a.
+#
+# THE 64x64 ARM (docs/thesis/evidence/proposed_build_res64.md, claim N-03b) is
+# built with PATCH_ROWS=64 PATCH_COLS=64. It needs its OWN shift budget — the
+# transform gain falls with the point size on the forward AND the inverse pass —
+# so do not reuse 4-4-4/H_SHIFT=15 there without reading sec.3 of that file.
+PATCH_ROWS=${PATCH_ROWS:-$(mk PATCH_ROWS)}
+PATCH_COLS=${PATCH_COLS:-$(mk PATCH_COLS)}
+N_CHANNELS=${N_CHANNELS:-$(mk N_CHANNELS)}
+
 # Re-colourise the whole frame each push and abort on a mismatch. O(frame)/frame,
 # so it belongs on a short BRING-UP run, never on a 200-frame budget run.
 SCENE_VERIFY=${SCENE_VERIFY:-$(mk SCENE_VERIFY)}
@@ -113,7 +129,17 @@ case "$MODE" in budget|bringup) ;; *) echo "MODE must be budget or bringup, got 
 # The known-good run this build is one variable away from. Recorded next to the
 # artifacts so the A/B is legible months later; override it when the comparator
 # moves (after a successful H_SHIFT sweep it becomes runs/run_calib.log).
-COMPARATOR=${COMPARATOR:-"runs/run_0824_1354.log (gray/roi/4-4-4/H_SHIFT=11: mean IoU 0.9188, rails 0, accum max 52%, response max 49%)"}
+#
+# IT IS GEOMETRY-SPECIFIC. The stored comparator is a 128x128 run, and at any
+# other patch size the transform gain changes on all four passes, so its
+# amplitudes are not the yardstick. Recording it anyway would put a number in
+# calib_cfg.txt that a later reader would compare against in good faith — the
+# same failure mode as runs/.last_cfg describing a run that did not happen.
+if [ "$PATCH_ROWS" = 128 ] && [ "$PATCH_COLS" = 128 ]; then
+  COMPARATOR=${COMPARATOR:-"runs/run_0824_1354.log (gray/roi/4-4-4/H_SHIFT=11: mean IoU 0.9188, rails 0, accum max 52%, response max 49%)"}
+else
+  COMPARATOR=${COMPARATOR:-"NONE — ${PATCH_ROWS}x${PATCH_COLS} has no comparator run; the stored 128x128 one does NOT apply (different transform gain on all four passes). This build establishes its own budget."}
+fi
 
 # Run shape. 200 frames because THE RESPONSE GROWS AS THE FILTER CONVERGES — a
 # budget validated at ITER_CNT=2 is not validated, and the retired 4-2-2 point
@@ -130,6 +156,9 @@ DUMP_BUFFERS=${DUMP_BUFFERS:-0}
 TOTAL=$(( 2 * FFT_SHIFT + IFFT_ROW_SHIFT + IFFT_COL_SHIFT ))
 
 VARS=(TARGET=hw
+      PATCH_ROWS=$PATCH_ROWS
+      PATCH_COLS=$PATCH_COLS
+      N_CHANNELS=$N_CHANNELS
       CONV_IN_CH=$CONV_IN_CH
       BIAS_SCALE=$BIAS_SCALE
       FFT_SHIFT=$FFT_SHIFT
@@ -146,12 +175,15 @@ VARS=(TARGET=hw
       SCALE_TRAJ=1
       CONV2D_MODE=0)
 
-BUILD_DIR=build/hw/128x128/ch16
+BUILD_DIR=build/hw/${PATCH_ROWS}x${PATCH_COLS}/ch${N_CHANNELS}
 
 echo "=================================================================="
 echo " shift-budget calibration build"
 echo "=================================================================="
 printf '  arm            %s (CONV_IN_CH=%d)\n' "$ARM" "$CONV_IN_CH"
+printf '  geometry       %dx%d  ch%d   -> %s\n' \
+       "$PATCH_ROWS" "$PATCH_COLS" "$N_CHANNELS" \
+       "build/hw/${PATCH_ROWS}x${PATCH_COLS}/ch${N_CHANNELS}"
 printf '  budget         %d-%d-%d   (total 2*%d+%d+%d = %d)\n' \
        "$FFT_SHIFT" "$IFFT_ROW_SHIFT" "$IFFT_COL_SHIFT" \
        "$FFT_SHIFT" "$IFFT_ROW_SHIFT" "$IFFT_COL_SHIFT" "$TOTAL"
@@ -192,6 +224,44 @@ if [ "$SCENE_VERIFY" = 1 ] && [ "$ITER_CNT" -gt 20 ]; then
     bad "SCENE_VERIFY vs frame count" "SCENE_VERIFY=1 with ITER_CNT=$ITER_CNT is O(frame)/frame — use a short MODE=bringup run"
 else
     note "SCENE_VERIFY vs frame count" "OK (verify=$SCENE_VERIFY, frames=$ITER_CNT)"
+fi
+
+# ---- 1b. the geometry must be buildable -----------------------------------
+# Three things fail SILENTLY at a new patch size, so each is checked here rather
+# than after an hours-long build:
+#   * conv2d_kernel.cpp and mosse_tracker.cpp both select hanning_<PATCH_COLS>.h.
+#     A missing table is an #error, but it fires deep in an aiecompiler log.
+#   * roi_crop's BRAM scratch is sized by ROI_MAX_PATCH_*; the patch must fit.
+#   * the AIE FFT wants a power of two, and the DSPLib window rule needs
+#     PATCH_ROWS % FFT_ROW_WS == 0.
+if [ "$PATCH_ROWS" != "$PATCH_COLS" ]; then
+    bad "patch is square" "${PATCH_ROWS}x${PATCH_COLS} — the Hanning selection and both graphs assume PATCH_ROWS==PATCH_COLS"
+elif [ $(( PATCH_ROWS & (PATCH_ROWS - 1) )) != 0 ]; then
+    bad "patch is a power of 2" "$PATCH_ROWS — the AIE FFT point size must be"
+else
+    note "patch geometry" "OK (${PATCH_ROWS}x${PATCH_COLS})"
+fi
+
+HTAB_H=design/aie_src/hanning_${PATCH_COLS}.h
+if [ -f "$HTAB_H" ]; then
+    note "hanning table" "OK ($HTAB_H)"
+else
+    bad "hanning table" "$HTAB_H missing — run: make weights PATCH_COLS=$PATCH_COLS CONV_IN_CH=$CONV_IN_CH"
+fi
+
+ROI_MAX=$(grep -oP 'define ROI_MAX_PATCH_ROWS\s+\K[0-9]+' design/pl_src/roi_crop/roi_crop.h)
+if [ -n "$ROI_MAX" ] && [ "$PATCH_ROWS" -gt "$ROI_MAX" ]; then
+    bad "patch fits roi_crop scratch" "PATCH_ROWS=$PATCH_ROWS > ROI_MAX_PATCH_ROWS=$ROI_MAX"
+else
+    note "patch fits roi_crop scratch" "OK (max $ROI_MAX)"
+fi
+
+# The stored comparator is a 128x128 run. At any other geometry the transform
+# gain changes on BOTH the forward and the inverse pass, so its amplitudes are
+# not the yardstick and rails=0 has to be re-established from scratch.
+if [ "$PATCH_ROWS" != 128 ] || [ "$PATCH_COLS" != 128 ]; then
+    note "comparator applies" "NO — ${PATCH_ROWS}x${PATCH_COLS} is not the comparator's geometry"
+    note "  -> this is a NEW shift budget" "read proposed_build_res64.md sec.3 before quoting it"
 fi
 
 # ---- 2. the weights file must match the arm -------------------------------
@@ -269,7 +339,10 @@ echo "=== post-build verification (the stamps, not .last_cfg) ==="
 stamp_has() {   # stamp_has <file> <FLAG=VALUE>
     grep -qE -- "${2}(\"|[[:space:]]|\$)" "$1"
 }
-for want in "FFT_2D_TP_SHIFT=$FFT_SHIFT" \
+for want in "PATCH_ROWS=$PATCH_ROWS" \
+            "PATCH_COLS=$PATCH_COLS" \
+            "N_CHANNELS=$N_CHANNELS" \
+            "FFT_2D_TP_SHIFT=$FFT_SHIFT" \
             "FFT_2D_TP_IFFT_ROW_SHIFT=$IFFT_ROW_SHIFT" \
             "FFT_2D_TP_IFFT_COL_SHIFT=$IFFT_COL_SHIFT" \
             "CMUL_H_SHIFT=$H_SHIFT" \
@@ -282,6 +355,8 @@ for want in "FFT_2D_TP_SHIFT=$FFT_SHIFT" \
     fi
 done
 for want in "-DITER_CNT=$ITER_CNT" "-DCONV_IN_CH=$CONV_IN_CH" \
+            "-DPATCH_ROWS=$PATCH_ROWS" "-DPATCH_COLS=$PATCH_COLS" \
+            "-DN_CHANNELS=$N_CHANNELS" \
             "-DFFT_SHIFT_CFG=$FFT_SHIFT" "-DVERBOSITY=$VERBOSITY" \
             "-DCMUL_H_SHIFT=$H_SHIFT" "-DSCENE_VERIFY=$SCENE_VERIFY" \
             "-DFRAME_RGB_MODE=$FRAME_RGB_MODE" \
@@ -297,6 +372,7 @@ CFG="$BUILD_DIR/calib_cfg.txt"
 {
     date -Is
     echo "arm=$ARM CONV_IN_CH=$CONV_IN_CH BIAS_SCALE=$BIAS_SCALE"
+    echo "geometry=${PATCH_ROWS}x${PATCH_COLS} channels=$N_CHANNELS"
     echo "budget=${FFT_SHIFT}-${IFFT_ROW_SHIFT}-${IFFT_COL_SHIFT} total=$TOTAL H_SHIFT=$H_SHIFT"
     echo "ITER_CNT=$ITER_CNT VERBOSITY=$VERBOSITY DUMP_BUFFERS=$DUMP_BUFFERS"
     echo "mode=$MODE SCENE_VERIFY=$SCENE_VERIFY FRAME_RGB_MODE=$FRAME_RGB_MODE"

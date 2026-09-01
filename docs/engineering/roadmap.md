@@ -1,0 +1,207 @@
+# Roadmap
+
+## 2026-09-01 — the day's screens, and what each closed
+
+`MOSSE_SIGMA=4.0` at 128x128 is the best arm on record (A 0.5133 / R 0.4095 / **EAO 0.1931**,
+host-only). Everything else screened that day was a null or borderline. Full detail in the
+evidence notes; this is the index.
+
+| screened | verdict | note |
+|---|---|---|
+| 64x64 feature map | CONFIRMED on hw, then RE-ATTRIBUTED | `proposed_build_res64.md` sec.17-20, 25 |
+| sigma/target sweep (1/64..1/8) | **1/16 is the optimum; sigma4 SHIPS** | `proposed_build_res64.md` sec.21, 25 |
+| `PSR_GATE_MIN=3.5` rescale | REJECTED — EAO null, and the "conditional on PSR scale" claim REFUTED | sec.22-23 |
+| one-hot + orthonormal banks | the conv layer is a LINEAR LIFT; one-hot ties the network | `feature_bank.md` |
+| ReLU / abs / CReLU on the shipping bank | refuted (−0.0332 / −0.0232 / +0.0020) | `feature_bank.md` |
+| Stage B3 channel reliability | REJECTED — mechanism holds, gain does not | `channel_reliability.md` |
+| Layer-1 banks x {16,32}ch x {7x7/2, 3x3+pool, 5x5/1} | mechanism CONFIRMED 4x, arms BORDERLINE | `layer1_features.md` |
+
+**The next build is pre-registered**: 7x7 stride 2, 32ch, `CONV_RELU=1`, 64x64 map, sigma 2 —
+[`../thesis/evidence/proposed_build_l1relu.md`](../thesis/evidence/proposed_build_l1relu.md).
+It is borderline on tracking (P(dR<=0)=0.041) and the reason to build it is that `CONV_RELU=0`
+makes the CNN provably redundant, which this project's conv-feature requirement cannot carry.
+
+**Three things that changed how to read the older entries below:**
+
+1. **`MOSSE_SIGMA` is in BINS**, so any change to the map size silently changes `sigma/target`.
+   The 64x64 arm's robustness gain was the sigma it carried, not its resolution. Every
+   geometry arm scored before 2026-09-01 has this confound.
+2. **px/bin is NOT the axis** `pooled_features.md` proposed — at matched sigma/target the two
+   resolutions nearly agree, and on HARDWARE the finer map wins.
+3. **The offline proxy's ACCURACY column is not usable** on response-shape arms: it predicted
+   A −0.039 and −0.043 for the two arms that then gained +0.021 and +0.030 on hardware.
+
+---
+
+# Roadmap — what to try next, in order
+
+Moved out of CLAUDE.md 2026-08-31; content unchanged.
+
+### Next, in order — ROBUSTNESS
+
+Localisation, the gate, quantization, saturation, pooling, feature resolution, padding and
+**init perturbations** are ALL exonerated or rejected (see [`settled.md`](settled.md)). Ranked list and the
+supporting measurements: `docs/thesis/evidence/robustness_proposals.md`. What is left is host-only:
+
+1. **THE NEXT BUILD: the 64x64 feature map (`PATCH_ROWS=PATCH_COLS=64`) — PROPOSED 2026-08-31,
+   `docs/thesis/evidence/proposed_build_res64.md`, claim N-03b.** The first arm whose offline
+   signal survives a symmetric trim AND a bootstrap: dR **+0.1071**, drop-top-3 **+0.050**,
+   P(dR<=0) = 0.000, against the shipped spatial mask's +0.0330 / +0.0101 on the same
+   instrument. A RESOLUTION change, not a pooling one (`dec2` alone scores it). **Buys frame
+   time too** — 0.25x the host work, ~15 ms/frame predicted against 28.58. Most of the build is
+   free: `roi_crop` takes `patch_rows` as a RUNTIME AXI-Lite arg and its `.xo` is stamp-verified
+   reusable, `hanning_64.h` already exists, `BUILD_DIR` is already keyed on geometry. **The real
+   price is the shift budget** — the FFT gain falls ~4x at 64 points but Stage A renormalises
+   over 4x fewer samples, so the net is NOT derivable; budget one 200-frame calibration run.
+   Falsifier has TWO parts this time (dEAO >= +0.005 AND survives drop-top-3), because the mask
+   cleared a one-part bar and was still not separable from a null.
+   **PREPARED 2026-08-31 (sec.8-14 of that file), nothing built:** the graph COMPILES and PLACES
+   at 64x64 (`make graph`, 0 errors, tile buffers 623.8 -> 254.5 KB, every window buffer halved),
+   the PL `.xo` files are seeded into `build/hw/64x64/ch16` so HLS really is skipped, and
+   `calib_build.sh` takes the geometry — it did NOT before, and would have verified the 128x128
+   stamps while building 64x64. **The budget candidate is `FFT_SHIFT=3 IFFT_ROW_SHIFT=3
+   IFFT_COL_SHIFT=3` with `H_SHIFT=15` unchanged** — one bit off each of the four shifts is
+   exactly the halved point size and holds every intermediate magnitude, `F_ch` included, at the
+   validated 128x128 values. sec.3's "2 bits, partially offset" is wrong twice over (Stage A is a
+   FIXED-scale z-score, not a unit-L2 norm; the inverse pass loses gain as well): the response
+   correction is 4 bits. Still a model, still decided by the one 200-frame `rails=0` run.
+   **THE CALIBRATION CARD IMAGE IS BUILT AND EVERYTHING OFF-BOARD IS GREEN** (sec.14-16):
+   `test_host`/`test_roi_crop` (both arms)/`test_scene`/`test_vot_source` pass at 64x64, all four
+   `x86sim_check` kernels are BIT-EXACT at the new point size (conv2d s6 and s6rgb, cmul s7 and
+   cmul_stress), `BUILD VERIFIED` on all 21 stamps, timing met (WNS +0.322 ns), PL utilisation
+   byte-identical to the 128x128 build, image re-provisioned. **What remains needs the board:
+   flash, the 200-frame calibration, then the sweep.**
+
+2. **A spatial mask on the filter — SWEPT 2026-08-31. EAO ROSE, AND THE ARM IS STILL NOT
+   DISTINGUISHABLE FROM A NULL.** `docs/thesis/evidence/spatial_mask.md`, claim R-10, `results/arms.csv` row
+   `rgb_mask`. **EAO 0.1629 → 0.1740 (+0.0110), against a +0.005 bar written before the run.**
+   **But the gain is carried by 3 sequences of 62 — the top 3 are 133% of it, dropping them FLIPS the sign to −0.0030, the per-sequence median dR is 0.0000 and the bootstrap CI is [−0.0135, +0.0318] with P(dR≤0)=0.22.** EAO cannot be bootstrapped (one value per tracker), so the arbiter has no stability estimate. **Quote it with that caveat, never as a clean win.** R 0.3417 → 0.3608, 16.6% more frames tracked, and the pooled A drop (−0.0187) is a SELECTION
+   effect: on the common survived prefix A goes **0.5319 → 0.5499, i.e. +0.0179**. Mechanism
+   confirmed by `mask_ebox`, which separates the arms at init 0.6049 → 0.9500 with
+   non-overlapping quartiles. Control: the paired baseline's 419 trajectories are BYTE-IDENTICAL
+   to the stored shipping arm, so `FILTER_MASK=0` is inert on hardware and the instrument
+   perturbs nothing. **Offline over-predicted the gain 3× (dR +0.0601 against +0.0192) — quote
+   the hardware delta.** **THE PREDICTED `PSR_GATE_MIN` RE-TUNE IS NOT SUPPORTED BY THE HARDWARE DATA — do
+   not spend a 100-minute sweep on it.** Masking DID move the PSR scale, by half what offline
+   predicted (median 30.87 → 27.18, −12%, against a predicted −24%), but **the gate's BITE did
+   not move**: `LOW_PSR` is 0.10% of evaluated frames on the baseline and 0.09% under the mask,
+   and the fraction below 7 FELL (1.56% → 1.32%). The threshold has almost no lever left —
+   moving it 5.0 → 3.0 flips 161 frames (0.09% of evaluated), 5.0 → 7.0 flips 1966 (1.09%).
+   99.1% of vetoes are `NEGATIVE_PEAK`, which `PSR_GATE_MIN` cannot disable. (Those flip counts
+   are OPEN-LOOP — a flipped decision changes every later frame — so read them as how much room
+   the knob has, not as a predicted outcome.)
+   **`calib_build.sh` CANNOT build either arm** — it accepts only `ARM=gray|rgb`, never passes
+   `FILTER_MASK`, and would print `BUILD VERIFIED` on a build that silently omitted it. Use
+   `make application` with the flags spelled out; see `evidence/spatial_mask.md`.
+   *(The pre-sweep entry follows; its numbers are OFFLINE predictions, not results.)*
+   **The window swept on 08-28 is NOT the one the board runs** — the bench centred its axis at
+   `(n-1)/2`, the hardware's periodic Hann at `n/2`; half a sample, worth mean IoU 0.1715 vs
+   0.2813 on `tiger`. Re-swept over all 62 in the board form: **dR +0.0601** (was +0.0718),
+   trim +0.0409, mean IoU 0.1792 → 0.2016, common-prefix dA −0.0103. Still 3.0× the
+   instrument's resolution, and every check that cleared the old arm clears this one.
+   `rgb_vs_gray_loop.py --mask-center board|bench` now carries both, defaulting to board.
+   **`--mask-taper 1.0` is REQUIRED and is not the default** — at the 0.25 default `mask0` has
+   99 non-zero bins per axis and is not board-implementable.
+   *(Original 08-28 entry follows.)*
+   **A spatial mask on the filter — MEASURED OFFLINE 2026-08-28.** `docs/thesis/evidence/proposed_build_mask.md`. CSR-DCF's highest-priced item, applied
+   as a one-shot projection `h ← m⊙h` on the published `H` (`A`/`B` untouched), so the AIE sees
+   an already-masked filter and detection stays consistent. Host-only — an scp, not a card swap.
+   62 sequences, shipping eta/gate, `vot_ar_offline`:
+
+   ```
+   arm                  A        R   tracked/19903   meanIoU        dA        dR
+   rgb             0.5394   0.2910            5792    0.1792
+   rgb-mask50      0.5413   0.3033            6037    0.1939   +0.0020   +0.0123   (Tukey)
+   rgb-mask0       0.5048   0.3628            7221    0.2040   -0.0346   +0.0718   (Hann)
+   ```
+
+   **ONLY A HANN-SHAPED MASK IS EXACTLY 9 BINS, and this was written down wrong here first.**
+   The 9-bin claim comes from the Stage B2 identity and holds for a periodic Hann (3 bins per
+   axis, zero error). A **Tukey** mask — flat plateau plus roll-off — has a rect in it, and a
+   rect transforms to a sinc: 7 bins per axis for 99% of the energy, and truncating to 9 bins in
+   2D gives max error 0.30-0.50 on a mask whose range is [0,1]. So the tight-box arms that were
+   swept first are NOT board-implementable without a 49-tap convolution and its own truncation
+   study, and **the exactly-sparse shape is a much wider, smoother mask that behaves completely
+   differently.** Checking the claim is what found the result.
+   **dR +0.0718 is 3.6× the instrument's measured resolution and survives a symmetric trim
+   (+0.0480)** — the only arm of that day's twelve to do either. `dA −0.0346` trips the
+   failure-rule artifact test in [`measurement.md`](measurement.md) and three checks clear it: mean IoU RISES where the `gsign`
+   mutant's fell; the hold rate moves only +0.64% of frames; and **on the frames BOTH arms
+   survived the gap is −0.0085** (see the selection-effect rule under Measurement methodology).
+   **The board is still required and not as a formality**: EAO is not computable offline and EAO
+   is the arbiter for an A/R trade (pad30 lost EAO while gaining R), and this is SINGLE-START
+   where the toolkit is 419 anchored runs — a mask concentrates its effect in a filter's early
+   life, so the protocol may cut either way. Median per-sequence dR is 0.0000: 35 of 62 are
+   untouched and the gain lives in 18.
+   **Two things measured before the arm, both load-bearing.** The filter's energy is centred at
+   the **PATCH CENTRE** (peak of `Σ|h|²` at (64,64); a corner-wrapped 64×64 box holds 8-12%),
+   even though `resp[0,0]` is the zero-displacement bin — masking at the response origin deletes
+   the filter and reads as "masking hurts". And a centred 64×64 box, exactly the target box at
+   padding 2, holds only **51.6% (`car1`) / 54.9% (`tiger`)** of the filter's energy, which is
+   CSR-DCF's complaint quantified on this design.
+   **NOT `TARGET_PADDING` by another name**: padding moves the mask, px/bin, the search range and
+   the DSST extraction region at once, which is why pad30 was unattributable. **Expect to re-tune
+   `PSR_GATE_MIN` on a second sweep** — masking moves the PSR scale (car1 mean PSR 48.2 → 36.7),
+   and the gate's worth is conditional on that scale. One variable at a time: mask first at the
+   inherited gate, then the gate.
+3. **Channel reliability in Stage B3, and it needs no per-channel response map.** B3 normalises
+   by ENERGY, not discriminative power; the blocker was that `cmul_accum` sums channels before
+   the IFFT. Both halves are available in the frequency domain by Parseval:
+   `r_ch(0) = (1/N)·Σᵢ Hᵢ·conj(Fᵢ)` and `‖r_ch‖² = (1/N)·Σᵢ|Hᵢ Fᵢ|²`, i.e. two scalar
+   accumulators inside the existing per-channel loop of `filter_update_quantize` over arrays it
+   already streams. Reliability `r(0)²/‖r‖²` folds into `chscale`. CSR-DCF price theirs at −12%.
+4. **A two-filter temporal ensemble** (TCLCFcpp, the one embedded tracker at R 0.598). eta 0.125
+   and eta 0.05 already win on different sequences; run both, select per frame by PSR. Host-only,
+   +2 MB filter state, roughly doubles the ~5 ms filter tail. **Take the cheap half first**: a
+   long-term filter at eta≈0 used only as a VALIDATOR at the selected peak (one dot product per
+   channel, item 2's identity, no second AIE bank) feeding a confidence-modulated eta.
+5. **A REPLACEMENT feature bank — NARROWED SHARPLY 2026-08-29, see `docs/thesis/evidence/feature_bank.md`.**
+   **Swapping the donor network is close to a null: at layer 1 the pretraining is worth
+   ~0.011-0.015 in R, below the offline bench's own resolution, and it does not survive a
+   symmetric trim.** A RANDOM bank of matched row norms ties the pretrained one on held-out PSR
+   across 4 sequences and scores A 0.5651 / R 0.2801 against 0.5394 / 0.2910 over all 62 (two
+   seeds; seed spread 0.0038). **And "PCA a wider net down to 16 better features" rests on a
+   statistic that is MAXIMISED BY NOISE** — random Gaussian 16x27 scores participation ratio
+   10.69 against the shipping bank's 7.43, a random orthonormal basis the maximum 16.00, and on
+   real activations 1.99 against 1.43. (The PCA *mechanism* is sound and free — a linear map of
+   conv outputs folds into the weights and stays a 3x3 conv — it is the objective that fails.)
+   Also: no torchvision 3x3x3 stem is better conditioned; the widest, vgg16_bn at 64 channels,
+   is the WORST (PR 5.17). What is NOT refuted is the GEOMETRY — 16ch / 3x3 / stride 1 — which
+   is an AIE rebuild, not a weights export. **Corollary, and it costs more than the arm: the
+   offline AR bench cannot separate a pretrained bank from noise, so it cannot rank two
+   pretrained banks either.**
+
+**Recovery AFTER a loss is worth NOTHING to R or EAO** — VOT terminates a run 10 frames after
+failure and re-enters at the next anchor. Only not-losing, or recovering inside the grace,
+scores. That retires re-detection and search-window expansion outright, however good they look
+on mean IoU.
+
+**Score any of these on `vot analysis`, never on mean IoU** — the two have ordered arms
+oppositely on identical trajectories (`HOLD_COAST`), and the offline AR proxy
+(`vot_ar_offline.py`) has a MEASURED resolution of only ~0.02 in R and did not transfer to a
+geometry arm.
+
+
+### Next, in order — PERFORMANCE
+
+The APU is a **flat tail** — biggest single item 5.2 ms — so the remaining wins are structural.
+
+1. **Software-pipeline the CHANNEL loop.** The `fft_col_out` + `accum_out` pair (~8.7 ms) is the
+   col-FFT + cmul production time for 16 channels, proven immune to transaction count. Overlap it
+   with the host's ~0.4 ms/channel of APU work, exactly as `roi_crop` was pipelined
+   (5.196 → 1.020 ms). The graph already permits one channel of lookahead; the host serialises.
+2. **More of the second core.** Parallel-for over channels inside `filter_update_quantize` —
+   expect well under 2×, it is memory-bound and the two cores share a controller. **See the abandoned parallel-for attempt in
+   [`performance.md`](performance.md) before trying.** Then re-enable `CMUL_ACCUM_MEMTILE`, which only pays
+   once a helper exists to absorb the wait (alone it loses 0.36 ms; paired, ~2.7 ms of freed CPU).
+3. **NEON-vectorise the int16→float conversion in `unpack_spectrum`** (`SSHLL` + `SCVTF`) — maybe
+   1 ms, and the only remaining idea for that slot.
+4. **6.6 ms/frame of XRT descriptor cost** — the two 256-tx ports cost 11.0 µs of host CPU per
+   `async()`. The only lever is fewer, larger transactions, i.e. item 2's memtile.
+5. **At `CONV_IN_CH=3` only: `frame push` 1.385 ms.** The 6 MB `frame_bo` is now the single
+   biggest RGB-specific cost — bigger than everything conv2d added to the frame.
+
+**Retired, do not reopen:** `FFT_COL_WS` 8→32 (a 9.57 ms loss), `CMUL_ACCUM_MEMTILE` alone (0.36
+ms), Hermitian symmetry in the host filter (premise refuted in fixed point), the accumulator as a
+`shared_buffer`, parallel-for inside `filter_update_quantize` as attempted. Each has an entry in [`performance.md`](performance.md) or [`settled.md`](settled.md).
+

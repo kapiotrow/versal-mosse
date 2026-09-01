@@ -267,7 +267,7 @@ once those chapters declare their claims and one of these is still missing.
 
 | source | claims | contributes |
 |---|---|---|
-| `scripts/calib_build.sh:42` | `B-07`, `M-06` | The hardware build with pre-flight checks: it verifies the FLAGSTAMPS against the intended config, because a flag-only change has silently reused a stale libadf.a. |
+| `scripts/calib_build.sh:44` | `B-07`, `M-06` | The hardware build with pre-flight checks: it verifies the FLAGSTAMPS against the intended config, because a flag-only change has silently reused a stale libadf.a. |
 
 <details><summary>claims cited here</summary>
 

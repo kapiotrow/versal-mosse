@@ -1,0 +1,9 @@
+2026-08-31T22:13:40+02:00
+arm=rgb CONV_IN_CH=3 BIAS_SCALE=roi
+geometry=64x64 channels=16
+budget=3-3-3 total=12 H_SHIFT=15
+ITER_CNT=200 VERBOSITY=1 DUMP_BUFFERS=0
+mode=budget SCENE_VERIFY=0 FRAME_RGB_MODE=1
+weights_md5=2aa7031f1f537e1a4f073642c7d50f4a
+comparator=NONE - 64x64 has no comparator run; the stored 128x128 one does NOT apply (different transform gain on all four passes). This build establishes its own budget.
+# corrected by hand 2026-08-31: the script recorded the 128x128 default before it was made geometry-aware.
