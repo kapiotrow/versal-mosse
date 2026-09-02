@@ -63,8 +63,9 @@ def load_patch_int8(scenario: str) -> np.ndarray:
     need = G.N_SAMPLES // 4
     if words.size < need:
         sys.exit(f"ERROR: {path} has {words.size} words, need at least {need} "
-                 f"({G.N} px x {G.CONV_IN_CH} plane(s)). Wrong PATCH_ROWS/PATCH_COLS "
-                 f"or CONV_IN_CH, or stale vectors — run `make gen_vectors`.")
+                 f"({G.CROP_N} crop px x {G.CONV_IN_CH} plane(s); the feature "
+                 f"map is {G.N}). Wrong PATCH_ROWS/PATCH_COLS, CONV_IN_CH or "
+                 f"CONV_STRIDE, or stale vectors — run `make gen_vectors`.")
     words = words[:need].astype(np.uint32)
     b = np.empty(G.N_SAMPLES, dtype=np.uint8)
     b[0::4] = (words) & 0xFF
@@ -119,14 +120,19 @@ def check_conv2d(scenario: str, actual_path: str, ch: int, relu: int) -> bool:
     wpath = os.path.join(scenario, f'weights_ch{ch}.bin')
     with open(wpath, 'rb') as f:
         weights = f.read()
-    lay = CWL.Layout(G.CONV_IN_CH)
-    if len(weights) < lay.end:
-        sys.exit(f"ERROR: {wpath} is {len(weights)} bytes, expected >= {lay.end}")
-    tag = CWL.detect(weights[:CWL.BUF_BYTES])
+    lay = CWL.Layout(G.CONV_IN_CH, G.CONV_KSIZE)
+    if len(weights) < lay.buf:
+        sys.exit(f"ERROR: {wpath} is {len(weights)} bytes, expected >= {lay.buf}")
+    tag = CWL.detect(weights[:lay.buf])
     if tag != G.CONV_IN_CH:
         sys.exit(f"ERROR: {wpath} was exported for CONV_IN_CH={tag} but the check "
                  f"is running at CONV_IN_CH={G.CONV_IN_CH}. Re-run "
                  f"`make weights CONV_IN_CH={G.CONV_IN_CH}`.")
+    tag_k = CWL.detect_ksize(weights[:lay.buf])
+    if tag_k != G.CONV_KSIZE:
+        sys.exit(f"ERROR: {wpath} was exported for CONV_KSIZE={tag_k} but the "
+                 f"check is running at CONV_KSIZE={G.CONV_KSIZE}. Re-run "
+                 f"`make weights CONV_KSIZE={G.CONV_KSIZE}`.")
 
     # mean_prev lives at bytes [18:22] and the KERNEL reads it from there
     # (conv2d_kernel.cpp:135-139). Passing 0 instead would silently compare
@@ -135,7 +141,8 @@ def check_conv2d(scenario: str, actual_path: str, ch: int, relu: int) -> bool:
     mean_prev = struct.unpack_from('<i', weights, lay.mean)[0]
     out_shift = weights[lay.shift]
     bias_acc = struct.unpack_from('<i', weights, lay.bias)[0]
-    print(f"  weights: CONV_IN_CH={G.CONV_IN_CH} taps={lay.raw} out_shift={out_shift} "
+    print(f"  weights: CONV_IN_CH={G.CONV_IN_CH} CONV_KSIZE={G.CONV_KSIZE} "
+          f"CONV_STRIDE={G.CONV_STRIDE} taps={lay.raw} out_shift={out_shift} "
           f"bias_acc={bias_acc} mean_prev={mean_prev}")
 
     # relu is passed EXPLICITLY rather than inherited from G's GEN_CONV_RELU, so

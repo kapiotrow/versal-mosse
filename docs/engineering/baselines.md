@@ -18,7 +18,8 @@ Results*, ECCVW 2022, Table 12 (41 trackers, EAO 0.602 down to 0.195).
 | CSRDCF | HOG/CN + spatial & channel reliability | 0.251 | 0.519 | 0.580 |
 | KCF | kernelized DCF + HOG | 0.239 | 0.542 | 0.532 |
 | LGT | part-based, last of 41 | 0.195 | 0.461 | 0.486 |
-| **this tracker, SHIPPING (eta 0.05, gate 5.0)** | fixed-point MOSSE/DSST | **0.163** | **0.510** | **0.342** |
+| this tracker, 2026-08-27 (eta 0.05, gate 5.0) | fixed-point MOSSE/DSST | 0.163 | 0.510 | 0.342 |
+| **this tracker, SHIPPING 2026-09-02 (Layer-1 features)** | fixed-point MOSSE/DSST | **0.196** | **0.513** | **0.428** |
 
 **The split is the finding and it is sharp: ACCURACY IS INSIDE THE CLASSICAL-DCF BAND,
 ROBUSTNESS IS NOT IN THE TABLE AT ALL.** A = 0.510 sits 0.009 under CSRDCF and 0.032 under KCF,
@@ -58,8 +59,11 @@ explanation is open. `docs/thesis/evidence/spatial_mask.md`.
    deformation. This is 16 channels of 3x3 conv1, no pooling, participation ratio 4.94 gray /
    7.43 RGB — **and read that number with `docs/thesis/evidence/feature_bank.md` in hand: PR is maximised by
    NOISE (random Gaussian scores 10.69), so it ranks nothing, and the activation-space width is
-   1.43, not 7.43.** The dimension comparison with HOG stands; the PR comparison does not. **NOTE: aggregating THIS bank was tested and is a null** (see the feature-geometry
-   entry in [`settled.md`](settled.md)); the open question is a different bank, not a filter over this one.
+   1.43, not 7.43.** The dimension comparison with HOG stands; the PR comparison does not. **NOTE: aggregating THIS bank is refuted on every operator and bank tried, and on the
+   RECTIFIED Layer-1 bank it is a LOSS (−0.0242, trim-5 −0.0269)** — see `pooled_features.md`.
+   Their maxpool follows a STRIDE-1 3x3 conv and pools DOWN TO the working resolution; ours would
+   pool BELOW it, since the stride-2 conv already decimated. **The open question is a different
+   BANK GEOMETRY (3x3 stride 1 + pool), not a filter over this map.**
 2. **A spatial reliability map** (CSR-DCF's contribution). **Its cheap stand-in was tested and
    FAILED**: every `TARGET_PADDING` below 2.0 is worse offline, and 3.0 lost EAO on hardware. So
    background contamination is not the binding constraint, and CSR-DCF's ">50% EAO" ablation

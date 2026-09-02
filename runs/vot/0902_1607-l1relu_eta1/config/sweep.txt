@@ -1,0 +1,10 @@
+date       2026-09-02T16:07:47+02:00
+arm        l1relu_eta1
+jobs       all
+stream     auto
+sequences  agility animal ants1 bag ball2 ball3 basketball birds1 birds2 bolt1 book bubble butterfly car1 conduction1 crabs1 dinosaur diver drone1 drone_across fernando fish1 fish2 flamingo1 frisbee girl graduate gymnastics1 gymnastics2 gymnastics3 hand2 handball1 handball2 hand helicopter iceskater1 iceskater2 kangaroo lamb leaves marathon matrix monkey motocross1 nature polo rabbit2 rabbit rowing shaking singer2 singer3 snake soccer1 soccer2 soldier surfing tennis tiger wheel wiper zebrafish1 
+elf        build/hw/64x64/ch32/mosse_tracker.elf
+elf_md5    043fc5a6ed2b532e44cf349580e7478a
+xclbin_md5 9cea47ce8abf5695507cbfc281bb208f
+weights    d8a7d6ff009841cc12481c858e5f1f42
+git        5a35c74b34638f2fe63005f8996cb920558ff1ff DIRTY

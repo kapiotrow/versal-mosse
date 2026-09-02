@@ -59,11 +59,15 @@ the `dsp` subdirectory (the Makefile appends `/dsp`).
 
 ## Build parameters
 
-**THE DEFAULTS ARE THE SHIPPING CONFIGURATION as of 2026-08-28.** A bare
-`make application FRAME_SOURCE=vot` reproduces the benchmark arm's `app.flagstamp` exactly, and
-the default `aie.flagstamp` matches the flashed `a.xclbin`. Four defaults moved that day:
-`CONV_IN_CH` 1->3, `H_SHIFT` 11->15, `MOSSE_ETA` 0.125->0.05, `PSR_GATE_MIN` 7.0->5.0.
-**Grayscale is still fully supported** — pass `CONV_IN_CH=1` (what aiesim `s6`/`s7` need).
+**THE DEFAULTS ARE THE SHIPPING CONFIGURATION as of 2026-09-02** (`rgb_l1relu`, EAO 0.1960).
+A bare `make application FRAME_SOURCE=vot` reproduces the benchmark arm's `app.flagstamp`
+exactly, and the default `aie.flagstamp` matches the flashed `a.xclbin`. Eight defaults moved
+that day, all of them the Layer-1 arm: geometry `128->64` and `N_CHANNELS 16->32`, budget
+`4-4-4 -> 3-3-3`, `CONV_KSIZE 3->7`, `CONV_STRIDE 1->2`, `CONV_RELU 0->1`,
+`WEIGHT_BANK mobilenet->l1resnet`, `ACC_BOUND` now DERIVED from the bank.
+**The 128x128 3x3 arms are still fully supported** and are how every pre-09-02 row in the table
+below is reproduced — pass the geometry and the bank back explicitly.
+**Grayscale too** — `CONV_IN_CH=1` (what aiesim `s6`/`s7` need).
 Artifacts land in `build/$(TARGET)/$(PATCH_ROWS)x$(PATCH_COLS)/ch$(N_CHANNELS)/`.
 
 Digest below; **the reasoning for every knob is in
@@ -74,13 +78,13 @@ before moving one. Everything is host-only (an scp, not a card swap) EXCEPT `H_S
 | Parameter | Default | One line |
 |---|---|---|
 | `TARGET` | `hw_emu` | `hw_emu` or `hw` |
-| `PATCH_ROWS`/`PATCH_COLS` | `128` | powers of 2 (AIE FFT constraint) |
-| `N_CHANNELS` | `16` | conv feature channels |
+| `PATCH_ROWS`/`PATCH_COLS` | `64` | the FEATURE MAP, powers of 2 (AIE FFT constraint). **Moving it silently moves `sigma/target`** — see `MOSSE_SIGMA` |
+| `N_CHANNELS` | `32` | conv feature channels. Host cost scales as `N_CHANNELS x map_pixels` and so does conv2d's read loop |
 | `FFT_2D_DT` | `0` | 0=cint16, 1=cfloat |
 | `ITER_CNT` | `1` | frames; **needs ≥2** — frame 0 initialises the filter |
 | `PL_FREQ` | `312.5` | MHz; platform also offers 625/156.25/100/78.125 |
 | `H_SHIFT` | `15` | filter-product shift, deliberately OVER-shifted (`rails=0` over 101,564 frames). 13 is the tight RGB value, 12 rails, gray's arm is 14. **The one non-host-only knob here** |
-| `FFT_SHIFT`/`IFFT_ROW_SHIFT`/`IFFT_COL_SHIFT` | `4`/`4`/`4` | validated on hardware; do not change without a ≥20-frame hw run |
+| `FFT_SHIFT`/`IFFT_ROW_SHIFT`/`IFFT_COL_SHIFT` | `3`/`3`/`3` | the 64x64 budget (calibrated 2026-09-02, `rails=0` on 200 frames). **4-4-4 is the 128x128 one** — the budget follows the POINT SIZE, so a geometry change needs a new calibration run |
 | `FFT_ROW_WS`/`FFT_COL_WS` | `64`/`8` | rows/cols per FFT invocation. `FFT_COL_WS=32` is a 9.6 ms LOSS |
 | `MEMTILE_TRANSPOSE` | `1` | transposes in AIE-ML memory tiles; a one-sided flag is a board deadlock |
 | `ROI_CROP_PIPELINE` | `1` | launch channel k+1's crop before polling k |
@@ -89,10 +93,14 @@ before moving one. Everything is host-only (an scp, not a card swap) EXCEPT `H_S
 | `TAIL_PARALLEL` | `1` | filter update on core 1 ∥ scale filter on core 0; needs `-pthread` |
 | `ROI_CROP_USER_MANAGED` | `1` | roi_crop via `xrt::ip`. **20.6× on frame rate** — KDS completion costs 503 ms/launch |
 | `CONTROL_CU_RUNS` | `8` on `hw` | camera_capture launches: the within-run KDS control |
-| `CONV2D_MODE` | `0` | 0=real 3×3 conv, 1=echo, 2=synthesize. **Check before every expensive run** |
+| `CONV2D_MODE` | `0` | 0=real conv, 1=echo, 2=synthesize. **Check before every expensive run** |
 | `CONV_VECTORIZE`/`CMUL_VECTORIZE` | `1` | bit-identical to scalar; 0 for bisection |
-| `CONV_RELU` | `0` | off. **Bank-specific**: refuted on the shipping 3x3/16 bank (dR −0.0332), but it BEATS its own linear twin on a Layer-1 bank (`evidence/layer1_features.md`) |
+| `CONV_RELU` | `1` | **Bank-specific.** Refuted on the 3x3/16 mobilenet bank (dR −0.0332); beats its own linear twin four times offline on a LEARNED Layer-1 bank, and loses on an analytic Gabor one — the property that matters is that the bank is learned. Ships on. **The linear twin has NOT run on hardware**, so N-16's gain is attributable to the arm, not yet to the rectifier. **The scalar path (`CONV_VECTORIZE=0`) of the 3x3 GRAY branch hardcodes ReLU and ignores this flag**; RGB and generic honour it |
 | `CONV_IN_CH` | `3` | 1=BT.601 luma, 3=RGB. Picks the **weight-buffer layout**, so it drives `AIE_FLAGS`/`GCC_FLAGS`/`ROI_IN_CH` |
+| `CONV_KSIZE`/`CONV_STRIDE` | `7`/`2` | conv kernel and stride. Anything but 3/1 selects conv2d's **generic KxK branch** (taps stay in the weight buffer, line buffer split by column phase, `CONV_VEC_GEN=32`); the two 3x3 branches are byte-for-byte as shipped and keep their own `CONV_VEC=16`. Both reach BOTH toolchains |
+| `CROP_ROWS`/`CROP_COLS` | derived | `PATCH x CONV_STRIDE` — the ROI crop, **not** the feature map. `roi_crop` takes it at RUNTIME so a 128x128 crop needs no PL rebuild, but its BRAM scratch caps at 128; `make check_geometry` and a host `static_assert` both refuse an overrun |
+| `ACC_BOUND` | **derived from `WEIGHT_BANK`** | which exact worst-case accumulator bound sizes `out_shift`. `l1resnet`→`l1` (`127*Σ|w_int8|` per channel, ~2 bits tighter, needed at 147 taps — without it `F_ch` measured 0.13% of int16); `mobilenet`→`loose` (`n_in*K^2*127^2`, what every pre-09-02 arm used and what reproducing them requires). Both are exact worst cases, so neither can rail. **Reaches NEITHER toolchain** — it changes only the weights DATA — so no flagstamp sees it; `calib_build.sh` re-derives both bounds from the file's own taps |
+| `WEIGHT_BANK` | `l1resnet` | donor bank for `make weights`. `l1resnet` = resnet18 conv1 7x7/2 PCA'd to `N_CHANNELS`, via `scripts/l1_banks.py` — the same function the offline screen scored |
 | `CONV2D_STACK` | `2048` | conv2d AIE stack; applied only at `CONV_IN_CH=3` (27 taps need 1344 > 1024 default) |
 | `BIAS_SCALE` | `roi` | `bias_acc` input scale for `make weights`; `127` restores pre-correction weights |
 | `FRAME_RGB_MODE` | `1` | 1=per-plane tint, 0=replicate luma (the COLOUR-FREE CONTROL) |
@@ -108,8 +116,8 @@ before moving one. Everything is host-only (an scp, not a card swap) EXCEPT `H_S
 | `PSR_GATE_MIN` | `5.0` | Bolme §3.5. Below it the host HOLDS and skips the update. **Worth is conditional on the PSR scale** |
 | `TARGET_H`/`TARGET_W` | `64` | target box, frame px |
 | `TARGET_PADDING` | `2` | settled three ways; 1.5 and 3.0 both worse. At 64/2 the resample is 1:1 |
-| `MOSSE_SIGMA`/`SIGMA_FROM_TARGET` | `2.0`/`0` | **BINS, so what matters is sigma/target; 1/16 = DSST's `target/16` is the measured optimum. `4.0` at 128x128 is the BEST ARM ON RECORD** (EAO 0.1931) |
-| `MOSSE_ETA` | `0.05` | +0.0218 R vs 0.125; not monotone (0.025 much worse) |
+| `MOSSE_SIGMA`/`SIGMA_FROM_TARGET` | `2.0`/`0` | **BINS, so what matters is sigma/target, and 1/16 (DSST's `target/16`) is the measured optimum** — 2.0 on a 64x64 map and 4.0 on a 128x128 one both sit there. **The interior is CLOSED**: a 22-cell grid puts sigma 3, 5, 6 and 8 all below it (`runs/vot/0902_offline-sigmaeta/`) |
+| `MOSSE_ETA` | `0.05` | +0.0218 R vs 0.125; not monotone (0.025 much worse). **`0.1` MEASURED AND REJECTED on hardware 2026-09-02** — EAO 0.1960 → 0.1817, R a wash (median dR exactly 0.0000), A −0.0136. The offline grid's only trim-stable cell of 22 (dR +0.0481, P=0.021) **INVERTED**; it was screened at 128x128/sigma 4 and `sigma/target` governs SIGMA, not eta |
 | `SCALE_N`/`SCALE_STEP` | `33`/`1.04` | `SCALE_N=1` disables. **1.04 beats DSST §6.1's 1.02 on hardware** |
 | `SCALE_ETA` | `0.025` | deliberately ≠ `MOSSE_ETA` |
 | `SCALE_CONF_MIN` | `2.0` | veto HOLDS the box and SKIPS `scale_update()` |
@@ -127,9 +135,11 @@ before moving one. Everything is host-only (an scp, not a card swap) EXCEPT `H_S
 | `DUMP_BUFFERS` | `1` | **1216 KB/frame, ~2 s/frame** — set `0` for any tracking or FPS run |
 | `CSV_LOG` | `1` | one row/frame to `track.csv` (`track_<sequence>.csv` at `FRAME_SOURCE=vot`), ~60 B/frame |
 
-### Shift budget — SETTLED: 4-4-4, `H_SHIFT` 14 (gray) / 15 (RGB)
+### Shift budget — SETTLED: 3-3-3 at 64x64 (SHIPPING), 4-4-4 at 128x128; `H_SHIFT` 15
 
-Closed on hardware (FFT budget 2026-08-24, `H_SHIFT` 2026-08-27).
+Closed on hardware (128x128 2026-08-24/27; 64x64 2026-09-02, `rails=0` on 200 frames and all
+four buffers). **The budget follows the POINT SIZE** — one bit off each of the four shifts is
+exactly the halved transform — so a geometry change needs its own 200-frame calibration.
 [`docs/engineering/shift_budget.md`](docs/engineering/shift_budget.md) has the retired points,
 the four rules it cost, and the uncensored real-video distribution. The short version:
 
@@ -157,19 +167,20 @@ PS (A72) — mosse_tracker.cpp
 PL kernels (2)
   camera_capture : zero-fill DDR frame buffer (stub; TODO: MIPI RX)
   roi_crop       : DDR frame → Stage A → 32-bit AXIS (int8) → AIE PatchIn.
-                   Bilinear resample of roi_h×roi_w to the fixed patch size with border
+                   Bilinear resample of roi_h×roi_w to CROP_ROWS×CROP_COLS with border
                    clamping, log, zero mean, unit L2 × ROI_NORM_Q, int8 quantize.
                    Two reduction passes + a stream-out pass; `recompute=1` on channel 0,
-                   channels 1..15 re-stream the cache. All geometry is runtime AXI-Lite,
+                   the rest re-stream the cache. All geometry is runtime AXI-Lite,
                    so ROI/box changes need no rebuild of anything but the host ELF.
                    At ROI_IN_CH=3 it resamples three interleaved planes with shared
                    geometry and ONE joint mean/sigma. ROI_IN_CH is compile-time.
 
 AIE (single instances, serial per-channel; both custom kernels vectorized)
-  conv2d_kernel     : int8 patch → 3×3 MAC → Hanning window → cint16 stream
-                      (MobileNet-v3 Small layer 1, INT8; RGB collapsed to grayscale at
-                      CONV_IN_CH=1, all 27 taps at 3). Stage B1 subtracts mean_prev,
-                      which the host SEEDS before frame 0.
+  conv2d_kernel     : int8 crop → KxK/stride-S MAC → ReLU → Hanning window → cint16 stream.
+                      SHIPPING: resnet18 conv1 7x7 stride 2, PCA'd to 32 channels, INT8,
+                      128x128 crop → 64x64 map. Three branches: 3x3 gray, 3x3 RGB (both
+                      byte-for-byte as shipped), and the generic KxK/stride-S one.
+                      Stage B1 subtracts mean_prev, which the host SEEDS before frame 0.
   fft2d             : PATCH_COLS-pt row FFT → memory-tile transpose → PATCH_ROWS-pt col FFT
   cmul_accum_kernel : col-FFT ⊙ H_ch* + accumulate (int32 intermediates, saturating cint16
                       accumulator in DDR)
@@ -250,13 +261,15 @@ until the streaming reader. Full tables, per-frame AIE compute and the memory fo
 [`docs/engineering/performance.md`](docs/engineering/performance.md),
 `docs/thesis/evidence/TODO_board_memory.md`.
 
-## Current status (2026-08-28)
+## Current status (2026-09-02)
 
-**THE SHIPPING CONFIG, and every line of it is a hardware A/B:**
+**THE SHIPPING CONFIG — `rgb_l1relu`, EAO 0.1960, the best on record:**
 
 ```
-CONV_IN_CH=3  H_SHIFT=15  budget 4-4-4  MOSSE_ETA=0.05  PSR_GATE_MIN=5.0
-TARGET_PADDING=2.0  SCALE_STEP=1.04  SCALE_MAX_STEP=2  HOLD_COAST=0
+64x64 map from a 128x128 crop  N_CHANNELS=32  CONV_IN_CH=3
+conv 7x7 stride 2, resnet18-conv1 PCA bank, CONV_RELU=1, ACC_BOUND=l1
+budget 3-3-3  H_SHIFT=15  MOSSE_SIGMA=2.0 (= sigma/target 1/16)
+MOSSE_ETA=0.05  PSR_GATE_MIN=5.0  TARGET_PADDING=2.0  SCALE_STEP=1.04
 ```
 
 Full VOT-STb2022, 62 sequences, 419 trajectories per arm. Each row moves ONE knob:
@@ -266,67 +279,119 @@ Full VOT-STb2022, 62 sequences, 419 trajectories per arm. Each row moves ONE kno
 | gray `H_SHIFT=14` | 0.4890 | 0.2743 | 0.1367 | `full62` |
 | RGB `H_SHIFT=15` | 0.5043 | 0.3065 | 0.1474 | `full62` |
 | + `MOSSE_ETA=0.05` | 0.5100 | 0.3283 | 0.1600 | `eta05ab` |
-| **+ `PSR_GATE_MIN=5.0` — SHIPPING** | **0.5100** | **0.3417** | **0.1629** | `gate` |
+| + `PSR_GATE_MIN=5.0` | 0.5100 | 0.3417 | 0.1629 | `gate` |
 | + `TARGET_PADDING=3.0` — REJECTED | 0.5030 | 0.3494 | 0.1570 | `pad30ab` |
-| + `FILTER_MASK=1` — EAO up, but NOT SEPARABLE FROM A NULL | 0.4913 | 0.3608 | 0.1740 | `0831_mask` |
-| **+ 64x64 feature map (3-3-3, `H_SHIFT=15`) — CONFIRMED 2026-09-01** | **0.5336** | **0.3873** | **0.1849** | `0901_res64` |
-| ...+ `PSR_GATE_MIN=3.5` (rescaled to the new PSR) — REJECTED, EAO null | 0.5308 | 0.3936 | 0.1849 | `0901_gate35` |
-| **+ `MOSSE_SIGMA=4.0` at 128x128 (HOST-ONLY) — BEST ON RECORD 2026-09-01** | **0.5133** | **0.4095** | **0.1931** | `0901_sigma4` |
+| + `FILTER_MASK=1` — not separable from a null | 0.4913 | 0.3608 | 0.1740 | `0831_mask` |
+| + 64x64 map (3-3-3) | 0.5336 | 0.3873 | 0.1849 | `0901_res64` |
+| ...+ `PSR_GATE_MIN=3.5` — REJECTED, EAO null | 0.5308 | 0.3936 | 0.1849 | `0901_gate35` |
+| + `MOSSE_SIGMA=4.0` at 128x128 (HOST-ONLY) | 0.5133 | 0.4095 | 0.1931 | `0901_sigma4` |
+| **+ Layer-1 features (7x7/2, ReLU, 32ch, 64x64) — SHIPPING** | **0.5129** | **0.4279** | **0.1960** | `0902_l1relu` |
 
-`PSR_GATE_MIN=0` is a null (13-seq probe, `g0partial`). The padding arm gained R and LOST EAO —
-**EAO is the arbiter for an A/R trade**. Every arm after the first two is HOST-ONLY.
-**The gate's worth is NOT conditional on the PSR scale — REFUTED on hardware 2026-09-01**
-(`proposed_build_res64.md` sec.23): a threshold rescaled to the 64x64 PSR returned an EAO null,
-because 95.9% of vetoes fire after the run is already lost. The gate is a small, mostly post-hoc
-veto and its threshold is NOT worth re-tuning per geometry. **The offline gate estimate
-(+0.056 at 64x64) does not transfer (+0.0063).**
+`PSR_GATE_MIN=0` is a null (13-seq probe). The padding arm gained R and LOST EAO — **EAO is the
+arbiter for an A/R trade**. **The gate's worth is NOT conditional on the PSR scale** (refuted
+2026-09-01): 95.9% of vetoes fire after the run is already lost, so the threshold is not worth
+re-tuning per geometry.
 
-The full chain runs on hardware at 128x128 ch16 on the real conv path. Heap, not tracking, was
-the last blocker; `vot::StreamBlob` closed it, proven by identical run-state digests both ways.
+**The shipping arm did NOT meet its own pre-registered bar** (`dEAO >= +0.005`; measured
++0.0029) and is shipped on two other grounds, both recorded in
+[`evidence/proposed_build_l1relu.md`](docs/thesis/evidence/proposed_build_l1relu.md) sec.10-12:
+the paired per-sequence result is strong where the scalar is not (R **+0.0112 after drop-top-5,
+P(dR<=0)=0.011**, accuracy up too, no A/R trade), and at `CONV_RELU=0` the conv layer is a
+**LINEAR LIFT the online filter absorbs** — a one-hot bank with no network ties the pretrained
+one, so the previous config was a CNN-feature tracker whose CNN was provably redundant.
+**Never write this arm up as having passed the falsifier.** The linear twin `ARM=l1lin` has not
+run, so the gain belongs to the arm and not yet to the rectifier.
+
+### THE EAO WINDOW IS [115, 755], AND IT CAPS WHAT FEATURES CAN BUY
+
+`l1relu`'s +0.0184 pooled R became only +0.0029 EAO, and the reason generalises to every future
+arm (sec.10.3, reimplemented to within 0.0008 of the toolkit):
+
+| EAO sub-window | share | dEO |
+|---|---|---|
+| 115-300 | 29% | **+0.0092** |
+| 301-755 | **71%** | **+0.0005** |
+
+**Better FEATURES improve acquisition and mid-horizon survival and are then diluted threefold.**
+18 fewer runs die within 30 frames; nothing changes after ~300. What governs the other 71% is
+long-horizon BOX QUALITY — **but that is NOT the scale filter, and the whole scale direction is
+CLOSED** (2026-09-02, [`docs/engineering/scale_filter.md`](docs/engineering/scale_filter.md)).
+**A PERFECT scale filter is worth +0.0023 R on the shipping arm and −0.0089 on `sigma4`**
+(`scripts/scale_oracle_bound.py`: the board's own trajectories, tracker's centre, ground-truth
+size, VOT's rule re-applied). It lifts mean IoU by **+0.054** and converts almost none of that
+into survival, because a run at IoU <= 0.1 has lost the target's POSITION and resizing a box that
+is not on the target rescues nothing. The filter IS broken and it is well understood — frozen on
+~90% of frames, detector gain **−0.003** against the position detector's 0.93, root-caused to a
+self-confirming loop fed by a scale-NORMALISING feature — **it is simply not worth fixing.**
+The pre-loss mis-sizing (>25% on 60% of frames) is a MARKER of a run in trouble, not its cause:
+both errors are already large 40 frames out and POSITION accelerates faster into the loss.
+
+The full chain runs on hardware on the real conv path. Heap, not tracking, was the last blocker;
+`vot::StreamBlob` closed it, proven by identical run-state digests both ways.
 
 **Best hardware FPS: 26.29 ms/frame = 38.04 FPS** (`runs/run_0821_1725.log`, gray, synthetic,
-UART console). RGB is 28.58 ms. `car1` over ssh is **24.43 ms = 40.9 FPS** and is NOT comparable
-to either — the UART alone was 3.79 ms. **Quote FPS only from a serial-console run.**
-The frame is **84% CPU-BOUND**; perfect two-core use floors at ≈12-15 ms, 65-80 FPS.
-Optimisation history and the frame breakdown: [`docs/engineering/performance.md`](docs/engineering/performance.md).
+UART console). **Quote FPS only from a serial-console run** — over ssh the same work reads
+differently, and the UART alone was 3.79 ms. On the ssh instrument the shipping arm is **24.07 ms
+on `agility` against `sigma4`'s 24.55** — 32 channels and 147 taps for slightly less than the old
+16-channel 3x3 arm, after the 2026-09-02 conv2d rework (2.39x on the schedule; row bases hoisted
+out of the column loop, `kc` unrolled, the PLIO read stored straight from the word).
+Frame breakdown: [`docs/engineering/performance.md`](docs/engineering/performance.md).
 
-Where this sits against the 41 published VOT-STb2022 trackers, and the attributed loss
-mechanism: [`docs/engineering/baselines.md`](docs/engineering/baselines.md). The split is sharp
-— **A = 0.510 is inside the classical-DCF band (0.009 under CSRDCF); R = 0.342 is below every
-one of the 41.** The gate is the AFTERMATH of a loss, not its cause: 95.8% of vetoes land after
-the run is already at IoU ≤ 0.1, and in the 5 frames before a first loss the verdict is ACCEPT
-82.0% at median PSR 18.83. **It walks off the target confidently — do not spend a sweep
-relaxing the gate, and do not look for the fault in localisation.**
+Where this sits against the 41 published VOT-STb2022 trackers:
+[`docs/engineering/baselines.md`](docs/engineering/baselines.md). The split is sharp — **A is
+inside the classical-DCF band; R is below every one of the 41.** The gate is the AFTERMATH of a
+loss, not its cause: 95.8% of vetoes land after the run is already at IoU <= 0.1. **It walks off
+the target confidently — do not spend a sweep relaxing the gate, and do not look for the fault in
+localisation.**
 
 ## What to try next
 
 Ranked, with the evidence for each rank, in
 [`docs/engineering/roadmap.md`](docs/engineering/roadmap.md). Headlines:
 
-- **NEXT BUILD — Layer-1 features: 7x7 stride 2, 32ch, `CONV_RELU=1`, 64x64 map, sigma 2.**
-  Pre-registered in [`evidence/proposed_build_l1relu.md`](docs/thesis/evidence/proposed_build_l1relu.md).
-  The only screened cell that beats its control AND is not slower than today (~20-22 ms).
-  **Offline +0.0383 R is BORDERLINE — P(dR<=0)=0.041 where the two arms that transferred were
-  0.000 — so it must not be sold as a robustness win.** The reason to build it is that
-  `CONV_RELU=0` makes the CNN *provably redundant* (a one-hot bank ties the pretrained one), and
-  this project's requirement is conv features. NOT host-only: rebuild, reflash, re-calibrate.
-- **ROBUSTNESS.** (1) `MOSSE_SIGMA` interior at 128x128 — sigma 3 and 5 are host-only sweeps and
-  the optimum is bracketed but not located. (2) A two-filter temporal ensemble — untested.
-  (3) The spatial mask — EAO up, still not separable from a null. (4) Re-screen channel
-  reliability on the sigma-4 operating point ONCE, and nothing more.
-- **PERFORMANCE.** `scale extract` is now the head of the tail (16.6% of the frame, and it did
-  not move when everything else fell 4x), then the 1080p frame-source path at 8.9%. Structural
-  wins: software-pipeline the CHANNEL loop, more of the second core, NEON in `unpack_spectrum`,
-  fewer/larger DMA transactions.
+- **DONE, REJECTED — `MOSSE_ETA=0.1`.** EAO 0.1960 → 0.1817 (sec.13). The named assumption is
+  what broke: the grid ran at 128x128/sigma 4, the arm at 64x64/sigma 2, and `sigma/target`
+  governs SIGMA only. **The methodological result outlives the arm — see below.**
+- **THE MECHANISM CHECK STILL OWED — `ARM=l1lin`.** Same bank, same geometry, `CONV_RELU=0`.
+  Rebuild + reflash, NOT host-only. If the twin also lands near 0.196 the gain is the BANK, not
+  the rectifier, and N-16's "confirmed" weakens to "the bank helps".
+- **ROBUSTNESS, and the target has moved.** 71% of the EAO window is long-horizon box quality
+  (see above), so: **nothing — the direction is CLOSED by the oracle bound above.** What is left is POSITION
+  drift, which is what actually ends runs: (1) a **training-sample memory** (SRDCF/CSRDCF keep
+  weighted sample SETS; this keeps one running average, which is exactly the "walks off target
+  confidently" mechanism); (2) the **two-filter temporal ensemble** — TCLCFcpp, the embedded peer
+  at R 0.598, is built on it, and `eta 0.05`/`eta 0.125` already win on different sequences.
+  Host-only, untested. (3) The spatial mask ON TOP of this arm — its mechanism targets drift and it
+  has only ever been measured on the old shipping arm. (4) A two-filter temporal ensemble,
+  untested. **`MOSSE_SIGMA`'s interior is CLOSED** (22-cell grid; 3, 5, 6, 8 all worse).
+- **FEATURES — mostly closed, and the ceiling is now known.** The bank's weights are a linear
+  lift (random ties pretrained, one-hot ties the network), pooling is a null, channel count is
+  not trim-separable between 16 and 32, and Danilowicz & Kryjak measure 8ch ~ 32ch ~ 64ch. What
+  is left is geometry, and the EAO-window result caps any feature arm at ~1/3 of its R gain. The
+  one untested affordable cell is a **16-channel Layer-1 bank at a 128x128 map** (host cost =
+  `sigma4`'s), which is the only route that puts better features at the finer geometry.
+- **PERFORMANCE.** conv2d's read loop is now 82% of that kernel and its scheduled floor is
+  84 cycles per 4 pixels; each (plane, phase) receives `4/S` CONTIGUOUS bytes, so 12 byte stores
+  could be 6 halfword ones — priced, not taken. Host side: `scale extract` is invariant to the
+  map and is the head of the tail; the rest scales as `N_CHANNELS x map_pixels`.
   **Retired, do not reopen**: `FFT_COL_WS` 8->32, `CMUL_ACCUM_MEMTILE` alone, Hermitian symmetry
   in the host filter, the accumulator as a `shared_buffer`, parallel-for inside
-  `filter_update_quantize` as attempted.
+  `filter_update_quantize` as attempted, a `px[4][NC]` staging array or an `srow[NC][S]` pointer
+  array in conv2d's read loop (both measured WORSE than the rolled original).
 
 **`MOSSE_SIGMA` is in BINS and the target spans `patch/padding` bins — what matters is
 sigma/target, and 1/16 (DSST's `target/16`) is the measured optimum.** That one fact re-attributed
 the 64x64 arm: it sat at 1/16 by accident, so it and `sigma4` are a MATCHED PAIR on width, and at
-matched width the FINER map wins. res64's gain was the sigma it carried, not its resolution; it is
-now the SPEED option (2.37x faster for -0.0082 EAO).
+matched width the FINER map wins. **Any geometry change silently moves this knob.**
+
+**THE OFFLINE PROXY BOUNDS SAMPLING NOISE, NOT TRANSFER.** `vot_ar_offline.py` has now
+transferred on sigma (84%) and `dec2` (43%), UNDER-called Layer-1 features, over-called the mask
+3x and `pad30` ~11x, and on 2026-09-02 **INVERTED on `MOSSE_ETA`** — its only trim-stable,
+bootstrap-significant cell of a 22-cell grid (dR +0.0481, P(dR<=0)=0.021) returned −0.0030 on
+hardware. **A trim and a bootstrap say a result is not carried by three sequences; they say
+NOTHING about whether the bench models the tracker.** Treat `P(dR<=0)` as necessary, never
+sufficient, and write down the transfer assumption before any arm screened at a geometry the
+board does not run.
 
 **Recovery AFTER a loss is worth NOTHING to R or EAO** — VOT terminates 10 frames after failure
 and re-enters at the next anchor. That retires re-detection and search-window expansion outright,
@@ -389,13 +454,19 @@ the 2025.2 rootfs (`make rootfs`). XRT AXIS ports consume a positional argument 
 by explicit index. hw_emu wall time is meaningless but its simulated PL cycles are RTL-accurate.
 
 **Settled — do not reopen** ([`docs/engineering/settled.md`](docs/engineering/settled.md)):
-`eps_rel = 1e-3`; ReLU off (paired with the `bias_acc` fix); padding 2.0, closed three ways;
+`eps_rel = 1e-3`; padding 2.0, closed three ways;
 fDSST's PCA (the real-input DFT was the win, and is done);
 Hermitian halving of the host filter (premise false in fixed point); **quantization is NOT the
 cause of the poor robustness — removing it makes tracking WORSE**, so the fixed-point design
 costs nothing in accuracy or robustness and the frame rate is bought at no algorithmic price;
-init perturbations (the 16-channel denominator is already the cure); pooling and max-pooling
-(a null on both banks); channel pruning. Also validated there: `roi_crop` cycle counts and
+init perturbations (the 16-channel denominator is already the cure); **aggregation over this map
+— box average, max and decimate, on the linear AND the rectified bank** (a null at best, and a
+LOSS of −0.0242 on the shipping bank; its old "linearity" explanation is WITHDRAWN — the linear
+negative control lost too); channel pruning; **the sigma interior** (22-cell grid) and
+**`SCALE_ETA`** (inert 0.025-0.3 — the scale filter is FROZEN on ~90% of frames, so the freeze is
+a DETECTION failure and no learning rate reaches it), both 2026-09-02.
+*ReLU left this list on 2026-09-02* — refuted on a 3x3 mobilenet bank, ships on a learned
+Layer-1 one; the flag is bank-specific, not settled. Also validated there: `roi_crop` cycle counts and
 bit-exactness, the bounding-box/padding unit tests, `nature` and `tiger` being deformation not
 tracker defects, sub-bin interpolation, the hold budget, mean-IoU-vs-AR disagreement, PSR gating,
 `scale_gate()`, the DSST degeneracy, the per-frame FNV-1a run digest, and the Phase 4 transport
@@ -403,8 +474,9 @@ result.
 
 ## RGB features — SHIPPING
 
-`CONV_IN_CH=3` is the default; 4-4-4 carries both arms. Build with `make weights CONV_IN_CH=3`
-then `ARM=rgb scripts/calib_build.sh`. Datapath, testing and cost:
+`CONV_IN_CH=3` is the default and carries into the Layer-1 arm. To rebuild the 3x3 RGB arm:
+`make weights WEIGHT_BANK=mobilenet CONV_KSIZE=3 CONV_STRIDE=1 N_CHANNELS=16` then
+`ARM=rgb PATCH_ROWS=128 PATCH_COLS=128 N_CHANNELS=16 scripts/calib_build.sh`. Datapath, testing and cost:
 [`docs/engineering/rgb.md`](docs/engineering/rgb.md).
 
 - **It is a ROBUSTNESS win, never an accuracy one.** Hardware, 419 runs/arm: R 0.2743 → 0.3065,
@@ -425,15 +497,21 @@ then `ARM=rgb scripts/calib_build.sh`. Datapath, testing and cost:
 
 ## Weight export
 
-`make weights` → extracts torchvision mobilenet_v3_small conv1, folds BatchNorm, then either
-collapses RGB→gray by luminance (`CONV_IN_CH=1`) or keeps all 27 taps (`CONV_IN_CH=3`, default);
-symmetric per-channel INT8 quantization over ALL taps of a channel, never per plane.
-`BIAS_SCALE` picks the activation scale `bias_acc` is derived against (`roi` since 2026-08-23).
-Outputs `design/aie_src/weights/layer0_weights.bin` (16 × 64 B), `weights/layer0.h`,
-`design/aie_src/hanning_128.h`. **Byte 63 of each channel buffer is the layout tag**; the live
+`make weights` → loads the donor bank picked by `WEIGHT_BANK` and folds BatchNorm:
+**`l1resnet` (default) = resnet18 conv1 7x7/2, 64 filters PCA'd to `N_CHANNELS`**
+(`scripts/l1_banks.py`, the same function the offline screen scored); `mobilenet` =
+mobilenet_v3_small conv1 3x3, either collapsed RGB→gray by luminance (`CONV_IN_CH=1`) or all 27
+taps. Then symmetric per-channel INT8 quantization over ALL taps of a channel, never per plane.
+`BIAS_SCALE` picks the activation scale `bias_acc` is derived against (`roi` since 2026-08-23);
+`ACC_BOUND` (derived from the bank) picks which exact worst-case bound sizes `out_shift`.
+Outputs `design/aie_src/weights/layer0_weights.bin` (32 × 192 B on the shipping bank, 16 × 64 B
+on a 3x3 one), `weights/layer0.h`, `design/aie_src/hanning_<PATCH_COLS>.h`.
+**The LAST TWO bytes of each channel buffer are the layout tags** (`CONV_IN_CH`, `CONV_KSIZE`);
+the live
 guard is the host's runtime tag check (the `#error` in `layer0.h` is inert — nothing includes
-it). The weights are a RUNTIME data file: switching arms is `make weights CONV_IN_CH=<n>` plus a
-1 KB file copy onto the card — no re-synthesis, no re-flash.
+it). The weights are a RUNTIME data file: switching BANKS within one geometry is `make weights`
+plus a small file copy onto the card — no re-synthesis, no re-flash. Changing the KERNEL or the
+geometry is not: those reach `AIE_FLAGS`.
 
 `scripts/check_collapse.py` is the front-end diagnostic — four checks, no hardware, seconds,
 where the alternative for each is an aiesim or hw_emu run. **Re-run it after any change to
@@ -445,11 +523,14 @@ Q2-Q4 without torch.
 ## Build commands
 
 ```bash
-# DEFAULTS ARE THE SHIPPING ARM since 2026-08-28 (CONV_IN_CH=3 H_SHIFT=15
-# MOSSE_ETA=0.05 PSR_GATE_MIN=5.0). Pass CONV_IN_CH=1 for the grayscale arm --
-# the gray aiesim scenarios and the 17 gray roi_crop cases need it explicitly.
-make weights                       # export layer-1 INT8 weights + hanning table (RGB, 27 taps)
-make weights CONV_IN_CH=1          # ...as the 9-tap BT.601 luminance collapse instead
+# DEFAULTS ARE THE SHIPPING ARM since 2026-09-02: 64x64 map / ch32 / 7x7 stride 2 /
+# CONV_RELU=1 / l1resnet / 3-3-3 / H_SHIFT=15. The older 3x3 arms need their
+# geometry AND bank back explicitly -- see the reproduction lines below.
+make weights                       # 147-tap resnet18 conv1 PCA'd to N_CHANNELS (the shipping bank)
+make weights WEIGHT_BANK=mobilenet CONV_KSIZE=3 CONV_STRIDE=1 N_CHANNELS=16 \
+     PATCH_ROWS=128 PATCH_COLS=128            # ...the pre-09-02 RGB 3x3 bank
+make weights WEIGHT_BANK=mobilenet CONV_KSIZE=3 CONV_STRIDE=1 N_CHANNELS=16 \
+     PATCH_ROWS=128 PATCH_COLS=128 CONV_IN_CH=1   # ...the 9-tap BT.601 luminance collapse
 make gen_vectors                   # generate aiesim test vectors
 make graph                         # AIE graph only — answers placement questions in 5 min
                                    #   instead of a 25-min package
@@ -478,8 +559,10 @@ make x86sim_check KUT=cmul   SCENARIO=s7                 # ...same for cmul_accu
 make x86sim_check KUT=cmul   SCENARIO=cmul_stress        # ...exercising sat16's rails
 #   cmul needs CMUL_SPLIT_ACCUM=0 here — kernel_only_graph leaves cmul.in[2]
 #   unconnected otherwise and the x86sim graph refuses to compile.
-make x86sim_check KUT=conv2d SCENARIO=s6rgb              # RGB conv2d, 27 taps, bit-exact
-                                   #   needs `make weights` and `make gen_vectors` first
+make x86sim_check KUT=conv2d SCENARIO=s6rgb CONV_KSIZE=3 CONV_STRIDE=1 N_CHANNELS=16 \
+     PATCH_ROWS=128 PATCH_COLS=128 CONV_RELU=0            # RGB 3x3, 27 taps, bit-exact
+make x86sim_check KUT=conv2d SCENARIO=s6l1               # the SHIPPING 147-tap 7x7/2 path
+                                   #   each needs its own `make weights` + `make gen_vectors`
 make aiesim CMUL_SPLIT_ACCUM=0     # AIE simulator — bypasses PatchIn→conv2d→row-FFT
 make aiesim_plio                   # same, but forces the REAL PatchIn path
 make aiesim_plio CONV2D_MODE=2     # bisect: conv2d synthesizes output, never reads the stream
@@ -531,19 +614,20 @@ design/
 │   ├── fft_graph.h / ifft_graph.h    # FFT2D / IFFT2D graphs (memory-tile transpose)
 │   ├── conv_weight_layout.h          # THE weight-buffer layout, derived from CONV_IN_CH.
 │   │                                 #   Included by the kernel AND the host (no <adf.h>)
-│   ├── conv2d_kernel.h/.cpp          # 3×3 MAC + optional ReLU + Hanning window + Stage B1
+│   ├── conv2d_kernel.h/.cpp          # KxK/stride-S MAC + ReLU + Hanning window + Stage B1.
+│   │                                 #   3 branches: 3x3 gray, 3x3 RGB, generic (SHIPPING)
 │   ├── cmul_accum_kernel.h/.cpp      # col-FFT ⊙ H_ch* + saturating accumulate
 │   ├── mosse_graph.h/.cpp            # top level: PLIO + GMIO + 2 kernels + FFT2D + IFFT2D
 │   ├── kernel_only_graph.h/.cpp      # x86sim single-kernel harness
 │   ├── aiesim_scenario_io.h          # shared scenario loader (keeps the two harnesses in sync)
 │   ├── constraints.aiecst            # PatchIn PLIO shim placement
-│   ├── hanning_128.h, weights/       # auto-generated
+│   ├── hanning_<N>.h, weights/       # auto-generated (64 and 128 both live)
 │   └── aiesim_data/s*/               # s0-s4 raw patches (echo mode only); s6 Stage-A
 │                                     #   preprocessed, H=unity, real conv path; s7 = s6 + a
 │                                     #   real per-bin complex H, off-centre target (the only
 │                                     #   one exercising H_SHIFT, PSR, the F_ch tap); s6rgb
-│                                     #   3-plane Stage A -> the 27-tap path; cmul_stress
-│                                     #   exercises sat16's rails
+│                                     #   3-plane Stage A -> the 27-tap path; s6l1 the
+│                                     #   147-tap 7x7/2 SHIPPING path; cmul_stress the rails
 ├── pl_src/{camera_capture,roi_crop}/
 ├── host_app_src/
 │   ├── mosse_tracker.cpp             # GMIO-driven XRT tracking loop; CropIp (user-managed
@@ -578,10 +662,9 @@ scripts/
   calib_build.sh         # hardware build for a budget or bring-up run: pre-flight, then
                          #   verifies the FLAGSTAMPS against the intended config. Budget
                          #   defaults DERIVED from the Makefile (print-%), never copied.
-                         #   CANNOT build either FILTER_MASK arm (ARM=gray|rgb only).
-                         #   TAKES THE GEOMETRY since 2026-08-31 (PATCH_ROWS/PATCH_COLS/
-                         #   N_CHANNELS -> VARS, BUILD_DIR and the stamp checks) -- before that
-                         #   it built 64x64 and verified the 128x128 stamps next to it
+                         #   ARM=gray|rgb|l1relu|l1lin; CANNOT build a FILTER_MASK arm.
+                         #   Takes the GEOMETRY, and cross-checks the weights file's out_shift
+                         #   against ACC_BOUND -- which no flagstamp can see
   board_provision.sh     # static end0 address + root's authorized_keys into the rootfs (or an
                          #   sd_card.img partition) with debugfs -- no root, no loop device.
                          #   sshd is already enabled in the stock image

@@ -1,0 +1,9 @@
+2026-09-02T14:04:15+02:00
+arm=l1relu CONV_IN_CH=3 BIAS_SCALE=roi
+conv=7x7 stride=2 CONV_RELU=1 bank=l1resnet acc_bound=l1
+geometry=crop 128x128 -> map 64x64 channels=32
+budget=3-3-3 total=12 H_SHIFT=15
+ITER_CNT=200 VERBOSITY=1 DUMP_BUFFERS=0
+mode=budget SCENE_VERIFY=0 FRAME_RGB_MODE=1
+weights_md5=d8a7d6ff009841cc12481c858e5f1f42
+comparator=NONE — 64x64 has no comparator run; the stored 128x128 one does NOT apply (different transform gain on all four passes). This build establishes its own budget.

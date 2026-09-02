@@ -1,8 +1,46 @@
 # Roadmap
 
+## 2026-09-02 — the Layer-1 arm SHIPS, and the EAO window is now the constraint
+
+`rgb_l1relu` (7x7 stride 2, resnet18-PCA bank, ReLU on, 32ch, 64x64 map) is the best arm on
+record at **EAO 0.1960** and is the default. It did **not** meet its pre-registered `dEAO >=
++0.005` bar (+0.0029); the grounds for shipping it anyway are in
+`../thesis/evidence/proposed_build_l1relu.md` sec.12 and must never be written up as a pass.
+
+| screened 2026-09-02 | verdict | note |
+|---|---|---|
+| Layer-1 7x7/2 + ReLU on hardware | **SHIPS**, best EAO; falsifier NOT met | `proposed_build_l1relu.md` sec.10-12 |
+| `out_shift` bound (`ACC_BOUND=l1`) | FIXED — `F_ch` 0.13% -> ~1% of int16 | sec.7-8 |
+| conv2d generic-branch rework | 2.39x scheduled; frame 61.5 -> 24.1 ms | sec.8, COST block |
+| `MOSSE_SIGMA` interior (22-cell grid) | **CLOSED** — 3, 5, 6, 8 all worse than 4 | `runs/vot/0902_offline-sigmaeta/` |
+| `MOSSE_ETA` interior at sigma/target 1/16 | eta 0.1 the only trim-stable cell of 22 | board A/B in flight |
+| `ARM=l1lin` linear twin | **OWED** — rebuild+reflash, decides N-16's attribution | — |
+| `MOSSE_ETA=0.1` on the shipping arm | **REJECTED on hardware, EAO 0.1960 -> 0.1817**; the offline grid INVERTED | `proposed_build_l1relu.md` sec.13 |
+| aggregation on the RECTIFIED bank (2x2, blur x relu/lin) | **REFUTED, a LOSS −0.0242**; the linearity explanation WITHDRAWN | `pooled_features.md` |
+| scale error before a loss | **CAUSAL**: >25% mis-sized on 60% of pre-loss frames vs 20-31% on survivors | `scale_filter.md` |
+| scale detector, root cause | **LOCKED, not blind**: P(idx==0) 88.4% vs 3.0% for noise, conf FLAT, gain α −0.003 vs the position detector's 0.93; the sim's SAME estimator reaches 0.93 at speed, so the loop is SELF-CONFIRMING | `scale_filter.md` |
+| **the whole SCALE direction** | **CLOSED. An ORACLE scale filter is worth +0.0023 R (and −0.0089 on `sigma4`)**; it lifts mean IoU +0.054 and converts none of it into survival. The filter is broken, understood, and NOT WORTH FIXING | `scale_filter.md`, `scripts/scale_oracle_bound.py` |
+
+**THE RESULT THAT REFRAMES THE WHOLE LIST.** The toolkit's EAO window is [115, 755]. `l1relu`'s
++0.0184 pooled R became +0.0029 EAO because **the gain lives entirely below N ~ 300**: +0.0092
+over the 29% of the window that is 115-300, and **+0.0005 over the 71% that is 301-755**. Better
+FEATURES improve acquisition and mid-horizon survival and are then diluted threefold. What owns
+the other 71% is long-horizon BOX QUALITY, and 2026-09-02 measured what that is: **the scale
+estimate is FROZEN on ~90% of all frames** across 838 real runs, `scale_idx` is already 0 on 84%,
+and a third of every non-zero decision is vetoed. A "diffusing scale" reading of the growing IQR
+was tested and REFUTED (var 1.95x over a 20x span; a random walk predicts 20x) -- the spread is
+survivorship plus many runs parked at their own offsets. **`SCALE_ETA` is inert over 0.025-0.3
+and is CLOSED**; the freeze is a DETECTION failure. Untried: `SCALE_MAX_STEP=3`,
+`SCALE_N`/`SCALE_STEP` (`max|idx|` hits the filter boundary), `SCALE_CONF_MIN`. Screen with
+`make scale_sim`: `rgb_vs_gray_loop.py` has no DSST filter, the blind spot that sank `pad30`.
+`scale_filter.md`.
+
+---
+
 ## 2026-09-01 — the day's screens, and what each closed
 
-`MOSSE_SIGMA=4.0` at 128x128 is the best arm on record (A 0.5133 / R 0.4095 / **EAO 0.1931**,
+`MOSSE_SIGMA=4.0` at 128x128 was the best arm on record that day (A 0.5133 / R 0.4095 / EAO 0.1931,
+*superseded 2026-09-02 by `rgb_l1relu`, EAO 0.1960*;
 host-only). Everything else screened that day was a null or borderline. Full detail in the
 evidence notes; this is the index.
 
@@ -16,10 +54,8 @@ evidence notes; this is the index.
 | Stage B3 channel reliability | REJECTED — mechanism holds, gain does not | `channel_reliability.md` |
 | Layer-1 banks x {16,32}ch x {7x7/2, 3x3+pool, 5x5/1} | mechanism CONFIRMED 4x, arms BORDERLINE | `layer1_features.md` |
 
-**The next build is pre-registered**: 7x7 stride 2, 32ch, `CONV_RELU=1`, 64x64 map, sigma 2 —
-[`../thesis/evidence/proposed_build_l1relu.md`](../thesis/evidence/proposed_build_l1relu.md).
-It is borderline on tracking (P(dR<=0)=0.041) and the reason to build it is that `CONV_RELU=0`
-makes the CNN provably redundant, which this project's conv-feature requirement cannot carry.
+*(That build ran on 2026-09-02 and now ships — see the section above. Its offline
+P(dR<=0)=0.041 understated it: on hardware the paired R survives drop-top-5 at P=0.011.)*
 
 **Three things that changed how to read the older entries below:**
 

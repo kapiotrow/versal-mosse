@@ -209,16 +209,23 @@ Moved out of CLAUDE.md 2026-08-31; content unchanged.
   integer pipeline: ratio 12.90 / 13.96 / **16.15** / 10.62 / 4.01 at ε = 1e-5…1e-1. Bolme
   Fig. 4's flat curve does not transfer — his ε is absolute on the denominator, ours is relative
   to `mean(B)`.
-- **ReLU off beats ReLU on — CONFIRMED ON AR 2026-09-01, 62 sequences** (`feature_bank.md`):
-  pooled dR relu **−0.0332**, full-wave abs **−0.0232**, sign-paired CReLU **+0.0020** (a tie),
-  all collapsing under a symmetric trim. The sign-paired repair buys back exactly the span it
-  costs and no more. The entry below is the ORIGINAL one-patch evidence; the verdict is
-  unchanged and now rests on the metric of record.
+- **ReLU — NO LONGER SETTLED. THE SCOPE IS THE BANK, and it left this file on 2026-09-02.**
+  On the 3x3 mobilenet bank the refutation below stands and is confirmed on AR (62 sequences,
+  `feature_bank.md`): pooled dR relu **−0.0332**, full-wave abs **−0.0232**, sign-paired CReLU
+  **+0.0020** (a tie), all collapsing under a symmetric trim. **But on a LEARNED Layer-1 bank the
+  rectifier beats its own linear twin four times offline, and on an ANALYTIC Gabor bank it
+  LOSES** — so the property that matters is that the bank is learned, not that a nonlinearity is
+  present (`layer1_features.md`). `CONV_RELU=1` SHIPS since 2026-09-02 on a 7x7/2 resnet18-PCA
+  bank (EAO 0.1960). The mechanism reading below — "a DCF is linear in feature space, so the
+  filter cannot undo a rectifier" — explains why it fails on a 3x3 signed edge map and is
+  incomplete for a large-kernel learned one. **`ARM=l1lin` has NOT run on hardware**, so the
+  arm's gain is not yet attributed to the rectifier itself.
 - **ReLU off beats ReLU on, by ~3×, and the `bias_acc` fix must be paired with it.** Held-out
   peak/max-sidelobe: base(ReLU) 12.82, bias-corrected(ReLU) 3.92, bias-corrected(no ReLU) 16.25.
   `base` only looks decent because its oversized `bias_acc` makes ReLU a no-op on 11 of 16
   channels. **The shipping pair is now the best of the three** (`CONV_RELU=0`,
-  `BIAS_SCALE=roi`, applied 2026-08-23); the middle column is what "apply the fix alone" means
+  `BIAS_SCALE=roi`, applied 2026-08-23 — superseded as the SHIPPING pair on 2026-09-02, see
+  above); the middle column is what "apply the fix alone" means
   and is why the correction sat unapplied for months. A DCF is linear in feature space; a half-wave rectifier throws away half the signal
   and the filter cannot undo it. Caveat: one patch (s6), held out by circular shift, and it
   diverges from Danelljan §3.3.
@@ -320,7 +327,18 @@ Moved out of CLAUDE.md 2026-08-31; content unchanged.
 - **FEATURE GEOMETRY — POOLING, RESOLUTION AND PADDING ALL TESTED, ALL REJECTED (2026-08-28).**
   Offline (8 seq, then all 62, `rgb_vs_gray_loop.py` arms `-pool<N>/-dec<N>/-blur<N>`), then
   hardware. `docs/thesis/evidence/pooled_features.md`.
-  * **Aggregation is a NULL on both banks, and MAX POOLING IS THE SAME NULL (2026-08-31).**
+  * **Aggregation is REFUTED on every bank and every operator tried — and RE-CONFIRMED on the
+    RECTIFIED Layer-1 bank 2026-09-02, where it is a LOSS, not a null** (`l1relublur` vs
+    `l1relu`: dR **−0.0242**, trim-5 −0.0269, P(dR<=0)=0.995, worse on 7 sequences and better on
+    3). **The LINEARITY EXPLANATION this entry used to carry is WITHDRAWN.** It said a box
+    average of a linear map is another linear map with the same span and so "CANNOT do anything";
+    that predicts a NULL for the linear arm, and the 2026-09-02 negative control measures
+    **−0.0180** on exactly that arm. The argument is arithmetically true and trackingwise
+    irrelevant — the same fate as the signed-lobe hypothesis it replaced. What is left is a
+    RESOLUTION reading: the map is already 64x64 from a 128x128 crop, aggregation and decimation
+    agree to 0.001, and at matched `sigma/target` hardware prefers the FINER map.
+    `docs/thesis/evidence/pooled_features.md`.
+    *(Original 2026-08-31 entry, verdict unchanged:)*
     `blur2` (2x2 box average at STRIDE 1) is −0.0010 gray / −0.0012 RGB, and `pool2 <= dec2`
     everywhere. Prompted by Danilowicz & Kryjak 2022, whose stem is VGG11 conv1 **with ReLU and
     2x2 MAXPOOL**, `-mpool`/`-relumpool` were added: `dec2` R 0.3981, `mpool2` 0.3971, `pool2`
@@ -355,10 +373,34 @@ Moved out of CLAUDE.md 2026-08-31; content unchanged.
     LOOSER (holds 15.51% → 10.94%). **Instrument bug:** `vot_detector_gain.py` hardcodes
     `box*2/128`, so on pad30 it reports alpha 0.442 where the corrected value is ~0.66.
   Still NOT refuted: a REPLACEMENT bank. That is a weights export plus the same offline loop.
-- **Channel pruning is moot** with ReLU off, and doubly so at `BIAS_SCALE=roi`, which retires
+- **Channel pruning is moot** (written when ReLU was off; the span argument is unchanged by the
+  rectifier since it is about the LIFT, not the nonlinearity), and doubly so at `BIAS_SCALE=roi`, which retires
   the last two structurally dead channels (ch3, ch15) outright. The real
   redundancy is the collapse: it caps the bank at **rank 9** (participation ratio 4.94) and
   leaves ch0/ch9/ch14 collinear up to sign, and collinear channels add exactly coherently. The
   fix is RGB. `check_collapse.py` Q2 used to print "14 independent filters" here — that was a
   count of near-parallel GROUPS, not a rank, and it understated the problem for months.
 
+
+---
+
+## Closed 2026-09-02
+
+- **`MOSSE_SIGMA`'s interior — CLOSED.** A 22-cell sigma x eta grid over 62 sequences
+  (`runs/vot/0902_offline-sigmaeta/`, positive control reproduces `rgb-s4` digit for digit) puts
+  sigma **3, 5, 6 and 8 all below 4** at `sigma/target = 1/16`, with sigma 8 the worst cell in
+  the search (paired trim-3 **−0.0914**). The optimum is located, on the geometry that ships, and
+  the turnover is now measured on THIS map rather than inferred from the 64x64 one.
+  **The knob is `sigma/target`, not sigma** — 2.0 at 64x64 and 4.0 at 128x128 are the same point.
+- **`SCALE_ETA` — CLOSED, and for a mechanical reason.** Inert from 0.025 to 0.3 in
+  `scale_loop_sim` (a 43-frame terminal freeze at 0.3 is the same 41-frame freeze as at 0.025;
+  0.5 falls apart at 41.5% error). It cannot be otherwise: on 838 real board runs `scale_idx` is
+  already **0 on 84% of frames** and `est_h` is EXACTLY unchanged on **~90%**, so no learning
+  rate can move a filter that is not asking to move. **The freeze is a DETECTION failure.**
+  `scale_filter.md`.
+- **"The scale estimate diffuses" — REFUTED the day it was proposed.** var(log est_h/truth_h)
+  grows **1.95x** from t=25 to t=500 where a random walk predicts **20x**; the saturating fit
+  beats the linear one. The growing IQR is SURVIVORSHIP (runs whose scale goes wrong fail and
+  leave the population) plus many runs each parked at their own offset. **Recorded because the
+  wrong reading was written into three files before it was tested** — a spread statistic on a
+  shrinking population is not a process measurement.

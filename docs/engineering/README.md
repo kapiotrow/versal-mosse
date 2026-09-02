@@ -8,7 +8,8 @@ measurement and cost are in one of these files.
 | file | what it holds |
 |---|---|
 | [`build_params.md`](build_params.md) | the unabridged build-parameter table, one paragraph per knob |
-| [`shift_budget.md`](shift_budget.md) | the 4-4-4 / `H_SHIFT` budget: how it was closed, the four rules it cost, the real-video arm |
+| [`shift_budget.md`](shift_budget.md) | the shift budget (3-3-3 at 64x64 SHIPPING, 4-4-4 at 128x128) and `H_SHIFT`: how each was closed, the four rules they cost, the real-video arm |
+| [`scale_filter.md`](scale_filter.md) | the DSST scale filter. **It is FROZEN on ~90% of real frames** and that governs 71% of the EAO window |
 | [`performance.md`](performance.md) | resource use, per-frame AIE compute, the optimisation history, the frame breakdown, hw_emu wall times, the abandoned parallel-for |
 | [`roadmap.md`](roadmap.md) | what to try next for robustness and for frame time, ranked, with the evidence behind each rank |
 | [`scale_filter.md`](scale_filter.md) | the DSST scale filter: root cause, `SCALE_STEP=1.04`, where it stops |

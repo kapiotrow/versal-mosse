@@ -163,11 +163,28 @@ void draw_target(std::vector<uint8_t> &f, const std::vector<uint8_t> &bg,
 // Truth size envelope. `moving` is the hardware config; `static` holds it fixed
 // (the discriminator); `step` applies one jump and then holds (measures pure
 // convergence, which is the property run_scale_tests() asserts).
+// `ramp` is the ARM ADDED 2026-09-02, and it exists because `moving` cannot
+// answer the question the board raised. `moving`'s envelope changes ~0.94%/frame
+// -- BELOW half a scale level (1.96% at step 1.04) -- so a zero proposal there is
+// correct behaviour and says nothing about whether the detector can see anything.
+// VOT ground truth moves at a median of 2.41%/frame and a p75 of 5.97%, so
+// `ramp` sweeps a CONSTANT geometric rate set by --rate, well above the deadband,
+// and the statistic to read is the GAIN (below), not the freeze.
+// A CONSTANT geometric ramp is degenerate: 200 frames at 2.4%/frame is 115x and
+// the target leaves the frame (measured, max|err| -> 100%). So the rate is raised
+// by SHORTENING THE PERIOD of the existing bounded sinusoid instead, which moves
+// only the rate and keeps the amplitude at the hardware arm's +-30%. Peak rate is
+// TRAJ_AMP * 2*pi / period: 200 -> 0.94%/frame (the hardware config), 78 -> 2.41%
+// (VOT's median), 32 -> 5.97% (VOT's p75).
+double g_rate   = 0.0;      // arm `ramp` only, kept for the degenerate control
+double g_period = TRAJ_PERIOD;
+
 double truth_size(const std::string &arm, int frame)
 {
     if (arm == "static") return BOX0;
     if (arm == "step")   return frame < 5 ? BOX0 : BOX0 * g_step_ratio;
-    return BOX0 * (1.0 + TRAJ_AMP * std::sin(2.0 * M_PI * frame / TRAJ_PERIOD));
+    if (arm == "ramp")   return BOX0 * std::pow(1.0 + g_rate, (double)frame);
+    return BOX0 * (1.0 + TRAJ_AMP * std::sin(2.0 * M_PI * frame / g_period));
 }
 
 struct Result {
@@ -180,6 +197,15 @@ struct Result {
     double end_rel_err = 0.0;
     double conf_min = 1e9, conf_max = -1e9;
     int    n_held = 0;
+    // DETECTOR GAIN, the scale analogue of vot_detector_gain.py's alpha: the
+    // slope of PROPOSED index on the index the frame actually warranted,
+    // log(truth/est)/log(step). The position detector scores 0.93 against VOT's
+    // own annotations; the board's SCALE detector scores -0.003 on 140k accepted
+    // frames across two banks. This is what localises that: if the sim scores ~1
+    // on a clean envelope the estimator works and the board's zero is a property
+    // of real ROI content; if the sim scores ~0 too it is reproducible offline.
+    double gain = 0.0, gain_r2 = 0.0;
+    int    gain_n = 0;
 };
 
 Result run(const std::string &arm, int frames, float eta, int n_scales,
@@ -198,6 +224,8 @@ Result run(const std::string &arm, int frames, float eta, int n_scales,
     double box = BOX0;
     Result res;
     std::vector<double> hist;
+    // Paired (ideal, proposed) index samples for the detector-gain regression.
+    std::vector<double> gi, gp;
 
     if (verbose)
         printf("  %5s %8s %8s %7s %6s %6s  %s\n",
@@ -231,7 +259,16 @@ Result run(const std::string &arm, int frames, float eta, int n_scales,
                                       g_max_step);
                 if (g_no_gate && sr.valid) { d.accept = true; d.new_h = box * sr.factor;
                                              d.new_w = box * sr.factor; }
-                if (it == 0) { idx = sr.idx; conf = d.conf; veto = mosse::scale_veto_tag(d.reason);
+                if (it == 0) {
+                    // The correction this frame WARRANTED, in levels, measured
+                    // BEFORE the box is touched -- exactly the quantity the board
+                    // analysis regresses on. Warm-up frames are excluded because
+                    // the model is still converging and would bias the slope.
+                    if (f >= 10 && box > 0.0 && th > 0.0) {
+                        gi.push_back(std::log(th / box) / std::log((double)step));
+                        gp.push_back((double)sr.idx);
+                    }
+                    idx = sr.idx; conf = d.conf; veto = mosse::scale_veto_tag(d.reason);
                                if (d.conf < res.conf_min) res.conf_min = d.conf;
                                if (d.conf > res.conf_max) res.conf_max = d.conf;
                                if (!d.accept) ++res.n_held; }
@@ -272,6 +309,21 @@ Result run(const std::string &arm, int frames, float eta, int n_scales,
     }
     res.frozen_len  = best;
     res.frozen_from = best_end - best + 1;
+    // Least-squares slope of proposed on ideal, plus r^2. Reported, never
+    // thresholded here -- the caller decides what a gain means.
+    if (gi.size() >= 10) {
+        double mx = 0, my = 0;
+        for (size_t i = 0; i < gi.size(); ++i) { mx += gi[i]; my += gp[i]; }
+        mx /= (double)gi.size(); my /= (double)gi.size();
+        double sxy = 0, sxx = 0, syy = 0;
+        for (size_t i = 0; i < gi.size(); ++i) {
+            const double dx = gi[i] - mx, dy = gp[i] - my;
+            sxy += dx * dy; sxx += dx * dx; syy += dy * dy;
+        }
+        res.gain    = sxx > 0 ? sxy / sxx : 0.0;
+        res.gain_r2 = (sxx > 0 && syy > 0) ? (sxy * sxy) / (sxx * syy) : 0.0;
+        res.gain_n  = (int)gi.size();
+    }
     return res;
 }
 
@@ -308,6 +360,8 @@ int main(int argc, char **argv)
         else if (a == "--reuse")       g_reuse = true;
         else if (a == "--re-extract")  g_reuse = false;
         else if (a == "--step-ratio")  g_step_ratio = atof(val("0.70"));
+        else if (a == "--rate")        g_rate = atof(val("0.03"));
+        else if (a == "--period")      g_period = atof(val("200"));
         else if (a == "--sigma-factor") g_sigma_f = (float)atof(val("16.0"));
         else if (a == "--pos-err")     g_pos_err = atof(val("0"));
         else if (a == "--bg-pan")      { g_pan_r = atoi(val("31")); g_pan_c = atoi(val("47")); }
@@ -328,6 +382,9 @@ int main(int argc, char **argv)
                "(from %d)  conf %.2f..%.2f  held %d\n",
                arm.c_str(), 100.0 * r.max_rel_err, 100.0 * r.end_rel_err,
                r.frozen_len, r.frozen_from, r.conf_min, r.conf_max, r.n_held);
+        printf("  DETECTOR GAIN alpha %+.3f  (r^2 %.4f, n %d)   "
+               "[position detector scores 0.93 on VOT]\n",
+               r.gain, r.gain_r2, r.gain_n);
         return 0;
     }
 

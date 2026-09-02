@@ -180,7 +180,18 @@ def split_chrel(name):
 L1_KINDS = ('l1lin', 'l1relu', 'l1lin16', 'l1relu16',
             'l5lin', 'l5relu', 'l5lin16', 'l5relu16',
             'danlin', 'danrelu',
-            'gablin', 'gabrelu', 'gabrelublur')
+            'gablin', 'gabrelu', 'gabrelublur',
+            # AGGREGATION ON THE SHIPPING BANK, and its NEGATIVE CONTROL.
+            # settled.md refutes aggregation with an ARGUMENT, not only a
+            # measurement: "a box average of a linear map is another linear map
+            # with the same span, it CANNOT do anything -- a fact about
+            # LINEARITY, not about aggregation". `CONV_RELU=1` shipped
+            # 2026-09-02, so that argument no longer applies to the map this
+            # tracker actually computes. The pair tests exactly that: `l1relublur`
+            # must GAIN and `l1linblur` must reproduce the `blur2` null
+            # (-0.0010/-0.0012). If both gain, the linearity explanation was
+            # wrong; if neither does, aggregation is refuted on its own terms.
+            'l1relublur', 'l1linblur')
 
 
 def split_l1(name):

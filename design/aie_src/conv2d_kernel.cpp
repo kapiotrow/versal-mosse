@@ -67,6 +67,99 @@
  *   NOT frame time. conv2d's +4.59 ms from RGB does not appear in the frame at
  *                 all: the frame is 84% CPU-bound and the AIE had the slack.
  *                 See docs/thesis/results/frame_budget_rgb_delta.csv.
+ *
+ * ---------------------------------------------------------------------------
+ * COST — the GENERIC KxK / stride-S branch, at the pre-registered Layer-1 point
+ * (7x7 stride 2, CONV_IN_CH=3, 147 taps, 128x128 crop -> 64x64 map, ch32).
+ * Source: the aiecompiler.log of `make graph TARGET=hw PATCH_ROWS=64
+ * PATCH_COLS=64 N_CHANNELS=32 CONV_IN_CH=3 CONV_KSIZE=7 CONV_STRIDE=2
+ * CONV_RELU=1`, reworked 2026-09-02, 0 errors. Claim N-16.
+ *
+ *   compute       MEASURED ON HARDWARE, then optimised. The first build of
+ *                 this branch cost 1.32 ms per channel = 42.4 ms/frame at ch32,
+ *                 read off `roi_crop`'s ap_done poll: with ROI_CROP_PIPELINE=1
+ *                 that poll measures how far the AIE lags the host, and the
+ *                 per-call FLOOR rose from ~0 (sigma4, 16 ch) to 1.19 ms, which
+ *                 is conv2d back-pressure and not crop work. 19.3M MACs in
+ *                 42.4 ms is 0.36 MAC/cycle on a core with 128 int8 lanes.
+ *                 runs/l1relu_calib/, evidence/proposed_build_l1relu.md sec.7.4.
+ *                 The doc's ~20-22 ms model was 2.4x optimistic; the frame body
+ *                 was 61.48 ms against sigma4's 27.11 on the same instrument.
+ *   loop schedule per-iteration cycles from aiecompiler, BEFORE -> AFTER the
+ *                 2026-09-02 rework, at this same point:
+ *                   PLIO read loop, per 4 pixels          143 -> 84 cycles
+ *                   MAC loop, per (ic, kr) = 7 taps    7 x 11 -> 28 cycles
+ *                 Weighted by iteration counts (128 read rows x CROP_COLS/4;
+ *                 NC x K x PATCH_ROWS x PATCH_COLS/VEC), that is 1.00M -> 419k
+ *                 cycles per channel: a 2.39x SCHEDULED improvement. The model
+ *                 under-predicted hardware by 1.85x before, so the expected
+ *                 landing is ~18 ms/frame of conv2d and a ~37 ms frame -- A
+ *                 PREDICTION, written down before the run, not a reading.
+ *   what changed  three things, none of them arithmetic, all bit-exact:
+ *                 (1) the row bases moved OUT of the column loop -- they depend
+ *                     on out_r, never on c, and inside they made every tap a 4-D
+ *                     dynamic index ("minimum length due to resources: 10");
+ *                 (2) the kc loop is UNROLLED so its phase and offset
+ *                     constant-fold instead of being a div and a mod per tap;
+ *                 (3) the PLIO read loop stores straight from the word through
+ *                     ONE hoisted base pointer. A px[4][NC] staging array and an
+ *                     srow[NC][S] pointer array were each tried and each made it
+ *                     WORSE (248 and 174 cycles) -- an array indexed by unrolled
+ *                     constants still went to memory. Both are recorded because
+ *                     the negative result is the useful part.
+ *                 The read loop is now 82% of what is left and is the next
+ *                 target: 84 cycles for 4 pixels is 21 cycles/pixel for 3 byte
+ *                 stores. Each (ic, phase) receives 4/S CONTIGUOUS bytes per
+ *                 group, so 12 byte stores could be 6 halfword ones -- priced,
+ *                 not taken, because it needs HALO aligned and a re-verification.
+ *   vectorization vectorized over CONV_VEC_GEN = 32 output columns (its OWN
+ *                 knob -- the 3x3 branches keep 16 and are byte-for-byte as
+ *                 shipped), UNROLLED over kc, rolled over ic and kr. 32 measured
+ *                 2.3x better than 16 here. BIT-EXACT against the model and
+ *                 checked, not assumed: `make x86sim_check KUT=conv2d
+ *                 SCENARIO=s6l1 CONV_KSIZE=7 CONV_STRIDE=2 ...` reports
+ *                 4096/4096 identical, and so does CONV_VECTORIZE=0, and so do
+ *                 s6/s6rgb/s7/cmul_stress after the change.
+ *   stride        the line buffer is split by COLUMN PHASE on the way in, which
+ *                 is what keeps every tap a unit-stride vector load at S=2. See
+ *                 the branch comment.
+ *   tile memory   sub[3][7][2][70] = 2940 B plus a 70 B zero row. Far under the
+ *                 64 KB tile, and it is `static` -- TILE DATA MEMORY, NOT STACK.
+ *   stack         CONV2D_STACK=2048 SUFFICED, unchanged from the 27-tap arm.
+ *                 proposed_build_l1relu.md called ~7.3 KB "the sharp risk" and
+ *                 predicted a loop restructure would be needed; the restructure
+ *                 was needed, but for the STRIDE, and it made the stack question
+ *                 disappear rather than answering it -- the taps never leave the
+ *                 weight input_buffer. The mapper emitted libadf.a with 0 errors
+ *                 and placed conv2d at AIE_ML_CORE_X15Y0.
+ *   SIGNAL LEVEL  THE THING TO WATCH ON THIS ARM, and it is measured, not
+ *                 feared. export_weights.py sizes out_shift against
+ *                 acc_max_theory = n_in*K^2*127^2, a bound LINEAR in the tap
+ *                 count, while a real decorrelated tap sum grows like its square
+ *                 root. On the s6l1 Stage-A patch the observed max|acc| over all
+ *                 32 channels is 125354 against a bound of 2370963 -- 18.9x
+ *                 loose -- so out_shift lands at 7 where 2 would fit, and the
+ *                 feature map uses 9.9 of 15 bits (weakest channel 5.4).
+ *                 The shipping 3x3 RGB bank does NOT have this problem: its
+ *                 bias_acc is large and real, observed max|acc| 571420 against a
+ *                 bound of 435483, and it uses 14.1 of 15 bits. The Layer-1 PCA
+ *                 bank has b_fold == 0 by construction, so nothing anchors its
+ *                 shift to a measured quantity.
+ *                 CONFIRMED ON HARDWARE and worse than estimated: the first
+ *                 200-frame run measured F_ch at 0.13% of int16 against the
+ *                 res64 arm's 15.4%, and mean_prev seeded to 0 on every channel.
+ *                 FIXED by `--acc-bound l1` (export_weights.py), which sizes
+ *                 out_shift against 127*sum|w_int8| per channel -- also an exact
+ *                 worst case, attained at x = 127*sign(w), so it cannot rail --
+ *                 taking out_shift from 7 flat to 3..5 and the feature map from
+ *                 1.9% to 10.3% of int16 on a real Stage-A patch, next to the
+ *                 shipping bank's 12.3%. It is NOT the default: flipping it
+ *                 would move the shipping bank's shifts and every arm in
+ *                 claims.md with them.
+ *   caveat        The loop schedules are COMPILER SCHEDULES. The 42.4 ms, the
+ *                 61.48 ms frame and the F_ch level are HARDWARE, from the
+ *                 2026-09-02 calibration run. The post-rework figures are
+ *                 predictions and have NOT run on the board.
  */
 
 #include "conv2d_kernel.h"
@@ -85,6 +178,15 @@
 // Output pixels per vector iteration. PATCH_COLS must be a whole multiple.
 #ifndef CONV_VEC
 #  define CONV_VEC 16
+#endif
+
+// ...and the same for the GENERIC KxK branch, which is a SEPARATE knob on
+// purpose. 32 measured 2.3x better than 16 there (aiecompiler schedule at the
+// 7x7/2 point: 28 cycles per 7 unrolled taps against 32, over half as many
+// column iterations), but the two 3x3 branches are byte-for-byte as shipped and
+// a shared knob would move them too. Their 16 is left exactly where it was.
+#ifndef CONV_VEC_GEN
+#  define CONV_VEC_GEN 32
 #endif
 
 // Half-wave rectifier after the output shift.
@@ -181,6 +283,340 @@ void conv2d_kernel(
         out[4 * i + 1].real = (int8_t)((w >>  8) & 0xFF);  out[4 * i + 1].imag = 0;
         out[4 * i + 2].real = (int8_t)((w >> 16) & 0xFF);  out[4 * i + 2].imag = 0;
         out[4 * i + 3].real = (int8_t)((w >> 24) & 0xFF);  out[4 * i + 3].imag = 0;
+    }
+    return;
+
+// ====================================================================
+// GENERIC KxK / STRIDE-S PATH — taken whenever CONV_KSIZE != 3 or
+// CONV_STRIDE != 1. The two 3x3 stride-1 branches below are left byte for
+// byte as they shipped, so selecting this path is the only thing that can
+// change a shipped arm's numerics.
+//
+// WHY A SEPARATE BRANCH AND NOT A GENERALISATION OF THE 3x3 ONE. The shipped
+// branches hoist every tap into a named scalar (9 of them gray, 27 RGB) and
+// unroll the MAC by hand. At 147 taps that is what proposed_build_l1relu.md
+// flags as the sharp risk: "~7.3 KB of stack ... likely restructuring the
+// inner loop rather than raising a number". This branch keeps the taps IN THE
+// WEIGHT BUFFER and loops over them, so CONV2D_STACK does not have to grow
+// with the tap count at all -- the cost moves to a rolled loop the compiler
+// can still pipeline over the CONV_VEC output columns.
+//
+// THE STRIDE IS WHY THE LINE BUFFER IS DE-INTERLEAVED.
+// At stride 2 output column c reads input column 2c + kc - P, so consecutive
+// output columns are 2 input columns apart and a contiguous vector load no
+// longer lines up with the outputs. Splitting each input row into its S column
+// PHASES as it is read puts every tap back on a unit stride:
+//
+//     input col 2c + d, d = kc - P
+//       = phase (d mod S), half-column c + floor(d / S)
+//
+// so tap kc is a single unaligned load at a CONSTANT offset from c. One pass
+// over the row does the split, which the read loop was already doing byte by
+// byte. At S = 1 the phase collapses to 0 and this is the ordinary sliding
+// window.
+//
+// GEOMETRY. The input map is the ROI CROP -- PATCH_ROWS*S x PATCH_COLS*S --
+// and the output map is PATCH_ROWS x PATCH_COLS, which is what the Hann table,
+// the FFTs and the whole host tail are sized for. roi_crop takes its patch size
+// as a RUNTIME AXI-Lite argument, so a 128x128 crop feeding a 64x64 feature map
+// costs no PL rebuild; see CROP_ROWS/CROP_COLS in the Makefile.
+//
+// Padding is 'same' with an odd kernel: P = K/2 zero columns and rows on each
+// side, which reproduces the 3x3 branches' padding=1 exactly at K=3.
+// ====================================================================
+// @thesis subsec:wyborSieci | N-16 | The Layer-1 datapath: a KxK stride-S INT8 convolution
+//   whose taps stay in the weight buffer and whose line buffer is split by column phase, so
+//   the stride does not break vectorization.
+#elif (CONV_KSIZE != 3) || (CONV_STRIDE != 1)
+
+    constexpr int K  = CONV_KSIZE;
+    constexpr int P  = K / 2;               // 'same' padding, both sides
+    constexpr int S  = CONV_STRIDE;
+    constexpr int NC = CONV_IN_CH;
+
+    // The ROI crop conv2d consumes. NOT the feature map.
+    constexpr int CROP_ROWS = PATCH_ROWS * S;
+    constexpr int CROP_COLS = PATCH_COLS * S;
+
+    // Half-row halo. off = floor(d/S) for d in [-P, P], so |off| <= P, and a
+    // VEC load starting at c + off must stay inside the buffer. P on each
+    // side covers both.
+    constexpr int HALO = P;
+    constexpr int HW   = PATCH_COLS + 2 * HALO;   // phase-row width
+
+    static_assert(K % 2 == 1, "'same' padding needs an odd kernel");
+    static_assert(S == 1 || S == 2, "phase split is written for S = 1 or 2");
+    static_assert(CROP_COLS % 4 == 0, "the PatchIn read loop consumes 4 pixels at a time");
+    static_assert(4 % S == 0, "the read loop splits (c+b)/S as c/S + b/S, which needs S | 4");
+    constexpr int VEC = CONV_VEC_GEN;   // this branch's own vector width
+    static_assert(PATCH_COLS % VEC == 0, "output row must divide into vectors");
+
+    const int8_t *wb = weights.data();
+    const int out_shift = (int)(uint8_t)wb[CONV_W_OFF_SHIFT];
+
+    int32_t bias;
+    bias  = (int32_t)(uint8_t)wb[CONV_W_OFF_BIAS + 0];
+    bias |= (int32_t)(uint8_t)wb[CONV_W_OFF_BIAS + 1] << 8;
+    bias |= (int32_t)(uint8_t)wb[CONV_W_OFF_BIAS + 2] << 16;
+    bias |= (int32_t)(uint8_t)wb[CONV_W_OFF_BIAS + 3] << 24;
+
+    int32_t mean_prev;
+    mean_prev  = (int32_t)(uint8_t)wb[CONV_W_OFF_MEAN + 0];
+    mean_prev |= (int32_t)(uint8_t)wb[CONV_W_OFF_MEAN + 1] << 8;
+    mean_prev |= (int32_t)(uint8_t)wb[CONV_W_OFF_MEAN + 2] << 16;
+    mean_prev |= (int32_t)(uint8_t)wb[CONV_W_OFF_MEAN + 3] << 24;
+
+    constexpr int ROWS_PER_INV = CONV_OUT_CHUNK / PATCH_COLS;
+    static_assert(CONV_OUT_CHUNK % PATCH_COLS == 0,
+                  "output window must be a whole number of feature-map rows");
+    static_assert(PATCH_ROWS % ROWS_PER_INV == 0,
+                  "feature map must divide evenly into output windows");
+
+    // sub[plane][slot][phase][HALO + half-col]. Input row y lives in slot y % K:
+    // the K rows an output row needs are K CONSECUTIVE input rows, so they
+    // occupy K distinct slots, and reading row y evicts row y-K, which is one
+    // below the window. STATIC, i.e. tile data memory, not stack:
+    // 3 x 7 x 2 x 70 = 2940 B at the 7x7/2 RGB point.
+    static int8_t sub[NC][K][S][HW];
+    static int8_t zsub[HW];                 // the implicit zero rows and columns
+    static int    rows_read = 0;            // input rows consumed this patch
+    static int    rows_out  = 0;            // feature rows produced this patch
+
+    if (rows_out == 0) {                    // first firing of a new patch
+        memset(sub,  0, sizeof(sub));
+        memset(zsub, 0, sizeof(zsub));
+        rows_read = 0;
+    }
+
+    cint16_t *out = feature_out.data();
+    int o = 0;
+
+    for (int kk = 0; kk < ROWS_PER_INV; ++kk) {
+
+        const int out_r = rows_out;
+
+        // Read forward until input row out_r*S + P is buffered. Reads per firing
+        // are uneven (the first pulls S*0+P+1 rows, later ones S) but total
+        // exactly CROP_ROWS over the patch, which is what roi_crop emits.
+        while (rows_read <= out_r * S + P && rows_read < CROP_ROWS) {
+            const int slot = rows_read % K;
+
+            // Destination base, hoisted: `slot` does not depend on c. ONE
+            // pointer, not an array of NC*S -- an array of pointers indexed by
+            // unrolled constants still went to memory, and 12 pointer loads per
+            // 4 pixels is what the read loop was paying. `sub` is
+            // [NC][K][S][HW], so the (ic, ph) offset from this base is the
+            // compile-time constant SB_IC*ic + HW*ph.
+            int8_t *const sb = &sub[0][slot][0][HALO];
+            constexpr int SB_IC = K * S * HW;
+
+            for (int c = 0; c < CROP_COLS; c += 4)
+            chess_prepare_for_pipelining
+            chess_loop_range(CROP_COLS / 4, CROP_COLS / 4)
+            {
+                // NC words carry exactly 4 pixels: 1 word gray, 3 words RGB
+                // (R0 G0 B0 R1 | G1 B1 R2 G2 | B2 R3 G3 B3), which is what
+                // roi_crop puts on the wire at ROI_IN_CH=3.
+                //
+                // BOTH INNER LOOPS ARE FULLY UNROLLED, and that is the point:
+                // rolled, this body's `lin/NC`, `lin%NC`, `x%S` and `x/S` are
+                // four integer div/mod per byte on a machine that has none, and
+                // the nest is a NON-LEAF loop, which aiecompiler then refuses to
+                // software-pipeline ("Skipping pipelining of non-leaf loop").
+                // It scheduled at 143 cycles per 4 pixels -- 64% of conv2d's
+                // whole cost at the 7x7/2 point, more than the 147 MACs it
+                // feeds. Unrolled, every index is a compile-time constant and
+                // the body is straight-line stores, which is exactly the shape
+                // the 3x3 RGB branch's hand-written unpacker already has.
+                //
+                // `half_c` uses c/S + b/S == (c+b)/S and b%S == (c+b)%S, both exact
+                // because S divides 4 and c steps by 4 -- asserted below.
+                const int half_c = c / S;   // c/S + b/S == (c+b)/S, exact since S | 4
+                for (int j = 0; j < NC; ++j)
+                chess_unroll_loop(NC)
+                {
+                    const int32_t w = readincr(patch_in);
+                    for (int b = 0; b < 4; ++b)
+                    chess_unroll_loop(4)
+                    {
+                        const int lin = j * 4 + b;   // sample index within the 4 pixels
+                        const int pix = lin / NC;    // which of the 4 pixels
+                        const int ic  = lin % NC;    // which plane
+                        // Stored STRAIGHT FROM THE WORD. A px[4][NC] staging
+                        // array here cost 24 extra memory ops and a read-after-
+                        // write chain the scheduler could not break: it put this
+                        // loop at 248 cycles against a 192-cycle resource bound.
+                        sb[SB_IC * ic + HW * (pix % S) + half_c + pix / S] =
+                            (int8_t)((w >> (8 * b)) & 0xFF);
+                    }
+                }
+            }
+            // Left/right zero pad. The halo columns are written once per row
+            // because a row buffer is reused every K rows and must not carry a
+            // previous row's edge pixels into this one's padding.
+            for (int ph = 0; ph < S; ++ph)
+                for (int ic = 0; ic < NC; ++ic)
+                    for (int h = 0; h < HALO; ++h) {
+                        sub[ic][slot][ph][h] = 0;
+                        sub[ic][slot][ph][HALO + PATCH_COLS + h] = 0;
+                    }
+            ++rows_read;
+        }
+
+        const int16_t h_r = HTAB[out_r];
+
+        // ROW BASES, HOISTED OUT OF THE COLUMN LOOP. Everything that selects a
+        // tap's source row -- the input row y, whether it is inside the crop,
+        // its slot in the K-row ring, and the phase split -- depends on out_r
+        // and NOT on c. Left inside the c loop (as this branch first shipped)
+        // it made the address a 4-D dynamic index recomputed per tap, which is
+        // what put the kc loop at "minimum length due to resources: 10" in the
+        // aiecompiler schedule and cost the arm 42.4 ms/frame of conv2d on
+        // hardware -- runs/l1relu_calib/run_l1relu_calib.log, read off
+        // roi_crop's ap_done poll (docs/thesis/evidence/proposed_build_l1relu.md
+        // sec.7.4).
+        //
+        // rowb[ic][kr][ph] points at half-column 0 of the row that tap
+        // (ic, kr, phase ph) reads, so the tap address is a base plus the
+        // COMPILE-TIME offset `off`. The zero row has no phase dimension, so
+        // both phases point at zsub -- which is correct because zsub is zero
+        // everywhere and the two phases of a zero row are the same row.
+        //
+        // BIT-EXACTNESS: the mac order (ic, kr, kc) and every operand value are
+        // unchanged; only address arithmetic moved. Verified by
+        // `make x86sim_check KUT=conv2d SCENARIO=s6l1` after the change.
+        const int8_t *rowb[NC][K][S];
+        for (int ic = 0; ic < NC; ++ic)
+            for (int kr = 0; kr < K; ++kr) {
+                const int  y    = out_r * S + kr - P;
+                const bool in_r = (y >= 0) && (y < CROP_ROWS);
+                const int  slot = in_r ? (y % K) : 0;
+                for (int ph = 0; ph < S; ++ph)
+                    rowb[ic][kr][ph] = in_r ? &sub[ic][slot][ph][HALO]
+                                            : &zsub[HALO];
+            }
+
+#if CONV_VECTORIZE
+
+        // Vectorized over VEC output columns, rolled over the K*K*NC taps.
+        // BIT-IDENTICAL to the scalar loop below: every shift is aie::downshift
+        // (arithmetic/floor, matching signed `>>`), never srs, for the reasons
+        // spelled out in the 3x3 branch.
+        for (int c = 0; c < PATCH_COLS; c += VEC)
+        chess_prepare_for_pipelining
+        chess_loop_range(PATCH_COLS / VEC, PATCH_COLS / VEC)
+        {
+            aie::accum<acc32, VEC> a;
+            a.from_vector(aie::broadcast<int32_t, VEC>(bias), 0);
+
+            for (int ic = 0; ic < NC; ++ic) {
+                const int8_t *wp = wb + CONV_W_OFF_PLANE(ic);
+                for (int kr = 0; kr < K; ++kr) {
+                    const int8_t *wrow = wp + kr * K;
+                    // UNROLLED so `ph` and `off` constant-fold: they are pure
+                    // functions of kc, and K and S are constexpr. Rolled, they
+                    // are a modulo and a division per tap on the critical path.
+                    for (int kc = 0; kc < K; ++kc)
+                    chess_unroll_loop(K)
+                    {
+                        const int d   = kc - P;
+                        // Floor division / positive modulo: d is negative for
+                        // half the taps and C's / and % truncate toward zero.
+                        const int ph  = ((d % S) + S) % S;
+                        const int off = (d - ph) / S;
+                        a = aie::mac(a,
+                                     aie::load_unaligned_v<VEC>(
+                                         rowb[ic][kr][ph] + c + off),
+                                     wrow[kc]);
+                    }
+                }
+            }
+
+            aie::vector<int32_t, VEC> sh =
+                aie::downshift(a.to_vector<int32_t>(0), out_shift);
+#if CONV_RELU
+            aie::vector<int32_t, VEC> r = aie::min(aie::max(sh, 0), 32767);
+#else
+            aie::vector<int32_t, VEC> r = aie::min(aie::max(sh, -32768), 32767);
+#endif
+            aie::vector<int32_t, VEC> cen =
+                aie::sub(r, aie::broadcast<int32_t, VEC>(mean_prev));
+            cen = aie::min(aie::max(cen, -32768), 32767);
+
+            aie::vector<int32_t, VEC> w1v =
+                aie::downshift(aie::mul(cen, (int32_t)h_r).template to_vector<int32_t>(0), 15);
+            aie::vector<int32_t, VEC> hc =
+                aie::unpack(aie::load_unaligned_v<VEC>((const int16_t *)HTAB + c));
+            aie::vector<int32_t, VEC> w2v =
+                aie::downshift(aie::mul(w1v, hc).template to_vector<int32_t>(0), 15);
+            w2v = aie::min(aie::max(w2v, -32768), 32767);
+
+            aie::accum<acc32, VEC> t;
+            t.from_vector(w2v, 0);
+            const aie::vector<int16_t, VEC> re16 = t.template to_vector<int16_t>(0);
+            const aie::vector<int16_t, VEC> zero =
+                aie::zeros<int16_t, VEC>();
+            const auto zp = aie::interleave_zip(re16, zero, 1);
+
+            int16_t *dst = (int16_t *)(out + o);
+            aie::store_unaligned_v(dst,            zp.first);
+            aie::store_unaligned_v(dst + VEC, zp.second);
+            o += VEC;
+        }
+
+#else   // scalar reference — the bisection path, and BIT-IDENTICAL to the above
+
+        for (int c = 0; c < PATCH_COLS; ++c)
+        chess_prepare_for_pipelining
+        chess_loop_range(PATCH_COLS, PATCH_COLS)
+        {
+            int32_t acc = bias;
+            for (int ic = 0; ic < NC; ++ic) {
+                const int8_t *wp = wb + CONV_W_OFF_PLANE(ic);
+                for (int kr = 0; kr < K; ++kr) {
+                    // Same hoisted bases as the vectorized path, so the two
+                    // stay one expression of one addressing scheme. An
+                    // out-of-crop row reads zsub, which is zero, instead of
+                    // being `continue`d -- arithmetically identical, and it
+                    // keeps this loop's shape the same as the one above.
+                    const int8_t *wrow = wp + kr * K;
+                    for (int kc = 0; kc < K; ++kc) {
+                        const int d   = kc - P;
+                        const int ph  = ((d % S) + S) % S;
+                        const int off = (d - ph) / S;
+                        acc += (int32_t)wrow[kc]
+                             * (int32_t)rowb[ic][kr][ph][c + off];
+                    }
+                }
+            }
+
+            int32_t shifted = acc >> out_shift;
+#if CONV_RELU
+            if      (shifted >  32767) shifted =  32767;
+            else if (shifted <      0) shifted =  0;
+#else
+            if      (shifted >  32767) shifted =  32767;
+            else if (shifted < -32768) shifted = -32768;
+#endif
+            int32_t centred = shifted - mean_prev;
+            if      (centred >  32767) centred =  32767;
+            else if (centred < -32768) centred = -32768;
+
+            const int16_t h_c = HTAB[c];
+            int32_t wnd = (centred * (int32_t)h_r) >> 15;
+            wnd         = (wnd * (int32_t)h_c) >> 15;
+            if      (wnd >  32767) wnd =  32767;
+            else if (wnd < -32768) wnd = -32768;
+
+            out[o].real = (int16_t)wnd;
+            out[o].imag = 0;
+            ++o;
+        }
+
+#endif  // CONV_VECTORIZE
+
+        ++rows_out;
+        if (rows_out >= PATCH_ROWS) rows_out = 0;   // patch complete — rearm
     }
     return;
 

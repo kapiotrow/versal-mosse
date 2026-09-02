@@ -68,7 +68,7 @@ transferred, and its two over-predictions (`pad30` +0.088 -> +0.0077, the gate +
 were both on knobs acting through the filter/veto path rather than the response shape.
 
 **One legitimate re-open, and it must be labelled as such rather than sold as a rescue:** this
-was screened against the sigma-2 baseline, and `MOSSE_SIGMA=4.0` is now the best arm on record
+was screened against the sigma-2 baseline, and the operating point has moved twice since (`MOSSE_SIGMA=4.0`, then `rgb_l1relu` at EAO 0.1960)
 (EAO 0.1931) with a materially different response shape — median accepted PSR 30.9 -> 18.6. The
 per-channel `rho` distribution is a function of that shape, so the screen does not transfer by
 assumption. Re-screening `-chrel05` on top of the sigma-4 operating point is one offline run.

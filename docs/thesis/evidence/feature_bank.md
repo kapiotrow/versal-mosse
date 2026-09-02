@@ -120,7 +120,7 @@ GEOMETRY — 16 channels, 3x3, stride 1, no pooling. Danelljan's "conv1 beats HO
 7x7 conv1 PCA'd to 40, and HOG's deformation tolerance is the CELL. Neither is reachable by a
 weights export; both are `N_CHANNELS` / kernel-size / stride changes, i.e. an AIE rebuild.
 Aggregation over THIS map is separately refuted (`pooled_features.md`: `blur2` -0.0010 gray /
--0.0012 RGB).
+-0.0012 RGB, and on the RECTIFIED Layer-1 bank a LOSS of -0.0242).
 
 **AND A METHODOLOGICAL RESULT WORTH MORE THAN THE ARM.** `vot_ar_offline` cannot separate a
 pretrained bank from a random one at 62 sequences. **A bench that cannot tell trained from noise
@@ -173,9 +173,14 @@ A residual of the size §3 measured (0.011-0.015 R, below resolution) is what th
 
 ## It retro-explains three recorded results
 
-- **`blur2` is an exact null** (-0.0010 gray / -0.0012 RGB, `pooled_features.md`). A box average
-  of a linear map is another linear map with the same span. It CANNOT do anything. That file
-  read it as a fact about aggregation; it is a fact about linearity.
+- **`blur2` is an exact null** (-0.0010 gray / -0.0012 RGB, `pooled_features.md`) — but the
+  linearity reading of it is **WITHDRAWN (2026-09-02)**. This file used to argue that a box
+  average of a linear map is another linear map with the same span and so "CANNOT do anything".
+  That predicts a null for a LINEAR arm and a gain once the map is rectified; the 2x2 screen in
+  `pooled_features.md` measures **−0.0180 on the linear arm and −0.0242 on the rectified one**.
+  Both predictions fail, so the span argument was never the operative mechanism. The remaining
+  reading is resolution: aggregation and decimation agree to 0.001, and hardware prefers the
+  finer map at matched `sigma/target`.
 - **The gray rank cap.** Gray's 16 channels live in 9 dimensions — the ENTIRE gray patch space.
   The gray bank is already an identity lift up to conditioning, which is why the cap is
   "structural" and why RGB (16 of 27) had room to help.

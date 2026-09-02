@@ -1,10 +1,16 @@
 # RGB features (`CONV_IN_CH=3`) — shipping
 
+*(`CONV_IN_CH=3` still ships. The rest of this file describes the 3x3 mobilenet arm it was
+measured on; since 2026-09-02 the shipping bank is resnet18 conv1 7x7/2 PCA'd to 32 channels at
+a 64x64 map, so the ch16 conv2d figures below are that arm's, not today's — see
+`../thesis/evidence/proposed_build_l1relu.md`.)*
+
 Moved out of CLAUDE.md 2026-08-31; content unchanged.
 
 
 `CONV_IN_CH=3` is the default. Build with `make weights CONV_IN_CH=3` then
-`ARM=rgb scripts/calib_build.sh`. 4-4-4 carries both arms; no RGB-specific FFT budget.
+`ARM=rgb PATCH_ROWS=128 PATCH_COLS=128 N_CHANNELS=16 scripts/calib_build.sh`. 4-4-4 carries both
+gray and RGB at 128x128; no RGB-specific FFT budget.
 
 ### Why RGB — CLOSED ON HARDWARE 2026-08-27
 

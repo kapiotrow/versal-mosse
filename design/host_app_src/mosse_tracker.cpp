@@ -104,6 +104,38 @@
 #ifndef PATCH_COLS
 #  define PATCH_COLS  128
 #endif
+
+// conv2d's kernel size and stride, and the ROI CROP they imply.
+//
+// PATCH_ROWS/PATCH_COLS are the FEATURE MAP -- the FFT point sizes, the
+// accumulator, the response, the filter and every bin<->pixel conversion below
+// are sized on them. The crop roi_crop must produce to feed that map is
+// CONV_STRIDE times larger on each axis, and it is the only geometry the host
+// programs into roi_crop's AXI-Lite registers.
+//
+// The Makefile passes all four from ONE place (see the CONV_KSIZE block there).
+// These #ifndef defaults exist for the native test builds; a mismatch with the
+// graph is exactly the silent failure CLAUDE.md's shared-constant rule is about,
+// which is why the weight file carries both as tag bytes and this file checks
+// them at startup.
+#ifndef CONV_KSIZE
+#  define CONV_KSIZE  3
+#endif
+#ifndef CONV_STRIDE
+#  define CONV_STRIDE 1
+#endif
+#ifndef CROP_ROWS
+#  define CROP_ROWS   (PATCH_ROWS * CONV_STRIDE)
+#endif
+#ifndef CROP_COLS
+#  define CROP_COLS   (PATCH_COLS * CONV_STRIDE)
+#endif
+static_assert(CROP_ROWS == PATCH_ROWS * CONV_STRIDE &&
+              CROP_COLS == PATCH_COLS * CONV_STRIDE,
+              "CROP_ROWS/COLS must be PATCH_ROWS/COLS x CONV_STRIDE -- the "
+              "Makefile derives them; do not set them by hand");
+static_assert(CROP_ROWS <= 128 && CROP_COLS <= 128,
+              "crop exceeds roi_crop's BRAM scratch (ROI_MAX_PATCH_ROWS/COLS)");
 #ifndef N_CHANNELS
 #  define N_CHANNELS  16
 #endif
@@ -3844,6 +3876,20 @@ int main(int argc, char **argv)
                 return 1;
             }
 
+            // The SECOND tag, for the same reason. The tap count is a product of
+            // CONV_IN_CH and CONV_KSIZE, so one tag cannot separate a 3x3 RGB
+            // bank (27 taps) from a 7x7 gray one (49) — and once a second kernel
+            // size exists the pair is the only thing that pins the layout.
+            // Byte PAD-2 is 0 in files exported before this tag, which were all
+            // 3x3.
+            const int tag_k = (int)w[CONV_W_OFF_TAG_K];
+            if (tag_k != CONV_KSIZE && !(tag_k == 0 && CONV_KSIZE == 3)) {
+                printf("FATAL: %s ch%d has kernel-size tag %d, this build is "
+                       "CONV_KSIZE=%d. Re-run: make weights CONV_KSIZE=%d\n",
+                       WEIGHTS_FILE, ch, tag_k, CONV_KSIZE, CONV_KSIZE);
+                return 1;
+            }
+
             int32_t bias;
             memcpy(&bias, w + CONV_W_OFF_BIAS, sizeof(int32_t));
             const int shift = (int)w[CONV_W_OFF_SHIFT];
@@ -4116,8 +4162,11 @@ int main(int argc, char **argv)
     const auto _rc_t0 = std::chrono::steady_clock::now();
 #if ROI_CROP_USER_MANAGED
     CropIp crop_ip(device, uuid);
+    // CROP_ROWS/COLS, not PATCH_ROWS/COLS. Identical while CONV_STRIDE == 1,
+    // which is every arm shipped to date; at stride 2 roi_crop must resample the
+    // ROI to twice the feature map on each axis or conv2d starves.
     crop_ip.set_static_args(frame_bo, (uint32_t)g_frame_rows, (uint32_t)g_frame_cols,
-                            (uint32_t)PATCH_ROWS, (uint32_t)PATCH_COLS);
+                            (uint32_t)CROP_ROWS, (uint32_t)CROP_COLS);
     printf("[roi_crop] USER-MANAGED (xrt::ip) launch path, CU driven directly; "
            "KDS completion bypassed. Constructed in %.3f ms\n",
            std::chrono::duration<double, std::milli>(
@@ -4127,8 +4176,8 @@ int main(int argc, char **argv)
     crop_run.set_arg(0, frame_bo);
     crop_run.set_arg(2, (uint32_t)g_frame_rows);
     crop_run.set_arg(3, (uint32_t)g_frame_cols);
-    crop_run.set_arg(8, (uint32_t)PATCH_ROWS);
-    crop_run.set_arg(9, (uint32_t)PATCH_COLS);
+    crop_run.set_arg(8, (uint32_t)CROP_ROWS);   // the CROP, not the feature map
+    crop_run.set_arg(9, (uint32_t)CROP_COLS);
     printf("[roi_crop] KDS (xrt::run) launch path. crop_run constructed once "
            "(hoisted): %.3f ms\n",
            std::chrono::duration<double, std::milli>(

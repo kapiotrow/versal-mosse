@@ -102,3 +102,60 @@ Two principles that have repeatedly earned their keep: **instruments before chan
   build-flash-run to find; the second only broke a diagnostic and **failed silently rather than
   printing a plausible wrong number**. Failing loudly-or-not-at-all beats failing plausibly.
 
+
+
+## The offline proxy bounds SAMPLING noise, not TRANSFER — 2026-09-02
+
+`vot_ar_offline.py`'s ~0.02 resolution in R was already measured. This adds a sharper limit.
+
+| axis | offline | hardware | |
+|---|---|---|---|
+| sigma 2 -> 4 | +0.0808 dR | +0.0678 | transferred, 84% |
+| 64x64 map (`dec2`) | +0.1071, P(dR<=0)=0.000 | +0.0456 | transferred, 43% |
+| Layer-1 + ReLU | borderline, P=0.041 | trim-5 stable, P=0.011 | UNDER-called |
+| spatial mask | +0.0601 | +0.0192 | over-called 3x |
+| `pad30` | large | ~0 | over-called ~11x |
+| **`MOSSE_ETA` 0.05 -> 0.1** | **+0.0481, trim-3 +0.0097, P=0.021** | **−0.0030 R, EAO −0.0143** | **INVERTED** |
+
+The eta cell was the ONLY one of 22 in its grid to survive a symmetric trim AND a bootstrap, and
+it still inverted. **A trim says the result is not carried by three sequences. A bootstrap says
+it is not sampling noise. NEITHER says the bench models the tracker.** `P(dR<=0)` is necessary
+and never sufficient.
+
+**The practice that made this cheap rather than mysterious:** the transfer assumption was written
+down BEFORE the run (`proposed_build_l1relu.md` sec.11) — the grid ran at 128x128/sigma 4, the
+arm at 64x64/sigma 2, and `sigma/target` was established to govern SIGMA and nothing else. When
+the arm failed, the suspect was already named. **Do that for every arm screened at a geometry the
+board does not run.**
+
+
+## BOUND THE PRIZE BEFORE ATTRIBUTING THE DEFECT — 2026-09-02
+
+A full day went into the scale filter: it is frozen on ~90% of real frames, its detector gain
+against the correction actually warranted is **−0.003** where the position detector scores 0.93,
+and the cause is a self-confirming loop fed by a scale-NORMALISING feature. Every step was
+correctly measured and reproducible.
+
+**Then the prior question was asked, and it took ten minutes on data already on disk.** Replace
+the box SIZE with ground truth on the board's own trajectories, keep the tracker's centre,
+re-apply VOT's rule (`scripts/scale_oracle_bound.py`):
+
+| arm | R as tracked | R with a PERFECT scale filter | dR |
+|---|---|---|---|
+| `l1relu` (shipping) | 0.4536 | 0.4559 | **+0.0023** |
+| `sigma4` | 0.4549 | 0.4460 | **−0.0089** |
+
+Mean IoU rises **+0.054** on both and converts into nothing, because VOT fails a run on POSITION
+(IoU <= 0.1 for 10 frames) and resizing a box that is not on the target rescues nothing.
+
+**THE RULE: before attributing a defect, bound what removing it is worth.** An ORACLE over the
+trajectories already collected is nearly always available, costs minutes, and is strictly cheaper
+than the attribution it may retire. Attribution tells you WHY something is broken; an oracle tells
+you WHETHER to care. Do the second one first.
+
+**A corollary the same day paid for twice:** an instrument that cannot show the failure cannot
+score its fix. `scale_loop_sim`'s raw-feature alpha is 0.174-0.83 where the board's is −0.003, so
+it never reproduced the defect — yet it was proposed, and used, as the acceptance test for a
+repair. This project had already written that rule down for `rgb_vs_gray_loop.py` having no scale
+filter at all. **Check that the instrument reproduces the defect BEFORE it scores a candidate**,
+one level up from where the rule was first learned.

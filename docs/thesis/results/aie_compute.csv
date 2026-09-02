@@ -10,3 +10,5 @@ conv2d (gray arm),4.60,,,"CONV_IN_CH=1, ch16, 1 GHz; stream read 28-31 cyc/4px, 
 conv2d (RGB arm),9.19,,,"CONV_IN_CH=3; stream read 84-87 cyc/4px (3.00x), MAC+post 219 cyc/16px (1.34x), no software pipelining"
 total before vectorization,21.6,,,"the same chain with scalar conv2d and cmul kernels"
 cmul_accum (scalar),7.9,,,"pre-vectorization: 30 cyc/complex element, not pipelined, 64 invocations x 16 channels"
+conv2d (Layer-1 arm as first built),42.4,,,"MEASURED, not scheduled: 7x7/2 RGB ch32 64x64 map, 1.32 ms/channel off roi_crop's ap_done poll (runs/l1relu_calib/, ROI_CROP_PIPELINE=1 makes the poll read AIE lag). Scheduled model said 23.4 -- under by 1.85x"
+conv2d (Layer-1 arm reworked),18.0,13.0,25.0,"PREDICTED, has not run: schedule 1.00M -> 419k cyc/channel (read loop 143 -> 84 cyc/4px, MAC 7x11 -> 28 cyc per 7 taps, CONV_VEC_GEN=32), scaled by the 1.85x model-to-hardware factor above. Band is that factor +-35%"

@@ -222,14 +222,22 @@ IMAGENET_STD  = np.array([0.229, 0.224, 0.225], dtype=np.float64)
 # Luminance coefficients for RGB → grayscale weight collapse (ITU-R BT.601)
 LUM = np.array([0.2989, 0.5870, 0.1140], dtype=np.float64)
 
-def acc_max_theory(n_in: int) -> int:
-    """Worst-case |acc| before bias:  n_in * KSIZE^2 * 127 * 127.
+def acc_max_theory(n_in: int, ksize: int = KSIZE) -> int:
+    """Worst-case |acc| before bias:  n_in * ksize^2 * 127 * 127.
 
-    145 161 at 9 taps, 435 483 at 27. out_shift is sized against this plus
-    |bias_acc|, so the tap count costs ~log2(3) = 1.6 bits of headroom, of which
-    ~0.6 shows up in the mean shift once the bias term is included.
+    145 161 at 9 taps, 435 483 at 27, 2 370 963 at 147. out_shift is sized
+    against this plus |bias_acc|, so the tap count costs ~log2(taps) bits of
+    headroom, of which ~0.6 showed up in the mean shift at 27 once the bias term
+    was included. AT 147 TAPS THIS IS A REAL COST, not a rounding one: the bound
+    is 16.3x the grayscale one, i.e. ~4 more bits of out_shift, which is part of
+    why proposed_build_l1relu.md says the shift budget must be re-calibrated and
+    is NOT the res64 budget.
+
+    It is also LOOSE by construction — it assumes every tap simultaneously at
+    +-127 against a +-127 activation, which a real patch never does. Do not read
+    it as an expected magnitude; `rails` on a 200-frame run is the instrument.
     """
-    return n_in * KSIZE * KSIZE * 127 * 127
+    return n_in * ksize * ksize * 127 * 127
 
 
 # ---------------------------------------------------------------------------
@@ -243,9 +251,10 @@ def fold_bn(conv_w: np.ndarray, conv_b, gamma, beta, mu, var, eps: float):
         w_fold  [N_OUT, 3, KSIZE, KSIZE]  BN-folded RGB conv weights (float64)
         b_fold  [N_OUT]                   folded bias (float64)
     """
-    s      = gamma / np.sqrt(var + eps)                      # [N_OUT]
-    w_fold = conv_w * s[:, None, None, None]                  # [N_OUT, 3, K, K]
-    b_in   = conv_b if conv_b is not None else np.zeros(N_OUT, dtype=np.float64)
+    s      = gamma / np.sqrt(var + eps)                      # [n_out]
+    w_fold = conv_w * s[:, None, None, None]                  # [n_out, 3, K, K]
+    b_in   = conv_b if conv_b is not None else np.zeros(conv_w.shape[0],
+                                                        dtype=np.float64)
     b_fold = s * (b_in - mu) + beta                          # [N_OUT]
     return w_fold, b_fold
 
@@ -279,7 +288,8 @@ def quantize_weights(w: np.ndarray):
 
     Returns w_int8 (int8) and scales (float64), both indexed by output channel.
     """
-    flat   = w.reshape(N_OUT, -1)                           # [N_OUT, 9 or 27]
+    n_out  = w.shape[0]
+    flat   = w.reshape(n_out, -1)                           # [n_out, 9, 27 or 147]
     maxabs = np.abs(flat).max(axis=1).clip(min=1e-12)
     scales = maxabs / 127.0
     w_q    = np.clip(np.round(w / scales[:, None, None, None]), -127, 127)
@@ -290,8 +300,35 @@ def quantize_weights(w: np.ndarray):
 # Step 3 — integer bias and per-channel output shift
 # ---------------------------------------------------------------------------
 
+def acc_max_exact(w_int8: np.ndarray) -> np.ndarray:
+    """EXACT per-channel worst case |acc| before bias:  127 * sum|w_int8[oc]|.
+
+    Same kind of bound as acc_max_theory and strictly tighter: it is attained by
+    the activation x = 127*sign(w), so nothing is being assumed away. What it
+    drops is the pretence that every tap carries +-127 of WEIGHT, which is false
+    for any real bank -- a quantized channel has ONE tap at +-127 by construction
+    (that is what the per-channel scale does) and the rest below it.
+
+    Measured on one Stage-A patch (scratch probe, 2026-09-02), against the
+    observed max|acc| of the real integer datapath:
+
+        bank                    loose bound   L1-exact   observed
+        mobilenet 3x3/1 ch16       7.1x          2.3x       1.0x
+        l1resnet  7x7/2 ch32      29.9x          6.6x       1.0x
+
+    So the loose bound costs the Layer-1 bank ~2 bits that this one gives back,
+    and BOTH still sit above what a real patch reaches -- the residual is
+    coherence (a real ROI never aligns with sign(w)) and is deliberately NOT
+    claimed here, because a bound that depends on the patch is not a bound.
+    `rails` on a 200-frame run remains the instrument.
+    """
+    n_out = w_int8.shape[0]
+    return 127 * np.abs(w_int8.reshape(n_out, -1).astype(np.int64)).sum(axis=1)
+
+
 def compute_acc_params(b_fold: np.ndarray, scales: np.ndarray,
-                       n_in: int, bias_input_scale: float):
+                       n_in: int, bias_input_scale: float, ksize: int = KSIZE,
+                       w_int8: np.ndarray = None, acc_bound: str = 'loose'):
     """Derive per-channel bias_acc and out_shift for the AIE kernel.
 
     The accumulator holds  acc ≈ (y_float - b_fold) * q / scale, where q is the
@@ -303,7 +340,16 @@ def compute_acc_params(b_fold: np.ndarray, scales: np.ndarray,
     emits. See the --bias-scale section of the module docstring.
 
     out_shift is chosen so |full_acc| >> out_shift fits in int16 [-32767, 32767],
-    sized against the worst case |bias_acc| + acc_max_theory(n_in).
+    sized against the worst case |bias_acc| + an accumulator bound.
+
+    `acc_bound` picks WHICH bound, and both are exact worst cases -- neither can
+    rail:
+      'loose'  n_in*ksize^2*127^2, tap-count-only, INDEPENDENT OF THE WEIGHTS.
+               THE DEFAULT, because it is what every recorded arm was built
+               with; changing it silently would move the shipping bank's
+               out_shift and invalidate the arms in claims.md.
+      'l1'     127*sum|w_int8[oc]|, per channel, from the actual taps. ~2 bits
+               tighter on the Layer-1 bank (see acc_max_exact). Opt-in.
 
     Returns:
         bias_acc  int32[N_OUT]
@@ -312,7 +358,16 @@ def compute_acc_params(b_fold: np.ndarray, scales: np.ndarray,
     bias_acc_f = b_fold * float(bias_input_scale) / scales
     bias_acc   = np.clip(np.round(bias_acc_f), -(2**31), 2**31 - 1).astype(np.int32)
 
-    max_full   = np.abs(bias_acc).astype(np.float64) + acc_max_theory(n_in)
+    if acc_bound == 'l1':
+        if w_int8 is None:
+            raise ValueError("acc_bound='l1' needs the quantized taps")
+        acc_max = acc_max_exact(w_int8).astype(np.float64)
+    elif acc_bound == 'loose':
+        acc_max = float(acc_max_theory(n_in, ksize))
+    else:
+        raise ValueError(f"unknown acc_bound {acc_bound!r}")
+
+    max_full   = np.abs(bias_acc).astype(np.float64) + acc_max
     log2_over  = np.log2(np.maximum(max_full / 32767.0, 1.0))
     shifts     = np.ceil(log2_over).astype(np.int8).clip(0, 30)
 
@@ -407,10 +462,10 @@ def _gen_hanning_h(out_path: Path, n: int) -> None:
 # ---------------------------------------------------------------------------
 
 def _run_float(w: np.ndarray, b_fold: np.ndarray, x_int8: np.ndarray) -> np.ndarray:
-    """Float-exact reference: BN-folded conv on one n_in×3×3 patch."""
+    """Float-exact reference: BN-folded conv on one n_in×K×K patch."""
     x_f = x_int8.astype(np.float64) / 127.0   # [n_in, K, K]
     return np.array(
-        [float(np.sum(w[oc] * x_f)) + b_fold[oc] for oc in range(N_OUT)]
+        [float(np.sum(w[oc] * x_f)) + b_fold[oc] for oc in range(w.shape[0])]
     )
 
 
@@ -428,19 +483,21 @@ def validate(w, b_fold, w_int8, scales, bias_acc, shifts, n_in, seed=42):
     regression; the arbiter for the corrected bias is roi_crop's real output,
     not this synthetic patch.
     """
+    n_out  = w.shape[0]
+    ksize  = w.shape[-1]
     rng    = np.random.default_rng(seed)
-    x_int8 = rng.integers(-127, 127, (n_in, KSIZE, KSIZE), dtype=np.int8)
+    x_int8 = rng.integers(-127, 127, (n_in, ksize, ksize), dtype=np.int8)
 
     y_float = _run_float(w, b_fold, x_int8)
 
     print(f"\n--- Kernel simulation vs float reference "
-          f"(random {n_in}×{KSIZE}×{KSIZE} patch, int8 full scale) ---")
+          f"(random {n_in}×{ksize}×{ksize} patch, int8 full scale) ---")
     print(f"\n  {'ch':>4}  {'float_ref':>10}  {'int_acc':>10}  "
           f"{'>>shft':>8}  {'recon':>10}  {'abs_err':>9}")
     print(f"  {'-'*66}")
 
     max_err = 0.0
-    for oc in range(N_OUT):
+    for oc in range(n_out):
         acc  = int(np.sum(w_int8[oc].astype(np.int32) * x_int8.astype(np.int32)))
         full = acc + int(bias_acc[oc])
         sh   = int(shifts[oc])
@@ -481,6 +538,32 @@ def main():
     ap.add_argument('--in-ch', type=int, default=1, choices=(1, 3),
                     help="1 = BT.601 luminance collapse (default, what ships); "
                          "3 = RGB, all 27 taps")
+    ap.add_argument('--bank', default='mobilenet',
+                    choices=('mobilenet', 'l1resnet'),
+                    help="which donor bank to export. mobilenet = "
+                         "mobilenet_v3_small conv1, 3x3, 16 channels, what every "
+                         "arm to date shipped. l1resnet = resnet18 conv1 7x7/2, "
+                         "BN folded, reduced to --n-out channels by PCA over the "
+                         "FOLDED WEIGHT matrix -- the Layer-1 bank of "
+                         "docs/thesis/evidence/proposed_build_l1relu.md. It is "
+                         "built by scripts/l1_banks.py, which is the SAME code "
+                         "the offline screen scored, so the board arm and the "
+                         "screen share a bank rather than two spellings of one.")
+    ap.add_argument('--n-out', type=int, default=None,
+                    help="output channels (= N_CHANNELS). Default 16 for "
+                         "mobilenet, 32 for l1resnet.")
+    ap.add_argument('--expect-ksize', type=int, default=None,
+                    help="assert the donor bank's kernel size. `make weights` "
+                         "passes the BUILD's CONV_KSIZE, so choosing a bank whose "
+                         "kernel the graph was not compiled for fails here rather "
+                         "than at the tag check on the board.")
+    ap.add_argument('--acc-bound', default='loose', choices=('loose', 'l1'),
+                    help="which exact worst-case accumulator bound sizes "
+                         "out_shift. loose = n_in*k^2*127^2 (the default, and "
+                         "what every arm in claims.md was built with); l1 = "
+                         "127*sum|w_int8| per channel, ~2 bits tighter on the "
+                         "Layer-1 bank. NOT the default because flipping it "
+                         "would move the shipping bank's shifts.")
     ap.add_argument('--bias-scale', default='127', choices=('127', 'roi'),
                     help="activation scale bias_acc is derived against. "
                          "127 = int8 full scale (default, what every hardware "
@@ -492,56 +575,83 @@ def main():
     out_dir.mkdir(parents=True, exist_ok=True)
     patch_size = args.patch_size
 
-    n_in = args.in_ch
-    lay  = CWL.Layout(n_in)
+    n_in    = args.in_ch
+    n_out   = args.n_out if args.n_out is not None else (32 if args.bank == 'l1resnet' else N_OUT)
     bias_input_scale = 127.0 if args.bias_scale == '127' else float(ROI_NORM_Q)
 
-    print(f"CONV_IN_CH = {n_in}  ({'RGB, 27 taps' if n_in == 3 else 'grayscale, 9 taps'})")
+    # ------------------------------------------------------------------
+    # 1. Load the donor bank, BN already folded, as [n_out, 3, K, K] + bias.
+    # ------------------------------------------------------------------
+    if args.bank == 'l1resnet':
+        # THE SAME FUNCTION THE OFFLINE SCREEN SCORED. l1_banks.resnet18_conv1_pca
+        # folds BatchNorm itself and caches to build/l1_resnet18_pca<N>.npz, so
+        # the board arm and evidence/layer1_features.md share one bank. Importing
+        # it rather than re-deriving the PCA here is deliberate: a second spelling
+        # of "resnet18 conv1, folded, PCA to 32" is exactly the kind of
+        # cross-implementation drift CLAUDE.md says only a cross-check catches.
+        import l1_banks
+        print(f"Loading resnet18 conv1 (7x7/2/64, BN folded) -> {n_out} channels "
+              f"by weight PCA, via scripts/l1_banks.py...")
+        w_fold, b_fold = l1_banks.resnet18_conv1_pca(n_out)
+        w_fold = np.asarray(w_fold, dtype=np.float64)
+        b_fold = np.asarray(b_fold, dtype=np.float64)
+        print("  NOTE this is NOT Danelljan's activation PCA — it projects the "
+              "FOLDED WEIGHTS, which composes with the conv exactly only while "
+              "the map stays linear. With CONV_RELU=1 it is 'a bank spanning the "
+              "principal directions of resnet18 conv1', and l1_banks.py labels it "
+              "so. Do not upgrade the claim in the thesis.")
+    else:
+        print("Loading MobileNetV3-Small (pretrained on ImageNet)...")
+        try:
+            weights_enum = models.MobileNet_V3_Small_Weights.IMAGENET1K_V1
+            m = models.mobilenet_v3_small(weights=weights_enum)
+        except AttributeError:
+            m = models.mobilenet_v3_small(pretrained=True)  # type: ignore[call-arg]
+        m.eval()
+
+        seq  = m.features[0]          # Conv2dNormActivation
+        conv = seq[0]                 # Conv2d(3, 16, 3, stride=2, padding=1, bias=False)
+        bn   = seq[1]                 # BatchNorm2d(16)
+        print(f"  {conv}")
+        print(f"  {bn}")
+        assert tuple(conv.weight.shape) == (n_out, N_IN, KSIZE, KSIZE), \
+            f"Unexpected conv weight shape: {conv.weight.shape}"
+
+        conv_w = conv.weight.detach().cpu().numpy().astype(np.float64)
+        conv_b = conv.bias.detach().cpu().numpy().astype(np.float64) \
+                 if conv.bias is not None else None
+        gamma  = bn.weight.detach().cpu().numpy().astype(np.float64)
+        beta   = bn.bias.detach().cpu().numpy().astype(np.float64)
+        mu     = bn.running_mean.detach().cpu().numpy().astype(np.float64)
+        var_   = bn.running_var.detach().cpu().numpy().astype(np.float64)
+        eps    = float(bn.eps)
+        w_fold, b_fold = fold_bn(conv_w, conv_b, gamma, beta, mu, var_, eps)
+
+    ksize = int(w_fold.shape[-1])
+    assert w_fold.shape == (n_out, N_IN, ksize, ksize), \
+        f"donor bank is {w_fold.shape}, expected ({n_out}, {N_IN}, K, K)"
+
+    if args.expect_ksize is not None and ksize != args.expect_ksize:
+        sys.exit(f"bank '{args.bank}' has a {ksize}x{ksize} kernel but the build "
+                 f"is CONV_KSIZE={args.expect_ksize}. Pick a matching --bank, or "
+                 f"rebuild the graph with CONV_KSIZE={ksize}.")
+
+    lay = CWL.Layout(n_in, ksize)
+    print(f"CONV_IN_CH = {n_in}, CONV_KSIZE = {ksize}, N_CHANNELS = {n_out} "
+          f"({lay.raw} taps/channel, {lay.buf} B/channel)")
     print(f"  {lay}")
     print(f"  bias_acc scale: {bias_input_scale:g} "
           f"({'int8 full scale — the shipped default' if args.bias_scale == '127' else 'ROI_NORM_Q — corrected; needs CONV_RELU=0 and a shift-budget re-sweep'})")
-    print(f"  acc_max_theory: {acc_max_theory(n_in)}")
+    print(f"  acc_max_theory: {acc_max_theory(n_in, ksize)}")
 
     # ------------------------------------------------------------------
-    # 1. Load pretrained model
+    # 3. Grayscale collapse, if asked for
     # ------------------------------------------------------------------
-    print("Loading MobileNetV3-Small (pretrained on ImageNet)...")
-    try:
-        weights_enum = models.MobileNet_V3_Small_Weights.IMAGENET1K_V1
-        m = models.mobilenet_v3_small(weights=weights_enum)
-    except AttributeError:
-        m = models.mobilenet_v3_small(pretrained=True)  # type: ignore[call-arg]
-    m.eval()
-
-    seq  = m.features[0]          # Conv2dNormActivation
-    conv = seq[0]                  # Conv2d(3, 16, 3, stride=2, padding=1, bias=False)
-    bn   = seq[1]                  # BatchNorm2d(16)
-    print(f"  {conv}")
-    print(f"  {bn}")
-    assert tuple(conv.weight.shape) == (N_OUT, N_IN, KSIZE, KSIZE), \
-        f"Unexpected conv weight shape: {conv.weight.shape}"
-
-    # ------------------------------------------------------------------
-    # 2. Extract parameters (float64 to preserve precision through fold)
-    # ------------------------------------------------------------------
-    conv_w = conv.weight.detach().cpu().numpy().astype(np.float64)
-    conv_b = conv.bias.detach().cpu().numpy().astype(np.float64) \
-             if conv.bias is not None else None
-    gamma  = bn.weight.detach().cpu().numpy().astype(np.float64)
-    beta   = bn.bias.detach().cpu().numpy().astype(np.float64)
-    mu     = bn.running_mean.detach().cpu().numpy().astype(np.float64)
-    var_   = bn.running_var.detach().cpu().numpy().astype(np.float64)
-    eps    = float(bn.eps)
-
-    # ------------------------------------------------------------------
-    # 3. Fold BN + grayscale collapse
-    # ------------------------------------------------------------------
-    w_fold, b_fold = fold_bn(conv_w, conv_b, gamma, beta, mu, var_, eps)
     if n_in == 1:
-        print("Folding BatchNorm + collapsing RGB → grayscale (ITU-R BT.601)...")
+        print("Collapsing RGB → grayscale (ITU-R BT.601)...")
         w_taps = collapse_lum(w_fold)
     else:
-        print("Folding BatchNorm, keeping all three input planes (RGB)...")
+        print("Keeping all three input planes (RGB)...")
         w_taps = w_fold
     print(f"  w_taps  shape: {w_taps.shape}  "
           f"range: [{w_taps.min():.5f}, {w_taps.max():.5f}]")
@@ -561,7 +671,19 @@ def main():
     # 5. Bias and output shift
     # ------------------------------------------------------------------
     print("Computing integer bias and per-channel output shift...")
-    bias_acc, shifts = compute_acc_params(b_fold, scales, n_in, bias_input_scale)
+    bias_acc, shifts = compute_acc_params(b_fold, scales, n_in, bias_input_scale,
+                                          ksize, w_int8, args.acc_bound)
+    print(f"  acc bound:   {args.acc_bound}", end="")
+    if args.acc_bound == 'l1':
+        loose = acc_max_theory(n_in, ksize)
+        tight = acc_max_exact(w_int8)
+        _, shifts_loose = compute_acc_params(b_fold, scales, n_in,
+                                             bias_input_scale, ksize)
+        print(f"  (loose bound {loose}, exact median {int(np.median(tight))}"
+              f" -> {int(np.median(shifts_loose - shifts))} bits recovered,"
+              f" median)")
+    else:
+        print()
     print(f"  out_shifts:  {shifts.tolist()}")
     print(f"  bias_acc range: [{bias_acc.min()}, {bias_acc.max()}]")
 
@@ -574,24 +696,25 @@ def main():
     # 7. Pack and write outputs
     # ------------------------------------------------------------------
     flat = bytearray()
-    for oc in range(N_OUT):
+    for oc in range(n_out):
         flat += pack_channel(lay, w_int8[oc], shifts[oc], bias_acc[oc], scales[oc])
 
     bin_path = out_dir / "layer0_weights.bin"
     bin_path.write_bytes(flat)
-    print(f"\nWrote {bin_path}  ({len(flat)} bytes = {N_OUT}×{BUF_BYTES}, "
-          f"layout tag {n_in})")
+    print(f"\nWrote {bin_path}  ({len(flat)} bytes = {n_out}×{lay.buf}, "
+          f"layout tags in_ch={n_in} ksize={ksize})")
 
     # Read it straight back through the SHARED unpacker. This is cheap and it
     # closes the loop the tag byte exists for: if the header and the Python
     # mirror ever disagree about an offset, the exporter itself says so instead
     # of shipping a file the kernel will misread.
-    for oc, (taps, sh, ba, dq, mp, _l) in enumerate(CWL.load_bin(bin_path, n_in)):
+    for oc, (taps, sh, ba, dq, mp, _l) in enumerate(
+            CWL.load_bin(bin_path, n_in, ksize)):
         assert taps == w_int8[oc].flatten().tolist(), f"tap round-trip failed on ch{oc}"
         assert sh == int(shifts[oc]) and ba == int(bias_acc[oc]), \
             f"shift/bias round-trip failed on ch{oc}"
         assert mp == 0, f"mean_prev must ship as 0 (the host seeds it), ch{oc}"
-    print(f"  round-trip through conv_weight_layout: OK ({N_OUT} channels)")
+    print(f"  round-trip through conv_weight_layout: OK ({n_out} channels)")
 
     # Numpy archive (for debugging / aiesim scenarios)
     npz_path = out_dir / "layer0_meta.npz"
@@ -620,17 +743,21 @@ def main():
         f.write("#pragma once\n\n")
         f.write('/* Load into weights_bo: fread(ptr, 1, LAYER0_TOTAL_BYTES, f) */\n')
         f.write('#define LAYER0_WEIGHTS_FILE  "layer0_weights.bin"\n')
-        f.write(f"#define LAYER0_N_OUT_CH      {N_OUT}\n")
-        f.write(f"#define LAYER0_BUF_BYTES     {BUF_BYTES}\n")
-        f.write(f"#define LAYER0_TOTAL_BYTES   {N_OUT * BUF_BYTES}\n\n")
+        f.write(f"#define LAYER0_N_OUT_CH      {n_out}\n")
+        f.write(f"#define LAYER0_BUF_BYTES     {lay.buf}\n")
+        f.write(f"#define LAYER0_TOTAL_BYTES   {n_out * lay.buf}\n\n")
         f.write("/* What this file was exported as. The BUILD must agree:\n"
                 " * a CONV_IN_CH=1 graph fed a CONV_IN_CH=3 weights file reads\n"
                 " * taps [0:9] as a 3x3 kernel and slices out_shift out of the\n"
                 " * G plane. Byte 63 of every channel buffer carries the same\n"
                 " * number so a reader can assert at runtime. */\n")
         f.write(f"#define LAYER0_IN_CH         {n_in}\n")
+        f.write(f"#define LAYER0_KSIZE         {ksize}\n")
         f.write(f"#define LAYER0_N_TAPS        {lay.raw}\n")
-        f.write(f"#define LAYER0_BIAS_SCALE    {bias_input_scale:.1f}f\n\n")
+        f.write(f"#define LAYER0_BIAS_SCALE    {bias_input_scale:.1f}f\n")
+        # Provenance, not a compile-time contract: out_shift is already baked
+        # into every channel buffer, so this only says HOW it was sized.
+        f.write(f"/* out_shift sized against the {args.acc_bound!r} accumulator bound */\n\n")
         # Bare include, not "../conv_weight_layout.h": design/aie_src is already on
         # the include path for both toolchains (GCC_INC and the aiecompiler
         # --include list), and a relative path breaks the moment layer0.h is
@@ -639,14 +766,18 @@ def main():
         f.write("#if LAYER0_IN_CH != CONV_IN_CH\n"
                 "#  error \"layer0_weights.bin was exported for a different "
                 "CONV_IN_CH. Re-run: make weights CONV_IN_CH=<n>\"\n"
+                "#endif\n")
+        f.write("#if LAYER0_KSIZE != CONV_KSIZE\n"
+                "#  error \"layer0_weights.bin was exported for a different "
+                "CONV_KSIZE. Re-run: make weights CONV_KSIZE=<k>\"\n"
                 "#endif\n\n")
         f.write("/* Per-channel dequantization scale: y_float ≈ out_int16 * scale * (1<<shift) */\n")
-        f.write(f"static const float layer0_dequant_scales[{N_OUT}] = {{\n")
+        f.write(f"static const float layer0_dequant_scales[{n_out}] = {{\n")
         for s in scales:
             f.write(f"    {s / 127.0:.10e}f,\n")
         f.write("};\n\n")
         f.write("/* Per-channel output right-shift stored at byte 9 of each 64-byte buffer */\n")
-        f.write(f"static const int layer0_out_shifts[{N_OUT}] = {{ ")
+        f.write(f"static const int layer0_out_shifts[{n_out}] = {{ ")
         f.write(", ".join(str(int(s)) for s in shifts))
         f.write(" };\n")
     print(f"Wrote {h_path}  (C header)")

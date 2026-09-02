@@ -54,7 +54,20 @@ N = PATCH_ROWS * PATCH_COLS
 #
 # N stays PIXELS. N_SAMPLES is what the PLIO actually carries.
 CONV_IN_CH = int(os.environ.get('GEN_CONV_IN_CH', 1))
-N_SAMPLES  = N * CONV_IN_CH
+
+# conv2d's kernel size and stride, from the Makefile's CONV_KSIZE / CONV_STRIDE.
+#
+# THE STRIDE IS WHY N AND N_SAMPLES ARE NO LONGER THE SAME PIXELS. N is the
+# FEATURE MAP -- what the FFTs, the filter and every expected value below are
+# sized on. The PLIO carries the ROI CROP, which at stride S is S times larger on
+# each axis. At S=1 the two coincide, which is every arm shipped to date and why
+# this distinction did not exist before.
+CONV_KSIZE  = int(os.environ.get('GEN_CONV_KSIZE', 3))
+CONV_STRIDE = int(os.environ.get('GEN_CONV_STRIDE', 1))
+CROP_ROWS   = PATCH_ROWS * CONV_STRIDE
+CROP_COLS   = PATCH_COLS * CONV_STRIDE
+CROP_N      = CROP_ROWS * CROP_COLS
+N_SAMPLES   = CROP_N * CONV_IN_CH
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import conv_weight_layout as CWL   # noqa: E402
@@ -209,24 +222,31 @@ def conv2d_relu_map(patch_int8: np.ndarray, weights_64b: bytes,
     # overrun the grayscale out_shift/bias/dequant/mean fields, so a hardcoded
     # weights_64b[9] would slice out_shift out of the G plane and produce a
     # model that is wrong in a way no assertion here could see.
-    _lay  = CWL.Layout(CONV_IN_CH)
+    _lay  = CWL.Layout(CONV_IN_CH, CONV_KSIZE)
+    K, P, S = CONV_KSIZE, CONV_KSIZE // 2, CONV_STRIDE
     w     = (np.frombuffer(weights_64b[0:_lay.raw], dtype=np.int8)
-             .reshape(CONV_IN_CH, 3, 3).astype(np.int64))
+             .reshape(CONV_IN_CH, K, K).astype(np.int64))
     shift = int(weights_64b[_lay.shift])
     bias  = struct.unpack_from('<i', weights_64b, _lay.bias)[0]
 
     # The stimulus is PIXEL-INTERLEAVED on the wire (R0 G0 B0 R1 ...), which is
-    # what roi_crop emits and what conv2d de-interleaves into three planar row
-    # buffers. Undo that here so the convolution is per plane.
-    x  = (patch_int8.reshape(PATCH_ROWS, PATCH_COLS, CONV_IN_CH)
-          .astype(np.int64).transpose(2, 0, 1))          # [P, R, C]
-    xp = np.pad(x, ((0, 0), (1, 1), (1, 1)), mode='constant')
+    # what roi_crop emits and what conv2d de-interleaves into planar row buffers.
+    # Undo that here so the convolution is per plane. Note the reshape is over the
+    # CROP, not the feature map.
+    x  = (patch_int8.reshape(CROP_ROWS, CROP_COLS, CONV_IN_CH)
+          .astype(np.int64).transpose(2, 0, 1))          # [P, CR, CC]
+    xp = np.pad(x, ((0, 0), (P, P), (P, P)), mode='constant')
 
+    # out[r, c] = bias + sum w[p,kr,kc] * x[r*S + kr - P, c*S + kc - P], i.e.
+    # 'same' padding with an odd kernel, strided. The slice below indexes the
+    # PADDED array, where the same window starts at (r*S + kr, c*S + kc).
     acc = np.full((PATCH_ROWS, PATCH_COLS), bias, dtype=np.int64)
     for p in range(CONV_IN_CH):
-        for kr in range(3):
-            for kc in range(3):
-                acc += w[p, kr, kc] * xp[p, kr:kr + PATCH_ROWS, kc:kc + PATCH_COLS]
+        for kr in range(K):
+            for kc in range(K):
+                acc += w[p, kr, kc] * xp[p,
+                                         kr:kr + PATCH_ROWS * S:S,
+                                         kc:kc + PATCH_COLS * S:S]
 
     shifted = acc >> shift
     # ReLU + saturate, matching conv2d_kernel.cpp's `#if CONV_RELU` branch
@@ -336,8 +356,9 @@ def write_plio_txt(path: str, samples: np.ndarray) -> None:
     assert samples.dtype == np.int8, f"PLIO stimulus must be int8, got {samples.dtype}"
     assert len(samples) == N_SAMPLES, (
         f"PLIO stimulus is {len(samples)} samples, expected {N_SAMPLES} "
-        f"({N} px x {CONV_IN_CH} plane(s)). A 3-plane stimulus fed to a 1-plane "
-        f"graph desynchronises the stream rather than failing.")
+        f"({CROP_N} crop px x {CONV_IN_CH} plane(s); the feature map is {N}). "
+        f"A 3-plane stimulus fed to a 1-plane graph desynchronises the stream "
+        f"rather than failing.")
     padding = np.zeros(N_SAMPLES * PLIO_PADDING_FRAMES, dtype=np.int8)
     all_samples = np.concatenate([samples, padding])
 
@@ -596,7 +617,7 @@ def generate_scenario(out_dir: str, name: str, patch_int8: np.ndarray,
     # the same corrupted file — self-consistent and testing the wrong weights.
     # Caught only because mean_prev printed as 0 where the generator had computed
     # 4842. This is why the offsets live in exactly one place.
-    _lay = CWL.Layout(CONV_IN_CH)
+    _lay = CWL.Layout(CONV_IN_CH, CONV_KSIZE)
     if weights_64b is not None:
         wb = bytearray(weights_64b)
         struct.pack_into('<i', wb, _lay.mean, int(mean_prev))
@@ -657,7 +678,14 @@ def _require_layout(path: str, data: bytes) -> None:
     produces vectors that look entirely plausible and match nothing the kernel
     computes. The layout tag turns that into an error.
     """
-    n_in = CWL.detect(data[:CWL.BUF_BYTES])
+    _lay = CWL.Layout(CONV_IN_CH, CONV_KSIZE)
+    n_in  = CWL.detect(data[:_lay.buf])
+    ksize = CWL.detect_ksize(data[:_lay.buf])
+    if ksize != CONV_KSIZE:
+        raise SystemExit(
+            f"{path} was exported with CONV_KSIZE={ksize}, but the vectors are "
+            f"being generated for CONV_KSIZE={CONV_KSIZE}.\n"
+            f"  Re-run: make weights CONV_KSIZE={CONV_KSIZE}")
     if n_in != CONV_IN_CH:
         raise SystemExit(
             f"{path} was exported with CONV_IN_CH={n_in}, but the vectors are "
@@ -666,7 +694,7 @@ def _require_layout(path: str, data: bytes) -> None:
 
 
 def _load_all_weights(repo_root: str):
-    """Every 64-byte channel buffer from layer0_weights.bin, or [] if absent.
+    """Every channel buffer from layer0_weights.bin, or [] if absent.
 
     Used to give the kernel-only harness a choice of channel — see the note in
     generate_scenario about ch0 being unable to exercise ReLU.
@@ -677,32 +705,46 @@ def _load_all_weights(repo_root: str):
     with open(path, 'rb') as f:
         data = f.read()
     _require_layout(path, data)
-    return [data[i * 64:(i + 1) * 64] for i in range(len(data) // 64)]
+    # The buffer is CONV_KSIZE-dependent (64 B at 3x3, 192 at 7x7 RGB), so it
+    # comes from the shared layout rather than a literal 64.
+    nb = CWL.Layout(CONV_IN_CH, CONV_KSIZE).buf
+    return [data[i * nb:(i + 1) * nb] for i in range(len(data) // nb)]
 
 
 def _load_ch0_weights(repo_root: str) -> bytes:
-    """Load 64-byte channel-0 weight buffer from layer0_weights.bin.
+    """Load the channel-0 weight buffer from layer0_weights.bin.
 
-    Returns bytes of length 64 on success, or 64 zero bytes if the file is not
-    available (weights not yet exported — run 'make weights' first).
+    Returns the buffer on success, or a zero buffer of the right size if the
+    file is not available (weights not yet exported — run 'make weights' first).
+    The SIZE is CONV_KSIZE-dependent — 64 B for every 3x3 bank, 192 for 7x7 RGB
+    — and comes from the shared layout, never a literal.
     """
+    nb   = CWL.Layout(CONV_IN_CH, CONV_KSIZE).buf
     path = os.path.join(repo_root, "design", "aie_src", "weights", "layer0_weights.bin")
     if not os.path.exists(path):
         print(f"  WARNING: {path} not found — using zero weights (run 'make weights' first)")
-        return bytes(64)
+        return bytes(nb)
     with open(path, 'rb') as f:
-        data = f.read(64)
-    if len(data) < 64:
-        print(f"  WARNING: {path} too short — using zero weights")
-        return bytes(64)
+        data = f.read(nb)
+    if len(data) < nb:
+        print(f"  WARNING: {path} too short for a {nb}-byte channel buffer — "
+              f"using zero weights")
+        return bytes(nb)
     _require_layout(path, data)
-    print(f"  Loaded channel-0 weights from {path}")
+    print(f"  Loaded channel-0 weights from {path} ({nb} B/channel)")
     return data
 
 
 
-def write_s6rgb(out_dir: str, weights_ch0: bytes) -> None:
+def write_s6rgb(out_dir: str, weights_ch0: bytes, name: str = "s6rgb") -> None:
     """s6's scene in colour: 3-plane Stage A -> the RGB conv2d path.
+
+    `name` exists because the KERNEL BRANCH under test is not a function of
+    CONV_IN_CH alone any more. At CONV_KSIZE=7 / CONV_STRIDE=2 the graph takes
+    the generic KxK branch, whose stimulus is a 128x128 CROP feeding a 64x64
+    feature map -- a different scenario in every respect except the scene. It
+    gets its own directory (`s6l1`) so it cannot silently overwrite the shipping
+    27-tap vectors, which is the same reason s6rgb does not overwrite s6.
 
     WHAT THIS IS FOR. The RGB conv2d branch had no test of any kind — it was
     written to read a schedule out of the compiler and never checked against a
@@ -725,12 +767,14 @@ def write_s6rgb(out_dir: str, weights_ch0: bytes) -> None:
     """
     import roi_crop_ref as RC
 
+    # The scene is sized on the CROP, which is what roi_crop resamples and what
+    # the PLIO carries. At CONV_STRIDE=1 this is the historical PATCH_ROWS.
     rng = np.random.default_rng(20260823)
-    rr = np.arange(2 * PATCH_ROWS, dtype=np.float64).reshape(-1, 1)
-    cc = np.arange(2 * PATCH_COLS, dtype=np.float64).reshape(1, -1)
-    r0 = int(round(0.35 * 2 * PATCH_ROWS))
-    c0 = int(round(0.60 * 2 * PATCH_COLS))
-    sig = 2 * PATCH_COLS / 9.0
+    rr = np.arange(2 * CROP_ROWS, dtype=np.float64).reshape(-1, 1)
+    cc = np.arange(2 * CROP_COLS, dtype=np.float64).reshape(1, -1)
+    r0 = int(round(0.35 * 2 * CROP_ROWS))
+    c0 = int(round(0.60 * 2 * CROP_COLS))
+    sig = 2 * CROP_COLS / 9.0
     blob = np.exp(-(((rr - r0) ** 2 + (cc - c0) ** 2) / (2.0 * sig ** 2)))
 
     # Per-plane amplitude and gradient, so R, G and B carry different structure
@@ -740,15 +784,15 @@ def write_s6rgb(out_dir: str, weights_ch0: bytes) -> None:
                                              (120.0, -0.05, 0.10, 60.0),
                                              (200.0, 0.03, -0.04, 20.0)]):
         img = (amp * blob + gx * cc + gy * rr + base
-               + 5.0 * rng.standard_normal((2 * PATCH_ROWS, 2 * PATCH_COLS)))
+               + 5.0 * rng.standard_normal((2 * CROP_ROWS, 2 * CROP_COLS)))
         planes.append(np.clip(np.round(img), 0, 255).astype(np.uint8))
-    frame = np.stack(planes)                      # [3, 2R, 2C] planar
+    frame = np.stack(planes)                      # [3, 2CR, 2CC] planar
 
     # Crop the middle at 1:1 so the interpolator is not the thing under test
     # here — roi_crop's own suite covers that, and mixing the two would make a
     # conv2d failure ambiguous.
-    patch = RC.stage_a_rgb(frame, PATCH_ROWS // 2, PATCH_COLS // 2,
-                           PATCH_ROWS, PATCH_COLS, PATCH_ROWS, PATCH_COLS)
+    patch = RC.stage_a_rgb(frame, CROP_ROWS // 2, CROP_COLS // 2,
+                           CROP_ROWS, CROP_COLS, CROP_ROWS, CROP_COLS)
     patch_i8 = patch.reshape(-1).astype(np.int8)   # already interleaved R G B
     assert patch_i8.size == N_SAMPLES
     assert int(np.abs(patch_i8).max()) <= 127, "s6rgb patch violates the int8 contract"
@@ -766,7 +810,7 @@ def write_s6rgb(out_dir: str, weights_ch0: bytes) -> None:
     zeros_re = np.zeros(N, dtype=np.float64)
 
     generate_scenario(
-        out_dir, "s6rgb",
+        out_dir, name,
         patch_i8,
         H_re=ones_re,    H_im=zeros_re,
         acc_re=zeros_re, acc_im=zeros_re,
@@ -778,12 +822,16 @@ def write_s6rgb(out_dir: str, weights_ch0: bytes) -> None:
         peak_im_lo=-32767, peak_im_hi=32767,
         max_noise=0, skip_snr=True,
         check_accum0=False,
-        description="RGB Stage-A patch (joint normalisation) through the REAL "
-                    "27-tap conv2d path, H=unity",
+        description=f"RGB Stage-A patch (joint normalisation) through the REAL "
+                    f"{CONV_IN_CH * CONV_KSIZE * CONV_KSIZE}-tap conv2d path "
+                    f"({CONV_KSIZE}x{CONV_KSIZE} stride {CONV_STRIDE}, "
+                    f"{CROP_ROWS}x{CROP_COLS} crop -> {PATCH_ROWS}x{PATCH_COLS} "
+                    f"map), H=unity",
     )
-    print(f"\n  s6rgb: {N_SAMPLES} samples ({N} px x 3), mean_prev={mean_prev}, "
+    print(f"\n  {name}: {N_SAMPLES} samples ({CROP_N} crop px x 3) -> {N} "
+          f"feature px, mean_prev={mean_prev}, "
           f"peak_idx={peak_idx} ({'negative' if peak_neg else 'positive'})")
-    per_plane = patch.reshape(PATCH_ROWS, PATCH_COLS, 3)
+    per_plane = patch.reshape(CROP_ROWS, CROP_COLS, 3)
     print("  plane means (JOINT normalisation leaves these OFFSET, which is the "
           "chromatic signal): " +
           ", ".join(f"{per_plane[:, :, k].mean():+.2f}" for k in range(3)))
@@ -816,7 +864,10 @@ def main():
     # feed RGB vectors to a grayscale x86sim_check, and the two are
     # indistinguishable from the outside.
     if CONV_IN_CH == 3:
-        write_s6rgb(out_dir, weights_ch0)
+        # The generic KxK / stride-S branch is a different kernel path, so it
+        # gets a different scenario directory. See write_s6rgb's `name`.
+        generic = (CONV_KSIZE != 3) or (CONV_STRIDE != 1)
+        write_s6rgb(out_dir, weights_ch0, "s6l1" if generic else "s6rgb")
         return
 
     # ------------------------------------------------------------------

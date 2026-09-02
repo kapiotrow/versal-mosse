@@ -21,9 +21,13 @@ SHELL := /bin/bash
 # Build parameters
 # =========================================================
 TARGET         := hw_emu
-PATCH_ROWS     := 128
-PATCH_COLS     := 128
-N_CHANNELS     := 16
+# GEOMETRY OF THE SHIPPING ARM since 2026-09-02 (rgb_l1relu, EAO 0.1960).
+# PATCH_* is the FEATURE MAP, not the crop: the crop is PATCH x CONV_STRIDE and
+# comes out at 128x128 here. MOSSE_SIGMA=2.0 on a 64x64 map is sigma/target =
+# 1/16, the measured optimum (claim R-11) -- moving PATCH_* silently moves it.
+PATCH_ROWS     := 64
+PATCH_COLS     := 64
+N_CHANNELS     := 32
 FFT_2D_DT      := 0          # 0=cint16, 1=cfloat
 ITER_CNT       := 1
 PL_FREQ        := 312.5
@@ -222,9 +226,12 @@ TAIL_PARALLEL       ?= 1
 # are AIE flags, so a host-only experiment invoked as `make sd_card TARGET=hw
 # SCALE_STEP=1.04` would have silently triggered a multi-hour graph rebuild AT A
 # DIFFERENT SHIFT BUDGET, i.e. moved two magnitudes at once without saying so.
-FFT_SHIFT           ?= 4
-IFFT_ROW_SHIFT      ?= 4
-IFFT_COL_SHIFT      ?= 4
+# 3-3-3 is the 64x64 budget, calibrated on hardware 2026-09-02 (rails=0 on all
+# 200 frames, all four buffers). 4-4-4 is the 128x128 one -- the budget follows
+# the POINT SIZE, so a geometry change needs a new calibration run.
+FFT_SHIFT           ?= 3
+IFFT_ROW_SHIFT      ?= 3
+IFFT_COL_SHIFT      ?= 3
 
 # cmul_accum filter-product shift. INDEPENDENT of the invariant above.
 #
@@ -431,9 +438,54 @@ AIE_FLAGS  += --Xpreproc="-DCONV2D_ECHO_TEST=$(CONV2D_MODE)"
 # grayscale AIESIM SCENARIOS need it explicitly (s6, not s6rgb).
 CONV_IN_CH ?= 3
 AIE_FLAGS  += --Xpreproc="-DCONV_IN_CH=$(CONV_IN_CH)"
+
+# conv2d kernel size and stride — the Layer-1 knobs.
+#
+# 3 / 1 is every arm shipped to date and conv2d_kernel.cpp keeps its two
+# hand-unrolled 3x3 branches for exactly that pair, byte for byte. Anything else
+# selects the GENERIC KxK / stride-S branch, which keeps the taps in the weight
+# buffer instead of hoisting 147 scalars — see the branch comment there for why
+# that is not a stack question.
+#
+# BOTH REACH BOTH TOOLCHAINS. CONV_KSIZE sizes the weight buffer, which the
+# graph reads and the host writes mean_prev into every frame, and CONV_STRIDE
+# decides how big a crop roi_crop must produce for a given feature map. A
+# host/graph disagreement on either is a plausible wrong feature map, not a
+# compile error — the same trap CONV_IN_CH documents above. The exporter stamps
+# CONV_KSIZE into the second-to-last byte of every channel buffer and the host
+# checks it at startup, so a stale layer0_weights.bin fails loudly.
+#
+# The pre-registered Layer-1 arm (docs/thesis/evidence/proposed_build_l1relu.md)
+# is CONV_KSIZE=7 CONV_STRIDE=2 with PATCH_ROWS=PATCH_COLS=64, i.e. a 128x128
+# crop into a 64x64 feature map. NOT host-only: graph rebuild, re-package,
+# re-flash and a shift-budget calibration.
+CONV_KSIZE ?= 7
+CONV_STRIDE ?= 2
+AIE_FLAGS  += --Xpreproc="-DCONV_KSIZE=$(CONV_KSIZE)"
+AIE_FLAGS  += --Xpreproc="-DCONV_STRIDE=$(CONV_STRIDE)"
+
+# The ROI CROP conv2d consumes, as opposed to the FEATURE MAP it produces.
+# PATCH_ROWS/PATCH_COLS are the feature map — the Hann table, both FFTs, the
+# accumulator and the entire host tail are sized on them — and at stride S the
+# crop feeding them is S times larger on each axis.
+#
+# DERIVED, never set by hand: it is the one number roi_crop and conv2d must
+# agree on and neither can check the other. roi_crop takes it as a RUNTIME
+# AXI-Lite argument, so a 128x128 crop costs no PL rebuild — but its BRAM
+# scratch is sized at ROI_MAX_PATCH_ROWS/COLS = 128 in roi_crop.h, which the
+# guard below is against.
+CROP_ROWS  := $(shell expr $(PATCH_ROWS) \* $(CONV_STRIDE))
+CROP_COLS  := $(shell expr $(PATCH_COLS) \* $(CONV_STRIDE))
 # conv2d's AIE stack in BYTES, applied only at CONV_IN_CH=3. The 27-tap MAC
 # chain measured 1344 against the 1024-byte default and the mapper REFUSED to
 # produce a libadf.a. See the stack_size() note in mosse_graph.h.
+#
+# proposed_build_l1relu.md priced 147 taps at ~7.3 KB "at the same unrolling"
+# and called it the sharp risk. The generic branch does NOT use the same
+# unrolling — the taps stay in the weight input_buffer and the line buffer is
+# `static`, i.e. tile data memory — so the stack does not scale with the tap
+# count. 2048 is left as the default for every arm; if the mapper ever refuses,
+# raise it here and record the number the LINK stage reported, not a guess.
 CONV2D_STACK ?= 2048
 AIE_FLAGS  += --Xpreproc="-DCONV2D_STACK=$(CONV2D_STACK)"
 # cmul_accum arithmetic: 1 = vectorized aie::mac (default), 0 = the original
@@ -465,7 +517,7 @@ AIE_FLAGS  += --Xpreproc="-DCONV_VECTORIZE=$(CONV_VECTORIZE)"
 # COUPLED: this changes numerics, so the shift budget moves with it (4-2-2 put
 # the ch16 response at 80% of rail; 4-3-3 puts it at 20%) and the aiesim goldens
 # must be regenerated — gen_aiesim_vectors.py takes GEN_CONV_RELU below.
-CONV_RELU ?= 0
+CONV_RELU ?= 1
 AIE_FLAGS  += --Xpreproc="-DCONV_RELU=$(CONV_RELU)"
 
 # Snapshot of the PORTABLE part of the flags — platform, includes and every -D —
@@ -592,6 +644,13 @@ GCC_FLAGS  += -DN_CHANNELS=$(N_CHANNELS)
 # Selects the conv2d weight-buffer layout the host writes mean_prev into. MUST
 # match the AIE build and the exported .bin — see the CONV_IN_CH note above.
 GCC_FLAGS  += -DCONV_IN_CH=$(CONV_IN_CH)
+GCC_FLAGS  += -DCONV_KSIZE=$(CONV_KSIZE)
+GCC_FLAGS  += -DCONV_STRIDE=$(CONV_STRIDE)
+# The crop geometry the host programs into roi_crop's AXI-Lite registers. Same
+# variable as the AIE side derives its input map from, per CLAUDE.md's rule that
+# a constant both engines derive from is passed to both from ONE place.
+GCC_FLAGS  += -DCROP_ROWS=$(CROP_ROWS)
+GCC_FLAGS  += -DCROP_COLS=$(CROP_COLS)
 GCC_FLAGS  += -DITER_CNT=$(ITER_CNT)
 # THE HOST MUST AGREE WITH THE GRAPH ABOUT WINDOW SIZE. These were missing until
 # 2026-08-14, and the failure mode was silent and expensive: mosse_tracker.cpp
@@ -1351,7 +1410,7 @@ KERNEL_XOS := $(CAM_XO) $(CROP_XO)
 # =========================================================
 # Rules
 # =========================================================
-.PHONY: help kernels graph gen_vectors aiesim graph_fft aiesim_fft xsa application package sd_card run_emu weights test_host test_roi_crop test_scene cleanall
+.PHONY: help check_geometry kernels graph gen_vectors aiesim graph_fft aiesim_fft xsa application package sd_card run_emu weights test_host test_roi_crop test_scene cleanall
 
 help:
 	@echo ""
@@ -1429,7 +1488,24 @@ $(AIE_FLAGS_STAMP):   FLAGS_FOR_STAMP := $(AIE_FLAGS)
 # `/aie.flagstamp` with an empty flag list (the recipe then died on "Permission
 # denied" at the filesystem root, and the SMOKE_SKIP_STREAM guard never armed).
 
-graph: $(LIBADF_A)
+# The one geometry invariant neither toolchain can check for itself: roi_crop's
+# BRAM scratch is sized at ROI_MAX_PATCH_ROWS/COLS = 128 in roi_crop.h, and
+# CROP_ROWS/CROP_COLS are what the host actually programs into it. Exceed it and
+# nothing fails to compile — the CU writes past its scratch buffer.
+.PHONY: check_geometry
+check_geometry:
+	@if [ $(CROP_ROWS) -gt 128 ] || [ $(CROP_COLS) -gt 128 ]; then \
+	    echo "ERROR: crop is $(CROP_ROWS)x$(CROP_COLS) (PATCH $(PATCH_ROWS)x$(PATCH_COLS)"; \
+	    echo "       x CONV_STRIDE=$(CONV_STRIDE)) but roi_crop's scratch is 128x128."; \
+	    echo "       Raise ROI_MAX_PATCH_ROWS/COLS in design/pl_src/roi_crop/roi_crop.h"; \
+	    echo "       and RE-SYNTHESISE roi_crop, or lower PATCH_ROWS/CONV_STRIDE."; \
+	    exit 1; \
+	fi
+	@echo "[geometry] crop $(CROP_ROWS)x$(CROP_COLS) -> feature map $(PATCH_ROWS)x$(PATCH_COLS)" \
+	      "(CONV_KSIZE=$(CONV_KSIZE) CONV_STRIDE=$(CONV_STRIDE) CONV_IN_CH=$(CONV_IN_CH)" \
+	      "N_CHANNELS=$(N_CHANNELS))"
+
+graph: check_geometry $(LIBADF_A)
 
 $(LIBADF_A): $(AIE_FLAGS_STAMP)                \
              $(AIE_SRC_REPO)/mosse_graph.cpp  \
@@ -1459,8 +1535,34 @@ $(LIBADF_A): $(AIE_FLAGS_STAMP)                \
 # `make weights BIAS_SCALE=127` reverts, bit-for-bit apart from the layout tag.
 BIAS_SCALE ?= roi
 
+# ACC_BOUND: which exact worst-case accumulator bound sizes out_shift.
+#   loose  n_in*CONV_KSIZE^2*127^2 -- tap count only, weight-independent.
+#          THE DEFAULT, and what every arm in docs/thesis/claims.md was
+#          built with. It is exact but weak: a quantized channel has one
+#          tap at +-127 by construction and the rest below it.
+#   l1     127*sum|w_int8[oc]|, per channel, from the actual taps. Also an
+#          exact worst case (attained at x = 127*sign(w)), ~2 bits tighter
+#          on the 147-tap Layer-1 bank, which measured F_ch at 0.13% of
+#          int16 on hardware (evidence/proposed_build_l1relu.md sec.7.3).
+# NOT flipped by default: it would move the shipping bank's out_shift and
+# every recorded arm with it.
+# TIED TO THE BANK, deliberately. `loose` is what every mobilenet arm in
+# claims.md was built with and reproducing them requires it; `l1` is ~2 bits
+# tighter and the 147-tap Layer-1 bank needs it (F_ch measured at 0.13% of int16
+# without it). Deriving it from WEIGHT_BANK means neither can be selected by
+# accident -- an explicit ACC_BOUND= on the command line still overrides.
+ACC_BOUND ?= $(if $(filter l1resnet,$(WEIGHT_BANK)),l1,loose)
+
+# Which donor bank `make weights` exports.
+#   mobilenet (default) — mobilenet_v3_small conv1, 3x3, what every arm shipped
+#   l1resnet            — resnet18 conv1 7x7/2, PCA to N_CHANNELS, the Layer-1
+#                         bank of docs/thesis/evidence/proposed_build_l1relu.md
+# The bank's kernel size is checked against CONV_KSIZE by the exporter, so a
+# mismatched pair fails here and not on the board.
+WEIGHT_BANK ?= l1resnet
+
 weights:
-	cd $(PROJECT_REPO) && env PYTHONHOME= PYTHONPATH= uv run --extra weights python3 scripts/export_weights.py $(AIE_SRC_REPO)/weights $(PATCH_COLS) --in-ch $(CONV_IN_CH) --bias-scale $(BIAS_SCALE)
+	cd $(PROJECT_REPO) && env PYTHONHOME= PYTHONPATH= uv run --extra weights python3 scripts/export_weights.py $(AIE_SRC_REPO)/weights $(PATCH_COLS) --in-ch $(CONV_IN_CH) --bias-scale $(BIAS_SCALE) --acc-bound $(ACC_BOUND) --bank $(WEIGHT_BANK) --n-out $(N_CHANNELS) --expect-ksize $(CONV_KSIZE)
 
 # int8 samples per PatchIn beat. mosse_graph.h creates PatchIn as plio_32_bits,
 # so 4; change to 16 if the PLIO ever goes back to plio_128_bits.
@@ -1471,6 +1573,8 @@ gen_vectors:
 	    GEN_PATCH_ROWS=$(PATCH_ROWS) \
 	    GEN_PATCH_COLS=$(PATCH_COLS) \
 	    GEN_CONV_IN_CH=$(CONV_IN_CH) \
+	    GEN_CONV_KSIZE=$(CONV_KSIZE) \
+	    GEN_CONV_STRIDE=$(CONV_STRIDE) \
 	    GEN_PLIO_BEAT_SAMPLES=$(PLIO_BEAT_SAMPLES) \
 	    GEN_IFFT_COL_SHIFT=$(IFFT_COL_SHIFT) \
 	    GEN_IFFT_ROW_SHIFT=$(IFFT_ROW_SHIFT) \
@@ -1613,6 +1717,8 @@ x86sim_check: x86sim_graph gen_vectors
 	    GEN_PATCH_ROWS=$(PATCH_ROWS) \
 	    GEN_PATCH_COLS=$(PATCH_COLS) \
 	    GEN_CONV_IN_CH=$(CONV_IN_CH) \
+	    GEN_CONV_KSIZE=$(CONV_KSIZE) \
+	    GEN_CONV_STRIDE=$(CONV_STRIDE) \
 	    GEN_H_SHIFT=$(H_SHIFT) \
 	    uv run python3 scripts/check_kernel_bitexact.py \
 	        --kernel $(KUT) \
@@ -1633,7 +1739,7 @@ $(BUILD_DIR)/$(XSA): $(KERNEL_XOS) $(LIBADF_A)
 # -------------------------------------------------------
 # Host application
 # -------------------------------------------------------
-application: $(BUILD_DIR)/$(APP_ELF)
+application: check_geometry $(BUILD_DIR)/$(APP_ELF)
 
 # The ELF gets a flag stamp for the same reason libadf.a does: N_CHANNELS,
 # ITER_CNT, IMPULSE_DR/DC and now CMUL_H_SHIFT are make variables that touch no

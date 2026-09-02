@@ -503,9 +503,11 @@ void scale_extract(const ScaleFilter &sf, const uint8_t *frame,
     const int S  = sf.n_scales;
     const int half = (S - 1) / 2;
 
+#if SCALE_FEATURE == 0
     std::vector<float> wr, wc;
     hann_into(wr, sf.tmpl_h);
     hann_into(wc, sf.tmpl_w);
+#endif
 
     std::vector<double> buf((size_t)d);
     // The real sample, in the same [l*S + k] layout F_out uses — so the scale
@@ -514,6 +516,11 @@ void scale_extract(const ScaleFilter &sf, const uint8_t *frame,
     // place; it replaces the per-dimension gather/scatter the complex path
     // needed, so it costs no traffic.
     std::vector<float> re_sample((size_t)d * (size_t)S);
+
+    // Resampled level, BEFORE any windowing. The HOG path needs the untapered
+    // patch (see SCALE_FEATURE in the header); the raw path windows it below, so
+    // it stays byte-identical to every arm in claims.md.
+    std::vector<double> px((size_t)sf.tmpl_h * (size_t)sf.tmpl_w);
 
     for (int n = -half; n <= half; ++n) {
         const double a  = std::pow((double)sf.step, (double)n);
@@ -526,11 +533,50 @@ void scale_extract(const ScaleFilter &sf, const uint8_t *frame,
             const double yy = y0 + (double)r * sy;
             for (int c = 0; c < sf.tmpl_w; ++c) {
                 const double xx = x0 + (double)c * sx;
-                const double v  = sample_bilinear(frame, frame_rows, frame_cols, yy, xx);
-                buf[(size_t)r * sf.tmpl_w + c] = v * (double)wr[(size_t)r]
-                                                   * (double)wc[(size_t)c];
+                px[(size_t)r * sf.tmpl_w + c] =
+                    sample_bilinear(frame, frame_rows, frame_cols, yy, xx);
             }
         }
+
+#if SCALE_FEATURE == 1
+        // 9-BIN UNSIGNED HOG over SCALE_HOG_CELL x SCALE_HOG_CELL cells.
+        // Central differences; the 1-px border is skipped rather than replicated
+        // so no gradient is invented from the crop edge. Binning is by 9 dot
+        // products against unit bin directions (Felzenszwalb's trick) instead of
+        // atan2 — the doubled angle makes it UNSIGNED, so g and -g share a bin.
+        const int CR = sf.cells_r(), CC = sf.cells_c();
+        std::fill(buf.begin(), buf.end(), 0.0);
+        for (int r = 1; r < sf.tmpl_h - 1; ++r) {
+            const int cr = r / SCALE_HOG_CELL;
+            if (cr >= CR) continue;
+            for (int c = 1; c < sf.tmpl_w - 1; ++c) {
+                const int cc = c / SCALE_HOG_CELL;
+                if (cc >= CC) continue;
+                const double gx = px[(size_t)r * sf.tmpl_w + (c + 1)]
+                                - px[(size_t)r * sf.tmpl_w + (c - 1)];
+                const double gy = px[(size_t)(r + 1) * sf.tmpl_w + c]
+                                - px[(size_t)(r - 1) * sf.tmpl_w + c];
+                const double mag = std::sqrt(gx * gx + gy * gy);
+                if (mag < 1e-12) continue;
+                // Best bin by max |<g, u_b>| on the DOUBLED angle.
+                int best = 0; double bestv = -1.0;
+                const double c2 = (gx * gx - gy * gy) / mag;   // mag*cos(2t)
+                const double s2 = (2.0 * gx * gy) / mag;       // mag*sin(2t)
+                for (int b = 0; b < SCALE_HOG_BINS; ++b) {
+                    const double th = M_PI * (double)b / (double)SCALE_HOG_BINS;
+                    const double v  = c2 * std::cos(2.0 * th) + s2 * std::sin(2.0 * th);
+                    if (v > bestv) { bestv = v; best = b; }
+                }
+                buf[((size_t)cr * CC + cc) * SCALE_HOG_BINS + best] += mag;
+            }
+        }
+#else
+        for (int r = 0; r < sf.tmpl_h; ++r)
+            for (int c = 0; c < sf.tmpl_w; ++c)
+                buf[(size_t)r * sf.tmpl_w + c] =
+                    px[(size_t)r * sf.tmpl_w + c] * (double)wr[(size_t)r]
+                                                  * (double)wc[(size_t)c];
+#endif
 
         // Zero-mean and unit-L2 for THIS level — see the note in the header for
         // why per level rather than jointly.

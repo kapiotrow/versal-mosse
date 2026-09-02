@@ -2,7 +2,12 @@
 
 Moved out of CLAUDE.md 2026-08-31; content unchanged.
 
-### Shift budget — SETTLED: 4-4-4, `H_SHIFT` 14 (gray) / 15 (RGB)
+### Shift budget — SETTLED: **3-3-3 at 64x64 (SHIPPING)**, 4-4-4 at 128x128, `H_SHIFT` 15
+
+*(The 64x64 budget was calibrated 2026-09-02: `rails=0` on 200 frames and all four buffers.
+The budget follows the POINT SIZE — one bit off each of the four shifts is exactly the halved
+transform — so a geometry change needs its own 200-frame run. Everything below was written for
+the 128x128 arm and its reasoning carries over unchanged.)*
 
 **FFT budget closed 2026-08-24 on five 200-frame runs; `H_SHIFT` closed 2026-08-27 on real
 video (see "Shift budget on real video").** The FFT budget never moved — every fix has been

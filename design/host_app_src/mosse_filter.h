@@ -632,6 +632,51 @@ constexpr int    DEFAULT_SCALE_MAX_STEP = (int)(SCALE_MAX_STEP);
 // a transform this small.
 void dft_1d(const cfloat *in, cfloat *out, int n, bool inverse);
 
+// SCALE_FEATURE — what scale_extract() turns each level's crop into.
+//
+//   0  RAW RESAMPLED INTENSITY (the shipped default, and byte-identical to every
+//      arm in claims.md). Its load-bearing assumption is stated at scale_extract:
+//      "at the correct level the target fills the template as it did in training,
+//      at a wrong level it does not." **MEASURED FALSE**: the detector gain
+//      against the correction actually warranted is alpha = -0.003 on 140k board
+//      frames across two banks, where the POSITION detector scores 0.93, and
+//      P(idx==0) is 88.4% against 3.0% for a noise argmax.
+//      The reason is that resampling every level back to a FIXED template is a
+//      scale-NORMALISING operation: crop-at-a^n then resize returns nearly the
+//      same image for every n, so the resize cancels the very change it is meant
+//      to detect. What little survives at the borders is then attenuated by the
+//      spatial Hann and removed by the per-level zero-mean/unit-L2.
+//
+//   1  9-BIN UNSIGNED HOG over 4x4 cells. Danelljan fDSST sec.6.1 computes the
+//      scale descriptor by "first re-sizing the patch to a fixed size. HOG
+//      features are then extracted using a cell size of 4x4" — a FIXED-GRID
+//      descriptor computed AFTER the resize, which is exactly what does not
+//      cancel: the histogram over a fixed cell grid responds to how many cells
+//      the target's structures span, and that changes with the extraction scale.
+//      This is his mechanism at a third of his dimensionality (he uses 31-dim
+//      PCA-HOG plus a grey channel, d ~ 1000); it tests the DIAGNOSIS, not his
+//      configuration.
+//      NO SPATIAL HANN on this path, deliberately — the window exists to taper a
+//      raw-pixel patch, DSST does not window the scale template, and it
+//      attenuates precisely the border cue. It is part of the feature definition,
+//      not a second free variable.
+//      COST — PREDICTED 0.78x, MEASURED 1.20x (0.271 -> 0.326 ms/call on x86,
+//      `scale_oracle_bound.py`'s sibling bench). The DFT saving was real (d falls
+//      484 -> 225) but the gradient pass was under-modelled: the 9-way bin search
+//      evaluates cos/sin per bin per pixel and needs a lookup table before this
+//      is worth timing again.
+//      STATUS: BUILT, MEASURED WORSE, AND THE WHOLE DIRECTION IS CLOSED. It
+//      scored alpha 0.03-0.09 against the raw path's 0.17-0.83 on the sim — on an
+//      instrument that does not reproduce the board defect and so could not have
+//      validated it either way. And an ORACLE scale filter is worth only
+//      +0.0023 R (docs/engineering/scale_filter.md). Kept behind the flag at
+//      default OFF as the record of a refuted repair, not as a candidate.
+#ifndef SCALE_FEATURE
+#  define SCALE_FEATURE 0
+#endif
+#define SCALE_HOG_CELL 4
+#define SCALE_HOG_BINS 9
+
 struct ScaleFilter {
     int   n_scales = 0;
     int   tmpl_h = 0, tmpl_w = 0;     // scale template, <= SCALE_TMPL_AREA px
@@ -639,10 +684,18 @@ struct ScaleFilter {
     float sigma = 0.0f;               // in scale bins
     bool  initialized = false;
 
-    FilterState         st;           // rows=1, cols=n_scales, channels=tmpl_h*tmpl_w
+    FilterState         st;           // rows=1, cols=n_scales, channels=dims()
     std::vector<cfloat> G;            // desired 1-D output, length n_scales
 
+    // Cells fit whole into the template; a partial cell at the edge is dropped
+    // rather than zero-padded, so every cell sees the same number of pixels.
+    int cells_r() const { return tmpl_h / SCALE_HOG_CELL; }
+    int cells_c() const { return tmpl_w / SCALE_HOG_CELL; }
+#if SCALE_FEATURE == 1
+    int dims()  const { return cells_r() * cells_c() * SCALE_HOG_BINS; }
+#else
     int dims()  const { return tmpl_h * tmpl_w; }        // d
+#endif
     int sample_elems() const { return dims() * n_scales; }
     bool enabled() const { return n_scales > 1; }
 };

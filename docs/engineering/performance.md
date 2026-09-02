@@ -32,6 +32,10 @@ orchestration, never core count. **`runtime<ratio>` is not utilization**: the ma
 
 ### Per-frame AIE compute (128×128, ch16, from `aiecompiler.log` schedules, post-vectorization)
 
+*(The 3x3 arm. The SHIPPING Layer-1 arm is 64x64/ch32/7x7-stride-2 and its conv2d was MEASURED,
+not scheduled — 42.4 ms/frame as first built, then reworked; `results/aie_compute.csv` carries
+both rows and `conv2d_kernel.cpp`'s COST block the method.)*
+
 | kernel | ms/frame | note |
 |---|---|---|
 | conv2d | 4.1 | 37 → 8.75 cyc/px; the untouched **stream-read loop is now 44%** of it |

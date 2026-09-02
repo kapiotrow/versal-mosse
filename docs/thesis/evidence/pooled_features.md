@@ -464,3 +464,76 @@ pooled variant, so nothing needs to aggregate: the arm is `PATCH_ROWS=PATCH_COLS
 `TARGET_PADDING=2.0`, i.e. px/bin = box/32. That is also exactly the geometry Danilowicz ships
 (128x128 ROI -> 64x64 filter) and their 8-channel row scores EAO 0.183 against DSST/KCF HOG at
 0.17 — though on VOT2015 with an inverted R, so no value there is comparable to ours.
+
+---
+
+# AGGREGATION ON THE RECTIFIED LAYER-1 BANK — REFUTED, and the LINEARITY EXPLANATION with it
+
+**2026-09-02.** `runs/vot/0902_offline-pool/pool62.json`, 62 sequences / 19,903 frames, shipping
+eta 0.05 / gate 5.0, `vot_ar_offline.py` + `scripts/grid_stats.py`. Offline only.
+
+## Why it was re-opened
+
+`settled.md` and `feature_bank.md` refute aggregation with an ARGUMENT as well as a measurement:
+
+> *"A box average of a linear map is another linear map with the same span. It CANNOT do
+> anything. That file read it as a fact about aggregation; it is a fact about LINEARITY."*
+
+**`CONV_RELU=1` shipped on 2026-09-02**, so the map this tracker computes is no longer linear and
+that argument no longer covers it. The literature all points the same way and all of it is
+post-nonlinearity: HOG's deformation tolerance IS the cell; Danelljan takes layer-1 activations
+after the ReLU; Danilowicz & Kryjak's embedded stem is conv + ReLU + 2x2 MAXPOOL. This project's
+own screen had a consistent hit — `rgb-danrelu` (vgg conv1 3x3 + maxpool + ReLU) beat its linear
+twin by **+0.0398**, the pooled arm that beat its control.
+
+## The design: a 2x2, because an ARGUMENT is under test, not an arm
+
+`l1linblur` is the NEGATIVE CONTROL. The linearity argument predicts it reproduces the `blur2`
+null (−0.0010/−0.0012); the hypothesis predicts `l1relublur` GAINS. Bank, geometry, channels and
+`sigma/target` are identical across all four — only the rectifier and the aggregation move.
+
+```
+arm              A        R    tracked
+rgb-l1relu    0.5077   0.4364     8686    <- SHIPPING, the control
+rgb-l1relublur 0.5154  0.4209     8377
+rgb-l1lin     0.5031   0.3910     7783
+rgb-l1linblur 0.5465   0.3255     6478
+```
+
+Paired per-sequence, against each arm's OWN no-aggregation twin:
+
+| comparison | dR mean | trim-3 | trim-5 | b/w/t | sign p | P(dR<=0) |
+|---|---|---|---|---|---|---|
+| `l1relublur` vs `l1relu` (rectified) | **−0.0242** | −0.0260 | −0.0269 | 3/7/52 | 0.344 | **0.995** |
+| `l1linblur` vs `l1lin` (linear) | **−0.0180** | −0.0198 | −0.0205 | 2/6/54 | 0.289 | 0.971 |
+
+## Verdict: BOTH PREDICTIONS FAILED
+
+**Aggregation LOSES on the rectified map** — −0.0242, stable under both trims, worse on 7
+sequences and better on 3, bootstrap 0.995 AGAINST. That is not a null; it is a measured loss
+larger than several effects this project has accepted.
+
+**And the negative control fires, which is what makes the result readable.** The linear arm loses
+−0.0180, where the linearity argument predicts a NULL. **So that argument was not the operative
+mechanism in 2026-08-28 either.** It is arithmetically correct and trackingwise irrelevant — the
+same verdict this file already reached for the signed-lobe-cancellation hypothesis, now applied
+to its replacement. Blur hurts both maps by a similar amount; the rectifier changes almost
+nothing about how aggregation behaves.
+
+**The likely operative mechanism is RESOLUTION, not linearity.** The map is already 64x64 from a
+128x128 crop; a further 2x2 average takes the effective resolution below what localisation needs.
+That is consistent with the hardware result that at matched `sigma/target` the FINER map wins
+(+0.0222 R, `proposed_build_res64.md` sec.25) and with `dec2`/`pool2`/`mpool2` agreeing to 0.001
+— aggregation and decimation are the same knob seen twice.
+
+**Accuracy rises in both pairs (0.5077→0.5154, 0.5031→0.5465) and it is the documented SELECTION
+effect** — the blur arms track 309 and 1305 fewer frames, so they are scored on an easier prefix.
+
+## What this closes, and what it does not
+
+- **CLOSED: aggregation over THIS map, on any bank, rectified or not.** Three operators (box
+  average, max, decimate) x two banks x rectified/linear, all null-to-negative.
+- **NOT closed: Danilowicz's stem as a whole.** Their maxpool follows a STRIDE-1 3x3 conv and
+  pools down TO the working resolution; ours would pool BELOW it, because the stride-2 conv has
+  already decimated. `rgb-danrelu`'s +0.0398 was measured with that 3x3/stride-1 geometry, not on
+  top of this bank. The two are not the same operation and this result does not speak to theirs.
