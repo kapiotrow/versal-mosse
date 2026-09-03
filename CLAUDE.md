@@ -350,6 +350,18 @@ both errors are already large 40 frames out and POSITION accelerates faster into
 The full chain runs on hardware on the real conv path. Heap, not tracking, was the last blocker;
 `vot::StreamBlob` closed it, proven by identical run-state digests both ways.
 
+**ENERGY PER FRAME: 12.2 mJ (0.487 W dynamic at 25.16 ms), measured 2026-09-03** — the last
+thesis debt with no number, now paid. From the VEK280 System Controller's INA226 rails
+(`sc_app` over `/dev/ttyUSB3`; **the APU exposes no current sensor at all**), as a DIFFERENCE
+against an idle baseline. **68% is the APU rail, 23% LPDDR4, 9% NoC — and the PL+AIE-ML rail
+does not move (< 33 mW)**, nor does merely having the graph resident (unresolved on every
+rail). That is P-02's CPU-bound frame confirmed in the energy domain by an instrument on a
+different chip. `results/power.csv`, `evidence/power.md`, claim `P-12`.
+**Never quote a rail delta without its error bar**: the rails are quantized very differently
+(149 distinct values on `VCC_PSFP`, three on `VCC_PMC`), and on a 3-level rail the sample sd
+collapses and any difference clears "2 s.e." — which is exactly how three null rails first
+reported `CONTROL FAILED` at ±0.000 W.
+
 **Best hardware FPS: 26.29 ms/frame = 38.04 FPS** (`runs/run_0821_1725.log`, gray, synthetic,
 UART console). **Quote FPS only from a serial-console run** — over ssh the same work reads
 differently, and the UART alone was 3.79 ms. On the ssh instrument the shipping arm is **24.07 ms
@@ -746,6 +758,22 @@ scripts/
                          #   writer against the toolkit's reader
   calib_report.py        # a run's console+track.csv -> a budget verdict (rails, amplitude early
                          #   vs converged, IoU). Keys on (job, frame)
+  -- power / energy, the one thesis debt with no claim behind it --
+  power_probe.sh         # samples whatever power/thermal channels a host exposes, as long-format
+                         #   CSV. Backends: `sc_app` (INA226 rails, runs ON the System
+                         #   Controller -- the only source of WATTS) and `sysmon` (the board's
+                         #   own iio: regulated voltages + die temp, NO current). Discovers its
+                         #   channels; exits 3 rather than emit an empty CSV
+  power_measure.py       # the protocol and the arithmetic: static -> graph -> run -> graph_post
+                         #   -> tail, and the answer is a DIFFERENCE. Refuses to print a delta
+                         #   smaller than the instrument's own noise, and cross-checks frame
+                         #   time two ways. Phase boundaries come from the tracker's own
+                         #   `[power] PHASE` markers, never from an assumed duration -- VOT
+                         #   staging reads up to 1.27 GB before frame 0.
+                         #   The tracker's `--power-pause <s>` (HOST-ONLY, no flagstamp, >= 5 s)
+                         #   is what creates the graph-idle windows: it holds twice, before
+                         #   frame 0 and after the last frame, and the SECOND hold is the
+                         #   thermal-drift CONTROL, not a duplicate
   -- diagnosis, all offline, reading existing CSVs or the dataset --
   vot_motion_check.py    # does a sequence's ANNOTATED motion appear in the PIXELS? NCC of the
                          #   box content at "moved" vs "still". Phase correlation cannot answer

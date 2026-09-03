@@ -1,0 +1,10 @@
+# power_probe backend=sysmon host=versal-rootfs-common-20252 channels=9 period_ms=500
+# channel vccaux mV /sys/bus/iio/devices/iio:device0/in_voltage0_vccaux_input
+# channel vccaux_pmc mV /sys/bus/iio/devices/iio:device0/in_voltage1_vccaux_pmc_input
+# channel vcc_pmc mV /sys/bus/iio/devices/iio:device0/in_voltage2_vcc_pmc_input
+# channel vcc_psfp mV /sys/bus/iio/devices/iio:device0/in_voltage3_vcc_psfp_input
+# channel vcc_pslp mV /sys/bus/iio/devices/iio:device0/in_voltage4_vcc_pslp_input
+# channel vcc_soc mV /sys/bus/iio/devices/iio:device0/in_voltage5_vcc_soc_input
+# channel vp_vn mV /sys/bus/iio/devices/iio:device0/in_voltage6_vp_vn_input
+# channel die_temp mC /sys/bus/iio/devices/iio:device0/in_temp160_temp_input
+# channel versal_thermal mC /sys/class/hwmon/hwmon0/temp1_input

@@ -1,0 +1,13 @@
+date=2026-09-03
+arm=l1relu
+sampler=root@192.168.10.2
+backend=sysmon
+board=root@192.168.10.2
+period_ms=500
+static_s=120.0
+pause_s=60.0
+tail_s=60.0
+settle_s=5.0
+run_cmd=/tmp/mosse/board_run.sh 1200 a.xclbin --vot-seq car1 --power-pause 60 --vot-jobs 0,0,0,0,0,0,0,0,0,0,0
+transport=ssh
+graph_phase=measured

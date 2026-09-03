@@ -44,6 +44,8 @@
 #include <fstream>
 #include <chrono>
 #include <thread>          // std::this_thread::yield() in rc_poll_until_done()
+#include <ctime>           // nanosleep() in power_pause_hold()
+#include <cerrno>
 
 #include "xrt/xrt_device.h"
 #include "xrt/xrt_kernel.h"
@@ -422,6 +424,100 @@ static inline void det_hash_bytes(const void *p, size_t n)
 #  define COAST_DECAY 0.5
 #endif
 
+// -----------------------------------------------------------------------
+// @thesis subsec:metrykiSystemowe | P-12 | The hold that separates the design's RESIDENT
+//   power from its per-frame work: the graph is up and idle, and no frame is in flight.
+//
+// --power-pause <seconds> — THE `graph` PHASE OF THE POWER PROTOCOL
+// -----------------------------------------------------------------------
+// `subsec:metrykiSystemowe` promises energy per frame. Watts cannot come from this
+// chip: the APU exposes no current sensor at all (evidence/power.md — SYSMON gives
+// seven REGULATED voltages and a die temperature, the device tree declares no INA
+// node, and the PMC i2c that would reach the board's rails is `disabled`). They come
+// from the System Controller, sampled by scripts/power_probe.sh while this process
+// runs, and the answer is a DIFFERENCE between phases.
+//
+// Two of those phases this process cannot provide without help. At 2% AIE
+// utilisation the interesting split is:
+//
+//     P_design = P_graph - P_static     what the design costs merely to be RESIDENT
+//     P_work   = P_run   - P_graph      what processing frames costs
+//
+// and `graph` means "xclbin loaded, graph free-running, no frame in flight" — a state
+// that otherwise exists for microseconds. So this holds there, twice: once before
+// frame 0 and once after the last frame.
+//
+// THE SECOND HOLD IS A CONTROL, NOT A DUPLICATE. If the two graph windows read the
+// same power, the board was thermally settled and the run delta is the workload. If
+// the second is higher, the board was still warming and the delta is contaminated —
+// which is exactly the failure a single before-only baseline reports as a result.
+// The tail-vs-static check in power_measure.py is the same test at the board level;
+// two independent controls beat one control twice.
+//
+// COST WHEN UNUSED IS ZERO — one comparison against 0 twice per process. This is
+// host-only: it reaches no flagstamp, so a power build is an scp, not a card swap.
+//
+// The markers are printed and FLUSHED because the driver aligns its phase windows on
+// their ARRIVAL, not on a duration it assumed. Staging a VOT sequence reads up to
+// 1.27 GB before frame 0, so a driver that timed the hold from process start would
+// bin the whole blob read into the `graph` phase and report the NFS transfer as the
+// design's resident power.
+static double g_power_pause_s = 0.0;
+
+// Scanned on BOTH frame sources, which is why it is not in vot_parse_args(): at
+// FRAME_SOURCE=synth there is no argument parser at all, and a power run has to be
+// possible on the synthetic scene (a fixed, sequence-independent workload is the
+// better power stimulus — see docs/thesis/evidence/power.md).
+static bool power_pause_parse(int argc, char **argv)
+{
+    for (int i = 2; i < argc; ++i) {
+        if (std::string(argv[i]) != "--power-pause") continue;
+        if (i + 1 >= argc) {
+            fprintf(stderr, "--power-pause needs a value in seconds\n");
+            return false;
+        }
+        g_power_pause_s = atof(argv[i + 1]);
+        // A pause the sampler cannot resolve is worse than none: it would put a
+        // `graph` window in the log that holds one or two samples, and a mean over
+        // two samples looks exactly like a mean over sixty in the output table.
+        // The sampler runs at a few Hz by construction, so refuse anything short.
+        if (g_power_pause_s < 5.0) {
+            fprintf(stderr, "--power-pause must be >= 5 s (the sampler runs at a few "
+                            "Hz; a shorter hold yields a mean over a handful of "
+                            "samples that reads like a real one), got '%s'\n",
+                    argv[i + 1]);
+            return false;
+        }
+        return true;
+    }
+    return true;
+}
+
+// Holds with the graph up and nothing in flight. `phase` names the window in the log.
+static void power_pause_hold(const char *phase)
+{
+    if (g_power_pause_s <= 0.0) return;
+    // Printed BEFORE the sleep and flushed: the marker's arrival time is the window
+    // boundary the driver uses.
+    //
+    // DELIBERATELY plain printf and NOT VP1. A power run wants VERBOSITY=0 — console
+    // cost was 62 ms/frame at VERBOSITY=1 — and gating the marker on the console knob
+    // would delete the phase boundary from exactly the runs that need it, leaving a
+    // driver that silently falls back to run-minus-static. This line is instrumentation,
+    // not diagnostics.
+    printf("\n[power] PHASE %s BEGIN %.1f s — graph up, no frame in flight\n",
+           phase, g_power_pause_s);
+    fflush(stdout);
+    // A real sleep, not a spin: the point is an IDLE APU. A busy-wait here would
+    // measure the A72 at 100% and call it the design's resident power.
+    struct timespec ts;
+    ts.tv_sec  = (time_t)g_power_pause_s;
+    ts.tv_nsec = (long)((g_power_pause_s - (double)ts.tv_sec) * 1e9);
+    while (nanosleep(&ts, &ts) == -1 && errno == EINTR) { }
+    printf("[power] PHASE %s END\n", phase);
+    fflush(stdout);
+}
+
 #if FRAME_SOURCE_VOT
 // -----------------------------------------------------------------------
 // @thesis subsec:zrodlaObrazu | R-08,R-09 | The VOT run: one sequence, one job, the
@@ -505,7 +601,7 @@ static bool vot_parse_args(int argc, char **argv)
         const bool needs_value = (a == "--vot-data" || a == "--vot-results" ||
                                   a == "--vot-seq" || a == "--vot-job" ||
                                   a == "--vot-jobs" || a == "--vot-max-frames" ||
-                                  a == "--vot-stream");
+                                  a == "--vot-stream" || a == "--power-pause");
         if (needs_value && i + 1 >= argc) {
             fprintf(stderr, "%s needs a value\n", a.c_str());
             return false;
@@ -517,6 +613,10 @@ static bool vot_parse_args(int argc, char **argv)
         else if (a == "--vot-jobs")    g_vot.job_spec    = argv[++i];
         else if (a == "--vot-max-frames") g_vot.max_frames = atoi(argv[++i]);
         else if (a == "--vot-stream")  g_vot.stream_mode  = argv[++i];
+        // Already consumed by power_pause_parse(), which runs on both frame sources.
+        // Listed here only so this parser's unrecognised-argument rule — deliberately
+        // fatal, so a typo cannot silently run the wrong sequence — does not reject it.
+        else if (a == "--power-pause") ++i;
         else {
             fprintf(stderr,
                     "unrecognised argument '%s'\n"
@@ -524,6 +624,7 @@ static bool vot_parse_args(int argc, char **argv)
                     "                   [--vot-seq NAME] [--vot-job N]\n"
                     "                   [--vot-jobs all|N,M,...] [--vot-max-frames N]\n"
                     "                   [--vot-stream auto|always|never]\n"
+                    "                   [--power-pause SECONDS]\n"
                     "  --vot-jobs runs several anchors in ONE process. Naming the\n"
                     "  same job twice is the determinism test: its two trajectories\n"
                     "  must come back byte-identical.\n",
@@ -3728,6 +3829,10 @@ int main(int argc, char **argv)
         return EXIT_FAILURE;
     }
 
+    // BEFORE vot_parse_args, and on both frame sources: the synth arm has no
+    // argument parser of its own, and a power run must be possible there too.
+    if (!power_pause_parse(argc, argv)) return EXIT_FAILURE;
+
 #if !FRAME_SOURCE_VOT
     // FRAME_SOURCE=synth MUST reproduce today's behaviour exactly, and the
     // runtime-geometry substitution above is only safe if these hold. Checked
@@ -4542,6 +4647,14 @@ int main(int argc, char **argv)
     // project. See docs/thesis/evidence/phase3.md. The determinism test (job A, job B, job A
     // in one process, A's two trajectories byte-identical) is the instrument
     // that can actually see a miss; nothing else here can.
+    // THE `graph` WINDOW. Everything above has run: xclbin loaded, graph started,
+    // weights pushed, mean_prev seeded, the sequence staged and the frame buffer
+    // filled. What has NOT happened is a single frame. Placed here rather than
+    // straight after gr.run() on purpose — the staging above reads up to 1.27 GB
+    // over NFS, and a window opened before it would price that transfer as the
+    // design's resident power.
+    power_pause_hold("graph");
+
     for (size_t job_i = 0; job_i < n_jobs; ++job_i) {
 #if FRAME_SOURCE_VOT
     if (!run_reset(job_i)) return EXIT_FAILURE;
@@ -6118,6 +6231,14 @@ int main(int argc, char **argv)
     }   // ===== end of the run loop =====================================
 
     csv_close();
+
+    // THE SECOND `graph` WINDOW — the control. Same state as the first: graph up,
+    // no frame in flight. If the two read the same power the board was settled and
+    // the run delta is the workload; if this one is higher the board was still
+    // warming and the delta is contaminated. Before the CUMULATIVE block, because
+    // that block is what board_run.sh watches for to declare the run finished —
+    // holding after it would have the wrapper kill the process mid-window.
+    power_pause_hold("graph_post");
 
 #if FRAME_SOURCE_VOT
     if (g_det_seen.size() < g_vot.job_list.size()) {

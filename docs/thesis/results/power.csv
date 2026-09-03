@@ -1,0 +1,43 @@
+# Power and energy per frame. Rails from the VEK280 System Controller (INA226).
+#
+# The APU exposes no current sensor (evidence/power.md, claim P-12), so every row here must
+# come from the System Controller's INA226 rails via scripts/power_measure.py. A row is
+# written by hand from that script's summary.csv, with the run's flagstamps beside it, per
+# results/README.md's provenance rule.
+#
+# EVERY POWER COLUMN IS A MEAN OVER A PHASE, and the quotable quantities are the DIFFERENCES:
+#   p_design_w = p_graph_w - p_static_w   what the design costs to be resident
+#   p_work_w   = p_run_w   - p_graph_w    what processing frames costs
+#   j_per_frame = p_work_w * frame_ms/1000
+#
+# An EMPTY CELL IS NOT MEASURED, NOT ZERO -- the FILTER_MASK_STAT convention. In particular
+# p_graph_w and p_graph_post_w are empty unless the run carried --power-pause, and
+# j_per_frame is empty whenever resolved=0.
+#
+# p_graph_post_w is the SECOND hold, after the last frame -- the same board state as
+# p_graph_w. It is a CONTROL, not a data point: if the two disagree by more than the noise
+# the board was still warming and p_work_w carries that drift rather than the workload.
+#
+# resolved: 1 when |p_work_w| exceeds TWICE ITS OWN STANDARD ERROR (se_work_w), computed
+# from an autocorrelation-corrected effective sample size -- NOT from the single-sample sd.
+# These are slow time series: on the 2026-09-03 thermal run a 383-sample phase had n_eff=31.
+# Judging against the raw sd calls a 3.6-sigma effect a null; judging against the naive sem
+# calls the same effect 7.7 sigma. Both are wrong, in opposite directions.
+# resolved=0 is a BOUND, not a measurement -- quote it as "< 2*noise_w W" and never as a
+# number. At 2% AIE utilisation this is a likely and publishable outcome.
+#
+# NOT YET IN csv2tex.py's TABLE_SPEC, deliberately: a booktabs body with no rows is a broken
+# float, not an empty one. Add the spec entry with the FIRST real row, not before -- otherwise
+# `make thesis-tables` quietly stops emitting a table nobody notices is missing.
+#
+# transport: ssh|uart. It is a confound for watts exactly as it is for FPS -- the PHY and
+# ssh's CPU share are inside the board total. Do not compare rows across transports.
+arm,date,channel,p_static_w,p_graph_w,p_run_w,p_graph_post_w,p_tail_w,noise_w,p_design_w,se_design_w,p_work_w,se_work_w,resolved,frame_ms,mj_per_frame,transport,run_dir,arm_pl
+l1relu,2026-09-03,VCC_PSFP,0.1846,0.1914,0.5197,0.1915,0.1876,0.0821,0.0068,0.0037,0.3282,0.0062,1,25.16,8.2584,ssh,runs/power/0903_l1relu_scapp,APU (rdzenie A72)
+l1relu,2026-09-03,VCC1V1_LP4,1.2019,1.2032,1.3175,1.2012,1.2019,0.1161,0.0013,0.0012,0.1143,0.0090,1,25.16,2.8759,ssh,runs/power/0903_l1relu_scapp,LPDDR4
+l1relu,2026-09-03,VCC_SOC,3.1534,3.1543,3.1984,3.1537,3.1527,0.0362,0.0008,0.0190,0.0441,0.0190,1,25.16,1.1106,ssh,runs/power/0903_l1relu_scapp,NoC
+l1relu,2026-09-03,VCC_PMC,0.1330,0.1330,0.1330,0.1330,0.1330,0.0003,0.0000,0.0008,0.0000,0.0008,0,25.16,,ssh,runs/power/0903_l1relu_scapp,PMC
+l1relu,2026-09-03,VCCAUX_PMC,0.1321,0.1321,0.1321,0.1321,0.1320,0.0003,-0.0000,0.0007,-0.0000,0.0007,0,25.16,,ssh,runs/power/0903_l1relu_scapp,VCCAUX PMC
+l1relu,2026-09-03,VCCAUX,1.1417,1.1414,1.1408,1.1413,1.1412,0.0015,-0.0003,0.0030,-0.0006,0.0030,0,25.16,,ssh,runs/power/0903_l1relu_scapp,VCCAUX
+l1relu,2026-09-03,VCC_PSLP_CPM5,1.7189,1.7191,1.7180,1.7181,1.7194,0.0026,0.0002,0.0046,-0.0011,0.0046,0,25.16,,ssh,runs/power/0903_l1relu_scapp,PS domena niskiej mocy
+l1relu,2026-09-03,VCCINT,3.8547,3.8586,3.8450,3.8552,3.8865,0.2357,0.0039,0.0164,-0.0137,0.0163,0,25.16,,ssh,runs/power/0903_l1relu_scapp,PL + AIE-ML

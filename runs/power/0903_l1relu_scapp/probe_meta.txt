@@ -1,0 +1,9 @@
+# power_probe backend=sc_app host=xilinx-versal-system-controller-20222 channels=8 period_ms=500
+# channel VCCINT W VCCINT
+# channel VCC_SOC W VCC_SOC
+# channel VCC_PMC W VCC_PMC
+# channel VCC_PSFP W VCC_PSFP
+# channel VCC_PSLP_CPM5 W VCC_PSLP_CPM5
+# channel VCC1V1_LP4 W VCC1V1_LP4
+# channel VCCAUX W VCCAUX
+# channel VCCAUX_PMC W VCCAUX_PMC

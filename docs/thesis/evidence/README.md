@@ -40,6 +40,7 @@ status (`TODO_`, `proposed_`), because the status changes and the filename does 
 | [`phase3.md`](phase3.md) | closed | 2026-08-25 | `R-09`, `M-04` | VOT bring-up 3: per-run reset, and the determinism test proven able to fail |
 | [`phase4.md`](phase4.md) | closed | 2026-08-25 | `P-09`, `M-06` | VOT bring-up 4: console overhead removal, and the transport that was the whole win |
 | [`pooled_features.md`](pooled_features.md) | closed | 2026-09-02 | `N-03`, `N-03b`, `N-04`, `N-05`, `M-10` | aggregation refuted on both banks; the resolution half, and the linearity explanation WITHDRAWN |
+| [`power.md`](power.md) | current | 2026-09-03 | `P-12` | the energy-per-frame measurement, the instrument it needed, and why the answer is a difference |
 | [`robustness_gap.md`](robustness_gap.md) | closed | 2026-08-27 | `R-06`, `N-14` | where the robustness gap comes from: the tracker walks off target confidently |
 | [`robustness_proposals.md`](robustness_proposals.md) | closed | 2026-08-29 | `N-13`, `O-02` | the ranked robustness candidate list and why this order; several entries have since been decided |
 | [`shift_budget_realvideo.md`](shift_budget_realvideo.md) | closed | 2026-08-26 | `B-01`, `B-02`, `B-03`, `B-04`, `B-05`, `B-09` | the shift budget re-derived on real video: the instrument gap, the censoring, and why `H_SHIFT` is the only lever |
@@ -47,6 +48,6 @@ status (`TODO_`, `proposed_`), because the status changes and the filename does 
 | [`subbin_lag.md`](subbin_lag.md) | closed | 2026-08-25 | `N-11` | `nature` fails without the gate firing — and the sub-bin mechanism first proposed for it is REFUTED in-file |
 | [`tiger.md`](tiger.md) | closed | 2026-08-25 | `N-10` | eta, sigma and eps_rel all chased on `tiger`, and why none of them is the answer |
 
-31 notes; 9 cited by no claim
+32 notes; 9 cited by no claim
 (`automation.md`, `evidence_arm0.md`, `evidence_arm_ab.md`, `layer1_features.md`, `phase0a.md`, `phase0b.md`, `phase0c.md`, `phase1.md`, `phase2.md`) — those are bring-up records
 rather than findings, and a note that should carry a claim looks exactly the same, so check.

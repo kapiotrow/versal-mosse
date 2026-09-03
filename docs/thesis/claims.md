@@ -110,7 +110,12 @@ The one debt with no claim behind it is **power** — see below.
 
 - **Power / energy per frame.** `subsec:metrykiSystemowe` promises energy per frame as the
   measure that makes embedded comparisons fair, and `sec:wydajnoscZasoby` lists `pobór mocy`.
-  **Nothing in `results/` measures power.** Either take the measurement or cut the promise.
+  **PAID 2026-09-03.** `results/power.csv` carries the measurement and **P-12** the verdict:
+  12.2 mJ/frame, 0.487 W dynamic, 68% of it the APU rail and the PL+AIE-ML rail not moving at
+  all. Measured from the System Controller's INA226 rails (the APU exposes no current sensor)
+  as a difference against an idle baseline, with four controls. `sec:wydajnoscZasoby`'s
+  `pobór mocy` and `subsec:metrykiSystemowe`'s energy-per-frame are both now answerable from a
+  CSV, and `docs/thesis/tables/power.tex` is generated.
 - **`subsec:wymiarowoscBanku` presents the participation ratio as the proper measure of bank
   dimensionality — and claim N-07 refutes using it to *rank* banks** (random Gaussian scores
   10.69 against the shipping bank's 7.43). The theory's actual use of it, the structural rank-9
@@ -195,6 +200,7 @@ implies.
 | P-09 | Phase 4's console knobs are worth 1.1%; the transport (UART→ssh, 3.79 ms) was the whole win | accepted-hw | `evidence/phase4.md` | three `car1` runs | `sec:metodykaBadan` |
 | P-10 | Halving the host filter on Hermitian symmetry does not work — the premise is false in fixed point (95.8% of bins differ from their conjugate partner) | refuted | GAP — **has the ideal control: the float golden is Hermitian to 0 LSB** | `make aiesim_plio` | `subsec:fftAie` |
 | P-11 | fDSST's PCA compression is not worth it; the real-input DFT was (3.11×, transferred exactly to hardware) | refuted (PCA) / accepted-hw (DFT) | GAP | `run_0821_1109` | `subsec:filtrSkali` |
+| P-12 | **Energy per frame is 12.2 mJ (0.487 W dynamic at 25.16 ms).** 68% is the APU rail, 23% LPDDR4, 9% NoC; **the PL+AIE-ML rail does not move (< 33 mW)** and the design's RESIDENT cost is unresolved on every rail. Confirms P-02's CPU-bound frame in the energy domain, on a different chip and instrument | accepted-hw | `evidence/power.md` | `runs/power/0903_l1relu_scapp`, `results/power.csv` | `subsec:metrykiSystemowe` |
 
 ## R — Tracking results
 

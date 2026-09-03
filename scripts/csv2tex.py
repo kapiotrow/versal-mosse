@@ -91,6 +91,18 @@ TABLE_SPEC = {
         ("status", "Stan", "l", "text"),
     ], lambda r: True),
 
+    # Only the rails that MOVED plus VCCINT: the null rails are the point of the note,
+    # not of the table, and a bound of "< 0.006 W" is not a number a booktabs column can
+    # carry honestly. VCCINT is kept BECAUSE it is null -- that is the result.
+    "power": ("power.csv", [
+        ("arm_pl", "Szyna zasilania", "l", "text"),
+        ("p_static_w", "Spoczynek [W]", "r", "num"),
+        ("p_work_w", "Przyrost [W]", "r", "num"),
+        ("se_work_w", "Bł. std. [W]", "r", "num"),
+        ("mj_per_frame", "Energia [mJ/klatkę]", "r", "num"),
+    ], lambda r: r.get("channel") in
+       ("VCC_PSFP", "VCC1V1_LP4", "VCC_SOC", "VCCINT")),
+
     "resources": ("resources.csv", [
         ("resource_pl", "Zasób", "l", "text"),
         ("available", "Dostępne", "r", "int"),

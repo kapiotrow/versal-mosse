@@ -1,0 +1,13 @@
+date=2026-09-03
+arm=
+sampler=x
+backend=sc_app
+board=root@192.168.10.2
+period_ms=500
+static_s=60.0
+pause_s=0.0
+tail_s=30.0
+settle_s=0.0
+run_cmd=
+transport=ssh
+graph_phase=measured
