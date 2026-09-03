@@ -1,5 +1,7 @@
 # Reproduction appendix
 
+**Status:** current · **Updated:** 2026-08-30 · **Scope:** the reproduction appendix: exact commands, per arm
+
 What a reader needs to rebuild and re-run each arm. Draft — the `TODO`s are the parts only you
 can supply; everything else is transcribed from `CLAUDE.md` and `scripts/vot_sweep.sh` and is
 believed correct as of 2026-08-30.

@@ -1,6 +1,8 @@
 # Pooled features — AGGREGATION IS REFUTED ON BOTH BANKS.
 # The RESOLUTION half is bank-dependent and was NOT.
 
+**Status:** closed · **Updated:** 2026-09-02 · **Scope:** aggregation refuted on both banks; the resolution half, and the linearity explanation WITHDRAWN
+
 **2026-08-28.** Offline, `scripts/rgb_vs_gray_loop.py`, 8 stb2022 sequences, 2841 frames,
 14 arms across both feature banks. No hardware.
 
@@ -147,7 +149,7 @@ So the honest statement is: **more sequences improve than not (39/23, p = 0.028)
 size of the aggregate is carried entirely by three of 62.** A direction without a magnitude.
 
 **And mean IoU is the wrong metric for this arm specifically.** Holds go up 2.3x and PSR
-halves — a weaker, more frequently vetoed detector. `evidence_ar.md` showed mean IoU and AR
+halves — a weaker, more frequently vetoed detector. `metric_ar_vs_iou.md` showed mean IoU and AR
 ordering `HOLD_COAST` OPPOSITELY on identical trajectories, and the mechanism there was
 exactly loss TIMING, which mean IoU cannot see. The survived-fraction row above is the
 nearest free proxy and it agrees (0.281 -> 0.312), but it is not AR: no anchors, no
@@ -240,7 +242,7 @@ the filter learns rather than what the features see, and is a different mechanis
 ## Caveats on the bench itself
 
 - Box size is held fixed (no DSST). Applies identically to every arm.
-- Mean IoU, not AR — and `evidence_ar.md` showed those can order two arms oppositely. A
+- Mean IoU, not AR — and `metric_ar_vs_iou.md` showed those can order two arms oppositely. A
   +0.0066-scale effect would need AR to be believed; a null this flat would not survive
   becoming a win under a different metric, but that is an argument, not a measurement.
 - `nature` is 35% of the frames and `tiger` another 13%.
@@ -523,7 +525,7 @@ nothing about how aggregation behaves.
 **The likely operative mechanism is RESOLUTION, not linearity.** The map is already 64x64 from a
 128x128 crop; a further 2x2 average takes the effective resolution below what localisation needs.
 That is consistent with the hardware result that at matched `sigma/target` the FINER map wins
-(+0.0222 R, `proposed_build_res64.md` sec.25) and with `dec2`/`pool2`/`mpool2` agreeing to 0.001
+(+0.0222 R, `arm_res64.md` sec.25) and with `dec2`/`pool2`/`mpool2` agreeing to 0.001
 — aggregation and decimation are the same knob seen twice.
 
 **Accuracy rises in both pairs (0.5077→0.5154, 0.5031→0.5465) and it is the documented SELECTION

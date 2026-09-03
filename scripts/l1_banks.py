@@ -143,7 +143,7 @@ def resnet18_conv1_5x5(n_out=NCH):
     """resnet18 conv1 CENTRE-CROPPED to 5x5, for a stride-1 arm at the 128x128 map.
 
     WHY 5x5 AND WHY STRIDE 1. Hardware measured the 64x64 map as the WORSE
-    geometry at matched sigma/target (-0.0222 R, proposed_build_res64.md sec.25),
+    geometry at matched sigma/target (-0.0222 R, arm_res64.md sec.25),
     so every arm in the Layer-1 screen ran at the losing end. Stride 1 keeps the
     128x128 map, and 5x5 is the largest kernel that stays FRAME-RATE NEUTRAL
     there: conv2d = S + t*taps with S = 2.31 ms and t = 0.255 ms/tap from the two

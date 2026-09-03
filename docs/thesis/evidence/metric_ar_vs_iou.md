@@ -1,5 +1,7 @@
 # The first AR numbers — and they REVERSE the coast verdict
 
+**Status:** closed · **Updated:** 2026-08-25 · **Scope:** the first AR numbers, and how they REVERSE a verdict mean IoU had given
+
 **2026-08-25.** The 108 trajectories from the 8-sequence evidence sweep
 (`evidence_arm0.md`, `evidence_arm_ab.md`) ingested into a toolkit workspace and
 scored by `vot analysis`. No board time: this is the same data, read by the

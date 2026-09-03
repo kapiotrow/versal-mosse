@@ -1,5 +1,7 @@
 # Robustness — the ranked candidate list, and why this order
 
+**Status:** closed · **Updated:** 2026-08-29 · **Scope:** the ranked robustness candidate list and why this order; several entries have since been decided
+
 **2026-08-28.** Written after `robustness_gap.md` (how runs lose), `detector_gain.md`
 (localisation exonerated) and `pooled_features.md` (aggregation refuted, geometry rejected
 on hardware). Two new measurements here, both from the existing `track_*.csv` of
@@ -214,7 +216,7 @@ re-deriving:
 
 ### WHAT BOLME ACTUALLY SAYS — the null has a candidate mechanism, and it is testable
 
-Re-reading `docs/Visual_object_tracking_using_adaptive_correlation_.pdf` after the four arms
+Re-reading `docs/papers/bolme2010_mosse.pdf` after the four arms
 failed. **Section 3.3 presents regularization and initialisation perturbations as ALTERNATIVE
 cures for the same defect**, and the defect is not "too few training samples" in the general
 sense — it is specifically low-energy denominator bins:
@@ -497,14 +499,14 @@ the only arm all day that does either. The `dA −0.0346` trips this file's own 
 three checks clear it: mean IoU RISES where the mutant's fell; the hold rate moves only +0.64%
 of frames; and on the frames BOTH arms survived (identical 5563-frame set) the gap is
 **−0.0085**, i.e. three quarters of the accuracy loss is the harder frames a longer-surviving
-arm is scored on. See `docs/thesis/evidence/proposed_build_mask.md`.
+arm is scored on. See `docs/thesis/evidence/arm_mask.md`.
 
 **AND THE WINDOW THE BOARD WILL ACTUALLY RUN IS NOT QUITE THIS ONE.** `spatial_mask()` centres
 the axis at `(n-1)/2`; the exact periodic Hann — `hanning_128.h`, the only one whose DFT is
 REAL — is centred at `n/2`. Half a sample, `max|Δm| = 0.0123`, and on `tiger` it is worth mean
 IoU 0.1715 (lost f107) against 0.2813 (lost f360). Re-swept over all 62 in the board form:
 **dR +0.0601, trim +0.0409, common-prefix dA −0.0103, hold rate +0.71%** — the arm survives the
-swap, at about 16% less gain. `docs/thesis/evidence/proposed_build_mask.md` §2 carries the table; the
+swap, at about 16% less gain. `docs/thesis/evidence/arm_mask.md` §2 carries the table; the
 trajectories are `mask62_boardform.json`.
 
 **So §2 does NOT drop below §3 — it becomes the proposed hardware build.** The refutation above

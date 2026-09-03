@@ -1,5 +1,7 @@
 # VOT Phase 1 — PC-side converter, all 62 stb2022 sequences
 
+**Status:** closed · **Updated:** 2026-08-24 · **Scope:** VOT bring-up 1: the PC-side converter over all 62 stb2022 sequences
+
 **2026-08-24. GATE MET.** 62/62 converted and byte-exact, md5s recorded, real
 anchors, 6/6 mutants caught, frame-buffer assertion enforced.
 

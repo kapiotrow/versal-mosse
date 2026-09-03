@@ -1,5 +1,7 @@
 # VOT Phase 0a — NFS staging link, board ↔ PC
 
+**Status:** closed · **Updated:** 2026-08-25 · **Scope:** VOT bring-up 0a: the NFS staging link, board <-> PC
+
 **2026-08-24. CLOSED. The TCP-preload fallback (S3) is retired.**
 
 Feasibility spike for the VOT-STb2022 run: is there an NFS client in the packaged

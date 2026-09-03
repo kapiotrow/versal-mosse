@@ -1,21 +1,23 @@
 # Roadmap
 
+**Status:** current · **Updated:** 2026-09-02 · **Scope:** what to try next, ranked, with the evidence behind each rank
+
 ## 2026-09-02 — the Layer-1 arm SHIPS, and the EAO window is now the constraint
 
 `rgb_l1relu` (7x7 stride 2, resnet18-PCA bank, ReLU on, 32ch, 64x64 map) is the best arm on
 record at **EAO 0.1960** and is the default. It did **not** meet its pre-registered `dEAO >=
 +0.005` bar (+0.0029); the grounds for shipping it anyway are in
-`../thesis/evidence/proposed_build_l1relu.md` sec.12 and must never be written up as a pass.
+`../thesis/evidence/arm_l1relu.md` sec.12 and must never be written up as a pass.
 
 | screened 2026-09-02 | verdict | note |
 |---|---|---|
-| Layer-1 7x7/2 + ReLU on hardware | **SHIPS**, best EAO; falsifier NOT met | `proposed_build_l1relu.md` sec.10-12 |
+| Layer-1 7x7/2 + ReLU on hardware | **SHIPS**, best EAO; falsifier NOT met | `arm_l1relu.md` sec.10-12 |
 | `out_shift` bound (`ACC_BOUND=l1`) | FIXED — `F_ch` 0.13% -> ~1% of int16 | sec.7-8 |
 | conv2d generic-branch rework | 2.39x scheduled; frame 61.5 -> 24.1 ms | sec.8, COST block |
 | `MOSSE_SIGMA` interior (22-cell grid) | **CLOSED** — 3, 5, 6, 8 all worse than 4 | `runs/vot/0902_offline-sigmaeta/` |
 | `MOSSE_ETA` interior at sigma/target 1/16 | eta 0.1 the only trim-stable cell of 22 | board A/B in flight |
 | `ARM=l1lin` linear twin | **OWED** — rebuild+reflash, decides N-16's attribution | — |
-| `MOSSE_ETA=0.1` on the shipping arm | **REJECTED on hardware, EAO 0.1960 -> 0.1817**; the offline grid INVERTED | `proposed_build_l1relu.md` sec.13 |
+| `MOSSE_ETA=0.1` on the shipping arm | **REJECTED on hardware, EAO 0.1960 -> 0.1817**; the offline grid INVERTED | `arm_l1relu.md` sec.13 |
 | aggregation on the RECTIFIED bank (2x2, blur x relu/lin) | **REFUTED, a LOSS −0.0242**; the linearity explanation WITHDRAWN | `pooled_features.md` |
 | scale error before a loss | **CAUSAL**: >25% mis-sized on 60% of pre-loss frames vs 20-31% on survivors | `scale_filter.md` |
 | scale detector, root cause | **LOCKED, not blind**: P(idx==0) 88.4% vs 3.0% for noise, conf FLAT, gain α −0.003 vs the position detector's 0.93; the sim's SAME estimator reaches 0.93 at speed, so the loop is SELF-CONFIRMING | `scale_filter.md` |
@@ -46,8 +48,8 @@ evidence notes; this is the index.
 
 | screened | verdict | note |
 |---|---|---|
-| 64x64 feature map | CONFIRMED on hw, then RE-ATTRIBUTED | `proposed_build_res64.md` sec.17-20, 25 |
-| sigma/target sweep (1/64..1/8) | **1/16 is the optimum; sigma4 SHIPS** | `proposed_build_res64.md` sec.21, 25 |
+| 64x64 feature map | CONFIRMED on hw, then RE-ATTRIBUTED | `arm_res64.md` sec.17-20, 25 |
+| sigma/target sweep (1/64..1/8) | **1/16 is the optimum; sigma4 SHIPS** | `arm_res64.md` sec.21, 25 |
 | `PSR_GATE_MIN=3.5` rescale | REJECTED — EAO null, and the "conditional on PSR scale" claim REFUTED | sec.22-23 |
 | one-hot + orthonormal banks | the conv layer is a LINEAR LIFT; one-hot ties the network | `feature_bank.md` |
 | ReLU / abs / CReLU on the shipping bank | refuted (−0.0332 / −0.0232 / +0.0020) | `feature_bank.md` |
@@ -71,7 +73,9 @@ P(dR<=0)=0.041 understated it: on hardware the paired R survives drop-top-5 at P
 
 # Roadmap — what to try next, in order
 
-Moved out of CLAUDE.md 2026-08-31; content unchanged.
+Split out of CLAUDE.md 2026-08-31 and **maintained here since** — this file, not
+CLAUDE.md, is where this topic is kept current; CLAUDE.md carries only the one-line
+version and a link.
 
 ### Next, in order — ROBUSTNESS
 
@@ -80,7 +84,7 @@ Localisation, the gate, quantization, saturation, pooling, feature resolution, p
 supporting measurements: `docs/thesis/evidence/robustness_proposals.md`. What is left is host-only:
 
 1. **THE NEXT BUILD: the 64x64 feature map (`PATCH_ROWS=PATCH_COLS=64`) — PROPOSED 2026-08-31,
-   `docs/thesis/evidence/proposed_build_res64.md`, claim N-03b.** The first arm whose offline
+   `docs/thesis/evidence/arm_res64.md`, claim N-03b.** The first arm whose offline
    signal survives a symmetric trim AND a bootstrap: dR **+0.1071**, drop-top-3 **+0.050**,
    P(dR<=0) = 0.000, against the shipped spatial mask's +0.0330 / +0.0101 on the same
    instrument. A RESOLUTION change, not a pooling one (`dec2` alone scores it). **Buys frame
@@ -139,7 +143,7 @@ supporting measurements: `docs/thesis/evidence/robustness_proposals.md`. What is
    **`--mask-taper 1.0` is REQUIRED and is not the default** — at the 0.25 default `mask0` has
    99 non-zero bins per axis and is not board-implementable.
    *(Original 08-28 entry follows.)*
-   **A spatial mask on the filter — MEASURED OFFLINE 2026-08-28.** `docs/thesis/evidence/proposed_build_mask.md`. CSR-DCF's highest-priced item, applied
+   **A spatial mask on the filter — MEASURED OFFLINE 2026-08-28.** `docs/thesis/evidence/arm_mask.md`. CSR-DCF's highest-priced item, applied
    as a one-shot projection `h ← m⊙h` on the published `H` (`A`/`B` untouched), so the AIE sees
    an already-masked filter and detection stays consistent. Host-only — an scp, not a card swap.
    62 sequences, shipping eta/gate, `vot_ar_offline`:

@@ -1,6 +1,14 @@
 # Proposed hardware build — the 64x64 feature map (`PATCH_ROWS=PATCH_COLS=64`)
 
-**2026-08-31. Status: PROPOSED, not built.** Written so the decision to spend board time is made
+**Status:** closed · **Updated:** 2026-09-01 · **Scope:** the 64x64 feature map: pre-registered, confirmed on hardware, then RE-ATTRIBUTED to mainlobe width
+
+**WHERE THIS ENDED UP.** Built and swept 2026-09-01: the arm was CONFIRMED (A 0.5100 ->
+0.5336, R 0.3417 -> 0.3873, EAO 0.1629 -> **0.1849**, sec.18) and then **RE-ATTRIBUTED the
+same day (sec.25): the gain was the MAINLOBE WIDTH the arm carried by accident, not the
+resolution**, which is a small loss at matched width. Superseded as the best arm by
+`arm_l1relu.md` on 2026-09-02. Everything up to sec.16 is the proposal as written.
+
+**2026-08-31, as proposed. Status at the time: PROPOSED, not built.** Written so the decision to spend board time is made
 against a falsifier and a cost, not against a hope. Claim `N-03b` in `docs/thesis/claims.md`.
 Evidence: `evidence/pooled_features.md` (both the px/bin section and the 2026-08-31 max-pool
 section). This is the FIRST arm in this project whose offline signal survives a symmetric trim
@@ -461,7 +469,7 @@ Converged-tail amplitudes (frames 21+, per the read-the-tail rule):
 | `response` | 10.6% | ~22% (`shift_budget.md`) |
 
 **`calib_report.py` prints UNDERSHOOT against a 49-64% band. That flag is ADVISORY and the band
-is retired** — `shift_budget.md` and `TODO_shift_budget.md` both say so in as many words: the
+is retired** — `shift_budget.md` and `shift_budget_realvideo.md` both say so in as many words: the
 band came from a distribution with a 1.30x spread, the corrected build spreads 2.07x at the
 converged end, and re-centring the typical frame puts the tail on the rail. The 49%/52% figures
 this proposal quoted in sec.11 as "the region the 128x128 arm measured" are from

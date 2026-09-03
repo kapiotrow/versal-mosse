@@ -385,9 +385,9 @@ static inline void det_hash_bytes(const void *p, size_t n)
 // rather than time to unrecoverable, and at car1's three hold onsets it gave
 // freeze 10/0/0 against coast 1/1/1 — i.e. it predicted no rescue. Hardware over
 // 8 sequences and 54 runs said otherwise on mean IoU
-// (docs/thesis/evidence/evidence_arm_ab.md): 0.2709 -> 0.3005 frame-weighted, nothing worse
+// (docs/thesis/evidence/metric_ar_vs_ioum_ab.md): 0.2709 -> 0.3005 frame-weighted, nothing worse
 // than -0.0042, car1 job 0 tracking all the way out. Then the SAME 54
-// trajectory pairs were scored by the toolkit (docs/thesis/evidence/evidence_ar.md) and the
+// trajectory pairs were scored by the toolkit (docs/thesis/evidence/metric_ar_vs_iou.md) and the
 // ordering reversed: accuracy 0.638 -> 0.616, robustness 0.309 -> 0.288, EAO
 // 0.208 -> 0.194. AR is the metric of record, so the default follows it.
 //
@@ -2225,7 +2225,7 @@ static FrameDiag g_fdiag;
 // FILTER_MASK_STAT — the mechanism check for the spatial mask, and the only way
 // a mask run can answer its own falsifier.
 //
-// docs/thesis/evidence/proposed_build_mask.md 4: "the fraction of the filter's energy inside
+// docs/thesis/evidence/arm_mask.md 4: "the fraction of the filter's energy inside
 // the target box should rise from the measured 51.6% (car1) / 54.9% (tiger). If
 // EAO moves while that does not, the gain is not the mask and the result is
 // unattributable." Those two numbers existed only as a COMMENT in

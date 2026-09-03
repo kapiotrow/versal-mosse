@@ -1,5 +1,7 @@
 # `docs/thesis/` — the thesis's evidence base
 
+**Status:** current · **Updated:** 2026-08-30 · **Scope:** how the thesis's evidence base is organised and how to write from it
+
 The repo already contained a thesis's worth of measurement; it was spread across an 1839-line
 agent-facing config file and 25 notes under `runs/vot/`. This directory is where that becomes
 citeable. Scaffolded 2026-08-30.
@@ -68,7 +70,12 @@ given English term. It never licenses Polish in the code.
 
 ## What did not move
 
-`CLAUDE.md` keeps the operational half — environment, build parameters, traps, commands — and
-that is what it is good at. It should shrink as findings migrate into `claims.md` and
-`evidence/`, but nothing depends on that happening today; every path reference has already been
-updated to the new locations.
+`CLAUDE.md` keeps the operational half — environment, the build-parameter DIGEST, commands, the
+shipping config — and that is what it is good at. The unabridged versions live in
+[`../engineering/`](../engineering/), which is where each topic is now maintained; CLAUDE.md
+links out rather than restating. It should keep shrinking as findings migrate into `claims.md`
+and `evidence/`, but nothing depends on that happening today.
+
+Where a number appears in two places, one of them is generated or checked: build defaults by
+`make check-build-table`, thesis tables by `make thesis-tables`, the code map by `make code-map`,
+and measured figures in comments by `make check-docs`.

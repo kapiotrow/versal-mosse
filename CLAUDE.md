@@ -5,18 +5,39 @@ features on Versal VEK280, extending the AIE 2D-FFT tutorial (XD073) with a full
 object-tracking pipeline. Papers in `docs/papers/` (Bolme MOSSE, Danelljan DSST); section
 numbers below refer to them.
 
-**This file is the operational half only.** Every derivation, measurement and cost behind a
-rule stated here lives in `docs/engineering/` — see [`docs/engineering/README.md`](docs/engineering/README.md)
-for the map. Nothing was deleted when it moved there (2026-08-31); if a line below reads as a
-bare assertion, the file it links to says how it was paid for.
+## Where things live — three tiers, one job each
+
+**This file is the operational half only**, and it is a DIGEST: it states what is true now and
+links out. If a line below reads as a bare assertion, the file it points at says how it was paid
+for — nothing was deleted when the detail moved (2026-08-31), and those files, not this one,
+are where each topic is now maintained.
+
+| tier | what it is | when it changes |
+|---|---|---|
+| `CLAUDE.md` | the entry point: environment, commands, the shipping config, the build DIGEST, the rules worth carrying in the head | every arm |
+| [`docs/engineering/`](docs/engineering/README.md) | the live operational truth, one file per topic — the unabridged build table, the shift budget, performance, traps, what is settled, what to try next | when a topic moves |
+| [`docs/thesis/`](docs/thesis/README.md) | the citeable record: [`claims.md`](docs/thesis/claims.md) (a verdict per question) → `results/*.csv` (every number) → [`evidence/`](docs/thesis/evidence/README.md) (the notes) | when a sweep lands |
+
+**Every doc carries a one-line `**Status:**` header** — `current`, `closed`, `superseded` or
+`generated` — with the date it was last true and a one-line scope. Read it before trusting the
+file. Inside an append-only evidence note the LATEST dated section wins, and the ones whose
+verdict later changed carry a `WHERE THIS ENDED UP` block under the header.
+
+**Four things are generated or checked, so they cannot drift** — run them, do not hand-edit
+their outputs: `make code-map` (code_map.md from `@thesis` tags), `make doc-index`
+(the evidence index from each note's header), `make thesis-tables` (LaTeX from the CSVs), and
+`make check-docs`, which fails if a documented build default disagrees with the Makefile, a
+documented path does not exist, a source file is missing from the Directory layout below, a
+claim id is duplicated or out of order, or a measured number in a comment cites nothing.
 
 ## Thesis scaffold
 
-Findings are indexed in `docs/thesis/claims.md` — one row per question answered, with a
-verdict, an evidence note and a run directory. **Every number the thesis quotes lives in
-`docs/thesis/results/*.csv`, not in prose**; evidence notes are in `docs/thesis/evidence/`.
+Findings are indexed in [`docs/thesis/claims.md`](docs/thesis/claims.md) — one row per question
+answered, with a verdict, an evidence note and a run directory; the notes are indexed the other
+way, note → status → claims, in [`docs/thesis/evidence/README.md`](docs/thesis/evidence/README.md).
+**Every number the thesis quotes lives in `docs/thesis/results/*.csv`, not in prose.**
 When a sweep finishes: append a row to `results/arms.csv`, update `claims.md`, write the note
-from `evidence/TEMPLATE.md`.
+from `evidence/TEMPLATE.md` (name it for its TOPIC, never its status), then `make doc-index`.
 
 - **`@thesis` tags bind code to thesis sections**: `// @thesis <label> | <claim>[,<claim>] | <one line>`,
   where `<label>` is the thesis's own `\label` and `<claim>` an id from `claims.md`.
@@ -70,31 +91,28 @@ below is reproduced — pass the geometry and the bank back explicitly.
 **Grayscale too** — `CONV_IN_CH=1` (what aiesim `s6`/`s7` need).
 Artifacts land in `build/$(TARGET)/$(PATCH_ROWS)x$(PATCH_COLS)/ch$(N_CHANNELS)/`.
 
-Digest below; **the reasoning for every knob is in
-[`docs/engineering/build_params.md`](docs/engineering/build_params.md)** — read that entry
-before moving one. Everything is host-only (an scp, not a card swap) EXCEPT `H_SHIFT`,
-`CONV_IN_CH`, `CONV2D_STACK`, the FFT/window knobs and the geometry, which reach `AIE_FLAGS`.
+**The table below is a DIGEST, not the list.** It carries only the knobs that reach a toolchain,
+that get set on a routine command line, or whose wrong value silently invalidates a run;
+**every knob, with the reasoning behind it, is in
+[`docs/engineering/build_params.md`](docs/engineering/build_params.md)** — read that entry before
+moving one. Neither table is the source of truth for a DEFAULT: the Makefile is, and
+`make check-build-table` (part of `make check-docs`) fails if either document disagrees with
+`make print-<KNOB>`. Everything is host-only (an scp, not a card swap) EXCEPT `H_SHIFT`,
+`CONV_IN_CH`, `CONV_KSIZE`/`CONV_STRIDE`, `CONV_RELU`, `CONV2D_STACK`, the FFT/window knobs and
+the geometry, which reach `AIE_FLAGS`.
 
 | Parameter | Default | One line |
 |---|---|---|
 | `TARGET` | `hw_emu` | `hw_emu` or `hw` |
 | `PATCH_ROWS`/`PATCH_COLS` | `64` | the FEATURE MAP, powers of 2 (AIE FFT constraint). **Moving it silently moves `sigma/target`** — see `MOSSE_SIGMA` |
 | `N_CHANNELS` | `32` | conv feature channels. Host cost scales as `N_CHANNELS x map_pixels` and so does conv2d's read loop |
-| `FFT_2D_DT` | `0` | 0=cint16, 1=cfloat |
 | `ITER_CNT` | `1` | frames; **needs ≥2** — frame 0 initialises the filter |
-| `PL_FREQ` | `312.5` | MHz; platform also offers 625/156.25/100/78.125 |
 | `H_SHIFT` | `15` | filter-product shift, deliberately OVER-shifted (`rails=0` over 101,564 frames). 13 is the tight RGB value, 12 rails, gray's arm is 14. **The one non-host-only knob here** |
 | `FFT_SHIFT`/`IFFT_ROW_SHIFT`/`IFFT_COL_SHIFT` | `3`/`3`/`3` | the 64x64 budget (calibrated 2026-09-02, `rails=0` on 200 frames). **4-4-4 is the 128x128 one** — the budget follows the POINT SIZE, so a geometry change needs a new calibration run |
-| `FFT_ROW_WS`/`FFT_COL_WS` | `64`/`8` | rows/cols per FFT invocation. `FFT_COL_WS=32` is a 9.6 ms LOSS |
 | `MEMTILE_TRANSPOSE` | `1` | transposes in AIE-ML memory tiles; a one-sided flag is a board deadlock |
-| `ROI_CROP_PIPELINE` | `1` | launch channel k+1's crop before polling k |
 | `CMUL_SPLIT_ACCUM` | `1` | own port for `accum_prev`. **`make aiesim` needs `0`** |
-| `CMUL_ACCUM_MEMTILE` | `0` | tried, 0.36 ms loss; code kept behind the flag |
-| `TAIL_PARALLEL` | `1` | filter update on core 1 ∥ scale filter on core 0; needs `-pthread` |
 | `ROI_CROP_USER_MANAGED` | `1` | roi_crop via `xrt::ip`. **20.6× on frame rate** — KDS completion costs 503 ms/launch |
-| `CONTROL_CU_RUNS` | `8` on `hw` | camera_capture launches: the within-run KDS control |
 | `CONV2D_MODE` | `0` | 0=real conv, 1=echo, 2=synthesize. **Check before every expensive run** |
-| `CONV_VECTORIZE`/`CMUL_VECTORIZE` | `1` | bit-identical to scalar; 0 for bisection |
 | `CONV_RELU` | `1` | **Bank-specific.** Refuted on the 3x3/16 mobilenet bank (dR −0.0332); beats its own linear twin four times offline on a LEARNED Layer-1 bank, and loses on an analytic Gabor one — the property that matters is that the bank is learned. Ships on. **The linear twin has NOT run on hardware**, so N-16's gain is attributable to the arm, not yet to the rectifier. **The scalar path (`CONV_VECTORIZE=0`) of the 3x3 GRAY branch hardcodes ReLU and ignores this flag**; RGB and generic honour it |
 | `CONV_IN_CH` | `3` | 1=BT.601 luma, 3=RGB. Picks the **weight-buffer layout**, so it drives `AIE_FLAGS`/`GCC_FLAGS`/`ROI_IN_CH` |
 | `CONV_KSIZE`/`CONV_STRIDE` | `7`/`2` | conv kernel and stride. Anything but 3/1 selects conv2d's **generic KxK branch** (taps stay in the weight buffer, line buffer split by column phase, `CONV_VEC_GEN=32`); the two 3x3 branches are byte-for-byte as shipped and keep their own `CONV_VEC=16`. Both reach BOTH toolchains |
@@ -102,38 +120,36 @@ before moving one. Everything is host-only (an scp, not a card swap) EXCEPT `H_S
 | `ACC_BOUND` | **derived from `WEIGHT_BANK`** | which exact worst-case accumulator bound sizes `out_shift`. `l1resnet`→`l1` (`127*Σ|w_int8|` per channel, ~2 bits tighter, needed at 147 taps — without it `F_ch` measured 0.13% of int16); `mobilenet`→`loose` (`n_in*K^2*127^2`, what every pre-09-02 arm used and what reproducing them requires). Both are exact worst cases, so neither can rail. **Reaches NEITHER toolchain** — it changes only the weights DATA — so no flagstamp sees it; `calib_build.sh` re-derives both bounds from the file's own taps |
 | `WEIGHT_BANK` | `l1resnet` | donor bank for `make weights`. `l1resnet` = resnet18 conv1 7x7/2 PCA'd to `N_CHANNELS`, via `scripts/l1_banks.py` — the same function the offline screen scored |
 | `CONV2D_STACK` | `2048` | conv2d AIE stack; applied only at `CONV_IN_CH=3` (27 taps need 1344 > 1024 default) |
-| `BIAS_SCALE` | `roi` | `bias_acc` input scale for `make weights`; `127` restores pre-correction weights |
-| `FRAME_RGB_MODE` | `1` | 1=per-plane tint, 0=replicate luma (the COLOUR-FREE CONTROL) |
 | `FRAME_SOURCE` | `synth` | `vot` = frames from a converted VOT blob; ignores `ITER_CNT`, the scene generator and its knobs. `vot`+RGB needs the `.luma` sidecar — the SHIPPING combination |
-| `RESET_MUTANT` | `0` | deliberately breaks one item of `run_reset()` so the determinism test's ability to FAIL is demonstrated |
 | `VOT_DATA_DIR`/`VOT_RESULTS_DIR`/`VOT_SEQUENCE`/`VOT_JOB` | `/mnt/vot`/`/mnt/vot-results`/`car1`/`0` | overridable on the board's command line; **repeating a job in `--vot-jobs` is the determinism test** |
-| `VOT_RESIDENT_MAX_MB`/`VOT_STREAM_RING` | `700`/`8` | stream from NFS above this size; usable heap is ~0.9-1.2 GB, not 12 GB. `--vot-stream always` is the MODE-EQUIVALENCE TEST |
-| `SCENE_VERIFY` | `0` | re-colourise and abort on mismatch; O(frame)/frame, `MODE=bringup` only |
-| `B2_NULL_BINS` | `1` | 1 = null the 9 low-frequency bins, 0 = subtract µ·W |
 | `FILTER_MASK` | `0` | spatial reliability `h ← m⊙h`; window FORCED periodic Hann ⇒ 8 complex adds/bin, no multiplies. **Swept 2026-08-31 (EAO +0.0110) but default still 0** — not separable from a null (3 of 62 sequences) |
-| `FILTER_MASK_STAT` | `0` | logs `mask_ebox` to `track.csv`; **`-1` is NOT MEASURED** (94.6% of rows). Sampled — an inverse FFT per channel is 30.1 ms |
-| `FILTER_MASK_STAT_WARM`/`_EVERY` | `5`/`20` | **matched to `vot_mask_stat.py`'s `PROFILE_FRAMES`** |
 | `PSR_GATE_MIN` | `5.0` | Bolme §3.5. Below it the host HOLDS and skips the update. **Worth is conditional on the PSR scale** |
 | `TARGET_H`/`TARGET_W` | `64` | target box, frame px |
 | `TARGET_PADDING` | `2` | settled three ways; 1.5 and 3.0 both worse. At 64/2 the resample is 1:1 |
 | `MOSSE_SIGMA`/`SIGMA_FROM_TARGET` | `2.0`/`0` | **BINS, so what matters is sigma/target, and 1/16 (DSST's `target/16`) is the measured optimum** — 2.0 on a 64x64 map and 4.0 on a 128x128 one both sit there. **The interior is CLOSED**: a 22-cell grid puts sigma 3, 5, 6 and 8 all below it (`runs/vot/0902_offline-sigmaeta/`) |
 | `MOSSE_ETA` | `0.05` | +0.0218 R vs 0.125; not monotone (0.025 much worse). **`0.1` MEASURED AND REJECTED on hardware 2026-09-02** — EAO 0.1960 → 0.1817, R a wash (median dR exactly 0.0000), A −0.0136. The offline grid's only trim-stable cell of 22 (dR +0.0481, P=0.021) **INVERTED**; it was screened at 128x128/sigma 4 and `sigma/target` governs SIGMA, not eta |
 | `SCALE_N`/`SCALE_STEP` | `33`/`1.04` | `SCALE_N=1` disables. **1.04 beats DSST §6.1's 1.02 on hardware** |
-| `SCALE_ETA` | `0.025` | deliberately ≠ `MOSSE_ETA` |
-| `SCALE_CONF_MIN` | `2.0` | veto HOLDS the box and SKIPS `scale_update()` |
-| `HOLD_COAST`/`COAST_DECAY` | `0`/`0.5` | coast a held frame at last velocity. **Flipped to 1 and reverted**: wins mean IoU, loses AR |
-| `SCALE_MAX_STEP` | `2` | rate limit on `|idx|`/frame. **`1` measured and rejected** |
-| `SCALE_MIN_REL`/`SCALE_MAX_REL` | `0.5`/`2.0` | drift bounds; must admit `SCALE_TRAJ_AMP` |
-| `OCCLUDE_MASK`/`OCCLUDE_SQUARE`/`OCCLUDE_START` | `0`/`8`/`30` | bit *f* ⇒ frame *f* occluded; `OCCLUDE_START` is a warm-up |
-| `TRAJECTORY`/`TRAJ_AMP_R,C`/`TRAJ_PERIOD` | `0` | closed elliptical path (absolute ground truth) |
-| `SCALE_TRAJ`/`SCALE_TRAJ_AMP`/`SCALE_TRAJ_PERIOD` | `0` | sinusoidal size envelope |
-| `FRAME_TEXTURE`/`FRAME_NOISE` | — /`2` | band-limited background; per-frame noise **does not** fix background lock |
-| `BG_PAN`/`BG_PAN_R`/`BG_PAN_C` | `1`/`31`/`47` | pan px/frame; decorrelates background 6.6× but **did not fix tracking** |
-| `PROGRESS_EVERY` | `1` | thins the level-0 line, never silences it. **Only has effect at `VERBOSITY=0`** |
-| `CSV_FLUSH_EVERY` | `1` | rows between `track.csv` flushes; a railed row flushes regardless |
-| `VERBOSITY` | `1` | 0=one line/frame, 1=per-frame block, 2=everything. Anomalies print at every level |
 | `DUMP_BUFFERS` | `1` | **1216 KB/frame, ~2 s/frame** — set `0` for any tracking or FPS run |
 | `CSV_LOG` | `1` | one row/frame to `track.csv` (`track_<sequence>.csv` at `FRAME_SOURCE=vot`), ~60 B/frame |
+
+**The other 45 knobs are not listed here.** Each one is either host-only, a bisection switch, or
+a synthetic-scene control, and every one of them has a paragraph in
+[`docs/engineering/build_params.md`](docs/engineering/build_params.md) — which is where their
+defaults live, so there is only ever one copy to update. By theme, so you know what exists:
+
+- **AIE / PL cost, all measured and all closed** — `FFT_2D_DT`, `PL_FREQ`, `FFT_ROW_WS`/`FFT_COL_WS`,
+  `ROI_CROP_PIPELINE`, `CMUL_ACCUM_MEMTILE`, `TAIL_PARALLEL`, `CONTROL_CU_RUNS`.
+- **Bisection switches** — `CONV_VECTORIZE`/`CMUL_VECTORIZE` (bit-identical to scalar),
+  `RESET_MUTANT` and `SCENE_VERIFY` (deliberate breakage, so a test is known to be able to fail).
+- **Weight export and preprocessing** — `BIAS_SCALE`, `B2_NULL_BINS`.
+- **Mask instrumentation** — `FILTER_MASK_STAT`, `FILTER_MASK_STAT_WARM`/`_EVERY`. `-1` in the
+  stat column is NOT MEASURED, not zero.
+- **Scale filter interior, all settled or refuted** — `SCALE_ETA`, `SCALE_CONF_MIN`,
+  `SCALE_MAX_STEP`, `SCALE_MIN_REL`/`SCALE_MAX_REL`, `HOLD_COAST`/`COAST_DECAY`.
+- **Synthetic scene only** (inert at `FRAME_SOURCE=vot`) — `FRAME_RGB_MODE`, `FRAME_TEXTURE`/
+  `FRAME_NOISE`, `BG_PAN*`, `TRAJECTORY`/`TRAJ_*`, `SCALE_TRAJ*`, `OCCLUDE_*`.
+- **VOT reader and console** — `VOT_RESIDENT_MAX_MB`/`VOT_STREAM_RING`, `PROGRESS_EVERY`,
+  `CSV_FLUSH_EVERY`, `VERBOSITY`.
 
 ### Shift budget — SETTLED: 3-3-3 at 64x64 (SHIPPING), 4-4-4 at 128x128; `H_SHIFT` 15
 
@@ -259,7 +275,7 @@ core count, and `runtime<ratio>` is not utilization. **Usable heap is ~0.9-1.2 G
 part's 12 GB** (Linux maps 2 GB, 512 MB of it CMA); it cost 5 of 62 sequences on the RGB VOT arm
 until the streaming reader. Full tables, per-frame AIE compute and the memory forensics:
 [`docs/engineering/performance.md`](docs/engineering/performance.md),
-`docs/thesis/evidence/TODO_board_memory.md`.
+`docs/thesis/evidence/board_memory.md`.
 
 ## Current status (2026-09-02)
 
@@ -294,7 +310,7 @@ re-tuning per geometry.
 
 **The shipping arm did NOT meet its own pre-registered bar** (`dEAO >= +0.005`; measured
 +0.0029) and is shipped on two other grounds, both recorded in
-[`evidence/proposed_build_l1relu.md`](docs/thesis/evidence/proposed_build_l1relu.md) sec.10-12:
+[`evidence/arm_l1relu.md`](docs/thesis/evidence/arm_l1relu.md) sec.10-12:
 the paired per-sequence result is strong where the scalar is not (R **+0.0112 after drop-top-5,
 P(dR<=0)=0.011**, accuracy up too, no A/R trade), and at `CONV_RELU=0` the conv layer is a
 **LINEAR LIFT the online filter absorbs** — a one-hot bank with no network ties the pretrained
@@ -647,15 +663,27 @@ design/
 │       ├── test_vot_source.cpp       # make test_vot_source; `<dir>` emits a trajectory + its
 │       │                             #   INPUT for make test_vot_format
 │       └── scale_loop_sim.cpp        # closed-loop DSST scale sim (make scale_sim)
-├── system_configs/mosse_x1.cfg       # v++ linker
+├── pl_src/test/test_roi_crop.cpp     # make test_roi_crop; ROI_IN_CH is COMPILE-TIME, so one
+│                                     #   build runs one arm (RGB by default, gray at
+│                                     #   CONV_IN_CH=1) and a build matching no case exits 2
+├── system_configs/mosse_x1.cfg       # v++ linker (plio_smoke.cfg links the smoke graph)
 ├── profiling_configs/, directives/
-└── exec_scripts/run_script.sh
+├── exec_scripts/run_script.sh        # ...and run_smoke.sh, the PLIO smoke test's board script
+└── (bring-up harnesses, all still built by the Makefile and kept for bisection)
+    fft_only_graph.h/.cpp + fft_only_constraints.aiecst   # the FFT chain with no conv2d
+    plio_smoke_graph.h/.cpp + plio_smoke_host.cpp + smoke_passthrough.h/.cpp
+                                      #   PL->AIE AXIS handshake only, scored by
+                                      #   scripts/analyze_plio_vcd.py
+    pl_src/stream_src/stream_src.h/.cpp   # the smoke test's PL producer
 
 scripts/
   -- generation and build --
   export_weights.py, gen_aiesim_vectors.py, gen_filter_golden.py, check_collapse.py,
   check_kernel_bitexact.py, phase1_sweep.py, roi_crop_ref.py, gen_roi_crop_golden.py,
   synth_frame.py, sweep_shift.sh, fix_sd_rootfs.sh
+  l1_banks.py            # THE Layer-1 donor banks (7x7/2, PCA'd to N_CHANNELS). The offline
+                         #   screen and `make weights` call the SAME function, so the board arm
+                         #   and the screened arm cannot be two spellings of one bank
   conv_weight_layout.py  # Python mirror of conv_weight_layout.h. EVERY reader of
                          #   layer0_weights.bin goes through it; the tag byte makes a layout
                          #   mismatch loud instead of plausible
@@ -673,6 +701,9 @@ scripts/
                          #   verifier. THE groundtruth reduction lives here -- other readers
                          #   import reduce_box from it
   vot_sweep.sh           # drives a whole sweep over ssh. --dry-run prints every command
+  board_run.sh           # runs the tracker on the board and RETURNS when it is done. `gr.end(0)`
+                         #   blocks forever on a free-running graph, which is cosmetic by hand
+                         #   and fatal to automation -- and NEVER KILL A RUN MID-SEQUENCE
   vot_ingest.py          # board trajectories -> toolkit workspace -> `vot analysis`. One
                          #   directory per ARM. Re-derives every run name from the sequence's
                          #   anchors and checks each trajectory's LENGTH -- scan() only notices
@@ -694,6 +725,12 @@ scripts/
   vot_init_anatomy.py    # INIT FAILURE or DRIFT? An init failure is visible at f1; a drifting
                          #   run is not, and that is the whole discriminator
   vot_traj_anatomy.py    # a board trajectory vs groundtruth in units of the tracker's own BIN
+  scale_oracle_bound.py  # WHAT IS A PERFECT SCALE FILTER WORTH? Board trajectories, tracker's
+                         #   centre, ground-truth size, VOT's rule re-applied: +0.0023 R. It is
+                         #   what CLOSED the scale direction, and it is cheaper than attribution
+  scale_drift_anatomy.py # is the long-horizon scale error a random walk, and what feeds it?
+  analyze_plio_vcd.py    # the PL->AIE AXIS handshake from plio_probe.vcd: TVALID/TREADY, beats
+                         #   completed, where it stalled
   vot_hold_budget.py     # frames before a frozen window loses the target, from groundtruth
   vot_mask_stat.py       # reads `mask_ebox` -- THE mechanism check for FILTER_MASK. Keyed on
                          #   (sequence, job, frame); EXCLUDES the -1 rows; reports at-init and
@@ -707,16 +744,35 @@ scripts/
                          #   Did NOT transfer on pad30
   -- offline benches, no hardware, seconds to minutes --
   mosse_loop_sim.py, bg_pan_sweep.py,
-  rgb_vs_gray_holdout.py / _loop.py / _vot.py   # gray vs RGB vs a colour-free control on real
-                         #   VOT video. _loop.py also carries the float quantization
+  rgb_vs_gray_holdout.py / rgb_vs_gray_loop.py / rgb_vs_gray_vot.py
+                         #   gray vs RGB vs a colour-free control on real VOT video.
+                         #   rgb_vs_gray_loop.py also carries the float quantization
                          #   counterfactual, the pooling/resolution arms, and the -warp<N>
                          #   init-perturbation arms with their mutants
+  offline_sweep_par.sh   # one process per sequence over all 62, then a merge. --json is a
+                         #   read-modify-write, so parallel workers MUST own private files
+  merge_grid.py          # one-arm-per-file grid cells -> one JSON with distinct arm names,
+                         #   because sigma and eta are global flags, not per-arm suffixes
+  grid_stats.py          # paired per-sequence stats for a merged grid: trim, sign test,
+                         #   bootstrap. `vot_ar_offline.py` prints POOLED R, which is the
+                         #   statistic this project has most often been misled by
+  -- documentation, generated or linted; all of these run in seconds --
+  thesis_index.py        # @thesis tags -> docs/thesis/code_map.md (make code-map)
+  csv2tex.py             # results/*.csv -> booktabs bodies (make thesis-tables)
+  check_build_table.py   # documented build defaults == `make print-<KNOB>` (make check-docs)
+  check_doc_links.py     # every documented path exists, and this map names every source file
+  doc_index.py           # each doc's status header -> docs/thesis/evidence/README.md
+                         #   (make doc-index); --check validates the headers without writing
+  check_doc_numbers.py   # a measured number in a comment must say where it came from
+  figs/fig_perf_history.py   # results/perf.csv -> docs/thesis/figures/perf_history.pdf. Every
+                         #   figure script reads a CSV and takes no arguments
 
 docs/
 ├── engineering/   # the operational detail this file summarises — see its README
 ├── thesis/        # claims.md, evidence/, results/*.csv, tables/, glossary.md
 └── papers/        # Bolme MOSSE, Danelljan DSST
-test-sequences/    # VOT sequences + annotations (16 usable, 5971 frames). The annotation
+test-sequences/    # VOT sequences + annotations. 17 directories, 16 USABLE, 5971 frames:
+                   # `fish4` holds 7 frames and is the one excluded. The annotation
                    # directories are named inconsistently ("car1-annotations" but
                    # "fernando - annotations"); the harness matches them loosely.
 ```

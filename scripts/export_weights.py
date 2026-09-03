@@ -230,7 +230,7 @@ def acc_max_theory(n_in: int, ksize: int = KSIZE) -> int:
     headroom, of which ~0.6 showed up in the mean shift at 27 once the bias term
     was included. AT 147 TAPS THIS IS A REAL COST, not a rounding one: the bound
     is 16.3x the grayscale one, i.e. ~4 more bits of out_shift, which is part of
-    why proposed_build_l1relu.md says the shift budget must be re-calibrated and
+    why arm_l1relu.md says the shift budget must be re-calibrated and
     is NOT the res64 budget.
 
     It is also LOOSE by construction — it assumes every tap simultaneously at
@@ -545,7 +545,7 @@ def main():
                          "arm to date shipped. l1resnet = resnet18 conv1 7x7/2, "
                          "BN folded, reduced to --n-out channels by PCA over the "
                          "FOLDED WEIGHT matrix -- the Layer-1 bank of "
-                         "docs/thesis/evidence/proposed_build_l1relu.md. It is "
+                         "docs/thesis/evidence/arm_l1relu.md. It is "
                          "built by scripts/l1_banks.py, which is the SAME code "
                          "the offline screen scored, so the board arm and the "
                          "screen share a bank rather than two spellings of one.")

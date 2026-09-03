@@ -1,5 +1,7 @@
 # The detector is EXONERATED on targets that actually translate
 
+**Status:** closed · **Updated:** 2026-08-28 · **Scope:** the position detector is EXONERATED: it recovers 93% of annotated motion
+
 **2026-08-28.** From the existing `track_*.csv` of the 62-sequence arms — no board time,
 no dataset. Instrument: `scripts/vot_detector_gain.py`.
 

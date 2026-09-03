@@ -1,7 +1,12 @@
-# TODO — re-derive the shift budget for REAL VIDEO
+# Re-deriving the shift budget for REAL VIDEO
 
-**Status: OPEN. Instrument gap CLOSED 2026-08-26 (host-only); the budget change
-itself is still the next hardware task, and the LEVER CHANGED — read the
+**Status:** closed · **Updated:** 2026-08-26 · **Scope:** the shift budget re-derived on real video: the instrument gap, the censoring, and why `H_SHIFT` is the only lever
+
+**WHERE THIS ENDED UP.** The budget is SETTLED — 4-4-4 at 128x128 (closed on hardware
+2026-08-24/27) and 3-3-3 at 64x64 (2026-09-02), with `H_SHIFT=15`; the current statement is
+`../../engineering/shift_budget.md`. This file is how it was reached.
+**Status at the time of writing: OPEN. Instrument gap CLOSED 2026-08-26 (host-only); the
+budget change itself was still the next hardware task, and the LEVER CHANGED — read the
 2026-08-26 section before the prediction below, which no longer stands.** Written down
 because it has now been deferred three times: the risk register predicted it
 before Phase 2, Phase 2 measured 8 railed frames and moved on, and the Phase 4

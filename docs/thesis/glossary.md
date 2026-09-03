@@ -1,5 +1,7 @@
 # Glossary — code English → thesis Polish
 
+**Status:** current · **Updated:** — · **Scope:** code English -> the Polish the thesis has already committed to
+
 **All documentation in this repository is English.** The thesis is Polish. This file is the
 bridge, and it exists because `teoria.tex` and `przeglad.tex` are already written: the
 terminology is *fixed*, and `projekt.tex`/`ewaluacja.tex` must reuse it rather than invent a

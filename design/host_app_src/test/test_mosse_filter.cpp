@@ -1295,7 +1295,7 @@ void idft2(const std::vector<cfloat> &X, std::vector<cfloat> &x, int R, int C)
 // n/2 — hanning_<N>.h's table, and the same window conv2d puts on the patch.
 // NOT the offline bench's (n-1)/2 centring; that half-sample difference is
 // worth mean IoU 0.1715 vs 0.2813 on `tiger` (claim O-01,
-// docs/thesis/evidence/proposed_build_mask.md) and is why this is spelled out.
+// docs/thesis/evidence/arm_mask.md) and is why this is spelled out.
 double hann(int i, int n)
 {
     const double s = std::sin(3.14159265358979323846 * (double)i / (double)n);

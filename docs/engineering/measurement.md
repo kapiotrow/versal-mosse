@@ -1,6 +1,10 @@
 # Measurement methodology — the rules that were paid for
 
-Moved out of CLAUDE.md 2026-08-31; content unchanged.
+**Status:** current · **Updated:** 2026-09-02 · **Scope:** the measurement rules that were paid for in board time
+
+Split out of CLAUDE.md 2026-08-31 and **maintained here since** — this file, not
+CLAUDE.md, is where this topic is kept current; CLAUDE.md carries only the one-line
+version and a link.
 
 
 Two principles that have repeatedly earned their keep: **instruments before changes**, and
@@ -123,7 +127,7 @@ it is not sampling noise. NEITHER says the bench models the tracker.** `P(dR<=0)
 and never sufficient.
 
 **The practice that made this cheap rather than mysterious:** the transfer assumption was written
-down BEFORE the run (`proposed_build_l1relu.md` sec.11) — the grid ran at 128x128/sigma 4, the
+down BEFORE the run (`arm_l1relu.md` sec.11) — the grid ran at 128x128/sigma 4, the
 arm at 64x64/sigma 2, and `sigma/target` was established to govern SIGMA and nothing else. When
 the arm failed, the suspect was already named. **Do that for every arm screened at a geometry the
 board does not run.**

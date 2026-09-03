@@ -1,6 +1,10 @@
 # Scale filter (DSST) — findings
 
-Moved out of CLAUDE.md 2026-08-31; content unchanged.
+**Status:** current · **Updated:** 2026-09-02 · **Scope:** the DSST scale filter: frozen on ~90% of frames, root-caused, and the direction CLOSED by an oracle bound
+
+Split out of CLAUDE.md 2026-08-31 and **maintained here since** — this file, not
+CLAUDE.md, is where this topic is kept current; CLAUDE.md carries only the one-line
+version and a link.
 
 ### Scale filter — root-caused offline, confirmed on hardware (2026-08-20)
 
@@ -72,7 +76,7 @@ driving noise is white (no ringing, no persistent lag), and **about a third of e
 scale decision is thrown away by a veto**, `MAX_STEP` being the larger half. `max|idx|` reaches
 16, the very edge of the 33-point filter, so the argmax is hitting its own boundary.
 
-**A "diffusing scale" reading was tested and REFUTED.** `proposed_build_l1relu.md` sec.10.3
+**A "diffusing scale" reading was tested and REFUTED.** `arm_l1relu.md` sec.10.3
 observed the `est_h/truth_h` IQR more than doubling between frames 100 and 500 and read it as a
 random walk. It is not one:
 

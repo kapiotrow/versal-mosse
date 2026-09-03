@@ -1,4 +1,6 @@
-# TODO — the board has 1.7 GB, not 12 GB, and RGB does not fit
+# The board has ~1.7 GB, not 12 GB, and RGB did not fit
+
+**Status:** closed · **Updated:** 2026-08-27 · **Scope:** usable heap is ~0.9-1.2 GB, not 12 GB; the streaming reader that recovered the five oversized RGB sequences
 
 **Status: CLOSED, 2026-08-27.** The streaming reader is built, tested,
 validated by a mode-equivalence run on `car1`, and the five oversized sequences

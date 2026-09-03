@@ -1,16 +1,18 @@
 # The spatial mask: EAO +0.0110 and the accuracy "loss" is a selection effect — but the gain is carried by 3 sequences of 62 and is NOT distinguishable from a null
 
+**Status:** closed · **Updated:** 2026-08-31 · **Scope:** the spatial mask on hardware: EAO +0.0110, not separable from a null, mechanism refuted
+
 **2026-08-31.** `runs/vot/0831_1528-mask` against `runs/vot/0831_1340-base_stat`, 62 sequences /
 419 trajectories per arm, workspace `~/vot/analysis/0831_mask`. The two arms differ in ONE
 `-D`: `app.flagstamp` diffs to a single line, `-DFILTER_MASK=0` against `=1`, and the
 disassembly shows `filter_mask_project` called from 4 sites in the masked ELF and 0 in the
 baseline. Same `a.xclbin` (`52235f49221e`) on the card for both — host-only, an scp, no reflash.
 Claim id: `O-01` in `docs/thesis/claims.md`, result row `R-10`. Pre-registration:
-`evidence/proposed_build_mask.md`.
+`evidence/arm_mask.md`.
 
 ## The prediction, written down first
 
-From `proposed_build_mask.md` sec.4, before any board time:
+From `arm_mask.md` sec.4, before any board time:
 
 - **Accept only on `vot analysis`, and only if EAO rises. `dEAO >= +0.005` to ship.** Below that
   it is inside the noise of a 419-run comparison. EAO is the arbiter for an A/R trade — that is
@@ -174,7 +176,7 @@ HOG's 31 pooled dims. **No amount of shaping a filter fixes the features it is b
   the published 0.5100 / 0.3417 / 0.1629 to four decimals. That proves three things at once —
   `FILTER_MASK=0` is inert on hardware, the `FILTER_MASK_STAT` instrument perturbs tracking not
   at all, and the clean-HEAD rebuild reproduces the DIRTY-tree ELF the shipping arm was run
-  with (the open provenance question in `proposed_build_mask.md` sec.3, now closed).
+  with (the open provenance question in `arm_mask.md` sec.3, now closed).
 - **The instrument itself is cross-checked and mutation-tested.**
   `scripts/check_ebox_crosscheck.py` runs the board's `filter_box_energy_fraction()` and the
   offline `box_energy_fraction()` on the SAME H over 4 geometries (including a rectangular
@@ -229,7 +231,7 @@ HOG's 31 pooled dims. **No amount of shaping a filter fixes the features it is b
 
 ## The mask WIDTH knob exists, and k=1 is already past its optimum
 
-**2026-08-31.** CLAUDE.md and `proposed_build_mask.md` both state the window is forced so
+**2026-08-31.** CLAUDE.md and `arm_mask.md` both state the window is forced so
 "there is no width knob". True of a SINGLE Hann, false of the family: `sin^2` raised to `k` is a
 cosine polynomial of degree `k`, so **`m^k` has exactly `2k+1` non-zero DFT bins per axis** and
 is still board-implementable, and multiplying by `m^k` is EXACTLY applying `filter_mask_project`

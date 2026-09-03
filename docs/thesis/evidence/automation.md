@@ -1,5 +1,7 @@
 # Board automation — ssh control, pushed ELF, one-command sweeps
 
+**Status:** closed · **Updated:** 2026-08-25 · **Scope:** board automation: ssh control, a pushed ELF, one-command sweeps
+
 **2026-08-25.** Every board session used to open with four typed lines and one
 hand-typed ELF invocation per sequence, and every arm change was a card swap.
 Two of the coast A/B's three defects came from that flow rather than from the

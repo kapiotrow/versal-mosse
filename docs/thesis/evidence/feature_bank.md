@@ -1,5 +1,7 @@
 # The feature bank — how much is the PRETRAINING actually worth?
 
+**Status:** closed · **Updated:** 2026-09-02 · **Scope:** how much the PRETRAINING is worth: a one-hot lift ties the network while `CONV_RELU=0`
+
 **2026-08-29.** Prompted by a design question: would swapping the network the conv1 layer comes
 from help, or taking a wider network and PCA-compressing it to 16 channels? Both are cheap on
 this hardware (`make weights` + a 1 KB file copy, no re-synthesis), so the question is whether

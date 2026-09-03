@@ -1,12 +1,16 @@
 # Performance — resources, history, and where the frame goes
 
-Moved out of CLAUDE.md 2026-08-31; content unchanged.
+**Status:** current · **Updated:** 2026-08-31 · **Scope:** resources, per-frame AIE compute, the frame breakdown, the optimisation history
+
+Split out of CLAUDE.md 2026-08-31 and **maintained here since** — this file, not
+CLAUDE.md, is where this topic is kept current; CLAUDE.md carries only the one-line
+version and a link.
 
 ## Resources and cost
 
 VEK280 `xcve2802-vsvh1760-2MP-e-S`, 12 GB LPDDR4 **of which Linux maps 2 GB, and
 512 MB of that is CMA — usable heap is ~0.9-1.2 GB, NOT 12 GB** (see
-`docs/thesis/evidence/TODO_board_memory.md`; it cost **5** of 62 sequences on the RGB VOT
+`docs/thesis/evidence/board_memory.md`; it cost **5** of 62 sequences on the RGB VOT
 arm — the predicted 8 included three that turned out to fit, which is why the
 "derive luma on the board" step recovers zero sequences and the streaming reader
 was the only fix. `VOT_RESIDENT_MAX_MB` above is that reader).

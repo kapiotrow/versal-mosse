@@ -1,6 +1,10 @@
 # Known issues and traps
 
-Moved out of CLAUDE.md 2026-08-31; content unchanged.
+**Status:** current · **Updated:** 2026-08-31 · **Scope:** build hygiene, metrics that cannot fail a broken tracker, correctness / AIE / infrastructure traps
+
+Split out of CLAUDE.md 2026-08-31 and **maintained here since** — this file, not
+CLAUDE.md, is where this topic is kept current; CLAUDE.md carries only the one-line
+version and a link.
 
 
 ### Measurement / build hygiene

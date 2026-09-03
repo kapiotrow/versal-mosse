@@ -1,5 +1,7 @@
 # VOT Phase 2 — board frame source + runtime geometry
 
+**Status:** closed · **Updated:** 2026-08-25 · **Scope:** VOT bring-up 2: the board frame source and runtime geometry — and the first real-video loss
+
 **2026-08-25. GATE MET on the datapath, FAILED on `rails=0`, and the tracker
 LOSES REAL VIDEO.** `car1` anchor 0, all 742 frames, `runs/run_0825_1314.log` —
 see "The gate run" at the bottom. The path is proven end to end; the tracking

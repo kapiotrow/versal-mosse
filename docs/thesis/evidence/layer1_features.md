@@ -1,5 +1,7 @@
 # Layer-1 conv features — THE NONLINEARITY MECHANISM IS CONFIRMED, THE ARMS ARE NOT
 
+**Status:** closed · **Updated:** 2026-09-01 · **Scope:** the offline screen behind the Layer-1 arm: the nonlinearity mechanism confirmed, the arms not
+
 **2026-09-01.** `runs/vot/0901_offline-layer1b/l1b62.json`, 62 sequences / 19,903 frames,
 shipping eta 0.05 / gate 5.0, `vot_ar_offline.py`. Offline only. Claim `N-16` in
 `docs/thesis/claims.md`.
@@ -17,7 +19,7 @@ once the bank is Layer-1 shaped**, so every arm here carries its own LINEAR TWIN
 
 **The control is `rgb-dec2`, not `rgb`.** Stride 2 and 2x2 pooling both halve the map, which
 doubles `sigma/target` onto the 1/16 optimum — the free win that turned out to be all of the
-res64 result (`proposed_build_res64.md` sec.25). Scoring against the 128x128 baseline would hand
+res64 result (`arm_res64.md` sec.25). Scoring against the 128x128 baseline would hand
 these arms that win a second time.
 
 ## The prediction, written down first
@@ -88,7 +90,7 @@ the numbers are not comparable, only the ORDERING within their own table is.
 
 **Every arm here sits at a 64x64 map**, because stride 2 or a maxpool forces it. Hardware
 measured the opposite preference the same day: at matched `sigma/target`, **128x128 beats 64x64
-by +0.0222 R and +0.0082 EAO** (`proposed_build_res64.md` sec.25). So this screen ran the
+by +0.0222 R and +0.0082 EAO** (`arm_res64.md` sec.25). So this screen ran the
 nonlinearity at the geometry that loses.
 
 **The untested configuration the evidence now points at is 7x7 STRIDE 1, 16 channels, ReLU, at a
@@ -183,7 +185,7 @@ is a null, and it does not justify a rebuild, a reflash and a shift-budget calib
 
 **Frame time is NOT the obstacle, which is worth recording separately.** At 7x7 stride 2 with 32
 channels the conv is ~19.9 ms of AIE against a ~15.1 ms host tail (model in sec.25 of
-`proposed_build_res64.md`, validated on two measured points), so the frame lands ~20-22 ms
+`arm_res64.md`, validated on two measured points), so the frame lands ~20-22 ms
 against today's 24.55 ms — **no frame-rate cost, possibly a small gain**. It is the
 STRIDE-1/128x128 variant that costs 2x (conv ~39.8 ms against a 24.5 ms host).
 
@@ -230,7 +232,7 @@ geometries: consistent direction, magnitude carried by a few sequences, bootstra
 
 ## THE COST FINDING THAT DECIDES THE CONFIGURATION
 
-Frame model of sec.25 (`proposed_build_res64.md`), validated on two measured points, plus
+Frame model of sec.25 (`arm_res64.md`), validated on two measured points, plus
 conv2d = `S + t*taps` with S = 2.31 ms, t = 0.255 ms/tap from `rgb.md`'s 4.60 (9 taps) / 9.19
 (27 taps):
 
@@ -244,7 +246,7 @@ l1relu(32):    64^2, 32ch, 7x7/2  15.1  ms    19.9 ms   ~20-22 ms +0.0383  FASTE
 
 **At 128x128 it is the 32 CHANNELS, not the kernel, that double the downstream.** The working
 configuration is not affordable and the affordable one is a null. **The one cell with both
-properties is `l1relu(32)` at the 64x64 map** — see `proposed_build_l1relu.md`.
+properties is `l1relu(32)` at the 64x64 map** — see `arm_l1relu.md`.
 
 ## Verdict on the whole Layer-1 direction
 

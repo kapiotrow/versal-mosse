@@ -1,6 +1,10 @@
 # Shift budget
 
-Moved out of CLAUDE.md 2026-08-31; content unchanged.
+**Status:** current · **Updated:** 2026-09-02 · **Scope:** the FFT/IFFT shift budget and `H_SHIFT`: 3-3-3 at 64x64, 4-4-4 at 128x128
+
+Split out of CLAUDE.md 2026-08-31 and **maintained here since** — this file, not
+CLAUDE.md, is where this topic is kept current; CLAUDE.md carries only the one-line
+version and a link.
 
 ### Shift budget — SETTLED: **3-3-3 at 64x64 (SHIPPING)**, 4-4-4 at 128x128, `H_SHIFT` 15
 
@@ -47,7 +51,7 @@ move an argmax) plus PSR not moving — PSR is where a quantization floor would 
 
 ### Shift budget on real video — CLOSED 2026-08-27
 
-`docs/thesis/evidence/TODO_shift_budget.md`. `car1` railed on 266 of 8434 frames at `H_SHIFT=11`, attributed
+`docs/thesis/evidence/shift_budget_realvideo.md`. `car1` railed on 266 of 8434 frames at `H_SHIFT=11`, attributed
 to BOTH `accum` and `response` — so `H_SHIFT`, the only knob upstream of both, was the lever. Two
 deliberately over-shifted arms returned the UNCENSORED distribution: over 101,564 RGB frames
 `rails_accum = rails_resp = 0`, maxima 15.6% / 10.1% of ceiling. **`H_SHIFT=13` is the

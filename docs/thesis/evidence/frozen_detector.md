@@ -1,5 +1,7 @@
 # The frozen detector: two sequences, two completely different causes
 
+**Status:** closed · **Updated:** 2026-08-25 · **Scope:** `nature` and `tiger` fail the same way for two completely different reasons
+
 **2026-08-25.** `nature` and `tiger` both fail by reporting zero displacement on
 most frames. They have nothing else in common, and one of them is not a tracker
 defect at all.
@@ -54,7 +56,7 @@ image and the wrong answer to the benchmark.
 
 **So `nature` is a task mismatch, and it is 46% of the frames in the 8-sequence
 evidence set.** Any frame-weighted mean over that set is dominated by a sequence
-this tracker cannot be right about. Read `docs/thesis/evidence/evidence_ar.md`'s per-sequence
+this tracker cannot be right about. Read `docs/thesis/evidence/metric_ar_vs_iou.md`'s per-sequence
 table, not the aggregate, and do not tune anything against `nature`.
 
 **Phase correlation was the wrong instrument and nearly produced a fourth wrong

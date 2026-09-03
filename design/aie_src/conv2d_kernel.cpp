@@ -82,7 +82,7 @@
  *                 per-call FLOOR rose from ~0 (sigma4, 16 ch) to 1.19 ms, which
  *                 is conv2d back-pressure and not crop work. 19.3M MACs in
  *                 42.4 ms is 0.36 MAC/cycle on a core with 128 int8 lanes.
- *                 runs/l1relu_calib/, evidence/proposed_build_l1relu.md sec.7.4.
+ *                 runs/l1relu_calib/, evidence/arm_l1relu.md sec.7.4.
  *                 The doc's ~20-22 ms model was 2.4x optimistic; the frame body
  *                 was 61.48 ms against sigma4's 27.11 on the same instrument.
  *   loop schedule per-iteration cycles from aiecompiler, BEFORE -> AFTER the
@@ -126,7 +126,7 @@
  *   tile memory   sub[3][7][2][70] = 2940 B plus a 70 B zero row. Far under the
  *                 64 KB tile, and it is `static` -- TILE DATA MEMORY, NOT STACK.
  *   stack         CONV2D_STACK=2048 SUFFICED, unchanged from the 27-tap arm.
- *                 proposed_build_l1relu.md called ~7.3 KB "the sharp risk" and
+ *                 arm_l1relu.md called ~7.3 KB "the sharp risk" and
  *                 predicted a loop restructure would be needed; the restructure
  *                 was needed, but for the STRIDE, and it made the stack question
  *                 disappear rather than answering it -- the taps never leave the
@@ -294,7 +294,7 @@ void conv2d_kernel(
 //
 // WHY A SEPARATE BRANCH AND NOT A GENERALISATION OF THE 3x3 ONE. The shipped
 // branches hoist every tap into a named scalar (9 of them gray, 27 RGB) and
-// unroll the MAC by hand. At 147 taps that is what proposed_build_l1relu.md
+// unroll the MAC by hand. At 147 taps that is what arm_l1relu.md
 // flags as the sharp risk: "~7.3 KB of stack ... likely restructuring the
 // inner loop rather than raising a number". This branch keeps the taps IN THE
 // WEIGHT BUFFER and loops over them, so CONV2D_STACK does not have to grow
@@ -473,7 +473,7 @@ void conv2d_kernel(
         // what put the kc loop at "minimum length due to resources: 10" in the
         // aiecompiler schedule and cost the arm 42.4 ms/frame of conv2d on
         // hardware -- runs/l1relu_calib/run_l1relu_calib.log, read off
-        // roi_crop's ap_done poll (docs/thesis/evidence/proposed_build_l1relu.md
+        // roi_crop's ap_done poll (docs/thesis/evidence/arm_l1relu.md
         // sec.7.4).
         //
         // rowb[ic][kr][ph] points at half-column 0 of the row that tap

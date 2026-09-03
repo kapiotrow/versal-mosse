@@ -1,5 +1,7 @@
 # <Claim in one line, stating the VERDICT, not the topic>
 
+**Status:** current · **Updated:** — · **Scope:** the skeleton every new evidence note starts from
+
 **<date>.** `<run dir or offline script>`, <N sequences / M frames>. <What differs from the
 comparison arm, and how that was verified — a flagstamp diff, an ELF `cmp`, an xclbin md5.>
 Claim id: `<X-NN>` in `docs/thesis/claims.md`.

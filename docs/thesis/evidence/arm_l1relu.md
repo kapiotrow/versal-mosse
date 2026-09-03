@@ -1,6 +1,15 @@
-# NEXT BUILD (PROPOSED, NOT BUILT): Layer-1 features — 7x7 stride 2, 32ch, ReLU, 64x64 map
+# The Layer-1 arm — 7x7 stride 2, 32ch, ReLU, 64x64 map. PRE-REGISTERED, BUILT, AND SHIPPING
 
-**Pre-registered 2026-09-01.** Nothing built. Claim `N-16` / `O-04` in `docs/thesis/claims.md`;
+**Status:** closed · **Updated:** 2026-09-02 · **Scope:** the SHIPPING arm: Layer-1 7x7/2 features, 32ch, ReLU, 64x64 map. Pre-registered, built, swept, shipped — and it did NOT meet its own falsifier
+
+**WHERE THIS ENDED UP.** Pre-registered 2026-09-01 with nothing built; **built, swept and
+SHIPPED 2026-09-02 at A 0.5129 / R 0.4279 / EAO 0.1960, the best arm on record.** It did NOT
+meet its own pre-registered `dEAO >= +0.005` bar (+0.0029) and ships on other grounds —
+**sec.10-12 carry the result and the grounds, and this must never be written up as a pass.**
+sec.13 then measured and REJECTED `MOSSE_ETA=0.1` on top of it. The linear twin `ARM=l1lin`
+is still OWED. Everything before sec.10 is the proposal as written, kept unedited.
+
+**Pre-registered 2026-09-01.** Nothing built at the time of writing. Claim `N-16` / `O-04` in `docs/thesis/claims.md`;
 the screens behind it are `evidence/layer1_features.md` and `evidence/feature_bank.md`.
 
 ```
@@ -70,7 +79,7 @@ rebuild, re-package, re-flash, and a shift-budget calibration.
 - **The shift budget must be re-calibrated and it is NOT the res64 budget.** A rectified map has
   a large DC for Stage B1/B2 to absorb, 32 channels sum 2x as many terms into the accumulator,
   and res64 already runs at 44-47% of ceiling on real video (sec.20.1 of
-  `proposed_build_res64.md`). Expect `H_SHIFT` to move UP, and size it on the TAIL over 200
+  `arm_res64.md`). Expect `H_SHIFT` to move UP, and size it on the TAIL over 200
   frames, not the typical frame.
 - Downstream (FFT, cmul, IFFT, APU tail) doubles with the channel count but quarters with the
   map: net ~0.5x of today per the sec.25 frame model.
@@ -560,7 +569,7 @@ replicate on the sigma-6 row -- 2 of 3.
 **THE ASSUMPTION THIS ARM RESTS ON, NAMED BEFORE THE RUN.** The grid ran at 128x128 / sigma 4.
 `l1relu` is 64x64 / sigma 2, i.e. the SAME `sigma/target` = 1/16 but half the map. Transfer
 therefore assumes eta's optimum is governed by `sigma/target` and not by the absolute geometry.
-`proposed_build_res64.md` sec.21 established that for SIGMA and for nothing else. **If this arm
+`arm_res64.md` sec.21 established that for SIGMA and for nothing else. **If this arm
 returns a null, that assumption is the first suspect, not the eta result.**
 
 **Falsifier.**
@@ -636,7 +645,7 @@ it does not improve anything systematically.**
 ### 13.1 THE ASSUMPTION NAMED BEFORE THE RUN IS THE ONE THAT BROKE
 
 Sec.11 wrote it down: the grid ran at 128x128 / sigma 4, this arm is 64x64 / sigma 2. Both sit at
-`sigma/target = 1/16`, and **`proposed_build_res64.md` sec.21 established that `sigma/target`
+`sigma/target = 1/16`, and **`arm_res64.md` sec.21 established that `sigma/target`
 governs SIGMA — it never established that it governs ETA.** The transfer assumed it did. It does
 not, or not at this map size. **A pre-registered assumption failing is the cheapest possible
 outcome here**: the arm cost one ELF and one sweep, and the negative result is attributable

@@ -1,11 +1,15 @@
 # RGB features (`CONV_IN_CH=3`) — shipping
 
+**Status:** current · **Updated:** 2026-09-02 · **Scope:** the `CONV_IN_CH=3` datapath, its testing, and what it costs
+
 *(`CONV_IN_CH=3` still ships. The rest of this file describes the 3x3 mobilenet arm it was
 measured on; since 2026-09-02 the shipping bank is resnet18 conv1 7x7/2 PCA'd to 32 channels at
 a 64x64 map, so the ch16 conv2d figures below are that arm's, not today's — see
-`../thesis/evidence/proposed_build_l1relu.md`.)*
+`../thesis/evidence/arm_l1relu.md`.)*
 
-Moved out of CLAUDE.md 2026-08-31; content unchanged.
+Split out of CLAUDE.md 2026-08-31 and **maintained here since** — this file, not
+CLAUDE.md, is where this topic is kept current; CLAUDE.md carries only the one-line
+version and a link.
 
 
 `CONV_IN_CH=3` is the default. Build with `make weights CONV_IN_CH=3` then

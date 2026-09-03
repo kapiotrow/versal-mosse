@@ -1,5 +1,11 @@
 # VOT Phase 4 — overhead removal: `PROGRESS_EVERY`, `CSV_FLUSH_EVERY`
 
+**Status:** closed · **Updated:** 2026-08-25 · **Scope:** VOT bring-up 4: console overhead removal, and the transport that was the whole win
+
+**WHERE THIS ENDED UP.** It ran: three `car1` runs on 2026-08-25 (all 15 anchors, 8434
+frames each) put both knobs at 1.1% and the TRANSPORT (UART -> ssh, 3.79 ms/frame) at the
+whole win — claim `P-09`. Both knobs are kept. The status below is as written before that.
+
 **2026-08-25. BUILT AND VERIFIED IN THE BINARY. Not yet run on hardware** — the
 gate is a before/after frame time on one sequence, which the next board session
 provides.

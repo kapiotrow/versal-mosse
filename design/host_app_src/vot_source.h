@@ -123,7 +123,7 @@ class Blob {
 // StreamBlob — the same frames as Blob, for a sequence that does not fit in heap.
 //
 // WHY IT EXISTS. The board maps 2 GB of the VEK280's 12 GB and 512 MB of that is
-// CMA, so usable heap is ~0.9-1.2 GB (docs/thesis/evidence/TODO_board_memory.md). Five RGB
+// CMA, so usable heap is ~0.9-1.2 GB (docs/thesis/evidence/board_memory.md). Five RGB
 // sequences exceed it -- flamingo1 3631 MB, zebrafish1 2373, nature 1482,
 // frisbee 1471, girl 1318 -- and the 2026-08-26 full-62 RGB sweep lost exactly
 // those five to std::bad_alloc and the OOM killer while the other 57 completed.

@@ -1,5 +1,7 @@
 # Multi-anchor evidence run — arm A vs arm B (`HOLD_COAST` 0 vs 1)
 
+**Status:** closed · **Updated:** 2026-08-25 · **Scope:** arm A vs arm B (`HOLD_COAST` 0 vs 1) on the same 54 runs
+
 **2026-08-25, both arms in `runs/run_0825_1604.log`** (the picocom session was
 never restarted, so arm B is appended to arm A's file). 8 sequences, 54 runs,
 23,297 frames per arm.

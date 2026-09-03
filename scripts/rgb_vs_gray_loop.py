@@ -214,7 +214,7 @@ def split_l1(name):
     THE CONTROL THAT MATTERS IS `rgb-dec2`, not `rgb`. MOSSE_SIGMA is in BINS
     and the target spans patch/padding bins, so a stride-2 map halves the bin
     count and DOUBLES sigma/target onto the 1/16 optimum -- the free win that
-    turned out to be all of the res64 result (sec.25 of proposed_build_res64.md).
+    turned out to be all of the res64 result (sec.25 of arm_res64.md).
     Scoring these against the 128x128 baseline would hand them that win a second
     time. `dec2` is the geometry-matched Layer 0.
     """
@@ -541,7 +541,7 @@ def spatial_mask(rows, cols, plateau_frac, taper_frac, centre='board'):
 def box_energy_fraction(H, box_rows, box_cols):
     """Fraction of SUM|h|^2 inside a CENTRED box of box_rows x box_cols BINS.
 
-    THE MECHANISM CHECK for the spatial mask (proposed_build_mask.md 4): "the
+    THE MECHANISM CHECK for the spatial mask (arm_mask.md 4): "the
     fraction of the filter's energy inside the target box should rise from the
     measured 51.6% (car1) / 54.9% (tiger). If EAO moves while that does not, the
     gain is not the mask." Those two numbers lived only in a COMMENT above --

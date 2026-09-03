@@ -1,6 +1,10 @@
 # Settled questions and validated facts — do not re-derive
 
-Moved out of CLAUDE.md 2026-08-31; content unchanged.
+**Status:** current · **Updated:** 2026-09-02 · **Scope:** validated facts and closed questions — do not reopen
+
+Split out of CLAUDE.md 2026-08-31 and **maintained here since** — this file, not
+CLAUDE.md, is where this topic is kept current; CLAUDE.md carries only the one-line
+version and a link.
 
 ## Validated / done (facts worth not re-deriving)
 
@@ -102,7 +106,7 @@ Moved out of CLAUDE.md 2026-08-31; content unchanged.
   the rule throws away. Failure COUNTS barely moved (48 of 54 runs vs 49) — only their timing
   did. **Quote which metric produced a verdict, and prefer AR for anything that will be
   reported**; mean IoU cannot see the timing of a loss, and that is what the challenge scores.
-  See `docs/thesis/evidence/evidence_ar.md`.
+  See `docs/thesis/evidence/metric_ar_vs_iou.md`.
 - **PSR gating (Bolme §3.5)** — four veto reasons reported separately: `ZERO_RESPONSE`,
   `FLAT_SIDELOBE` (sdev 0 — PSR undefined, not infinite), `NEGATIVE_PEAK`, `LOW_PSR`. Only
   `LOW_PSR` is disabled by `PSR_GATE_MIN=0`. On a gated frame the host **holds the position**

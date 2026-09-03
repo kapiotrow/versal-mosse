@@ -53,7 +53,7 @@ case "$ARM" in
   rgb)    CONV_IN_CH=3; CONV_KSIZE=3; CONV_STRIDE=1; CONV_RELU=0; WEIGHT_BANK=mobilenet; ACC_BOUND=loose ;;
   # The pre-registered Layer-1 arm: 7x7 stride 2, resnet18-PCA bank, ReLU ON,
   # a 128x128 crop into a 64x64 feature map.
-  # docs/thesis/evidence/proposed_build_l1relu.md, claim N-16 / O-04.
+  # docs/thesis/evidence/arm_l1relu.md, claim N-16 / O-04.
   #
   # IT CARRIES ITS OWN GEOMETRY AND ITS OWN NONLINEARITY, so it cannot be spelled
   # as `ARM=rgb` plus overrides: CONV_RELU and CONV_KSIZE reach AIE_FLAGS, and
@@ -63,7 +63,7 @@ case "$ARM" in
   # Makefile, so pass PATCH_ROWS=64 PATCH_COLS=64 N_CHANNELS=32 with it.
   l1relu) CONV_IN_CH=3; CONV_KSIZE=7; CONV_STRIDE=2; CONV_RELU=1; WEIGHT_BANK=l1resnet; ACC_BOUND=l1 ;;
   # The MECHANISM CHECK for the arm above -- the same bank and geometry with the
-  # rectifier off. proposed_build_l1relu.md's falsifier calls for it only if the
+  # rectifier off. arm_l1relu.md's falsifier calls for it only if the
   # ReLU arm wins; if the twin wins too, the gain is the bank, not the
   # nonlinearity, and the thesis argument is void.
   l1lin)  CONV_IN_CH=3; CONV_KSIZE=7; CONV_STRIDE=2; CONV_RELU=0; WEIGHT_BANK=l1resnet; ACC_BOUND=l1 ;;
@@ -112,7 +112,7 @@ H_SHIFT=${H_SHIFT:-$(mk H_SHIFT)}
 # of the 128x128 build sitting next to it — reporting BUILD VERIFIED for a
 # binary it never looked at. That is the same class as the stale libadf.a.
 #
-# THE 64x64 ARM (docs/thesis/evidence/proposed_build_res64.md, claim N-03b) is
+# THE 64x64 ARM (docs/thesis/evidence/arm_res64.md, claim N-03b) is
 # built with PATCH_ROWS=64 PATCH_COLS=64. It needs its OWN shift budget — the
 # transform gain falls with the point size on the forward AND the inverse pass —
 # so do not reuse 4-4-4/H_SHIFT=15 there without reading sec.3 of that file.
@@ -296,7 +296,7 @@ fi
 # not the yardstick and rails=0 has to be re-established from scratch.
 if [ "$PATCH_ROWS" != 128 ] || [ "$PATCH_COLS" != 128 ]; then
     note "comparator applies" "NO — ${PATCH_ROWS}x${PATCH_COLS} is not the comparator's geometry"
-    note "  -> this is a NEW shift budget" "read proposed_build_res64.md sec.3 before quoting it"
+    note "  -> this is a NEW shift budget" "read arm_res64.md sec.3 before quoting it"
 fi
 
 # ---- 2. the weights file must match the arm -------------------------------

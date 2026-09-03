@@ -1,8 +1,12 @@
 # Methodology: the rules this project paid to learn
 
-Chapter 8's material. The rules themselves currently live in `CLAUDE.md`'s *Measurement
-methodology* and *Known issues and traps* sections; the indexed, thesis-facing versions are the
-`M-*` rows of [`claims.md`](claims.md). This file is the bridge until that content migrates.
+**Status:** current · **Updated:** 2026-08-31 · **Scope:** which of the paid-for rules generalise past this project
+
+Chapter 8's material. The rules themselves live in
+[`../engineering/measurement.md`](../engineering/measurement.md) and
+[`../engineering/traps.md`](../engineering/traps.md) (they left CLAUDE.md on 2026-08-31); the
+indexed, thesis-facing versions are the `M-*` rows of [`claims.md`](claims.md). This file is the
+bridge: it says which of those rules generalise past this project and are worth a chapter.
 
 Two principles everything below is an instance of: **instruments before changes**, and **never
 move two magnitudes at once**.

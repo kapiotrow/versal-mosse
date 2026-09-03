@@ -7,7 +7,7 @@ IS THEORISED TO DO?
 (sum |h|^2 over all 16 channels) that sits inside a centred box the size of the
 target. It is the mechanism check for `FILTER_MASK`, and it is deliberately
 INDEPENDENT of it so the baseline arm is measurable with the same instrument --
-see docs/thesis/evidence/proposed_build_mask.md sec.4.
+see docs/thesis/evidence/arm_mask.md sec.4.
 
 The check the evidence doc asks for: `mask_ebox` should sit near 0.91 at init
 and 0.93-0.99 thereafter on a masked arm, against a baseline that starts near
@@ -61,7 +61,7 @@ from collections import defaultdict
 
 COL = 'mask_ebox'
 
-# Frame indices profiled, matching the table in proposed_build_mask.md sec.4 so
+# Frame indices profiled, matching the table in arm_mask.md sec.4 so
 # the board's numbers land next to the offline ones they are predicted from.
 PROFILE_FRAMES = (1, 5, 20, 40)
 
@@ -233,7 +233,7 @@ def paired(a, b, label_a, label_b, per_sequence=False):
         print("  Any EAO move is UNATTRIBUTABLE -- do not report it as the mask's.")
     print()
     print("  This is ATTRIBUTION, not acceptance. EAO on `vot analysis` is the")
-    print("  arbiter for an A/R trade; see proposed_build_mask.md sec.4.")
+    print("  arbiter for an A/R trade; see arm_mask.md sec.4.")
 
     if per_sequence:
         print()

@@ -1,5 +1,7 @@
 # Multi-anchor evidence run — arm A (`HOLD_COAST=0`), 8 sequences
 
+**Status:** closed · **Updated:** 2026-08-25 · **Scope:** the first multi-sequence tracking result: arm A, 8 sequences, 54 trajectories
+
 **2026-08-25, `runs/run_0825_1604.log`. 54 runs, 23,297 frames, 54 trajectories
 written, 0 failures.** This is the first multi-sequence tracking result the
 project has, and the baseline arm B is measured against.

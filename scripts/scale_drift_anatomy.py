@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 """Is the long-horizon SCALE error a random walk, and what feeds it?
 
-WHY. proposed_build_l1relu.md sec.10.3 measured that 71% of the EAO window
+WHY. arm_l1relu.md sec.10.3 measured that 71% of the EAO window
 (301-755) sees no improvement from better features, and that on surviving runs
 `est_h/truth_h` stays centred on 1.0 while its IQR MORE THAN DOUBLES between
 frames 100 and 500. That is a description, not a cause, and it does NOT match

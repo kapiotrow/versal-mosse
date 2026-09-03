@@ -2245,9 +2245,33 @@ code-map:
 
 # Reports comments whose measured numbers duplicate docs/thesis/results/*.csv without
 # citing anything, and measurements that no CSV records. --strict fails on the first class.
-check-docs:
+check-docs: check-build-table check-doc-links check-doc-headers
 	@python3 scripts/check_doc_numbers.py
 .PHONY: check-docs
+
+# Every default documented in CLAUDE.md's digest and docs/engineering/build_params.md
+# must equal `make print-<KNOB>`. Fails on any disagreement -- the Makefile is the
+# authority and a documented default that drifts describes a build the repo cannot make.
+check-build-table:
+	@python3 scripts/check_build_table.py
+.PHONY: check-build-table
+
+# Every path the docs name must exist, and CLAUDE.md's Directory layout block must name
+# every source file under scripts/ and design/. Fails on either -- a doc that describes a
+# tree the repo does not have is read as if it did.
+check-doc-links:
+	@python3 scripts/check_doc_links.py
+.PHONY: check-doc-links
+
+# Regenerates docs/thesis/evidence/README.md from each note's own status header and the
+# citations in claims.md. `check-doc-headers` is the same script in verify-only mode.
+doc-index:
+	@python3 scripts/doc_index.py
+.PHONY: doc-index
+
+check-doc-headers:
+	@python3 scripts/doc_index.py --check
+.PHONY: check-doc-headers
 
 # Generates docs/thesis/tables/*.tex (booktabs bodies) from docs/thesis/results/*.csv.
 # Copy them into the thesis repo by hand, or opt in with:

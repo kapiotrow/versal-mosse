@@ -417,7 +417,7 @@ void filter_update(FilterState &st, const cfloat *F_all,
 // holds only 51.6% (car1) / 54.9% (tiger) of SUM|h|^2. That is
 // filter_box_energy_fraction() below, and it is this build's mechanism check.
 //
-// EVIDENCE: docs/thesis/evidence/proposed_build_mask.md, claim O-01, and the rows
+// EVIDENCE: docs/thesis/evidence/arm_mask.md, claim O-01, and the rows
 // `off_rgb` / `off_mask0_boardform` in docs/thesis/results/arms_offline.csv -- which is
 // where these figures live and where they get corrected if the arm is re-swept.
 // 62 sequences, shipping eta/gate, vot_ar_offline: dR +0.0601 in the BOARD form of the

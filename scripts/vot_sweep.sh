@@ -46,7 +46,7 @@
 #                    force one mode for every sequence in the sweep -- that is
 #                    the MODE-EQUIVALENCE TEST: streaming changes no arithmetic,
 #                    so the same sequence run both ways must come back with
-#                    IDENTICAL run-state digests. See docs/thesis/evidence/TODO_board_memory.md
+#                    IDENTICAL run-state digests. See docs/thesis/evidence/board_memory.md
 #   --elf PATH       host ELF to push           (default: the hw build's)
 #   --out DIR        logs + config              (default: runs/vot/<date>-<arm>)
 #   --board HOST     (default 192.168.10.2)

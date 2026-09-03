@@ -1,5 +1,7 @@
 # Stage B3 channel reliability — THE MECHANISM IS REAL AND THE GAIN IS NOT SEPARABLE FROM A NULL
 
+**Status:** closed · **Updated:** 2026-09-01 · **Scope:** Stage B3 channel reliability: mechanism real, gain not separable from a null
+
 **2026-09-01.** `runs/vot/0901_offline-chrel/chrel62.json`, `scripts/rgb_vs_gray_loop.py` arm
 suffix `-chrel<N>`, 62 sequences / 19,903 frames, shipping eta 0.05 / gate 5.0, scored with
 `vot_ar_offline.py`. Offline only — no hardware. **Control: the `rgb` arm reproduces the stored

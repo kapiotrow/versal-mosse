@@ -1,5 +1,7 @@
 # The robustness gap — where it comes from
 
+**Status:** closed · **Updated:** 2026-08-27 · **Scope:** where the robustness gap comes from: the tracker walks off target confidently
+
 **2026-08-27.** Published CF baselines vs our full-62 run (`~/vot/analysis/full62`), plus an
 attribution of our own failures from the existing `track_*.csv` (180,544 frames, 434 runs, no
 board time). **The headline reverses the obvious suspect.**

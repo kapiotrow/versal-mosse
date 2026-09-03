@@ -1,5 +1,7 @@
 # The HOLD-on-gate policy, measured against the dataset
 
+**Status:** closed · **Updated:** 2026-08-25 · **Scope:** the HOLD-on-gate policy measured against the dataset
+
 **2026-08-25.** `car1` on hardware (`runs/run_0825_1314.log`) held position for
 53 consecutive frames and never recovered, losing 281 of 742 frames. This is the
 characterisation of *why*, and of how far it generalises.

@@ -1,5 +1,7 @@
 # `MOSSE_ETA=0.05` on hardware, all 62 — WINS ON AR, BUT NOT BY THE PREDICTED MECHANISM
 
+**Status:** closed · **Updated:** 2026-08-27 · **Scope:** `MOSSE_ETA=0.05` on hardware: wins on AR, but not by the predicted mechanism
+
 **2026-08-27.** `runs/vot/0827_1441-eta05`, 62 sequences, 419 runs, 180,125 frames.
 Host-only A/B against the shipping RGB arm (`rgb15` + `rgb15stream`, same 419 runs):
 one flag differs, `-DMOSSE_ETA=0.125` -> `0.05`, verified by `app.flagstamp` diff, and

@@ -1,5 +1,7 @@
 # `nature`: the tracker fails without the gate ever firing
 
+**Status:** closed · **Updated:** 2026-08-25 · **Scope:** `nature` fails without the gate firing — and the sub-bin mechanism first proposed for it is REFUTED in-file
+
 > **CORRECTION, 2026-08-25 (same day). THE MECHANISM BELOW IS REFUTED. The
 > OBSERVATIONS are all correct; the explanation built on them is not, and the
 > fix it proposed would not have fixed this sequence.** Two independent benches,

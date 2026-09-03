@@ -1,5 +1,7 @@
 # `results/` — the only place a thesis number may come from
 
+**Status:** current · **Updated:** — · **Scope:** the only place a thesis number may come from, and the provenance rules
+
 Prose drifts; a CSV does not. When an arm is re-swept you **append a row**, you do not edit five
 paragraphs in three files.
 

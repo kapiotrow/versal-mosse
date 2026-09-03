@@ -1,5 +1,7 @@
 # Chasing `tiger`: eta, sigma, eps_rel — and why none of them is the answer
 
+**Status:** closed · **Updated:** 2026-08-25 · **Scope:** eta, sigma and eps_rel all chased on `tiger`, and why none of them is the answer
+
 **2026-08-25, entirely offline.** `tiger` was identified in
 [frozen_detector.md](frozen_detector.md) as the one sequence with a real defect:
 the motion is real (still-wins 8%), the target never leaves the search window

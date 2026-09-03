@@ -1,6 +1,10 @@
 # Where this tracker sits — published VOT-STb2022 baselines
 
-Moved out of CLAUDE.md 2026-08-31; content unchanged.
+**Status:** current · **Updated:** 2026-09-02 · **Scope:** where this tracker sits against the 41 published VOT-STb2022 trackers
+
+Split out of CLAUDE.md 2026-08-31 and **maintained here since** — this file, not
+CLAUDE.md, is where this topic is kept current; CLAUDE.md carries only the one-line
+version and a link.
 
 
 **Directly comparable, which is unusual enough to state: same dataset, same anchor-based

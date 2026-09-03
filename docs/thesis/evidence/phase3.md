@@ -1,5 +1,7 @@
 # VOT Phase 3 — per-run reset (multi-start)
 
+**Status:** closed · **Updated:** 2026-08-25 · **Scope:** VOT bring-up 3: per-run reset, and the determinism test proven able to fail
+
 **2026-08-25. GATE MET. Determinism passes on the clean build
 (`runs/run_0825_1523.log`) and FAILS on the deliberately-broken one
 (`runs/run_0825_1530.log`), in the predicted manner. The trajectories land on

@@ -1,5 +1,7 @@
 # VOT Phase 0c — converter validated against the 16 local sequences
 
+**Status:** closed · **Updated:** 2026-08-24 · **Scope:** VOT bring-up 0c: the converter validated against the 16 local sequences
+
 **2026-08-24. CLOSED. 16/16 byte-exact, 5/5 mutants caught.**
 
 `test-sequences/` is a subset of the same dataset the stb2022 run will use, so the

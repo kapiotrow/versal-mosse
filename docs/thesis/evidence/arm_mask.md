@@ -1,5 +1,7 @@
 # Proposed hardware build — the spatial mask (`FILTER_MASK`)
 
+**Status:** superseded · **Updated:** 2026-08-31 · **Scope:** the spatial-mask build proposal; the result it predicted is in `spatial_mask.md`
+
 **SUPERSEDED 2026-08-31 — the arm was built, swept and ACCEPTED (EAO 0.1629 -> 0.1740,
 +0.0110). The result, and everything that must not be re-derived, is in
 `evidence/spatial_mask.md`. This file is kept as the PRE-REGISTRATION: its section 4 is the

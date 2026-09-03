@@ -1,4 +1,6 @@
-mount # VOT Phase 0b — toolkit result-format round-trip
+# VOT Phase 0b — toolkit result-format round-trip
+
+**Status:** closed · **Updated:** 2026-08-24 · **Scope:** VOT bring-up 0b: the toolkit result-format round-trip
 
 **2026-08-24. CLOSED.** Format written and read back with the toolkit's own
 writers/readers, `vot analysis` run end to end over a fabricated workspace, and
