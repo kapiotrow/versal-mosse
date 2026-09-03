@@ -142,9 +142,12 @@ def vgg16_conv1_pca(n_out=16):
 def resnet18_conv1_5x5(n_out=NCH):
     """resnet18 conv1 CENTRE-CROPPED to 5x5, for a stride-1 arm at the 128x128 map.
 
-    WHY 5x5 AND WHY STRIDE 1. Hardware measured the 64x64 map as the WORSE
-    geometry at matched sigma/target (-0.0222 R, arm_res64.md sec.25),
-    so every arm in the Layer-1 screen ran at the losing end. Stride 1 keeps the
+    WHY 5x5 AND WHY STRIDE 1. Hardware measured the 64x64 map as the worse
+    geometry at matched sigma/target (-0.0222 R POOLED, arm_res64.md sec.25),
+    so every arm in the Layer-1 screen ran at that end. CORRECTED 2026-09-04:
+    that difference is NOT paired-stable (trim-5 -0.0040, P(dR<=0)=0.205 --
+    claim R-14, evidence/harness_validation.md), so the geometry premise for a
+    128x128 arm is thin and this docstring no longer argues for one. Stride 1 keeps the
     128x128 map, and 5x5 is the largest kernel that stays FRAME-RATE NEUTRAL
     there: conv2d = S + t*taps with S = 2.31 ms and t = 0.255 ms/tap from the two
     measured points (rgb.md: 4.60 ms at 9 taps, 9.19 at 27), so 75 taps is

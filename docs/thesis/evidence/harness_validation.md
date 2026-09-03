@@ -1,6 +1,6 @@
 # The scoring path reproduces a published tracker: CSRDCF to within 0.008 EAO through this project's own ingest
 
-**Status:** current · **Updated:** 2026-09-03 · **Scope:** validating the multistart scoring path against published numbers, and the offline multistart harness that made it possible
+**Status:** current · **Updated:** 2026-09-03 · **Scope:** validating the multistart scoring path against published numbers and against a known-answer geometry pair, and the offline multistart harness that made it possible
 
 **2026-09-03.** No board time. `scripts/offline_multistart.py` runs a host-side tracker under
 the BOARD's multistart protocol and writes the board's trajectory format; `scripts/vot_ingest.py`
@@ -71,6 +71,81 @@ identical 419 runs**, so a path defect cannot be selective between them. **Never
   the comparison against a published number could, and only for a tracker whose features
   actually use colour. That is the argument for keeping a published reference in the loop
   permanently rather than treating today's check as one-off.
+
+## 2026-09-04 — the known-answer geometry calibration, and a correction it forced
+
+`results/geometry_calibration.csv`. Claim `R-14`.
+
+**Why.** Screening the proposed 128x128 Layer-1 arm offline would mean screening a GEOMETRY
+change on a bench that `arm_res64.md` sec.25.1 recorded **inverting on exactly that axis** — the
+old single-start proxy gave +0.0263 R to the 64 map where hardware gave +0.0222 R to the 128 map.
+So the bench was pointed at the pair whose answer hardware already knows, before being trusted
+with the pair whose answer it does not. That is `traps.md`'s *test an analysis tool against an
+OLD log first*, applied to a bench instead of a parser.
+
+**The pair.** Matched `sigma/target` = 1/16, same 3x3 RGB bank, eta 0.05, gate 5.0: a 64x64 map
+at sigma 2 against a 128x128 map at sigma 4 — hardware's `res64` and `sigma4`, run offline as
+`mosse:rgb-dec2 --sigma 2` and `mosse:rgb --sigma 4`.
+
+### The prediction, written down first
+
+Written before the run: *if the harness reproduces hardware's sign it is licensed to screen the
+128x128 L1 arm; if it also inverts, that arm goes straight to hardware with no offline opinion.*
+Recorded caveat, also written first: **one pair is one point of evidence, not a general licence.**
+
+### The result — two findings, and the second is the bigger one
+
+| resolution term (128 map − 64 map) | pooled dR | paired mean | median | trim-5 | better/worse/tied | P(dR≤0) |
+|---|---|---|---|---|---|---|
+| **hardware** (`sigma4` − `res64`) | **+0.0222** | +0.0049 | 0.0000 | **−0.0040** | 26/25/11 | 0.205 |
+| **offline twin** (this run) | **+0.0119** | −0.0009 | 0.0000 | **−0.0092** | 22/17/23 | 0.537 |
+| old single-start proxy | −0.0263 | — | — | — | — | — |
+
+**1. The harness is no longer inverted.** Pooled, it puts the 128 map ahead — hardware's sign,
+where the old proxy pointed the other way. It **undercalls the magnitude by about half**.
+
+**2. HARDWARE'S OWN RESOLUTION TERM IS NOT PAIRED-STABLE.** The +0.0222 is a **pooled,
+frame-weighted** difference between two separately-run arms. Paired across 62 sequences it is
++0.0049 with a median of **exactly 0.0000**, 26 better / 25 worse / 11 tied, and **trim-5 goes
+negative**. The harness reproduces that null faithfully. **So the harness agrees with hardware
+about the verdict — "not separable from a null" — and the calibration passed in a way that also
+invalidated the thing it was calibrating against.**
+
+### The correction this forced
+
+Until 2026-09-04, **five documents quoted +0.0222 R / +0.0082 EAO as an established effect**:
+`claims.md` (`R-11`), `arm_res64.md` sec.25.1, `layer1_features.md` (twice), `feature_bank.md`,
+`settled.md`, `baselines.md`, `embedded_comparison.md` and `scripts/l1_banks.py`. All now say
+pooled-only. **The pooled figure is not wrong and stays in `arms.csv`** — it is the official
+metric and what the challenge ranks on. What was wrong was treating it as a mechanism, when this
+project's own rules (*never accept an arm on R alone*; trim before believing) apply to it like
+any other.
+
+**Consequence for the 128x128 Layer-1 arm: its geometry premise is thin.** The support reduces to
+Danilowicz Table 1's +0.024 EAO (different dataset, protocol and metric, with no per-sequence data
+to trim) plus a pooled-only in-house difference whose paired form is a null. **That does not
+justify an AIE rebuild, re-package, re-flash and a fresh 200-frame shift-budget calibration.**
+`SCALE_N=1` — one host-only flag, deciding `R-13`'s open attribution — is the better next run.
+
+### Controls
+
+- Both offline arms resolve through `resolve_arm`, the same dispatch the bench's own `main()`
+  uses, so the twin's arms and hardware's arms cannot be two spellings of one config.
+- The hardware paired figures are computed from workspace `0902_cmp`, whose pooled values
+  reproduce `arms.csv` rows `rgb_res64` and `rgb_sigma4` exactly (0.3873 / 0.4095).
+- `P(dR≤0)` is a 10,000-sample bootstrap of the paired mean, seeded, on both sources.
+
+### What not to re-derive
+
+- **Pooled and paired answer different questions and both are legitimate.** Pooled says which arm
+  scored higher on the challenge's metric; paired says whether the difference survives across
+  sequences. Reporting only the first is, in this project's own words, the statistic it has most
+  often been misled by — and this is the case that proves it applies to HARDWARE numbers too, not
+  just to the offline proxy.
+- The offline twin's **run count is a bad progress indicator**: tasks are longest-first, so 54 of
+  419 runs done meant 34% of frames done. Estimate from frames.
+- 128-map arm cost 2335 s against the 64-map arm's 1680 s — 2.1x for 4x the map pixels, about
+  what an N log N transform predicts.
 
 ## What this buys, and what it does not
 

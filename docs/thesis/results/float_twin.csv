@@ -1,0 +1,44 @@
+# THE FLOAT TWIN of this project's own tracker, under the BOARD's multistart protocol.
+# scripts/offline_multistart.py --tracker mosse:rgb-l1relu -> scripts/vot_ingest.py.
+# Same 62 sequences, 419 anchored runs, 180,544 frames, same stack as arms.csv. Claim R-13.
+#
+# WHAT THE TWIN IS. The same algorithm as the shipping board arm: same Stage A (roi_crop_ref),
+# the SAME int8 conv bank via l1_banks.resnet18_conv1_pca (the function `make weights` calls),
+# same 128x128 crop -> 64x64 map, same shifted training target, same PSR gate, eta 0.05,
+# gate 5.0, sigma 2.0 -- but float64 downstream of the features instead of the cint16/Q1.15
+# correlation pipeline.
+#
+# WHAT IT IS NOT, AND WHY THE HEADLINE IS CONFOUNDED: it has NO DSST SCALE FILTER. It therefore
+# differs from the board in TWO ways at once -- arithmetic AND scale handling -- which is the
+# one thing measurement.md forbids. The dR below is real and trim-stable; its ATTRIBUTION is
+# open. See the two candidate mechanisms in evidence/float_twin.md and the one-flag board run
+# (SCALE_N=1, host-only) that separates them.
+#
+# CONTROLS. board-l1relu is the SAME trajectories as results/arms.csv row rgb_l1relu, re-ingested
+# in this workspace: it returns 0.5129 / 0.4279 / 0.1960, its published row exactly, which is what
+# makes the pairing valid. A forward run from anchor 0 is byte-for-byte identical to the bench's
+# own single-start run of the same arm (checked on car1, 741 boxes), which is what makes the
+# frame-list plumbing trustworthy.
+#
+# scale=fixed is SCALE_N=1 equivalent (box held at its init size). scale=oracle takes box size
+# from groundtruth. The two BRACKET what scale handling is worth; scale_oracle_bound.py prices a
+# PERFECT scale filter at +0.0023 R on the board arm.
+# EMPTY CELLS ARE NOT MEASURED. The oracle bracket COMPLETED 2026-09-04 (it had stopped at
+# 348/419; re-running the same command recomputed only the 71 missing runs).
+#
+# READ THE ORACLE ROW WITH ITS TRIM. Its pooled R looks like a large gain (+0.0446 over the
+# fixed-scale twin) and IT IS NOT TRIM-STABLE: paired per sequence the mean is +0.0319 but the
+# drop-top-5 is -0.0032, i.e. essentially zero, carried by a handful of sequences. Its ACCURACY
+# gain is the real one: +0.0936 mean, +0.0766 trimmed, 53 better / 8 worse, P(dA<=0)=0.000.
+# PERFECT SCALE KNOWLEDGE BUYS ACCURACY AND NOT SURVIVAL -- which is what scale_oracle_bound.py
+# found post-hoc (+0.0023 R, +0.054 mean IoU) now reproduced CLOSED-LOOP from the other
+# direction, where correct sizing also changes every crop and so every detection.
+#
+# THE BRACKET DOES NOT BOUND THE HARM OF A BROKEN FILTER. It spans no-filter to perfect-filter;
+# a self-confirming estimate that drifts can sit OUTSIDE that span. So it does not settle
+# (a) arithmetic vs (b) the board's broken scale filter -- only the board's SCALE_N=1 run does.
+arm,date,implementation,scale,A,R,EAO,frames,runs,workspace,arm_pl
+board-l1relu,2026-09-02,fixed-point on VEK280,DSST 33-scale,0.5129,0.4279,0.1960,82504,419,offline_paired,konfiguracja docelowa na płycie
+mosse-rgb-l1relu,2026-09-04,float64 host,fixed (no filter),0.5125,0.4559,0.2041,89107,419,offline_paired,bliźniak zmiennoprzecinkowy
+mosse-l1relu-oracle,2026-09-04,float64 host,oracle (groundtruth size),0.6233,0.5005,0.2667,98217,419,offline_paired,"bliźniak, rozmiar z danych referencyjnych"
+opencv-csrt,2026-09-03,CSRDCF (OpenCV) on host,own multi-scale,0.5134,0.5471,0.2432,113147,419,offline_paired,CSRDCF (OpenCV)

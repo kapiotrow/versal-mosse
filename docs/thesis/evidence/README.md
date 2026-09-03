@@ -28,8 +28,9 @@ status (`TODO_`, `proposed_`), because the status changes and the filename does 
 | [`evidence_arm0.md`](evidence_arm0.md) | closed | 2026-08-25 | — | the first multi-sequence tracking result: arm A, 8 sequences, 54 trajectories |
 | [`evidence_arm_ab.md`](evidence_arm_ab.md) | closed | 2026-08-25 | — | arm A vs arm B (`HOLD_COAST` 0 vs 1) on the same 54 runs |
 | [`feature_bank.md`](feature_bank.md) | closed | 2026-09-02 | `N-06`, `N-07`, `O-04` | how much the PRETRAINING is worth: a one-hot lift ties the network while `CONV_RELU=0` |
+| [`float_twin.md`](float_twin.md) | current | 2026-09-04 | `R-13`, `M-13` | this project's own tracker in float under the multistart protocol; the pre-registered prediction FIRED, its attribution is open, and the scale bracket is now COMPLETE |
 | [`frozen_detector.md`](frozen_detector.md) | closed | 2026-08-25 | `N-09` | `nature` and `tiger` fail the same way for two completely different reasons |
-| [`harness_validation.md`](harness_validation.md) | current | 2026-09-03 | `R-12` | validating the multistart scoring path against published numbers, and the offline multistart harness that made it possible |
+| [`harness_validation.md`](harness_validation.md) | current | 2026-09-03 | `R-12`, `R-14` | validating the multistart scoring path against published numbers and against a known-answer geometry pair, and the offline multistart harness that made it possible |
 | [`hold_policy.md`](hold_policy.md) | closed | 2026-08-25 | `N-08` | the HOLD-on-gate policy measured against the dataset |
 | [`layer1_features.md`](layer1_features.md) | closed | 2026-09-01 | — | the offline screen behind the Layer-1 arm: the nonlinearity mechanism confirmed, the arms not |
 | [`mask_bank_transfer.md`](mask_bank_transfer.md) | closed | 2026-09-03 | `R-10`, `N-20`, `N-21`, `M-14`, `O-01`, `O-02` | the spatial mask and Stage B3 channel reliability re-screened on the SHIPPING Layer-1 bank; both refuted, and the mask's sign flips |
@@ -50,6 +51,6 @@ status (`TODO_`, `proposed_`), because the status changes and the filename does 
 | [`subbin_lag.md`](subbin_lag.md) | closed | 2026-08-25 | `N-11` | `nature` fails without the gate firing — and the sub-bin mechanism first proposed for it is REFUTED in-file |
 | [`tiger.md`](tiger.md) | closed | 2026-08-25 | `N-10` | eta, sigma and eps_rel all chased on `tiger`, and why none of them is the answer |
 
-34 notes; 9 cited by no claim
+35 notes; 9 cited by no claim
 (`automation.md`, `evidence_arm0.md`, `evidence_arm_ab.md`, `layer1_features.md`, `phase0a.md`, `phase0b.md`, `phase0c.md`, `phase1.md`, `phase2.md`) — those are bring-up records
 rather than findings, and a note that should carry a claim looks exactly the same, so check.

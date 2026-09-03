@@ -1,6 +1,36 @@
 # Roadmap
 
-**Status:** current · **Updated:** 2026-09-03 · **Scope:** what to try next, ranked, with the evidence behind each rank
+**Status:** current · **Updated:** 2026-09-04 · **Scope:** what to try next, ranked, with the evidence behind each rank
+
+## 2026-09-04 — the offline path is validated, and `SCALE_N=1` is now the top item
+
+**New top of the list: `SCALE_N=1` on the board.** The float twin (`R-13`) beat the shipping arm
+by +0.0213 R paired, which fired the pre-registered prediction from `settled.md` — but the twin
+also has no scale filter, so **arithmetic and scale handling moved together** and the headline is
+unattributable as it stands. `SCALE_N=1` gives *fixed-point + no scale filter*, the matched
+comparison to the twin's *float + no scale filter*. It is one host-only flag, an scp rather than
+a card swap, and it is the only thing that separates:
+
+- **(a) the fixed-point pipeline costs robustness** — which overturns `settled.md`'s quantization
+  entry, an entry that `M-14` says was due for re-screening anyway (it was scored on the 3x3
+  mobilenet bank at 128x128 by single-start mean IoU); or
+- **(b) the board's broken scale filter costs robustness** — a broken estimator being worse than
+  no estimator, which nothing in this project has ever priced. `scale_oracle_bound.py` priced a
+  PERFECT filter (+0.0023 R); it never priced the HARM of the broken one.
+
+**The scale bracket narrowed (b) without closing it.** Fixed-scale and oracle-scale twins sit
+within ~0 R of each other (dR trim-5 −0.0032), so for (b) to carry +0.0213 the broken filter has
+to be substantially worse than BOTH ends of that bracket. Possible — a self-confirming drifting
+estimate can sit outside the span — but it is now the more demanding branch.
+
+**What the validation licenses.** `R-12`: CSRDCF reproduces its published row through this exact
+path to EAO −0.0078, and the `oracle` control returns R = 1.0000 exactly. Host-only candidates
+can now be scored by the toolkit on the real protocol instead of by `vot_ar_offline.py`'s
+single-start proxy (~0.02 R resolution, two recorded sign inversions). **That matters most for
+the one remaining robustness candidate, the training-sample memory (`R-06`), which is host-only.**
+
+**Still open and unchanged by any of this:** in float, CSRDCF beats the twin by +0.0144 R
+trimmed (P=0.018), so the robustness gap is not an artefact of the embedded implementation.
 
 ## 2026-09-03 — the mechanism check RAN: the gain is the RECTIFIER, not the bank
 
@@ -143,7 +173,8 @@ P(dR<=0)=0.041 understated it: on hardware the paired R survives drop-top-5 at P
    The 64x64 arm's robustness gain was the sigma it carried, not its resolution. Every
    geometry arm scored before 2026-09-01 has this confound.
 2. **px/bin is NOT the axis** `pooled_features.md` proposed — at matched sigma/target the two
-   resolutions nearly agree, and on HARDWARE the finer map wins.
+   resolutions nearly agree, and on HARDWARE the finer map wins POOLED (a null when paired,
+   `R-14`), which makes "nearly agree" the safer reading of both.
 3. **The offline proxy's ACCURACY column is not usable** on response-shape arms: it predicted
    A −0.039 and −0.043 for the two arms that then gained +0.021 and +0.030 on hardware.
 

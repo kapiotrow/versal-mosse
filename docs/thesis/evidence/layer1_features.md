@@ -90,8 +90,10 @@ the numbers are not comparable, only the ORDERING within their own table is.
 
 **Every arm here sits at a 64x64 map**, because stride 2 or a maxpool forces it. Hardware
 measured the opposite preference the same day: at matched `sigma/target`, **128x128 beats 64x64
-by +0.0222 R and +0.0082 EAO** (`arm_res64.md` sec.25). So this screen ran the
-nonlinearity at the geometry that loses.
+by +0.0222 R and +0.0082 EAO POOLED** (`arm_res64.md` sec.25). **CORRECTED 2026-09-04: that
+difference is not paired-stable** (mean +0.0049, median exactly 0.0000, trim-5 −0.0040,
+P(dR<=0)=0.205; `harness_validation.md`, `R-14`), so "the geometry that loses" overstates it —
+the two geometries are not separably different on this evidence.
 
 **The untested configuration the evidence now points at is 7x7 STRIDE 1, 16 channels, ReLU, at a
 128x128 map with `MOSSE_SIGMA=4`** — the rectifier combined with the geometry that actually won.
@@ -191,8 +193,9 @@ STRIDE-1/128x128 variant that costs 2x (conv ~39.8 ms against a 24.5 ms host).
 
 ## What would change the verdict
 
-Every arm here ran at a 64x64 map, which hardware measured as the WORSE geometry (-0.0222 R at
-matched sigma/target). The untested cell is **a learned Layer-1 bank with ReLU at a 128x128 map**
+Every arm here ran at a 64x64 map, which hardware measured as the worse geometry POOLED
+(-0.0222 R at matched sigma/target) — **but not paired: trim-5 is -0.0040 and P(dR<=0)=0.205,
+a null (`R-14`)**. The untested cell is **a learned Layer-1 bank with ReLU at a 128x128 map**
 -- 7x7 stride 1 (2x frame time) or 5x5 stride 1 (frame-rate neutral, conv ~21.4 ms). If the
 rectifier's +0.02 trim-stable gain over its linear twin SURVIVES at the better geometry, the arm
 would be starting from `sigma4`'s 0.1931 rather than `dec2`'s baseline, and that is the only

@@ -679,7 +679,8 @@ def run_arm(arm, wq, bias, shift, gt, n_frames, oracle_scale, verbose,
             mask_plateau=None, mask_taper=0.25, mask_centre='board',
             mask_power=1, rect=None, chrel_gamma=None, stride=1, blur_n=1,
             pool_n=1, pool_mode_ov=None,
-            ceta_lo=None, ceta_stat='psr', ceta_warmup=12, lt_eta=None):
+            ceta_lo=None, ceta_stat='psr', ceta_warmup=12, lt_eta=None,
+            frames=None):
     # float_conv = (w_float, b_fold) runs the UNQUANTIZED conv instead of the
     # int8 one, everything else identical. See conv_features_float's docstring:
     # this arm exists to answer whether quantization causes the tracker's poor
@@ -703,7 +704,18 @@ def run_arm(arm, wq, bias, shift, gt, n_frames, oracle_scale, verbose,
         pool, pool_mode = pool_n, pool_mode_ov
         fr, fc = fr // pool_n, fc // pool_n
     excl = 5                       # sidelobe exclusion, BINS (11x11 at pool1)
-    row, col, bh, bw = gt[0]
+    # FRAME ORDER. `frames` is 1-based ABSOLUTE indices in RUN order; None means
+    # the single-start bench, [1 .. n_frames], which is what every screening arm
+    # passes and is why the default reproduces those runs exactly.
+    #
+    # The multistart protocol needs the other two shapes: a forward run
+    # [anchor .. n] and a BACKWARD run [anchor .. 1], the second of which visits
+    # the sequence in reverse. Everything downstream indexes gt and the image
+    # loader by the absolute f, so neither shape needs special-casing -- only
+    # the INIT box moves, from gt[0] to the first frame actually visited.
+    if frames is None:
+        frames = list(range(1, n_frames + 1))
+    row, col, bh, bw = gt[frames[0] - 1]
     A = B = None
     mean_prev = None
     # `step` records the measurement itself, per frame, in BINS and in frame px,
@@ -711,7 +723,12 @@ def run_arm(arm, wq, bias, shift, gt, n_frames, oracle_scale, verbose,
     # while the target moves several bins -- invisible in IoU or PSR, which both
     # look healthy while it happens.
     rec = {'iou': [], 'cerr': [], 'psr': [], 'holds': 0, 'lost_at': None,
-           'step': [], 'resp00': [], 'ebox': [], 'etascale': [], 'ltdiv': []}
+           'step': [], 'resp00': [], 'ebox': [], 'etascale': [], 'ltdiv': [],
+           # `box` is the TRAJECTORY: (row, col, h, w) per visited frame, in run
+           # order, init frame included. The bench scores itself from `iou` and
+           # never needed it; the multistart protocol scores the boxes and
+           # nothing else. One append per iteration, both branches.
+           'box': []}
     # Causal history for the confidence law: appended AFTER each frame's
     # scale is computed, so median() never sees the current frame.
     conf_hist = []
@@ -744,9 +761,19 @@ def run_arm(arm, wq, bias, shift, gt, n_frames, oracle_scale, verbose,
             else spatial_mask(fr, fc, mask_plateau, mask_taper, mask_centre)
                  ** mask_power)
 
-    for f in range(1, n_frames + 1):
+    for f in frames:
         if oracle_scale:
-            bh, bw = gt[f - 1][2], gt[f - 1][3]
+            # AN EMPTY GROUNDTRUTH CARRIES NO SIZE, so hold the previous one.
+            # stb2022 has 41 zero-size annotations over 12 sequences (agility,
+            # girl, tennis, soldier ...). Adopting the zero collapses the ROI,
+            # Stage A then divides by zero, and the NaN surfaces hundreds of
+            # frames later as "cannot convert float NaN to integer" -- nowhere
+            # near its cause. The bench never hit this because car1, its default,
+            # has none; the multistart harness runs all 62 and found it.
+            # VOT's own failure rule skips empty-groundtruth frames too.
+            g = gt[f - 1]
+            if g[2] > 0 and g[3] > 0:
+                bh, bw = g[2], g[3]
         roi_h, roi_w = int(round(bh * PADDING)), int(round(bw * PADDING))
         roi_row = int(round(row - roi_h / 2.0))
         roi_col = int(round(col - roi_w / 2.0))
@@ -843,6 +870,7 @@ def run_arm(arm, wq, bias, shift, gt, n_frames, oracle_scale, verbose,
             rec['iou'].append(box_iou((row, col, bh, bw), gt[f - 1]))
             rec['cerr'].append(float(np.hypot(row - gt[f-1][0], col - gt[f-1][1])))
             rec['psr'].append(float('nan'))
+            rec['box'].append((row, col, bh, bw))
             continue
 
         # detect
@@ -973,6 +1001,7 @@ def run_arm(arm, wq, bias, shift, gt, n_frames, oracle_scale, verbose,
             # either -- the median must describe frames the filter LEARNED from.
 
         iou = box_iou((row, col, bh, bw), gt[f - 1])
+        rec['box'].append((row, col, bh, bw))
         rec['iou'].append(iou)
         rec['cerr'].append(float(np.hypot(row - gt[f-1][0], col - gt[f-1][1])))
         rec['psr'].append(bolme)
@@ -990,6 +1019,154 @@ def run_arm(arm, wq, bias, shift, gt, n_frames, oracle_scale, verbose,
         if k < len(iou):
             rec['lost_at'] = k + 1
     return rec
+
+
+# ---------------------------------------------------------------------------
+# THE ARM DISPATCH -- ONE COPY, and it has to stay that way.
+#
+# main() and scripts/offline_multistart.py both resolve arm names through this.
+# A second copy is how `rgb-l1relu` on the bench and `rgb-l1relu` under the
+# multistart protocol quietly become two different configurations -- the exact
+# failure l1_banks.py exists to prevent between the bench and `make weights`.
+# Extracted verbatim from main() 2026-09-04 and checked bit-identical on
+# rgb / rgb-l1relu / rgb-eye / rgb-dec2.
+# ---------------------------------------------------------------------------
+def resolve_arm(a, W, w_rgb, w_gray, b_fold, quiet=False):
+    """Arm name -> everything run_arm needs that is not a CLI knob.
+
+    Returns a dict with the run_arm keyword names, plus `stem` (the positional
+    arm string), `base` (for the FLOATW lookup) and `bank` (the (wq, bias,
+    shift) triple run_arm takes splatted).
+    """
+    _p = (lambda *x, **k: None) if quiet else print
+    stem, n_warps = split_warp(a)
+    stem, mask_plateau = split_mask(stem)
+    stem, rand_seed = split_rand(stem)
+    stem, bank_kind = split_bank(stem)
+    stem, chrel_gamma = split_chrel(stem)
+    stem, ceta_lo = split_ceta(stem)
+    stem, l1_kind = split_l1(stem)
+    rect = None
+    stride, blur_n = 1, 1
+    pool_n, pool_mode_ov = 1, None
+    base, pool, mode = parse_arm(stem)
+    if base not in W:
+        sys.exit(f"unknown arm '{a}' (base '{base}'): "
+                 f"expected one of {sorted(W)} with an optional "
+                 f"-pool<N> / -dec<N> / -warp<N> suffix")
+    if pool > 1 and (R % pool or C % pool):
+        sys.exit(f"{a}: pool {pool} does not divide the {R}x{C} patch")
+    # The random bank is built HERE, per arm, so the pretrained arm in the
+    # same invocation is untouched and both see identical frames.
+    if l1_kind is not None:
+        import l1_banks
+        if l1_kind.startswith('dan'):
+            # DANILOWICZ & KRYJAK's stem: 3x3 conv, ReLU, 2x2 MAXPOOL --
+            # NOT a 7x7. Their Table 1 (docs/papers/danilowicz2022_embedded_dcf.pdf,
+            # VOT2015 -- NOT comparable to this project's STb2022 numbers)
+            # reaches EAO 0.184 with it at exactly
+            # this project's 128x128 ROI / 64x64 map, and 8 channels ties
+            # 32. So the kernel does not have to grow for the nonlinearity
+            # to have something to act on; the maxpool is what makes the
+            # rectified map useful, and an AVERAGE over a signed map (this
+            # project's `blur2`) is the one aggregation that cannot work.
+            fw, bf = l1_banks.vgg16_conv1_pca(16)
+            label = 'vgg16 conv1 3x3 -> 16ch (VGG11 stand-in) + 2x2 MAXPOOL'
+            stride, pool_n, pool_mode_ov = 1, 2, 'max'
+        elif l1_kind.startswith('l5'):
+            # 5x5 STRIDE 1: the map stays 128x128, the geometry hardware
+            # prefers. Needs MOSSE_SIGMA=4 to hold sigma/target at 1/16 --
+            # pass --sigma 4, or the arm is scored at half the mainlobe and
+            # the comparison is against the wrong control.
+            n_ch = 16 if l1_kind.endswith('16') else 32
+            fw, bf = l1_banks.resnet18_conv1_5x5(n_ch)
+            label = f'resnet18 conv1 -> 5x5 CENTRE CROP, stride 1, {n_ch}ch'
+            stride, pool_n, pool_mode_ov = 1, 1, None
+        elif l1_kind.startswith('l1'):
+            n_ch = 16 if l1_kind.endswith('16') else 32
+            fw, bf = l1_banks.resnet18_conv1_pca(n_ch)
+            label = f'resnet18 conv1 7x7/2, 64 -> {n_ch} by weight PCA'
+            stride, pool_n, pool_mode_ov = l1_banks.STRIDE, 1, None
+        else:
+            fw, bf = l1_banks.gabor_bank()
+            label = ('analytic GABOR 7x7/2, 16 filters + negations = 32 ch'
+                     ' -- DIAGNOSTIC ONLY, hand-crafted taps are outside'
+                     ' this project\'s conv-feature requirement')
+            stride, pool_n, pool_mode_ov = l1_banks.STRIDE, 1, None
+        rect = 'relu' if 'relu' in l1_kind else None
+        blur_n = 2 if l1_kind.endswith('blur') else 1
+        bank = quantize(fw, bf)
+        _p(f"    *** LAYER-1 BANK: {label}, stride {stride}, "
+              f"rect={rect}, blur={blur_n} ***")
+    elif bank_kind is not None:
+        src = w_gray if base.startswith('gray') else w_rgb
+        n_src = np.linalg.norm(src.reshape(src.shape[0], -1), axis=1)
+        nout, ntap = src.shape[0], int(np.prod(src.shape[1:]))
+        if bank_kind in ('crelu', 'half8', 'abs'):
+            # THE NONLINEARITY ARMS. `-abs` keeps the pretrained bank and
+            # swaps the rectifier. `-crelu` is 8 filters AND THEIR
+            # NEGATIONS, so the existing half-wave rectifier emits both
+            # halves and the map spans {linear, |.|} at 8 directions
+            # instead of 16 -- and it is board-implementable as a WEIGHTS
+            # file plus CONV_RELU=1, no graph change. `-half8` is its
+            # control: the same 8 directions, DUPLICATED rather than
+            # negated, and no rectifier, so it prices the span 16->8 loss
+            # on its own. Without it a crelu result is unreadable between
+            # "the nonlinearity helped" and "halving the bank hurt".
+            if bank_kind == 'abs':
+                fw, bf, rect = src.copy(), b_fold.copy(), 'abs'
+                label = 'pretrained bank, FULL-WAVE rectifier (abs)'
+            else:
+                h = nout // 2
+                sgn = -1.0 if bank_kind == 'crelu' else 1.0
+                fw = np.concatenate([src[:h], sgn * src[:h]], axis=0)
+                bf = np.concatenate([b_fold[:h], sgn * b_fold[:h]])
+                rect = 'relu' if bank_kind == 'crelu' else None
+                label = ('8 filters + THEIR NEGATIONS, ReLU on (CReLU)'
+                         if bank_kind == 'crelu' else
+                         '8 filters DUPLICATED, no rectifier (span-8 control)')
+            bank = quantize(fw, bf)
+            _p(f"    *** BANK REPLACED: {label} ***")
+        elif bank_kind == 'eye':
+            # Cycle the colour planes fastest so the 16 chosen coordinates
+            # are not all one plane: tap index = spatial*in_ch + plane.
+            flat = np.zeros((nout, ntap))
+            order = [sp * src.shape[1] + pl
+                     for sp in range(src.shape[2] * src.shape[3])
+                     for pl in range(src.shape[1])]
+            for i in range(nout):
+                flat[i, order[i % ntap]] = 1.0
+            label = 'ONE-HOT (identity lift, no network)'
+        else:
+            seed = int(bank_kind[4:])
+            q, _ = np.linalg.qr(np.random.default_rng(seed)
+                                .standard_normal((ntap, nout)))
+            flat = q.T                      # orthonormal ROWS, 16 x 27
+            label = f'random ORTHONORMAL, seed {seed}'
+        if bank_kind not in ('crelu', 'half8', 'abs'):
+            flat *= n_src[:, None] / np.linalg.norm(flat, axis=1)[:, None]
+            bank = quantize(flat.reshape(src.shape), b_fold)
+            _p(f"    *** BANK REPLACED: {label}, per-channel row norms "
+                  f"matched to the pretrained bank ***")
+    elif rand_seed is None:
+        bank = W[base]
+    else:
+        src = w_gray if base.startswith('gray') else w_rgb
+        rng = np.random.default_rng(rand_seed)
+        rw = rng.standard_normal(src.shape)
+        # MATCH THE PER-CHANNEL ROW NORMS. Without this the arm also moves
+        # out_shift and bias_acc, and a loss would be unattributable
+        # between "the weights are random" and "the fixed-point scale moved".
+        n_src = np.linalg.norm(src.reshape(src.shape[0], -1), axis=1)
+        n_rw = np.linalg.norm(rw.reshape(rw.shape[0], -1), axis=1)
+        rw *= (n_src / n_rw)[:, None, None, None]
+        bank = quantize(rw, b_fold)
+        _p(f"    *** RANDOM BANK, seed {rand_seed}: pretrained conv1 "
+              f"REPLACED by Gaussian taps of matched row norms ***")
+    return dict(stem=stem, base=base, bank=bank, n_warps=n_warps,
+                mask_plateau=mask_plateau, chrel_gamma=chrel_gamma,
+                ceta_lo=ceta_lo, rect=rect, stride=stride, blur_n=blur_n,
+                pool_n=pool_n, pool_mode_ov=pool_mode_ov)
 
 
 def main():
@@ -1127,130 +1304,12 @@ def main():
     out = {}
     for a in args.arms:
         print(f"  running {a} ...", flush=True)
-        stem, n_warps = split_warp(a)
-        stem, mask_plateau = split_mask(stem)
-        stem, rand_seed = split_rand(stem)
-        stem, bank_kind = split_bank(stem)
-        stem, chrel_gamma = split_chrel(stem)
-        stem, ceta_lo = split_ceta(stem)
-        stem, l1_kind = split_l1(stem)
-        rect = None
-        stride, blur_n = 1, 1
-        pool_n, pool_mode_ov = 1, None
-        base, pool, mode = parse_arm(stem)
-        if base not in W:
-            sys.exit(f"unknown arm '{a}' (base '{base}'): "
-                     f"expected one of {sorted(W)} with an optional "
-                     f"-pool<N> / -dec<N> / -warp<N> suffix")
-        if pool > 1 and (R % pool or C % pool):
-            sys.exit(f"{a}: pool {pool} does not divide the {R}x{C} patch")
-        # The random bank is built HERE, per arm, so the pretrained arm in the
-        # same invocation is untouched and both see identical frames.
-        if l1_kind is not None:
-            import l1_banks
-            if l1_kind.startswith('dan'):
-                # DANILOWICZ & KRYJAK's stem: 3x3 conv, ReLU, 2x2 MAXPOOL --
-                # NOT a 7x7. Their Table 1 (docs/papers/danilowicz2022_embedded_dcf.pdf,
-                # VOT2015 -- NOT comparable to this project's STb2022 numbers)
-                # reaches EAO 0.184 with it at exactly
-                # this project's 128x128 ROI / 64x64 map, and 8 channels ties
-                # 32. So the kernel does not have to grow for the nonlinearity
-                # to have something to act on; the maxpool is what makes the
-                # rectified map useful, and an AVERAGE over a signed map (this
-                # project's `blur2`) is the one aggregation that cannot work.
-                fw, bf = l1_banks.vgg16_conv1_pca(16)
-                label = 'vgg16 conv1 3x3 -> 16ch (VGG11 stand-in) + 2x2 MAXPOOL'
-                stride, pool_n, pool_mode_ov = 1, 2, 'max'
-            elif l1_kind.startswith('l5'):
-                # 5x5 STRIDE 1: the map stays 128x128, the geometry hardware
-                # prefers. Needs MOSSE_SIGMA=4 to hold sigma/target at 1/16 --
-                # pass --sigma 4, or the arm is scored at half the mainlobe and
-                # the comparison is against the wrong control.
-                n_ch = 16 if l1_kind.endswith('16') else 32
-                fw, bf = l1_banks.resnet18_conv1_5x5(n_ch)
-                label = f'resnet18 conv1 -> 5x5 CENTRE CROP, stride 1, {n_ch}ch'
-                stride, pool_n, pool_mode_ov = 1, 1, None
-            elif l1_kind.startswith('l1'):
-                n_ch = 16 if l1_kind.endswith('16') else 32
-                fw, bf = l1_banks.resnet18_conv1_pca(n_ch)
-                label = f'resnet18 conv1 7x7/2, 64 -> {n_ch} by weight PCA'
-                stride, pool_n, pool_mode_ov = l1_banks.STRIDE, 1, None
-            else:
-                fw, bf = l1_banks.gabor_bank()
-                label = ('analytic GABOR 7x7/2, 16 filters + negations = 32 ch'
-                         ' -- DIAGNOSTIC ONLY, hand-crafted taps are outside'
-                         ' this project\'s conv-feature requirement')
-                stride, pool_n, pool_mode_ov = l1_banks.STRIDE, 1, None
-            rect = 'relu' if 'relu' in l1_kind else None
-            blur_n = 2 if l1_kind.endswith('blur') else 1
-            bank = quantize(fw, bf)
-            print(f"    *** LAYER-1 BANK: {label}, stride {stride}, "
-                  f"rect={rect}, blur={blur_n} ***")
-        elif bank_kind is not None:
-            src = w_gray if base.startswith('gray') else w_rgb
-            n_src = np.linalg.norm(src.reshape(src.shape[0], -1), axis=1)
-            nout, ntap = src.shape[0], int(np.prod(src.shape[1:]))
-            if bank_kind in ('crelu', 'half8', 'abs'):
-                # THE NONLINEARITY ARMS. `-abs` keeps the pretrained bank and
-                # swaps the rectifier. `-crelu` is 8 filters AND THEIR
-                # NEGATIONS, so the existing half-wave rectifier emits both
-                # halves and the map spans {linear, |.|} at 8 directions
-                # instead of 16 -- and it is board-implementable as a WEIGHTS
-                # file plus CONV_RELU=1, no graph change. `-half8` is its
-                # control: the same 8 directions, DUPLICATED rather than
-                # negated, and no rectifier, so it prices the span 16->8 loss
-                # on its own. Without it a crelu result is unreadable between
-                # "the nonlinearity helped" and "halving the bank hurt".
-                if bank_kind == 'abs':
-                    fw, bf, rect = src.copy(), b_fold.copy(), 'abs'
-                    label = 'pretrained bank, FULL-WAVE rectifier (abs)'
-                else:
-                    h = nout // 2
-                    sgn = -1.0 if bank_kind == 'crelu' else 1.0
-                    fw = np.concatenate([src[:h], sgn * src[:h]], axis=0)
-                    bf = np.concatenate([b_fold[:h], sgn * b_fold[:h]])
-                    rect = 'relu' if bank_kind == 'crelu' else None
-                    label = ('8 filters + THEIR NEGATIONS, ReLU on (CReLU)'
-                             if bank_kind == 'crelu' else
-                             '8 filters DUPLICATED, no rectifier (span-8 control)')
-                bank = quantize(fw, bf)
-                print(f"    *** BANK REPLACED: {label} ***")
-            elif bank_kind == 'eye':
-                # Cycle the colour planes fastest so the 16 chosen coordinates
-                # are not all one plane: tap index = spatial*in_ch + plane.
-                flat = np.zeros((nout, ntap))
-                order = [sp * src.shape[1] + pl
-                         for sp in range(src.shape[2] * src.shape[3])
-                         for pl in range(src.shape[1])]
-                for i in range(nout):
-                    flat[i, order[i % ntap]] = 1.0
-                label = 'ONE-HOT (identity lift, no network)'
-            else:
-                seed = int(bank_kind[4:])
-                q, _ = np.linalg.qr(np.random.default_rng(seed)
-                                    .standard_normal((ntap, nout)))
-                flat = q.T                      # orthonormal ROWS, 16 x 27
-                label = f'random ORTHONORMAL, seed {seed}'
-            if bank_kind not in ('crelu', 'half8', 'abs'):
-                flat *= n_src[:, None] / np.linalg.norm(flat, axis=1)[:, None]
-                bank = quantize(flat.reshape(src.shape), b_fold)
-                print(f"    *** BANK REPLACED: {label}, per-channel row norms "
-                      f"matched to the pretrained bank ***")
-        elif rand_seed is None:
-            bank = W[base]
-        else:
-            src = w_gray if base.startswith('gray') else w_rgb
-            rng = np.random.default_rng(rand_seed)
-            rw = rng.standard_normal(src.shape)
-            # MATCH THE PER-CHANNEL ROW NORMS. Without this the arm also moves
-            # out_shift and bias_acc, and a loss would be unattributable
-            # between "the weights are random" and "the fixed-point scale moved".
-            n_src = np.linalg.norm(src.reshape(src.shape[0], -1), axis=1)
-            n_rw = np.linalg.norm(rw.reshape(rw.shape[0], -1), axis=1)
-            rw *= (n_src / n_rw)[:, None, None, None]
-            bank = quantize(rw, b_fold)
-            print(f"    *** RANDOM BANK, seed {rand_seed}: pretrained conv1 "
-                  f"REPLACED by Gaussian taps of matched row norms ***")
+        R_ = resolve_arm(a, W, w_rgb, w_gray, b_fold)
+        stem, base, bank = R_['stem'], R_['base'], R_['bank']
+        n_warps, mask_plateau = R_['n_warps'], R_['mask_plateau']
+        chrel_gamma, ceta_lo = R_['chrel_gamma'], R_['ceta_lo']
+        rect, stride, blur_n = R_['rect'], R_['stride'], R_['blur_n']
+        pool_n, pool_mode_ov = R_['pool_n'], R_['pool_mode_ov']
         out[a] = run_arm(stem, *bank, gt, n, args.oracle_scale, args.verbose,
                          float_conv=FLOATW.get(base),
                          sigma=args.sigma if args.sigma else SIGMA,

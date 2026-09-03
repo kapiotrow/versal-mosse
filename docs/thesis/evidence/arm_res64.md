@@ -1073,6 +1073,17 @@ sigma/target 1/16    rgb-s4      R 0.3718              sigma4   R 0.4095   EAO 0
                      resolution term  +0.0263 (64 wins)   resolution term  -0.0222 (128 wins)
 ```
 
+**CORRECTED 2026-09-04 — THE HARDWARE RESOLUTION TERM IS POOLED-ONLY AND IS A NULL WHEN PAIRED.**
+Everything in this subsection is a difference of two POOLED, frame-weighted arm scores. Computed
+per sequence over the same 62 (`R-14`, `harness_validation.md`, `results/geometry_calibration.csv`):
+**dR mean +0.0049, median EXACTLY 0.0000, 26 better / 25 worse / 11 tied, trim-5 −0.0040,
+P(dR<=0)=0.205.** The offline multistart twin reproduces that null (+0.0119 pooled, −0.0009
+paired, trim-5 −0.0092). **So "the finer map wins" is not an established effect and must not be
+used to justify a geometry arm** — five other documents quoted it as one until this was checked.
+The pooled figure stays in `arms.csv`: it is the official metric and it is not wrong, it is just
+not separable from sampling noise across sequences. *The sentence below stands as originally
+written and is what was corrected.*
+
 **The sign flips.** On hardware, at matched mainlobe width, the FINER map wins by +0.0222 R and
 +0.0082 EAO. On the common survived prefix the two produce equally good boxes (+0.0014), so the
 whole difference is survival.

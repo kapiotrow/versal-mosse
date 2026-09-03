@@ -340,7 +340,8 @@ version and a link.
     **−0.0180** on exactly that arm. The argument is arithmetically true and trackingwise
     irrelevant — the same fate as the signed-lobe hypothesis it replaced. What is left is a
     RESOLUTION reading: the map is already 64x64 from a 128x128 crop, aggregation and decimation
-    agree to 0.001, and at matched `sigma/target` hardware prefers the FINER map.
+    agree to 0.001, and at matched `sigma/target` hardware prefers the FINER map **pooled;
+    that preference is NOT paired-stable and is a null across sequences (`R-14`)**.
     `docs/thesis/evidence/pooled_features.md`.
     *(Original 2026-08-31 entry, verdict unchanged:)*
     `blur2` (2x2 box average at STRIDE 1) is −0.0010 gray / −0.0012 RGB, and `pool2 <= dec2`

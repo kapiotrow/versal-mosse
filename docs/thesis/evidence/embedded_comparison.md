@@ -51,12 +51,14 @@ used both orderings:
   (0.203) does not beat 32ch (0.207); only 4ch collapses (0.145). Their 16ch row at 0.174 is
   anomalously low in their own table. `layer1_features.md` screened at 16 channels on exactly
   this reading.
-- **The larger geometry wins, by +0.024 EAO at 32 channels.** *Independently corroborated on
-  this project's own hardware*: at matched `sigma/target` = 1/16 the finer map wins by
-  **+0.0222 R / +0.0082 EAO** (`arm_res64.md` sec.25.1). **Two implementations, two datasets,
-  two protocols, same sign.** The shipping arm sits at the geometry both sources call the worse
-  one, which is the standing argument for the untested cell named in `layer1_features.md`
-  (Layer-1 features at a 128x128 map, `MOSSE_SIGMA=4`).
+- **The larger geometry wins in their table, by +0.024 EAO at 32 channels** — and this project's
+  hardware agrees in SIGN at matched `sigma/target` = 1/16 (+0.0222 R / +0.0082 EAO,
+  `arm_res64.md` sec.25.1). **CORRECTED 2026-09-04: the in-house figure is POOLED-ONLY and its
+  paired form is a null** (mean +0.0049, median exactly 0.0000, trim-5 −0.0040, P(dR<=0)=0.205 —
+  `harness_validation.md`, `R-14`). This bullet previously read "independently corroborated" and
+  claimed two sources for an established effect; **it does not support that, and the argument it
+  was carrying — for a Layer-1 arm at a 128x128 map — is correspondingly weak.** Their number has
+  no per-sequence data to trim, so it cannot be checked the same way.
 
 ## 2. THE COST AXIS IS COMPARABLE, AND IT IS THE HONEST ONE
 

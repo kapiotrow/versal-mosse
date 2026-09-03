@@ -42,7 +42,8 @@
 #     table. This is why the Layer-1 screen ran at 16 channels (layer1_features.md).
 #   - THE LARGER GEOMETRY WINS: 128x128 ROI/64x64 filter -> 224x224/112x112 is +0.024 EAO at
 #     32 channels. INDEPENDENTLY CORROBORATED HERE: at matched sigma/target = 1/16 this
-#     project's hardware measured the finer map winning by +0.0222 R / +0.0082 EAO
+#     project's hardware measured the finer map winning by +0.0222 R / +0.0082 EAO POOLED
+#     -- NOT paired-stable, a null across sequences (R-14); see geometry_calibration.csv
 #     (arm_res64.md sec.25.1). Two sources, two datasets, same sign. The shipping arm sits at
 #     the geometry both of them call the worse one.
 #

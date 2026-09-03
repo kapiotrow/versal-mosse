@@ -157,12 +157,108 @@ def make_tracker(spec):
         return Oracle(lag=1)
     if spec == "static":
         return Static()
+    if spec.startswith("mosse:"):
+        return None          # batch path; run_task dispatches, see run_mosse
     if spec.startswith("opencv:"):
         kind = spec.split(":", 1)[1]
         if kind.endswith("-rgb"):          # the colour-order mutant
             return OpenCV(kind[:-4], bgr=False)
         return OpenCV(kind, bgr=True)
     raise SystemExit(f"unknown tracker '{spec}'")
+
+
+
+# --------------------------------------------------------------------------
+# THIS PROJECT'S OWN TRACKER, in float -- the twin.
+#
+# rgb_vs_gray_loop.run_arm is a WHOLE-RUN function, not an incremental
+# init/update tracker, so it does not fit the class interface above and is not
+# forced into one: refactoring it into a stepping object would touch every
+# screening arm that file carries (the mask, eta, pooling, warp and bank
+# screens) and invite exactly the drift `resolve_arm` was extracted to prevent.
+# Instead the pool's task path calls it directly, once per anchored run.
+#
+# WHAT THIS TWIN IS FOR. It is the same algorithm as the board -- same Stage A,
+# same bank via l1_banks, same shifted training target, same PSR gate, same
+# 128x128 crop -> 64x64 map -- in float64 downstream of the features. The gap
+# between it and the board arm prices the embedded implementation; the gap
+# between it and CSRDCF (R-12) prices the algorithm. Neither question has a row
+# yet without it.
+#
+# WHAT IT DELIBERATELY IS NOT: it has NO DSST SCALE FILTER. Box size is held at
+# its init value (SCALE_N=1 equivalent) or taken from groundtruth
+# (--oracle-scale), and the two BRACKET the question. That is a priced decision,
+# not an oversight: scale_oracle_bound.py measures a PERFECT scale filter at
+# +0.0023 R on the shipping arm, and the board's own filter is frozen on ~90% of
+# frames with detector gain -0.003. State the assumption when reporting a number
+# from this twin.
+_MOSSE = {}
+
+
+def _mosse_setup(arm):
+    """Per-WORKER setup, cached: torch import, folded BN weights, PCA bank.
+
+    ~2.6 s, so it must not run per task. Keyed by arm because one invocation
+    scores one arm, but the dict costs nothing and makes that explicit.
+    """
+    if arm not in _MOSSE:
+        sys.path.insert(0, str(Path(__file__).resolve().parent))
+        import rgb_vs_gray_loop as RL
+        import rgb_vs_gray_holdout as RH
+        w_rgb, b_fold = RH.folded_weights()
+        w_gray = (w_rgb * RH.LUM[None, :, None, None]).sum(axis=1, keepdims=True)
+        W = {'gray': RH.quantize(w_gray, b_fold),
+             'rgb': RH.quantize(w_rgb, b_fold),
+             'rgb-lum': RH.quantize(w_rgb, b_fold),
+             'gray-float': RH.quantize(w_gray, b_fold),
+             'rgb-float': RH.quantize(w_rgb, b_fold)}
+        floatw = {'gray-float': (w_gray, b_fold), 'rgb-float': (w_rgb, b_fold)}
+        # ONE dispatch, shared with the bench's main(). See resolve_arm.
+        res = RL.resolve_arm(arm, W, w_rgb, w_gray, b_fold, quiet=True)
+        _MOSSE[arm] = (RL, RH, res, floatw)
+    return _MOSSE[arm]
+
+
+def run_mosse(seqdir, name, frames, spec, opts):
+    """One anchored run of the float twin. Returns boxes as (x, y, w, h)."""
+    arm = spec.split(":", 1)[1]
+    RL, RH, res, floatw = _mosse_setup(arm)
+
+    # set_sequence()/load_gt() drive MODULE GLOBALS in rgb_vs_gray_holdout, so
+    # they must be re-pointed for every task -- a worker handles many sequences.
+    #
+    # IT RESOLVES THE PATH ITSELF, from $VOT_ROOT, and does NOT know about this
+    # harness's --sequences. If those two disagree the twin would track a
+    # different dataset than the anchors were derived from and still produce a
+    # full, plausible, wrong trajectory -- so assert they are the same directory
+    # rather than trusting it. main() checks this once up front too; this is the
+    # per-task backstop, because the failure is silent.
+    RH.set_sequence(name)
+    resolved = Path(RH.SEQ).resolve().parent
+    wanted = (Path(seqdir) / name).resolve()
+    if resolved != wanted:
+        raise SystemExit(
+            f"{name}: rgb_vs_gray_holdout resolved {resolved} but this run's "
+            f"dataset is {wanted}. set_sequence() reads $VOT_ROOT; either "
+            f"export VOT_ROOT to match --sequences, or drop --sequences.")
+    gt = RH.load_gt()
+
+    rec = RL.run_arm(res['stem'], *res['bank'], gt, len(gt),
+                     opts.get('oracle_scale', False), False,
+                     frames=frames,
+                     float_conv=floatw.get(res['base']),
+                     sigma=opts.get('sigma') or RL.SIGMA,
+                     eta=opts.get('eta', RL.ETA),
+                     psr_min=opts.get('psr_min', RL.PSR_GATE_MIN),
+                     eps_rel=opts.get('eps_rel', RL.EPS_REL),
+                     n_warps=res['n_warps'], mask_plateau=res['mask_plateau'],
+                     rect=res['rect'], chrel_gamma=res['chrel_gamma'],
+                     stride=res['stride'], blur_n=res['blur_n'],
+                     ceta_lo=res['ceta_lo'], pool_n=res['pool_n'],
+                     pool_mode_ov=res['pool_mode_ov'])
+    # run_arm works in CENTRE convention (row, col, h, w); the trajectory file
+    # is TOP-LEFT (x, y, w, h). Same conversion as vot_source.cpp's as_text().
+    return [(c - w / 2.0, r - h / 2.0, w, h) for r, c, h, w in rec['box']]
 
 
 # --------------------------------------------------------------------------
@@ -235,7 +331,7 @@ def run_task(args):
     Per-run tasks cost one extra load_sequence() each -- the images are lazy, so
     that is a small config read -- and flatten the tail.
     """
-    seqdir, name, anchor, backward, want, spec, outdir = args
+    seqdir, name, anchor, backward, want, spec, outdir, opts = args
     from vot.dataset import load_sequence
 
     # ONE THREAD PER WORKER, and it is not optional. OpenCV's trackers are
@@ -255,8 +351,22 @@ def run_task(args):
     if traj.exists() and sum(1 for _ in traj.open()) == want:
         return name, want, True
 
-    seq = load_sequence(str(Path(seqdir) / name))
-    lines, times = run_one(seq, anchor, backward, spec)
+    if spec.startswith("mosse:"):
+        # BATCH PATH: run_arm is a whole-run function. It reads its own frames
+        # and groundtruth, so the toolkit Sequence is needed only for its length.
+        seq = load_sequence(str(Path(seqdir) / name))
+        idx = [i + 1 for i in run_order(anchor, len(seq), backward)]   # 1-based
+        t0 = time.perf_counter()
+        boxes = run_mosse(seqdir, name, idx, spec, opts)
+        dt = (time.perf_counter() - t0) * 1e3 / max(len(boxes), 1)
+        lines = ["1"] + ["%.4f,%.4f,%.4f,%.4f" % b for b in boxes[1:]]
+        times = [dt] * len(lines)
+    else:
+        seq = load_sequence(str(Path(seqdir) / name))
+        lines, times = run_one(seq, anchor, backward, spec)
+    if len(lines) != want:
+        raise RuntimeError(f"{name} anchor {anchor}: {len(lines)} regions, "
+                           f"the job needs {want}")
     traj.write_text("\n".join(lines) + "\n")
     (Path(outdir) / f"{name}_{anchor:08d}_time.value").write_text(
         "".join(f"{t:.3f}\n" for t in times))
@@ -267,7 +377,7 @@ def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--tracker", required=True,
-                    help="oracle | oracle-lag1 | static | opencv:csrt | opencv:kcf | opencv:mil; append -rgb to an opencv kind for the colour-order mutant")
+                    help="oracle | oracle-lag1 | static | opencv:csrt | opencv:kcf | opencv:mil (append -rgb for the colour-order mutant) | mosse:<arm>, e.g. mosse:rgb-l1relu")
     ap.add_argument("--arm", default=None, help="output arm name (default: the tracker spec)")
     ap.add_argument("--out", type=Path, default=None,
                     help="results root; one subdirectory per arm (default $VOT_ROOT/results-offline)")
@@ -275,7 +385,20 @@ def main():
                     help="dataset dir (default $VOT_ROOT/workspace/sequences)")
     ap.add_argument("--seqs", default=None, help="comma-separated subset; default all")
     ap.add_argument("--jobs", type=int, default=max(1, (os.cpu_count() or 2) - 1))
+    # --- the float twin's knobs. Defaults are the SHIPPING arm's, not the
+    # bench's: rgb_vs_gray_loop defaults to eta 0.125 / gate 7.0, which are the
+    # values from before eta05 and gate5 shipped. A twin left on those defaults
+    # would be a twin of a config the board stopped running on 2026-08-27.
+    ap.add_argument("--eta", type=float, default=0.05, help="MOSSE_ETA")
+    ap.add_argument("--psr-min", type=float, default=5.0, help="PSR_GATE_MIN")
+    ap.add_argument("--sigma", type=float, default=None,
+                    help="MOSSE_SIGMA in BINS; default 2.0 = sigma/target 1/16")
+    ap.add_argument("--oracle-scale", action="store_true",
+                    help="box size from groundtruth. The twin has NO DSST scale "
+                         "filter; this and the default BRACKET what scale is worth")
     a = ap.parse_args()
+    opts = dict(eta=a.eta, psr_min=a.psr_min, sigma=a.sigma,
+                oracle_scale=a.oracle_scale)
 
     # Pin the thread pools BEFORE numpy/cv2 are imported in any worker.
     for v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
@@ -303,6 +426,20 @@ def main():
         if not (Path(seqdir) / n / "sequence").exists():
             raise SystemExit(f"no sequence '{n}' under {seqdir}")
 
+    if a.tracker.startswith("mosse:"):
+        # The twin resolves its own dataset from $VOT_ROOT. Fail here, once,
+        # rather than 419 times inside the workers.
+        vr = os.environ.get("VOT_ROOT")
+        want = Path(seqdir).resolve()
+        got = (Path(vr) / "workspace" / "sequences").resolve() if vr else None
+        if got != want:
+            raise SystemExit(
+                f"the float twin resolves sequences from $VOT_ROOT "
+                f"({got}), but --sequences is {want}. Export VOT_ROOT to match.")
+        print(f"  twin knobs: eta {a.eta}, gate {a.psr_min}, "
+              f"sigma {a.sigma or 'default 2.0'}, "
+              f"scale {'ORACLE' if a.oracle_scale else 'HELD FIXED (no DSST filter)'}")
+
     print(f"tracker   {a.tracker}\narm       {arm}\nout       {outdir}")
     print(f"sequences {len(names)} from {seqdir}\njobs      {a.jobs}\n")
 
@@ -312,7 +449,7 @@ def main():
     for n in names:
         for name, anchor, backward, want in plan_sequence(seqdir, n):
             tasks.append((str(seqdir), name, anchor, backward, want,
-                          a.tracker, str(outdir)))
+                          a.tracker, str(outdir), opts))
     # LONGEST FIRST. With a fixed pool the makespan is set by the longest task,
     # so a 1500-frame run must not be picked up last.
     tasks.sort(key=lambda t: -t[4])

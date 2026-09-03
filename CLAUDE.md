@@ -385,11 +385,47 @@ loss, not its cause: 95.8% of vetoes land after the run is already at IoU <= 0.1
 the target confidently — do not spend a sweep relaxing the gate, and do not look for the fault in
 localisation.**
 
+### THE SCORING PATH IS VALIDATED, AND THE FLOAT TWIN BEAT THE BOARD (2026-09-04)
+
+`scripts/offline_multistart.py` runs a HOST-SIDE tracker under the board's multistart protocol
+and writes the board's trajectory format, so `vot_ingest.py` scores it exactly like a sweep.
+Two results, both without board time:
+
+- **`R-12` — the path reproduces a published tracker.** CSRDCF lands at A 0.5134 / R 0.5471 /
+  EAO 0.2432 against a published 0.519 / 0.580 / 0.251 (**EAO −0.0078**), and the `oracle`
+  control returns **R = 1.0000 EXACTLY** over all 419 runs. Until this ran, the sequence
+  conversion, the anchor set and the trajectory format had only ever been checked against
+  THEMSELVES, and every row of `arms.csv` rests on them. `opencv-kcf` does NOT reproduce — cv2's
+  KCF is not the VOT KCF; **never quote it as KCF.** `evidence/harness_validation.md`.
+- **`R-13` — the float twin BEATS the board arm**, R 0.4559 against 0.4279, EAO 0.2041 against
+  0.1960, paired dR +0.0213 (trim-5 +0.0222), accuracy a null. **The pre-registered prediction
+  from `settled.md` FIRED.** But it is **CONFOUNDED and is not a quantization result**: the twin
+  also has NO scale filter, so arithmetic and scale handling both moved.
+  **`SCALE_N=1` on the board separates them and is one host-only flag.**
+  `evidence/float_twin.md`, `results/float_twin.csv`.
+
+**Perfect scale buys ACCURACY, not survival — corroborated closed-loop** (`M-13`). The
+oracle-scale twin gains A +0.0766 trimmed (P=0.000) and **no** survival (dR trim-5 −0.0032),
+reproducing `scale_oracle_bound.py`'s post-hoc +0.0023 R by a method that could have
+contradicted it: here correct sizing also changes every crop and every detection.
+**Read that bracket with its trim — pooled R shows +0.0446 and is carried by a handful of
+sequences.**
+
+**In float, CSRDCF still wins by +0.0580 R pooled / +0.0144 trim-5 (P=0.018).** So the
+robustness gap is **not purely an embedded-implementation artefact**, and what the baselines
+have that this lacks is the anti-drift machinery `robustness_gap.md` named — no longer resting
+on a cross-paper comparison.
+
 ## What to try next
 
 Ranked, with the evidence for each rank, in
 [`docs/engineering/roadmap.md`](docs/engineering/roadmap.md). Headlines:
 
+- **THE CHEAPEST OPEN ITEM: `SCALE_N=1` on the board.** One host-only flag, an scp not a card
+  swap. It gives *fixed-point + no scale filter*, the matched comparison to the twin's *float +
+  no scale filter*, and so decides whether `R-13`'s +0.0213 R is the ARITHMETIC (which would
+  overturn `settled.md`'s quantization entry) or the board's BROKEN SCALE FILTER (a broken
+  estimator being worse than none). Nothing else separates them.
 - **DONE, REJECTED — `MOSSE_ETA=0.1`.** EAO 0.1960 → 0.1817 (sec.13). The named assumption is
   what broke: the grid ran at 128x128/sigma 4, the arm at 64x64/sigma 2, and `sigma/target`
   governs SIGMA only. **The methodological result outlives the arm — see below.**
@@ -420,6 +456,13 @@ Ranked, with the evidence for each rank, in
   - `MOSSE_SIGMA`'s interior is CLOSED (22-cell grid; 3, 5, 6, 8 all worse).
 
   Notes: `docs/thesis/evidence/confidence_eta.md`, `docs/thesis/evidence/mask_bank_transfer.md`.
+- **DOWNGRADED 2026-09-04 — the 128x128 Layer-1 arm.** Its geometry premise was hardware's
+  +0.0222 R resolution term, which is **pooled-only and a null when paired** (`R-14`). What is
+  left supporting it is Danilowicz Table 1's +0.024 EAO, on a different dataset, protocol and
+  metric, with no per-sequence data to trim. **That does not pay for an AIE rebuild, a re-flash
+  and a fresh 200-frame shift-budget calibration.** The known-answer calibration that found this
+  also licensed the offline harness for host-only screening (pooled AND paired both reported;
+  it undercalls magnitude ~2x) — `evidence/harness_validation.md`.
 - **FEATURES — mostly closed, and the ceiling is now known.** The bank's weights are a linear
   lift (random ties pretrained, one-hot ties the network), pooling is a null, channel count is
   not trim-separable between 16 and 32, and Danilowicz & Kryjak measure 8ch ~ 32ch ~ 64ch. What
@@ -438,7 +481,10 @@ Ranked, with the evidence for each rank, in
 **`MOSSE_SIGMA` is in BINS and the target spans `patch/padding` bins — what matters is
 sigma/target, and 1/16 (DSST's `target/16`) is the measured optimum.** That one fact re-attributed
 the 64x64 arm: it sat at 1/16 by accident, so it and `sigma4` are a MATCHED PAIR on width, and at
-matched width the FINER map wins. **Any geometry change silently moves this knob.**
+matched width the FINER map wins POOLED — **but that resolution term is NOT paired-stable and is
+a null across sequences** (mean +0.0049, median 0.0000, trim-5 −0.0040, P(dR<=0)=0.205; `R-14`,
+`results/geometry_calibration.csv`). **Do not spend a geometry arm on it.**
+**Any geometry change silently moves this knob.**
 
 **THE OFFLINE PROXY BOUNDS SAMPLING NOISE, NOT TRANSFER.** `vot_ar_offline.py` has now
 transferred on the RECTIFIER (**85%, the best rate on record**), sigma (84%) and `dec2` (43%),
@@ -814,7 +860,13 @@ scripts/
                          #   `oracle` control returns R = 1.0000 EXACTLY -- run it first, always.
                          #   Controls: oracle / oracle-lag1 / static / opencv:<kind>-rgb.
                          #   Needs opencv-contrib-python for csrt+kcf. Parallelise per RUN;
-                         #   pin cv2.setNumThreads(1) or 30 workers become 780 threads
+                         #   pin cv2.setNumThreads(1) or 30 workers become 780 threads.
+                         #   `mosse:<arm>` is THIS TRACKER IN FLOAT -- the twin. Same Stage A,
+                         #   same l1_banks bank, same gate, float64 downstream of the features,
+                         #   and NO DSST SCALE FILTER (held fixed, or --oracle-scale; the two
+                         #   BRACKET it, priced at +0.0023 R by scale_oracle_bound.py). Its
+                         #   knobs default to the SHIPPING arm (eta 0.05, gate 5.0), NOT to
+                         #   rgb_vs_gray_loop's pre-08-27 defaults
   eao_window.py          # RE-SCORES EXISTING trajectories under a second EAO window, using the
                          #   toolkit's own analysis. The window is a property of the CHALLENGE:
                          #   [115,755] here, [108,371] on VOT2015. Worth +0.0827 on the shipping

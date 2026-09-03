@@ -182,7 +182,8 @@ A residual of the size §3 measured (0.011-0.015 R, below resolution) is what th
   `pooled_features.md` measures **−0.0180 on the linear arm and −0.0242 on the rectified one**.
   Both predictions fail, so the span argument was never the operative mechanism. The remaining
   reading is resolution: aggregation and decimation agree to 0.001, and hardware prefers the
-  finer map at matched `sigma/target`.
+  finer map at matched `sigma/target` **pooled — though that preference is not paired-stable
+  (`R-14`)**.
 - **The gray rank cap.** Gray's 16 channels live in 9 dimensions — the ENTIRE gray patch space.
   The gray bank is already an identity lift up to conditioning, which is why the cap is
   "structural" and why RGB (16 of 27) had room to help.

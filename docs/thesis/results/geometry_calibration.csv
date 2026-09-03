@@ -1,0 +1,50 @@
+# THE KNOWN-ANSWER CALIBRATION of the offline multistart harness, on the axis where the OLD
+# single-start proxy was measured getting the sign BACKWARDS. Claim R-14.
+#
+# THE PAIR. At matched sigma/target = 1/16 (the measured optimum), the same 3x3 RGB bank at two
+# geometries: a 64x64 map at sigma 2 against a 128x128 map at sigma 4. Hardware ran this pair as
+# arms `res64` and `sigma4` (results/arms.csv); the twin runs it as `mosse:rgb-dec2 --sigma 2`
+# and `mosse:rgb --sigma 4` through scripts/offline_multistart.py.
+#
+# WHY IT WAS RUN. Screening the proposed 128x128 Layer-1 arm offline would mean screening a
+# GEOMETRY change on a bench that arm_res64.md sec.25.1 recorded inverting on exactly that axis
+# (offline proxy +0.0263 R to the 64 map; hardware +0.0222 R to the 128 map). traps.md's rule --
+# test an analysis tool against an OLD log first -- applied to a bench instead of a parser.
+#
+# ============================ THE RESULT IS TWO FINDINGS, NOT ONE ============================
+# 1. THE HARNESS IS NO LONGER INVERTED. Pooled, it puts the 128 map ahead (+0.0119 R, +0.0030
+#    EAO), the same SIGN as hardware, where the old single-start proxy pointed the other way.
+#    It UNDERCALLS the magnitude by about half.
+# 2. HARDWARE'S OWN RESOLUTION TERM IS NOT PAIRED-STABLE, and this is the bigger finding.
+#    The +0.0222 R that arm_res64.md sec.25.1 reports -- and that four other documents quoted as
+#    an established effect until 2026-09-04 -- is a POOLED, frame-weighted difference between two
+#    separately-run arms. Paired across the 62 sequences it is +0.0049 mean, median EXACTLY
+#    0.0000, 26 better / 25 worse / 11 tied, trim-5 NEGATIVE (-0.0040), P(dR<=0)=0.205.
+#    The harness reproduces that null faithfully (paired -0.0009, trim-5 -0.0092).
+#
+# WHAT THIS DOES AND DOES NOT LICENSE. The harness may screen host-only arms provided BOTH the
+# pooled and the paired statistic are reported and the ~2x magnitude undercall is priced. One
+# pair is not a general licence for geometry screening.
+#
+# WHAT IT DOES TO THE 128x128 LAYER-1 ARM: its geometry premise is thin. The support reduces to
+# Danilowicz Table 1's +0.024 EAO (different dataset, protocol and metric; no per-sequence data
+# to trim) plus a pooled-only in-house difference whose paired form is a null. That is not
+# enough to justify an AIE rebuild, re-flash and a fresh 200-frame shift-budget calibration.
+#
+# pooled_* are the toolkit's frame-weighted aggregate (what arms.csv carries and what the
+# challenge ranks on). paired_* weight each sequence equally. BOTH ARE LEGITIMATE AND THEY
+# ANSWER DIFFERENT QUESTIONS: pooled says which arm scored higher, paired says whether the
+# difference is separable from sampling noise across sequences. Quoting only the first is the
+# statistic this project has most often been misled by.
+source,pair,map,sigma,A,R,EAO,frames,runs,workspace,source_pl
+hardware,res64,64x64,2.0,0.5336,0.3873,0.1849,74309,419,0902_cmp,sprzęt
+hardware,sigma4,128x128,4.0,0.5133,0.4095,0.1931,82278,419,0902_cmp,sprzęt
+offline-twin,cal-map64-s2,64x64,2.0,0.5128,0.4363,0.1972,87933,419,offline_cal,"bliźniak zmiennoprzecinkowy"
+offline-twin,cal-map128-s4,128x128,4.0,0.5060,0.4482,0.2002,93578,419,offline_cal,"bliźniak zmiennoprzecinkowy"
+# The resolution term (128 map minus 64 map), by source and by statistic.
+comparison,statistic,dR,dEAO,dA,median_dR,trim5_dR,better_worse_tied,p_dr_le_0,note,comparison_pl
+hardware,pooled,0.0222,0.0082,-0.0203,,,,,"the figure four documents quoted as established",sprzęt (zbiorczo)
+hardware,paired-per-sequence,0.0049,,-0.0019,0.0000,-0.0040,26/25/11,0.205,"NOT separable from a null",sprzęt (parami)
+offline-twin,pooled,0.0119,0.0030,-0.0068,,,,,"same SIGN as hardware; ~54% of the magnitude",bliźniak (zbiorczo)
+offline-twin,paired-per-sequence,-0.0009,,-0.0013,0.0000,-0.0092,22/17/23,0.537,"reproduces hardware's null",bliźniak (parami)
+old-single-start-proxy,pooled,-0.0263,,,,,,,"SIGN INVERTED -- the reason this calibration was run",stary serwer zastępczy

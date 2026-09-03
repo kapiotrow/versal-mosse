@@ -105,9 +105,12 @@ failures per sequence and is oriented the other way; the EAO windows differ ([10
 [115, 755]); the ground truth is rotated polygons against mask-fitted axis-aligned boxes. Only
 the ORDERING inside their own table transfers — and two of those orderings are already load-bearing
 here: **channel count saturates** (8ch ties 32ch; only 4ch collapses), and **the larger geometry
-wins by +0.024 EAO**, which this project's own hardware corroborates at matched `sigma/target`
-(+0.0222 R / +0.0082 EAO, `arm_res64.md` sec.25.1). **Two implementations, two datasets, same
-sign — and the shipping arm sits at the geometry both of them call the worse one.**
+wins by +0.024 EAO**, which this project's own hardware echoes at matched `sigma/target`
+(+0.0222 R / +0.0082 EAO, `arm_res64.md` sec.25.1) — **but read that second figure with its
+correction: it is POOLED-ONLY, and paired across the 62 sequences it is a null** (mean +0.0049,
+median exactly 0.0000, trim-5 −0.0040, P(dR<=0)=0.205; `harness_validation.md` 2026-09-04,
+`R-14`). The two sources agree in sign; the in-house one is not an established effect, so
+**do not use it to justify an expensive geometry arm.**
 
 **The COST numbers do compare, and this is the axis to write up:**
 
