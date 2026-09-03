@@ -1,0 +1,11 @@
+# N-23, the mechanism: high-PSR lost frames are WELDED to static background -- the box does not
+# move at all while the target does, so the filter self-correlates more sharply than on a real
+# target. Same run as psr_correctness.csv; n is FRAME-PAIRS, not sequences.
+# Survives the trim: excluding nature (N-09) and tiger (N-10) the welded set is still 4842
+# frame-pairs at a 0.00 px median across 17 of 60 sequences.
+# NOT ACTIONABLE: the freeze is post-loss (0.70% of pre-loss frames vs 4.59% after; 6 of 221
+# losing runs show any welded frame before their loss), i.e. the gate's shape -- see R-06, N-13.
+population,n,est_motion_px,truth_motion_px,population_pl
+on_target_iou_gt_0.5,44866,2.56,3.04,na celu (IoU > 0.5)
+lost_psr_le_20,45973,2.81,3.16,zgubiony, PSR <= 20
+lost_psr_gt_50,9034,0.00,2.24,zgubiony, PSR > 50 (przyspawany do tla)

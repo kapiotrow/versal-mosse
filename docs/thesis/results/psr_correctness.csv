@@ -1,0 +1,11 @@
+# N-23: PSR is NON-MONOTONE in tracking correctness -- the MOST CONFIDENT band is the WORST.
+# Shipping arm rgb_l1relu, runs/vot/0902_1413-l1relu, 419 runs / 180,125 evaluated frames.
+# frac_lost = fraction of frames in the band already at IoU <= 0.1, computed PER SEQUENCE and
+# then MEDIANED, so pooling cannot carry it. n_seq = sequences with >= 20 frames in the band.
+# Companion file: psr_welded_motion.csv (why the top band is the worst).
+band,n_seq,frac_lost_median,band_pl
+0-10,59,0.702,PSR 0--10
+10-20,60,0.500,PSR 10--20
+20-30,50,0.484,PSR 20--30
+30-50,37,0.778,PSR 30--50
+50+,20,0.969,PSR powyzej 50

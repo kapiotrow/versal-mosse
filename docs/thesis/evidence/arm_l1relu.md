@@ -674,3 +674,92 @@ sampling noise, not the transfer. They say a result is not carried by three sequ
 nothing about whether the bench models the tracker. Treat `P(dR<=0)` as necessary and never
 sufficient, and keep sec.11-style named assumptions on every arm derived from a geometry the
 board does not run.
+
+## 14. THE MECHANISM CHECK RAN — 2026-09-03. **FALSIFIER MET: the rectifier, not the bank**
+
+`runs/vot/0903_1227-l1lin/`, workspace `~/vot/analysis/0903_l1lin`. 62 sequences, 419
+trajectories, 72,087 frames, **0 failures**, every run name and length verified against the
+dataset's anchors. Claim `N-16`; results row `rgb_l1lin` in `results/arms.csv`.
+
+**THE CLEANEST ONE-KNOB COMPARISON THIS PROJECT HAS RUN.** Checked before the sweep, not after:
+
+| | |
+|---|---|
+| `app.flagstamp` vs the shipping sweep's | **byte-identical** — `CONV_RELU` is AIE-only, so the host ELF is not what distinguishes these arms |
+| `aie.flagstamp` vs the shipping sweep's | **exactly one line**: `-DCONV_RELU=1` -> `=0` |
+| `layer0_weights.bin` | md5 `d8a7d6ff...` on the card == `calib_cfg.txt`'s `weights_md5` == the shipping bank |
+| host sources since the shipping sweep | 12 changed lines, **0 non-comment**, line counts preserved; the ELF md5 differs only because a GNU build-id hashes sections comment text reaches |
+| board `a.xclbin` | `3f024802`, guard passed |
+
+The 200-frame calibration ran first and is in `../../engineering/shift_budget.md`'s terms: **`rails=0`
+on all 800 readings** (4 buffers x 200 frames), budget 3-3-3 / `H_SHIFT=15` unchanged. Removing
+the rectifier makes the activation signed, so the magnitudes moved and moved as they should --
+`F_ch` x1.57 (the negative half of the activation is restored), `H(q15)` x0.74 (`H ~ 1/|F|`, so a
+1.57x rise predicts ~0.64x), response x1.42, i.e. **the budget is used MORE, not less**, and the
+response undershoot is smaller than the shipping arm's. The budget was deliberately NOT re-tuned:
+that would have bought headroom at the cost of making the delta unattributable.
+
+## The result
+
+```
+arm         accuracy  robustness      EAO   frames
+l1lin         0.5294      0.3790   0.1851    72087
+l1relu        0.5129      0.4279   0.1960    82504
+```
+
+**Sec.12's falsifier: "if the twin also lands near 0.196 the gain is the BANK, not the rectifier."
+It lands at 0.1851.** dEAO **−0.0109**, dR **−0.0489**, 12.6% fewer frames survive.
+
+Paired per-sequence, `relu - lin`, positive = the rectifier wins:
+
+| | mean | trim-3 | trim-5 | median | b/w/t | sign p | P(d<=0) |
+|---|---|---|---|---|---|---|---|
+| R | **+0.0447** | +0.0331 | **+0.0274** | +0.0095 | 39/20/3 | **0.018** | **0.000** |
+| A | +0.0187 | +0.0104 | +0.0061 | +0.0054 | 39/23/0 | 0.056 | 0.003 |
+
+**R survives drop-top-FIVE at P(dR<=0) = 0.000 with a significant sign test** -- stronger than
+`l1relu` over `sigma4` (trim-5 +0.0112, P = 0.011), and the strongest per-sequence result on
+record here. **A moves the same way, so there is no A/R trade.**
+
+**THE POOLED ACCURACY READS BACKWARDS AND IT IS THE `M-02` SELECTION EFFECT.** Pooled A is 0.5294
+for `l1lin` against 0.5129 -- apparently favouring the LINEAR arm -- while the paired per-sequence
+A favours the rectifier on 39 of 62 sequences. A is averaged over TRACKED frames and `l1lin`
+survives 12.6% fewer of them, so it is scored on an easier, earlier frame set. The paired number
+is the valid comparison. (The stricter common-survived-prefix computation was not run; the paired
+A already establishes the absence of a trade.)
+
+## What it settles
+
+**`N-16` becomes mechanism CONFIRMED ON HARDWARE, not offline.** `feature_bank.md` proved that at
+`CONV_RELU=0` the conv layer is a LINEAR LIFT the online filter absorbs -- a one-hot bank with no
+network in it ties the pretrained one -- so the pre-09-02 configuration was a CNN-feature tracker
+whose CNN was provably redundant. The rectifier is now MEASURED at **+0.0489 R / +0.0109 EAO** on
+an otherwise byte-identical build. **The thesis's conv-feature requirement is answered by
+measurement rather than by argument**, and sec.12's third shipping ground -- the one that never
+depended on the delta -- is now the one with a hardware number behind it.
+
+**What is still NOT claimed:** that `l1relu` passed ITS OWN pre-registered bar. It did not
+(sec.10.1, dEAO +0.0029 against +0.005). Sec.12 stands unchanged. This section answers a
+different question -- WHERE the arm's gain comes from -- and answers it in the rectifier's favour.
+
+## The bench transferred here, and it is the best rate on record
+
+`layer1_features.md` predicted **+0.0575** pooled dR for `l1relu` vs `l1lin` (32ch, the only
+comparison in that screen to survive a drop-top-FIVE). Hardware returned **+0.0489** pooled.
+
+| axis | offline | hardware | |
+|---|---|---|---|
+| **ReLU vs its linear twin** | **+0.0575** | **+0.0489** | **transferred, 85% -- the best rate recorded** |
+| sigma 2 -> 4 | +0.0808 | +0.0678 | transferred, 84% |
+| 64x64 map (`dec2`) | +0.1071, P=0.000 | +0.0456 | transferred, 43% |
+| spatial mask (old bank) | +0.0601 | +0.0192 | over-called 3x |
+| spatial mask (this bank) | −0.0127 | not run | INVERTED vs the old bank (`N-21`) |
+| `pad30` | large | ~0 | over-called ~11x |
+| `MOSSE_ETA` 0.05 -> 0.1 | +0.0481, P=0.021 | −0.0030 | INVERTED |
+
+**The pattern that now has evidence on both sides: the bench transfers on arms that change the
+FEATURES or the response WIDTH, and misleads on arms that act through the filter/veto path.**
+sigma, `dec2` and the rectifier are all the former; the mask, `pad30` and eta are all the latter.
+That is a usable prior for the next arm, and it is a hypothesis rather than a rule -- it is fitted
+to seven points.
+

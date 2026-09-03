@@ -302,6 +302,7 @@ Full VOT-STb2022, 62 sequences, 419 trajectories per arm. Each row moves ONE kno
 | ...+ `PSR_GATE_MIN=3.5` — REJECTED, EAO null | 0.5308 | 0.3936 | 0.1849 | `0901_gate35` |
 | + `MOSSE_SIGMA=4.0` at 128x128 (HOST-ONLY) | 0.5133 | 0.4095 | 0.1931 | `0901_sigma4` |
 | **+ Layer-1 features (7x7/2, ReLU, 32ch, 64x64) — SHIPPING** | **0.5129** | **0.4279** | **0.1960** | `0902_l1relu` |
+| ...+ `CONV_RELU=0` (`l1lin`, the linear twin) — MECHANISM CHECK, rectifier CONFIRMED | 0.5294 | 0.3790 | 0.1851 | `0903_l1lin` |
 
 `PSR_GATE_MIN=0` is a null (13-seq probe). The padding arm gained R and LOST EAO — **EAO is the
 arbiter for an A/R trade**. **The gate's worth is NOT conditional on the PSR scale** (refuted
@@ -315,8 +316,12 @@ the paired per-sequence result is strong where the scalar is not (R **+0.0112 af
 P(dR<=0)=0.011**, accuracy up too, no A/R trade), and at `CONV_RELU=0` the conv layer is a
 **LINEAR LIFT the online filter absorbs** — a one-hot bank with no network ties the pretrained
 one, so the previous config was a CNN-feature tracker whose CNN was provably redundant.
-**Never write this arm up as having passed the falsifier.** The linear twin `ARM=l1lin` has not
-run, so the gain belongs to the arm and not yet to the rectifier.
+**Never write this arm up as having passed the falsifier** — that is a separate question and is
+unchanged. **But the linear twin RAN on 2026-09-03 and the gain IS the rectifier**: `l1lin`
+(same bank, `aie.flagstamp` differing on exactly `CONV_RELU`) lands at EAO **0.1851** against
+0.1960, paired R **+0.0447 / +0.0274 after drop-top-5, P(dR<=0)=0.000**, A moving the same way.
+So the conv layer is doing real work and the CNN is no longer provably redundant — `N-16`,
+`evidence/arm_l1relu.md` sec.14.
 
 ### THE EAO WINDOW IS [115, 755], AND IT CAPS WHAT FEATURES CAN BUY
 
@@ -368,19 +373,33 @@ Ranked, with the evidence for each rank, in
 - **DONE, REJECTED — `MOSSE_ETA=0.1`.** EAO 0.1960 → 0.1817 (sec.13). The named assumption is
   what broke: the grid ran at 128x128/sigma 4, the arm at 64x64/sigma 2, and `sigma/target`
   governs SIGMA only. **The methodological result outlives the arm — see below.**
-- **THE MECHANISM CHECK STILL OWED — `ARM=l1lin`.** Same bank, same geometry, `CONV_RELU=0`.
-  Rebuild + reflash, NOT host-only. If the twin also lands near 0.196 the gain is the BANK, not
-  the rectifier, and N-16's "confirmed" weakens to "the bank helps".
-- **ROBUSTNESS, and the target has moved.** 71% of the EAO window is long-horizon box quality
-  (see above), so: **nothing — the direction is CLOSED by the oracle bound above.** What is left is POSITION
-  drift, which is what actually ends runs: (1) a **training-sample memory** (SRDCF/CSRDCF keep
-  weighted sample SETS; this keeps one running average, which is exactly the "walks off target
-  confidently" mechanism); (2) the **two-filter temporal ensemble** — TCLCFcpp, the embedded peer
-  at R 0.598, is built on it, and `eta 0.05`/`eta 0.125` already win on different sequences.
-  Host-only, untested. (3) ~~The spatial mask ON TOP of this arm~~ — **REFUTED offline 2026-09-03: on the shipping
-  Layer-1 bank its sign INVERTS (+0.0601 on the old bank, −0.0127 paired here, P(dR<=0)=0.706),
-  and the k=2 width knob is worse. `docs/thesis/evidence/mask_bank_transfer.md`, claim N-21.**
-  Stage B3 channel reliability was re-screened on the same sweep and is a null there too. **`MOSSE_SIGMA`'s interior is CLOSED** (22-cell grid; 3, 5, 6, 8 all worse).
+- **DONE, FALSIFIER MET — `ARM=l1lin`, the mechanism check.** EAO **0.1851** against 0.1960, so the
+  gain is the RECTIFIER and not the bank; paired R +0.0447, trim-5 +0.0274, P(dR<=0)=0.000, no A/R
+  trade. `N-16` is confirmed ON HARDWARE and the conv layer is no longer provably redundant.
+- **ROBUSTNESS — after 2026-09-03 there is ONE candidate left.** 71% of the EAO window is
+  long-horizon box quality and the scale direction is CLOSED by the oracle bound above, so what
+  ends runs is POSITION drift. Everything host-only that attacked it is now refuted:
+  - **THE ONE REMAINING ITEM: a training-sample memory.** SRDCF/CSRDCF keep weighted sample SETS;
+    this keeps one running average, which is exactly the "walks off target confidently" mechanism
+    (R-06). It is the only candidate that was never a confidence mechanism, which is why none of
+    2026-09-03's results touch it. Untested.
+  - ~~two-filter temporal ensemble~~ — **CLOSED, both halves (N-22, N-24, O-03).** The cheap half
+    (a long-term filter as a confidence VALIDATOR feeding a modulated eta) loses on PSR and APCE
+    with its mutant failing to lose. The premise underneath — a second memory sees drift one
+    filter does not — is refuted by a pure-observer probe: peak disagreement predicts an imminent
+    loss at AUC **0.461** frozen / **0.555** slow, against PSR's already-too-weak 0.618. A
+    per-frame selection rule has no signal left, so the second AIE bank has nothing to select on.
+  - ~~confidence-modulated eta, and CONFIDENCE-DERIVED PER-FRAME STATISTICS AS A CLASS~~ —
+    **CLOSED (N-22, N-23).** PSR is U-SHAPED in correctness: the most confident band is 96.9%
+    lost, because those frames are welded to static background (box motion 0.00 px while the
+    target moves 2.24 px/frame). Both tails are POST-LOSS, so a two-sided law is two aftermath
+    detectors bolted together. Pre-loss the tracker looks confident and MOVING.
+  - ~~the spatial mask on this arm~~ — **REFUTED (N-21):** its sign INVERTS on the Layer-1 bank
+    (+0.0601 on the old 3x3 one, −0.0127 paired here, P(dR<=0)=0.706); the k=2 width knob is
+    worse. Stage B3 channel reliability was re-screened on the same sweep and is a null too.
+  - `MOSSE_SIGMA`'s interior is CLOSED (22-cell grid; 3, 5, 6, 8 all worse).
+
+  Notes: `docs/thesis/evidence/confidence_eta.md`, `docs/thesis/evidence/mask_bank_transfer.md`.
 - **FEATURES — mostly closed, and the ceiling is now known.** The bank's weights are a linear
   lift (random ties pretrained, one-hot ties the network), pooling is a null, channel count is
   not trim-separable between 16 and 32, and Danilowicz & Kryjak measure 8ch ~ 32ch ~ 64ch. What
@@ -402,8 +421,11 @@ the 64x64 arm: it sat at 1/16 by accident, so it and `sigma4` are a MATCHED PAIR
 matched width the FINER map wins. **Any geometry change silently moves this knob.**
 
 **THE OFFLINE PROXY BOUNDS SAMPLING NOISE, NOT TRANSFER.** `vot_ar_offline.py` has now
-transferred on sigma (84%) and `dec2` (43%), UNDER-called Layer-1 features, over-called the mask
-3x and `pad30` ~11x, and on 2026-09-02 **INVERTED on `MOSSE_ETA`** — its only trim-stable,
+transferred on the RECTIFIER (**85%, the best rate on record**), sigma (84%) and `dec2` (43%),
+over-called the mask 3x and `pad30` ~11x, INVERTED the mask's SIGN on a new bank (N-21), and on
+2026-09-02 **INVERTED on `MOSSE_ETA`**. **The emerging pattern, fitted to seven points and offered
+as a prior rather than a rule: it transfers on arms that change the FEATURES or the response
+WIDTH, and misleads on arms acting through the filter/veto path** — its only trim-stable,
 bootstrap-significant cell of a 22-cell grid (dR +0.0481, P(dR<=0)=0.021) returned −0.0030 on
 hardware. **A trim and a bootstrap say a result is not carried by three sequences; they say
 NOTHING about whether the bench models the tracker.** Treat `P(dR<=0)` as necessary, never
@@ -446,8 +468,14 @@ catches a contract mismatch (five green unit tests coexisted with a statistic re
 a whole sweep). Launching over ssh changes the frame-time measurement. Verify a feature flag on a
 build that can actually exercise it — `strings` can report a false absence.
 
-**Metrics that cannot fail a broken tracker.** PSR is weak *in a specific direction* — a tracker
-179 px off target, confidently locked to background, reported PSR 33. **IoU is the only metric in
+**Metrics that cannot fail a broken tracker.** **PSR IS NON-MONOTONE IN CORRECTNESS** (N-23,
+measured over 180,125 frames): fraction already lost is 70.2% at PSR 0-10, 48.4% at 20-30 (the
+optimum) and **96.9% above 50** — the most confident band is the worst. Those frames are WELDED to
+static background (median box motion **0.00 px** while the truth moves 2.24 px/frame), so the filter
+self-correlates more sharply than on a real target. The old one-case version of this —  a tracker
+179 px off target, confidently locked to background, reported PSR 33 — is the same effect.
+**So no MONOTONE law on PSR can work** (it sank the confidence-modulated eta, N-22), and the welded
+population is detectable by zero MOTION, never by low confidence. **IoU is the only metric in
 the harness that can fail a confidently-wrong tracker; read `track.csv`, not the console.**
 `err=0 px` is weak too, a centred test impulse cannot validate localisation, and `[diag] F_ch` is
 CHANNEL 0 ONLY. Two different statistics are both called PSR.

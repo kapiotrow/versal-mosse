@@ -2,6 +2,67 @@
 
 **Status:** current · **Updated:** 2026-09-03 · **Scope:** what to try next, ranked, with the evidence behind each rank
 
+## 2026-09-03 — the mechanism check RAN: the gain is the RECTIFIER, not the bank
+
+`runs/vot/0903_1227-l1lin/`, 62 sequences / 419 trajectories, 0 failures. The pre-registered linear
+twin — same bank (identical weights md5), same geometry, `app.flagstamp` BYTE-IDENTICAL and
+`aie.flagstamp` differing on exactly `CONV_RELU=1 -> 0` — lands at **EAO 0.1851 against 0.1960**.
+Sec.12's falsifier said a twin near 0.196 would collapse `N-16` to "the bank helps"; it did not.
+Paired R **+0.0447 mean, +0.0331 trim-3, +0.0274 trim-5, sign p 0.018, P(dR<=0)=0.000**, with A
+moving the same way — no A/R trade, and the strongest per-sequence result on record here.
+**`N-16` is confirmed ON HARDWARE**, so the conv layer is no longer provably redundant and the
+thesis's conv-feature requirement is answered by measurement. The 200-frame calibration passed
+first (`rails=0` on all 800 readings) and the budget was deliberately NOT re-tuned, which is what
+keeps the delta attributable. **The bench transferred at 85%, its best rate.**
+`../thesis/evidence/arm_l1relu.md` sec.14.
+
+---
+
+## 2026-09-03 — confidence-modulated eta is REFUTED, and the ensemble's cheap half goes with it
+
+`runs/vot/0903_offline-ceta/`, offline, 62 sequences, 14 minutes. LMCF's high-confidence update as a
+one-sided law `eta_eff = eta * clamp(conf/median(own past), lo, 1.0)`, on BOTH PSR and APCE.
+**Every arm loses** (best −0.0108 against a +0.02 bar; floor 0.4 worse than floor 0.6, so the
+direction is wrong) **and the MUTANT does not lose** — inverting the law is not worse than the
+correct law (PSR −0.0047 pooled; APCE's +0.0133 pooled dies at trim-3 −0.0153, sign test 1.000).
+**The statistic is inert and no mechanism survives**, unlike `N-20`. The within-run dip is REAL and
+re-measured stronger than on the old arm (P[pre-loss < control] = 0.618, 29.6% vs 11.7% below 0.6x)
+— so a detectable signal existed and acting on it still lost.
+**Item 4 below (the two-filter ensemble) loses its cheap half**: the roadmap proposed a long-term
+filter as a VALIDATOR feeding exactly this modulation. What is left is the EXPENSIVE form, two real
+filters selected per frame — a second AIE bank, not host-only. `../thesis/evidence/confidence_eta.md`,
+claims `N-22` / `O-03`.
+**ROOT-CAUSED the same day (`N-23`), and the root cause outlives the arm:** PSR is NON-MONOTONE in
+correctness — frames already lost are 70.2% of the PSR 0-10 band, 48.4% at 20-30, and **96.9%
+above 50**, because the high-confidence lost frames are WELDED to static background (median box
+motion **0.00 px** against the truth's 2.24 px/frame). A monotone control law is therefore
+misspecified by construction, which is why the arm AND its mutant both failed.
+**AND THE FOLLOW-UP THIS SUGGESTED IS ALREADY CLOSED.** The welded population looked detectable by
+zero MOTION at high PSR with no confidence statistic; the prior question — is it a LEADING
+indicator? — answers no: 0.70% of pre-loss frames against 4.59% after, and only 6 of 221 losing
+runs show any welded frame before their loss. Same shape as the gate (`R-06`), and post-loss
+information is worth nothing (`N-13`). **Confidence-derived per-frame statistics are CLOSED as a
+class here** — pre-loss this tracker looks confident and MOVING, not frozen.
+
+**AND THE TWO-FILTER ENSEMBLE WENT WITH IT (`N-24`, `O-03` CLOSED).** The M-13 prior question was
+asked before building: a PURE OBSERVER long-term filter (bit-identical control, maxdiff 0) riding the
+live trajectory shows that long/short PEAK DISAGREEMENT does not predict an imminent loss —
+`P[healthy < doomed]` = **0.461** frozen, **0.555** slow, against PSR's 0.618 which is itself closed
+as too weak. The filters do not agree (3.61 bins apart when healthy); the disagreement is simply
+UNINFORMATIVE. A per-frame SELECTION rule therefore has no signal to use, so the expensive form —
+a second AIE bank — is closed too, not merely deprioritised.
+
+**WHAT IS LEFT FOR ROBUSTNESS IS ONE ITEM: THE TRAINING-SAMPLE MEMORY.** SRDCF/CSRDCF keep weighted
+sample SETS; this keeps one running average, which is exactly the "walks off target confidently"
+mechanism (`R-06`). It is the only remaining candidate that was never a confidence mechanism, which
+is why none of 2026-09-03's results touch it.
+**The warm-up was diagnosed from the shipping run's own logs and was NOT the limit** (N=20 and N=12
+are the same arm): the running median is biased 1.86x high at k=1, and the relative statistic does
+not separate doomed from healthy runs early (0.608 at f1, 0.461 by f12) where ABSOLUTE psr does
+(0.82-0.85). The early population is init failures, which eta cannot fix (`N-02`).
+
+---
+
 ## 2026-09-03 — the spatial mask is REFUTED on the shipping arm, and so is the chrel re-open
 
 `runs/vot/0903_offline-l1mask/`, offline, 62 sequences, 8 minutes. **The mask was the proposed
@@ -207,11 +268,13 @@ supporting measurements: `docs/thesis/evidence/robustness_proposals.md`. What is
    `r_ch(0) = (1/N)·Σᵢ Hᵢ·conj(Fᵢ)` and `‖r_ch‖² = (1/N)·Σᵢ|Hᵢ Fᵢ|²`, i.e. two scalar
    accumulators inside the existing per-channel loop of `filter_update_quantize` over arrays it
    already streams. Reliability `r(0)²/‖r‖²` folds into `chscale`. CSR-DCF price theirs at −12%.
-4. **A two-filter temporal ensemble** (TCLCFcpp, the one embedded tracker at R 0.598). eta 0.125
-   and eta 0.05 already win on different sequences; run both, select per frame by PSR. Host-only,
-   +2 MB filter state, roughly doubles the ~5 ms filter tail. **Take the cheap half first**: a
-   long-term filter at eta≈0 used only as a VALIDATOR at the selected peak (one dot product per
-   channel, item 2's identity, no second AIE bank) feeding a confidence-modulated eta.
+4. ~~**A two-filter temporal ensemble**~~ — **CLOSED 2026-09-03, both halves (`N-22`, `N-24`,
+   `O-03`).** The cheap half was a long-term filter used as a confidence VALIDATOR feeding a
+   modulated eta: the modulation is refuted on PSR and APCE with its mutant failing to lose. The
+   premise underneath — that a second memory sees drift a single filter does not — is refuted
+   directly by a pure-observer probe: peak disagreement predicts an imminent loss at AUC
+   0.461 (frozen) / 0.555 (slow) against PSR's already-too-weak 0.618. Nothing is left for a
+   per-frame selection rule to use. `../thesis/evidence/confidence_eta.md`.
 5. **A REPLACEMENT feature bank — NARROWED SHARPLY 2026-08-29, see `docs/thesis/evidence/feature_bank.md`.**
    **Swapping the donor network is close to a null: at layer 1 the pretraining is worth
    ~0.011-0.015 in R, below the offline bench's own resolution, and it does not survive a

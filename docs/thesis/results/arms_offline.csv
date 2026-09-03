@@ -17,3 +17,9 @@ off_l1relu_ctrl,2026-09-03,"SHIPPING Layer-1 bank control (7x7/2, 32ch, 64x64) �
 off_l1relu_mask0,2026-09-03,"Hann mask on the SHIPPING bank — INVERTS: +0.0601 on the old 3x3 bank, negative here; trim3 -0.0358, P(dR<=0)=0.706",0.4998,0.4269,8497,19903,,-0.0079,-0.0095,runs/vot/0903_offline-l1mask,N-21
 off_l1relu_mask0k2,2026-09-03,"...mask applied twice (the board-implementable width knob) — WORSE on both trims; accuracy gain is the M-02 selection effect",0.5487,0.4175,8309,19903,,0.0410,-0.0189,runs/vot/0903_offline-l1mask,N-21
 off_l1relu_chrel05,2026-09-03,"Stage B3 channel reliability gamma=0.5 re-screened at the new operating point — the licensed re-open is SPENT, N-20 stands",0.5220,0.4356,8669,19903,,0.0143,-0.0008,runs/vot/0903_offline-l1mask,N-20
+off_ceta_psr06,2026-09-03,"confidence-modulated eta, PSR, clamp floor 0.6, warmup 12 — REFUTED, loses on every column",0.5112,0.4179,8318,19903,,0.0035,-0.0185,runs/vot/0903_offline-ceta,N-22
+off_ceta_psr04,2026-09-03,"...floor 0.4 — MORE modulation is monotonically WORSE, so the direction is wrong",0.5104,0.4126,8212,19903,,0.0027,-0.0238,runs/vot/0903_offline-ceta,N-22
+off_ceta_psrneg,2026-09-03,"MUTANT: PSR law INVERTED (eta up when confidence low). Does NOT lose to the arm (-0.0047 pooled) — the statistic is INERT",0.5071,0.4307,8572,19903,,-0.0006,-0.0057,runs/vot/0903_offline-ceta,N-22
+off_ceta_apce06,2026-09-03,"same law on APCE (LMCF's statistic, independent of the gate's) — best ceta arm and still negative",0.5069,0.4236,8430,19903,,-0.0008,-0.0128,runs/vot/0903_offline-ceta,N-22
+off_ceta_apceneg,2026-09-03,"MUTANT: APCE law inverted. Arm-vs-mutant is +0.0133 POOLED but trim3 -0.0153, sign test 1.000 — not separable",0.5112,0.4198,8355,19903,,0.0035,-0.0166,runs/vot/0903_offline-ceta,N-22
+off_ceta_psr06_w20,2026-09-03,"PSR floor 0.6 at warmup 20 — the warm-up is NOT the binding constraint (same arm as w12)",0.5108,0.4177,8313,19903,,0.0031,-0.0187,runs/vot/0903_offline-ceta,N-22

@@ -140,6 +140,98 @@ def split_rand(name):
     return (m.group(1), int(m.group(2))) if m else (name, None)
 
 
+def apce(resp):
+    """Average Peak-to-Correlation Energy (LMCF, Wang et al. 2017 3.2).
+
+        APCE = (F_max - F_min)^2 / mean( (F - F_min)^2 )
+
+    THE SECOND CONFIDENCE STATISTIC, and the reason it exists here. PSR is
+    ALREADY what `PSR_GATE_MIN` tests, so modulating eta by PSR is one
+    instrument used twice -- and this project's own rule is that two
+    INDEPENDENT instruments beat one instrument twice. APCE reads the whole
+    response's shape (how peaked it is against its own floor) where PSR reads
+    the peak against a sidelobe set with an 11x11 hole in it, so the two fail
+    differently: PSR is blind to a broad pedestal inside the exclusion, APCE is
+    blind to where the peak sits.
+
+    NOT PRE-SCREENABLE FROM THE BOARD LOGS. `track.csv` carries psr_bolme and
+    no response map, so the PSR-vs-APCE comparison could only ever be made
+    here. Its within-run separation is an ASSUMPTION until this bench measures
+    it -- PSR's is 0.618 (scratch analysis of runs/vot/0902_1413-l1relu,
+    n=230 losing runs).
+
+    ON THE BOARD it is one pass over a 16 KB host-resident response (~22 us,
+    0.09% of a 24 ms frame) and folds into compute_psr's existing peak scan,
+    because min/max/sum/sum2 all come off one traversal.
+    """
+    r = np.asarray(resp, dtype=np.float64)
+    lo = r.min()
+    d = r - lo
+    den = float(np.mean(d * d))
+    return float((r.max() - lo) ** 2 / den) if den > 0 else 0.0
+
+
+def split_ceta(name):
+    """'rgb-ceta6' -> ('rgb', 0.6).  'rgb-cetaneg' -> ('rgb', -1.0).  else (name, None).
+
+    CONFIDENCE-MODULATED LEARNING RATE -- LMCF's high-confidence update, as a
+    SOFT law rather than their hard veto:
+
+        eta_eff = eta * clamp(conf / median(conf over this run's PAST frames),
+                              lo, 1.0)
+
+    The returned value IS `lo`, the clamp floor; `-ceta6` is lo = 0.6.
+
+    ONE-SIDED ON PURPOSE (hi = 1.0, eta is only ever REDUCED). The upward half
+    walks into measured-bad territory: MOSSE_ETA=0.1 was REJECTED on hardware
+    (EAO 0.1960 -> 0.1817, arm_l1relu.md 13) and 0.025 is "much worse". So
+    there is no version of this arm that raises eta and is not already refuted.
+
+    WHY A WARM-UP IS REQUIRED, AND WHY IT IS NOT A HACK. Measured on the
+    shipping arm (419 runs, 180,125 evaluated frames):
+
+      * the running median is BIASED HIGH early -- median(psr[:k]) reads 1.86x
+        the run's settled level at k=1, 1.05x by k=12, 0.98x by k=20. Seeding
+        it from frame 1 would cut eta across the board for a spurious reason.
+      * and the relative statistic does not SEPARATE early anyway:
+        P[doomed < healthy] is 0.608 at frame 1, 0.529 at frame 3 and 0.461 by
+        frame 12 -- i.e. worse than useless. ABSOLUTE psr separates those same
+        runs at 0.82-0.85, because dividing by a doomed run's own depressed
+        median removes exactly the evidence.
+
+    So the early population is NOT addressable by this law. It is also not
+    addressable by eta at all: those are INIT failures (61 runs broken one
+    frame after filter_init, f1 IoU 0.571 -- robustness_proposals 1), and
+    lowering eta on a bad init PRESERVES the bad init. That route is closed
+    separately as N-02.
+
+    The warm-up therefore EXEMPTS them, and the exemption is priced rather than
+    hidden: N=12 leaves ~17% of all losses untouched, N=20 leaves 24.3%.
+
+    WHAT THE LAW IS WORTH, from the same data -- the within-run dip is real and
+    is slightly STRONGER on this arm than on the one robustness_proposals 4
+    measured (0.892 vs 1.004 there):
+
+        window                median   frac < 0.6x
+        pre-loss (-5..0)       0.808         29.6%
+        control (-20..-15)     0.978         11.7%
+        P[pre-loss < control] = 0.618, paired 147/230
+
+    That is a WEAK discriminator. At lo = 0.6 the law acts on 29.6% of pre-loss
+    frames and 11.7% of control frames; expect a small effect or none.
+
+    `-cetaneg` is the MUTANT and must LOSE: it inverts the law, raising eta
+    when confidence is LOW. If it does not lose, the statistic is inert and any
+    gain is "perturbing eta", not confidence -- the role `-chrelneg` played for
+    channel reliability, and the reason that null was informative.
+    """
+    m = re.match(r'^(.*?)-ceta(neg|\d+)$', name)
+    if not m:
+        return name, None
+    tok = m.group(2)
+    return m.group(1), (-1.0 if tok == 'neg' else int(tok) / 10.0)
+
+
 def split_chrel(name):
     """'rgb-chrel10' -> ('rgb', 1.0).  'rgb-chrelneg' -> ('rgb', -1.0).  else (name, None).
 
@@ -586,7 +678,8 @@ def run_arm(arm, wq, bias, shift, gt, n_frames, oracle_scale, verbose,
             warp_aspect=0.0, warp_rot=0.0, eps_rel=EPS_REL,
             mask_plateau=None, mask_taper=0.25, mask_centre='board',
             mask_power=1, rect=None, chrel_gamma=None, stride=1, blur_n=1,
-            pool_n=1, pool_mode_ov=None):
+            pool_n=1, pool_mode_ov=None,
+            ceta_lo=None, ceta_stat='psr', ceta_warmup=12, lt_eta=None):
     # float_conv = (w_float, b_fold) runs the UNQUANTIZED conv instead of the
     # int8 one, everything else identical. See conv_features_float's docstring:
     # this arm exists to answer whether quantization causes the tracker's poor
@@ -618,7 +711,24 @@ def run_arm(arm, wq, bias, shift, gt, n_frames, oracle_scale, verbose,
     # while the target moves several bins -- invisible in IoU or PSR, which both
     # look healthy while it happens.
     rec = {'iou': [], 'cerr': [], 'psr': [], 'holds': 0, 'lost_at': None,
-           'step': [], 'resp00': [], 'ebox': []}
+           'step': [], 'resp00': [], 'ebox': [], 'etascale': [], 'ltdiv': []}
+    # Causal history for the confidence law: appended AFTER each frame's
+    # scale is computed, so median() never sees the current frame.
+    conf_hist = []
+    # LONG-TERM FILTER PROBE -- a PURE OBSERVER. A_lt/B_lt ride the live
+    # trajectory (same crops, same shifted training target) and differ only in
+    # TEMPORAL SUPPORT: lt_eta = 0 freezes them at the init state. Their peak is
+    # compared with the live peak and RECORDED; nothing here ever feeds back
+    # into the trajectory, which is what makes inertness the control -- a probe
+    # arm's IoU must be bit-identical to the baseline's.
+    #
+    # WHY THIS PROBE EXISTS (M-13, the prior question). Confidence-derived
+    # per-frame statistics are closed as a class (N-22/N-23): they read the
+    # CURRENT response map, and pre-loss this tracker looks confident and moving.
+    # Disagreement between two models with different memory is the one candidate
+    # signal that is NOT inside a single response map. If the peaks do not
+    # diverge before the loss, the two-filter ensemble (O-03) is dead too.
+    A_lt = B_lt = None
     # Built once: the mask is fixed in PATCH coordinates, so it does not move
     # with the box. Its fixedness is the whole reason it is host-only and free.
     # mask_power k: the mask is m**k. THIS IS A REAL, BOARD-IMPLEMENTABLE WIDTH
@@ -724,6 +834,12 @@ def run_arm(arm, wq, bias, shift, gt, n_frames, oracle_scale, verbose,
                 # sum would not.
                 A /= n_warps
                 B /= n_warps
+            # The observer starts from the SAME init. With lt_eta = 0 it stays
+            # there for the whole run: the filter the tracker had at frame 1,
+            # carried forward untouched.
+            if lt_eta is not None:
+                A_lt, B_lt = A.copy(), B.copy()
+            rec['ltdiv'].append(float('nan'))     # no detection on the init frame
             rec['iou'].append(box_iou((row, col, bh, bw), gt[f - 1]))
             rec['cerr'].append(float(np.hypot(row - gt[f-1][0], col - gt[f-1][1])))
             rec['psr'].append(float('nan'))
@@ -760,6 +876,21 @@ def run_arm(arm, wq, bias, shift, gt, n_frames, oracle_scale, verbose,
         resp = np.real(np.fft.ifft2(np.sum(F * np.conj(H), axis=0)))
         idx, peak, bolme, _ratio = metrics_rc(resp, fr, fc, excl)
         dr, dc = wrap(idx[0], fr), wrap(idx[1], fc)
+
+        # LONG-TERM PROBE (observer only -- see A_lt above). Same F, same
+        # chscale, same regularizer: the ONLY difference is how much history the
+        # filter carries. Distance is CIRCULAR in bins, because a response map
+        # wraps and a naive |a-b| would call a 1-bin disagreement across the
+        # wrap a 63-bin one.
+        if lt_eta is not None and A_lt is not None:
+            H_lt = A_lt * chscale[:, None, None] / (B_lt + eps_rel * B_lt.mean())[None]
+            resp_lt = np.real(np.fft.ifft2(np.sum(F * np.conj(H_lt), axis=0)))
+            i_lt = np.unravel_index(np.argmax(np.abs(resp_lt)), resp_lt.shape)
+            ddr = wrap(i_lt[0], fr) - dr
+            ddc = wrap(i_lt[1], fc) - dc
+            rec['ltdiv'].append(float(np.hypot(ddr, ddc)))
+        else:
+            rec['ltdiv'].append(float('nan'))
 
         # ITERATED LOCALISATION. A windowed correlation systematically reports
         # LESS than the true displacement: the patch is Hann-weighted, so a
@@ -812,9 +943,34 @@ def run_arm(arm, wq, bias, shift, gt, n_frames, oracle_scale, verbose,
             # sits at (dr,dc); training against a centred G teaches "target at
             # (dr,dc) peaks at 0" and compounds at ETA until zero-shift wins.
             Gt = FG.gaussian_target_spectrum(fr, fc, sigma, dr, dc)
-            A, B = FG.filter_update(A, B, F, Gt, eta)
+            # CONFIDENCE-MODULATED LEARNING RATE -- see split_ceta(). The scale
+            # is computed from the run's OWN PAST frames only; conf_hist is
+            # appended after, so the current frame can never normalise itself.
+            eta_eff = eta
+            if ceta_lo is not None:
+                conf = bolme if ceta_stat == 'psr' else apce(resp)
+                if len(conf_hist) >= ceta_warmup:
+                    med = float(np.median(conf_hist))
+                    if med > 0:
+                        r_conf = conf / med
+                        if ceta_lo < 0:      # -cetaneg MUTANT: invert the law
+                            eta_eff = eta * min(max(1.0 / max(r_conf, 1e-6),
+                                                    0.6), 1.0)
+                        else:
+                            eta_eff = eta * min(max(r_conf, ceta_lo), 1.0)
+                conf_hist.append(conf)
+            rec['etascale'].append(eta_eff / eta if eta else 1.0)
+            # The observer rides the live trajectory: same F, same shifted Gt.
+            # lt_eta = 0 leaves it frozen at the init state (filter_update with
+            # eta 0 is the identity, so this is written out rather than special-
+            # cased -- one code path, no branch that could differ).
+            if lt_eta is not None and A_lt is not None:
+                A_lt, B_lt = FG.filter_update(A_lt, B_lt, F, Gt, lt_eta)
+            A, B = FG.filter_update(A, B, F, Gt, eta_eff)
         else:
             rec['holds'] += 1        # hold position AND skip the update, both
+            # A vetoed frame does not update, so it does not enter the history
+            # either -- the median must describe frames the filter LEARNED from.
 
         iou = box_iou((row, col, bh, bw), gt[f - 1])
         rec['iou'].append(iou)
@@ -876,6 +1032,34 @@ def main():
                     help='apply the mask m**k, i.e. the board projection k times.\n'
                          'Exactly sparse for every k (2k+1 bins per axis), so k is\n'
                          'a board-implementable WIDTH knob needing no new code.')
+    ap.add_argument('--lt-probe', type=float, default=None, metavar='ETA',
+                    help='LONG-TERM FILTER PROBE, a PURE OBSERVER: keep a second\n'
+                         'filter at this eta (0 = frozen at init) riding the\n'
+                         'live trajectory, and record the CIRCULAR distance in\n'
+                         'bins between its peak and the live one. It never feeds\n'
+                         'back, so a probe run must be BIT-IDENTICAL to the same\n'
+                         'arm without it -- that is the control. Answers the M-13\n'
+                         'prior question for the two-filter ensemble (O-03):\n'
+                         'confidence statistics are closed as a class (N-22/N-23)\n'
+                         'because they read one response map, and disagreement\n'
+                         'between two memories is the one signal that is not in\n'
+                         'one. Costs one extra inverse FFT per frame.')
+    ap.add_argument('--ceta-stat', default='psr', choices=['psr', 'apce'],
+                    help="confidence statistic for a -ceta<N> arm (default\n"
+                         "psr). apce is the INDEPENDENT one -- psr is already\n"
+                         "what PSR_GATE_MIN tests, so modulating by it is one\n"
+                         "instrument used twice. APCE's separation is an\n"
+                         "ASSUMPTION until measured here; it is not in\n"
+                         "track.csv, so no board log can pre-screen it.")
+    ap.add_argument('--ceta-warmup', type=int, default=12,
+                    help='frames of causal history before a -ceta<N> arm\n'
+                         'modulates (default 12). Measured on the shipping\n'
+                         'arm: median(psr[:k])/settled is 1.86 at k=1 and\n'
+                         '1.05 by k=12, and the relative statistic does not\n'
+                         'separate doomed from healthy runs early anyway\n'
+                         '(0.608 at f1, 0.461 by f12). N=12 exempts ~17% of\n'
+                         'all losses, N=20 exempts 24.3%. Those are INIT\n'
+                         'failures, which eta cannot fix -- see split_ceta().')
     ap.add_argument('--mask-center', default='board', choices=['board', 'bench'],
                     help="where the -mask<N> axis is centred (default board).\n"
                          "board = n/2, the EXACT periodic Hann and the only\n"
@@ -948,6 +1132,7 @@ def main():
         stem, rand_seed = split_rand(stem)
         stem, bank_kind = split_bank(stem)
         stem, chrel_gamma = split_chrel(stem)
+        stem, ceta_lo = split_ceta(stem)
         stem, l1_kind = split_l1(stem)
         rect = None
         stride, blur_n = 1, 1
@@ -1078,6 +1263,8 @@ def main():
                          mask_centre=args.mask_center,
                          mask_power=args.mask_power, rect=rect,
                          chrel_gamma=chrel_gamma, stride=stride, blur_n=blur_n,
+                         ceta_lo=ceta_lo, ceta_stat=args.ceta_stat,
+                         ceta_warmup=args.ceta_warmup, lt_eta=args.lt_probe,
                          pool_n=pool_n, pool_mode_ov=pool_mode_ov)
 
     print()
@@ -1139,7 +1326,14 @@ def main():
             # mask's mechanism check and has to be persistable, or the board run
             # has a direction to hit and no value.
             blob[f"{seq}|{a}"] = {'iou': [float(x) for x in out[a]['iou']],
-                                  'ebox': [float(x) for x in out[a]['ebox']]}
+                                  'ebox': [float(x) for x in out[a]['ebox']],
+                                  # THE MECHANISM CHECK for a -ceta<N> arm: the
+                                  # per-frame eta multiplier. An arm that moves
+                                  # AR while this is flat did not move it by
+                                  # modulating eta -- the rule mask_ebox exists
+                                  # for (spatial_mask.md), applied here.
+                                  'etascale': [float(x) for x in out[a]['etascale']],
+                                  'ltdiv': [float(x) for x in out[a]['ltdiv']]}
         with open(args.json, 'w') as fh:
             json.dump(blob, fh)
         print(f"\nwrote {len(args.arms)} run(s) for '{seq}' to {args.json}")

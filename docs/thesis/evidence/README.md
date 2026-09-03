@@ -21,6 +21,7 @@ status (`TODO_`, `proposed_`), because the status changes and the filename does 
 | [`automation.md`](automation.md) | closed | 2026-08-25 | — | board automation: ssh control, a pushed ELF, one-command sweeps |
 | [`board_memory.md`](board_memory.md) | closed | 2026-08-27 | `R-08` | usable heap is ~0.9-1.2 GB, not 12 GB; the streaming reader that recovered the five oversized RGB sequences |
 | [`channel_reliability.md`](channel_reliability.md) | closed | 2026-09-01 | `N-20` | Stage B3 channel reliability: mechanism real, gain not separable from a null |
+| [`confidence_eta.md`](confidence_eta.md) | closed | 2026-09-03 | `N-22`, `N-23`, `N-24`, `M-15`, `M-16`, `O-03` | LMCF-style confidence-modulated eta (PSR and APCE) and the two-filter ensemble premise behind it: both refuted, and the confidence class is closed |
 | [`detector_gain.md`](detector_gain.md) | closed | 2026-08-28 | `R-07` | the position detector is EXONERATED: it recovers 93% of annotated motion |
 | [`eta05.md`](eta05.md) | closed | 2026-08-27 | `R-02`, `M-08` | `MOSSE_ETA=0.05` on hardware: wins on AR, but not by the predicted mechanism |
 | [`evidence_arm0.md`](evidence_arm0.md) | closed | 2026-08-25 | — | the first multi-sequence tracking result: arm A, 8 sequences, 54 trajectories |
@@ -28,7 +29,7 @@ status (`TODO_`, `proposed_`), because the status changes and the filename does 
 | [`feature_bank.md`](feature_bank.md) | closed | 2026-09-02 | `N-06`, `N-07`, `O-04` | how much the PRETRAINING is worth: a one-hot lift ties the network while `CONV_RELU=0` |
 | [`frozen_detector.md`](frozen_detector.md) | closed | 2026-08-25 | `N-09` | `nature` and `tiger` fail the same way for two completely different reasons |
 | [`hold_policy.md`](hold_policy.md) | closed | 2026-08-25 | `N-08` | the HOLD-on-gate policy measured against the dataset |
-| [`layer1_features.md`](layer1_features.md) | closed | 2026-09-01 | `N-16` | the offline screen behind the Layer-1 arm: the nonlinearity mechanism confirmed, the arms not |
+| [`layer1_features.md`](layer1_features.md) | closed | 2026-09-01 | — | the offline screen behind the Layer-1 arm: the nonlinearity mechanism confirmed, the arms not |
 | [`mask_bank_transfer.md`](mask_bank_transfer.md) | closed | 2026-09-03 | `R-10`, `N-20`, `N-21`, `M-14`, `O-01`, `O-02` | the spatial mask and Stage B3 channel reliability re-screened on the SHIPPING Layer-1 bank; both refuted, and the mask's sign flips |
 | [`metric_ar_vs_iou.md`](metric_ar_vs_iou.md) | closed | 2026-08-25 | `N-08`, `M-03` | the first AR numbers, and how they REVERSE a verdict mean IoU had given |
 | [`phase0a.md`](phase0a.md) | closed | 2026-08-25 | — | VOT bring-up 0a: the NFS staging link, board <-> PC |
@@ -40,12 +41,12 @@ status (`TODO_`, `proposed_`), because the status changes and the filename does 
 | [`phase4.md`](phase4.md) | closed | 2026-08-25 | `P-09`, `M-06` | VOT bring-up 4: console overhead removal, and the transport that was the whole win |
 | [`pooled_features.md`](pooled_features.md) | closed | 2026-09-02 | `N-03`, `N-03b`, `N-04`, `N-05`, `M-10` | aggregation refuted on both banks; the resolution half, and the linearity explanation WITHDRAWN |
 | [`robustness_gap.md`](robustness_gap.md) | closed | 2026-08-27 | `R-06`, `N-14` | where the robustness gap comes from: the tracker walks off target confidently |
-| [`robustness_proposals.md`](robustness_proposals.md) | closed | 2026-08-29 | `N-13`, `O-02`, `O-03` | the ranked robustness candidate list and why this order; several entries have since been decided |
+| [`robustness_proposals.md`](robustness_proposals.md) | closed | 2026-08-29 | `N-13`, `O-02` | the ranked robustness candidate list and why this order; several entries have since been decided |
 | [`shift_budget_realvideo.md`](shift_budget_realvideo.md) | closed | 2026-08-26 | `B-01`, `B-02`, `B-03`, `B-04`, `B-05`, `B-09` | the shift budget re-derived on real video: the instrument gap, the censoring, and why `H_SHIFT` is the only lever |
 | [`spatial_mask.md`](spatial_mask.md) | closed | 2026-08-31 | `R-10`, `M-11`, `O-01` | the spatial mask on hardware: EAO +0.0110, not separable from a null, mechanism refuted |
 | [`subbin_lag.md`](subbin_lag.md) | closed | 2026-08-25 | `N-11` | `nature` fails without the gate firing — and the sub-bin mechanism first proposed for it is REFUTED in-file |
 | [`tiger.md`](tiger.md) | closed | 2026-08-25 | `N-10` | eta, sigma and eps_rel all chased on `tiger`, and why none of them is the answer |
 
-30 notes; 8 cited by no claim
-(`automation.md`, `evidence_arm0.md`, `evidence_arm_ab.md`, `phase0a.md`, `phase0b.md`, `phase0c.md`, `phase1.md`, `phase2.md`) — those are bring-up records
+31 notes; 9 cited by no claim
+(`automation.md`, `evidence_arm0.md`, `evidence_arm_ab.md`, `layer1_features.md`, `phase0a.md`, `phase0b.md`, `phase0c.md`, `phase1.md`, `phase2.md`) — those are bring-up records
 rather than findings, and a note that should carry a claim looks exactly the same, so check.

@@ -1,0 +1,9 @@
+# N-24: long-term/short-term filter PEAK DISAGREEMENT does not predict an imminent loss.
+# scripts/rgb_vs_gray_loop.py --lt-probe ETA, 62 sequences, runs/vot/0903_offline-ltprobe/.
+# A PURE OBSERVER: the second filter rides the live trajectory and never feeds back, so a probe
+# run is bit-identical to the same arm without it (maxdiff 0). Divergence is CIRCULAR, in bins.
+# doomed = first loss within the next 10 frames; healthy = loss >40 frames away or never.
+# auc = P[healthy < doomed], 0.5 = no signal. PSR reaches 0.618 and is ALREADY closed as too weak.
+arm,lt_eta,doomed_frames,healthy_frames,median_div_doomed,median_div_healthy,auc,arm_pl
+frozen,0.0,426,6606,3.80,3.61,0.461,zamrozony (lt_eta = 0)
+slow,0.005,426,6606,1.41,1.00,0.555,wolny (lt_eta = 0)005)
