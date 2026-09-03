@@ -1,6 +1,6 @@
 # Where this tracker sits — published VOT-STb2022 baselines
 
-**Status:** current · **Updated:** 2026-09-02 · **Scope:** where this tracker sits against the 41 published VOT-STb2022 trackers
+**Status:** current · **Updated:** 2026-09-03 · **Scope:** where this tracker sits against the 41 published VOT-STb2022 trackers, and against the nearest published embedded equivalent
 
 Split out of CLAUDE.md 2026-08-31 and **maintained here since** — this file, not
 CLAUDE.md, is where this topic is kept current; CLAUDE.md carries only the one-line
@@ -84,3 +84,50 @@ explanation is open. `docs/thesis/evidence/spatial_mask.md`.
 Not a differentiator, but worth stating for the write-up: no tracker in that table estimates
 aspect ratio either, so the axis-aligned-box penalty on deforming targets is shared.
 
+
+## The nearest EMBEDDED equivalent — Danilowicz & Kryjak 2022
+
+Added 2026-09-03. Full argument and every number:
+[`docs/thesis/evidence/embedded_comparison.md`](../thesis/evidence/embedded_comparison.md) and
+`docs/thesis/results/embedded_baselines.csv`. Claims **`P-13`** (cost) and **`M-17`**
+(incomparability). The short version, because this is the comparison a reader of
+`cha:przeglad` will reach for:
+
+**Their deepDCF is architecturally this project's nearest neighbour** — conv1 features into a
+multichannel MOSSE filter, quantised, on an embedded SoC-FPGA, at **the same 128x128 ROI ->
+64x64 filter geometry this project ships**, with a row-FFT / transpose / column-FFT 2D
+transform. Of the 25 implementations their Section 3 reviews, none of the others reports
+tracking quality on a common benchmark.
+
+**The tracking numbers do NOT compare** (their A 0.491 / R 2.082 / EAO 0.183 against this
+project's 0.5129 / 0.4279 / 0.1960). **The EAO proximity is a coincidence.** VOT2015 `R` is
+failures per sequence and is oriented the other way; the EAO windows differ ([108, 371] against
+[115, 755]); the ground truth is rotated polygons against mask-fitted axis-aligned boxes. Only
+the ORDERING inside their own table transfers — and two of those orderings are already load-bearing
+here: **channel count saturates** (8ch ties 32ch; only 4ch collapses), and **the larger geometry
+wins by +0.024 EAO**, which this project's own hardware corroborates at matched `sigma/target`
+(+0.0222 R / +0.0082 EAO, `arm_res64.md` sec.25.1). **Two implementations, two datasets, same
+sign — and the shipping arm sits at the geometry both of them call the worse one.**
+
+**The COST numbers do compare, and this is the axis to write up:**
+
+| | deepDCF (ZCU104) | this work (VEK280) | ratio |
+|---|---|---|---|
+| LUT | 156,663 (68.0%) | 7,694 (1.5%) | **20.4x** |
+| FF | 334,373 (72.6%) | 7,539 (0.7%) | **44.4x** |
+| BRAM (36Kb equiv.) | 270.5 (86.7%) | 5 (0.8%) | **54.1x** |
+| DSP | 480 (27.8%) | 44 (3.4%) | **10.9x** |
+
+Quote the ABSOLUTE counts — the VEK280 is 2.26x the ZCU104 in LUT/FF, so percent flatters this
+work (though it has *fewer* DSPs, 1312 against 1728). **And attribute it correctly: the
+transforms did not get cheaper, they moved onto 6 of 304 AIE-ML cores.** The defensible claim is
+about the platform choice, not about a better-engineered filter. Their design is at 86.7% BRAM
+for **8 channels at one scale**; this runs 32 channels and 33 scales at 0.8%.
+
+**FPS does not compare and is the trap.** Their 467.3 fps is the PL module's throughput for ONE
+scale with the PS cropping and DMAing the patch; their 150 fps for 3 scales is a projection they
+state as one. This project's 38.04 FPS is measured wall clock for a whole frame that is 84%
+CPU-bound. A like-for-like row (`SCALE_N=1`, AIE/PL share isolated from the APU tail) is cheap and
+has **not been built — do not quote one until it is**. Energy has no counterpart at all: they
+report none, nor does any of the 25 works they review, so `P-12`'s 12.2 mJ/frame fills a gap
+rather than winning a contest.

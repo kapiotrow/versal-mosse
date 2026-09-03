@@ -13,6 +13,8 @@ paragraphs in three files.
 | `perf.csv` | frame-time history, one row per accepted optimisation | yes |
 | `frame_budget.csv`, `frame_budget_rgb_delta.csv` | where the frame goes | yes |
 | `resources.csv`, `aie_compute.csv` | device utilisation and scheduled AIE cycles | yes |
+| `embedded_baselines.csv` | Danilowicz & Kryjak 2022 vs this work | **cost block yes; tracking block NOT comparable** |
+| `eao_window.csv` | the same trajectories under both EAO windows | yes as a WINDOW TERM; `eao_108_371` is **not** a VOT2015 EAO |
 | `apu_stages.csv` | per-stage APU cost and what each measurement motivated | yes, per row |
 
 ## The `provenance` column in `arms.csv`

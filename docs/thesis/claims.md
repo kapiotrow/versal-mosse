@@ -74,11 +74,11 @@ This is the direction you will actually use.
 | `subsec:kosztTransferow` | P-05, P-06, P-04 |
 | `subsec:optymalizacjaOdrzucona` | P-07 — one case, by the thesis's own scoping |
 | `subsec:modelObalony` | B-09 |
-| `sec:metodykaBadan` | **M-01…M-10**, M-14, P-09 |
+| `sec:metodykaBadan` | **M-01…M-10**, M-14, M-17, P-09 |
 | `sec:zbioryTestowe` | R-08 (why streaming was needed), `runs/vot/seqs62.txt` |
 | `sec:jakoscSledzenia` | **R-01, R-02, R-03, R-04**, R-06, R-07, A-09 |
-| `sec:wydajnoscZasoby` | **P-01, P-02, P-04**, P-06, A-02, P-08 |
-| `sec:porownanieReferencyjne` | **R-05** — and it answers `przeglad`'s stated hypothesis |
+| `sec:wydajnoscZasoby` | **P-01, P-02, P-04**, P-06, A-02, P-08, P-13 |
+| `sec:porownanieReferencyjne` | **R-05**, **P-13**, **M-17** — and R-05 answers `przeglad`'s stated hypothesis |
 | `sec:dyskusjaWynikow` | **N-01…N-11, N-14, N-19, N-20, N-21**, B-05, R-06, R-07, M-01, M-02, M-03 |
 | `sec:wnioski` | R-04, R-05, N-01 |
 | `sec:dalszePrace` | **O-01…O-05**, N-13 |
@@ -201,6 +201,7 @@ implies.
 | P-10 | Halving the host filter on Hermitian symmetry does not work — the premise is false in fixed point (95.8% of bins differ from their conjugate partner) | refuted | GAP — **has the ideal control: the float golden is Hermitian to 0 LSB** | `make aiesim_plio` | `subsec:fftAie` |
 | P-11 | fDSST's PCA compression is not worth it; the real-input DFT was (3.11×, transferred exactly to hardware) | refuted (PCA) / accepted-hw (DFT) | GAP | `run_0821_1109` | `subsec:filtrSkali` |
 | P-12 | **Energy per frame is 12.2 mJ (0.487 W dynamic at 25.16 ms).** 68% is the APU rail, 23% LPDDR4, 9% NoC; **the PL+AIE-ML rail does not move (< 33 mW)** and the design's RESIDENT cost is unresolved on every rail. Confirms P-02's CPU-bound frame in the energy domain, on a different chip and instrument | accepted-hw | `evidence/power.md` | `runs/power/0903_l1relu_scapp`, `results/power.csv` | `subsec:metrykiSystemowe` |
+| P-13 | Against the nearest published embedded equivalent (Danilowicz & Kryjak 2022, deepDCF on ZCU104, same geometry): **20.4x fewer LUT, 44.4x fewer FF, 54.1x less BRAM, 10.9x fewer DSP**, at 32 channels and 33 scales against their 8 and 3. **The mechanism is the AIE array, not the filter.** Their FPS is a per-scale PL projection — never divide the two | accepted-hw | `evidence/embedded_comparison.md` | `results/embedded_baselines.csv` | `sec:porownanieReferencyjne` |
 
 ## R — Tracking results
 
@@ -217,6 +218,7 @@ implies.
 | R-09 | Multi-start determinism: two runs of the same job return byte-identical trajectories, and `RESET_MUTANT` proves the test can fail | accepted-hw | `evidence/phase3.md` | — | `subsec:weryfikacja` |
 | R-10 | The spatial mask on the OLD bank: EAO 0.1629 → 0.1740 (+0.0110), A +0.0179 on the common survived prefix — but **not distinguishable from a null** (3 sequences of 62 carry it, median dR 0.0000, P(dR≤0)=0.22) and the mechanism is refuted. **It does not carry to the shipping arm: re-screened 2026-09-03 the sign INVERTS (N-21), so this row scores a configuration the board no longer runs** | **weak-hw** | `evidence/spatial_mask.md`, `evidence/mask_bank_transfer.md` | `0831_1528-mask` vs `0831_1340-base_stat` | `sec:jakoscSledzenia` |
 | R-11 | The MAINLOBE WIDTH `sigma/target` is the axis, with an optimum at 1/16 (DSST's `target/16`). At matched width the FINER map wins — the OPPOSITE of the offline proxy. **Superseded as the best arm by `rgb_l1relu` 2026-09-02, and the sigma INTERIOR is closed too** (22-cell grid; 3, 5, 6, 8 all worse) | accepted-hw | `evidence/arm_res64.md` sec.21, sec.25 | `results/arms.csv` row `rgb_sigma4`; `runs/vot/0902_offline-sigmaeta/` | `sec:jakoscSledzenia`, `sec:dyskusjaWynikow` |
+| R-12 | **The scoring path reproduces a published tracker**: CSRDCF through `offline_multistart.py` -> `vot_ingest.py` lands at A 0.5134 / R 0.5471 / EAO 0.2432 against a published 0.519 / 0.580 / 0.251 (EAO −0.0078). The oracle control returns **R = 1.0000 exactly** over all 419 runs. `opencv-kcf` does NOT reproduce and that is a cv2 implementation difference, not a path defect — never quote it as KCF | accepted-hw | `evidence/harness_validation.md`, `results/reference_trackers.csv` |
 
 ## N — Refuted, and the reason the obvious explanation was wrong
 
@@ -268,6 +270,7 @@ implies.
 | M-14 | **A prior positive screen expires when the operating point moves.** Re-screen whenever the bank, the geometry or the response shape has changed since the arm was scored — not only when something feels suspect. The spatial mask was proposed for hardware on 2026-09-03 on the strength of a screen run against a bank the board no longer runs; eight minutes of CPU inverted it and saved a sweep, an ingest and a card round-trip | `evidence/mask_bank_transfer.md` |
 | M-15 | **Check a statistic's SHAPE against ground truth before building a control law on it.** A confidence-modulated eta was built, screened and refuted before anyone plotted PSR against IoU; the relation is U-shaped (`N-23`), so both the law and its inverted mutant were misspecified and the mutant's failure to lose — the one result that should have been diagnostic — was uninterpretable until the shape was known. Monotone law, non-monotone statistic | `evidence/confidence_eta.md` |
 | M-16 | **Match the test to how much data the runs actually give.** The ensemble probe was first scored by comparing two 5-frame windows per run — n = 27 on a single-start bench, and it returned 0.631, which read as a signal. The per-frame form uses the SAME runs, has 7,032 samples instead of 27 pairs, and inverts the reading to 0.555. A window statistic borrowed from a 419-run board protocol is underpowered on a 62-run bench | `evidence/confidence_eta.md` |
+| M-17 | Danilowicz & Kryjak's tracking numbers are not comparable to this project's in three independent ways: `R`'s definition and sign, the EAO window, and polygon vs mask-fitted ground truth. **The window term alone is +0.0827 on the shipping arm — 1.39x this project's entire measured arm ladder (0.0593)** — while leaving the ladder's ORDERING intact | accepted-hw | `evidence/embedded_comparison.md` sec.5, `results/eao_window.csv` |
 
 ## O — Open, at the time of writing
 

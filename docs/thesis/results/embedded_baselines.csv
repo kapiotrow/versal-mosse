@@ -1,0 +1,83 @@
+# The nearest published EMBEDDED equivalent: Danilowicz & Kryjak 2022, "Real-time embedded
+# object tracking with Discriminative Correlation Filters using convolutional features"
+# (docs/papers/danilowicz2022_embedded_dcf.pdf). deepDCF on a ZCU104: conv1 features into a
+# multichannel MOSSE filter, 128x128 ROI -> 64x64 filter, quantised, on FPGA. Architecturally
+# this project's nearest neighbour in the literature.
+#
+# ============================ READ THIS BEFORE QUOTING A ROW ============================
+# THE TRACKING BLOCK AND THE COST BLOCK HAVE OPPOSITE STATUS.
+#
+#   block=tracking  NOT COMPARABLE to this project's numbers. Three independent breaks:
+#     1. R IS A DIFFERENT QUANTITY WITH THE OPPOSITE SIGN CONVENTION. VOT2015 R is failures
+#        per sequence (lower better); VOT-STb2022 R is the fraction of frames tracked
+#        (higher better). 2.082 and 0.4279 are not on one axis.
+#     2. THE EAO WINDOWS DIFFER: [108, 371] (vot/stack/vot2015/rgb.yaml) against this
+#        project's [115, 755]. arm_l1relu.md sec.10.3 measured that 71% of OUR window
+#        contributes +0.0005 while the first 29% contributes +0.0092 -- the window is not a
+#        detail. Claim M-17 measures this term; see evidence/embedded_comparison.md.
+#     3. GROUND TRUTH DIFFERS: VOT2015 is rotated polygons, VOT-STb2022 is axis-aligned boxes
+#        fitted to segmentation masks. An axis-aligned tracker is penalised on A by the former
+#        and not the latter.
+#     ONLY THE ORDERING WITHIN THEIR OWN TABLE TRANSFERS. That ordering is the useful part and
+#     it is why these rows are here at all -- see the two orderings called out below.
+#
+#   block=resource  COMPARABLE, and it is the honest axis. Both sides are post-implementation
+#     utilisation of a named device for a named build. QUOTE THE ABSOLUTE COUNTS, NOT THE
+#     PERCENTAGES: the devices differ in size by ~2.3x in LUT, so percent flatters this work.
+#     used_pct is carried only so each number can be traced back to its source table.
+#
+#   block=throughput  NOT COMPARABLE AS FPS, and this is the trap. Their 467.3 fps is the PL
+#     module's throughput for ONE scale at 375 MHz with the PS cropping the patch and feeding
+#     it over DMA (their Fig. 2) -- it is not an end-to-end frame rate, and their 150 fps for
+#     3 scales is a PROJECTION they state as one, not a measurement. This project's 38.04 FPS
+#     is measured wall clock for a whole frame including the APU tail, on a frame that is 84%
+#     CPU-bound (P-02). Put them in one column and the reader will divide them; do not.
+#
+#   block=energy  Reported by neither of the 25 works their Section 3 reviews, and not by them.
+#     P-12 is the only energy figure in this comparison and it has no counterpart to beat.
+#
+# TWO ORDERINGS INSIDE THEIR TABLE THAT DO TRANSFER, both already used by this project:
+#   - CHANNEL COUNT SATURATES: 8ch (0.183) ties 32ch (0.184) and 64ch (0.203 at the larger
+#     geometry); only 4ch collapses (0.145). 16ch at 0.174 is anomalously low in their own
+#     table. This is why the Layer-1 screen ran at 16 channels (layer1_features.md).
+#   - THE LARGER GEOMETRY WINS: 128x128 ROI/64x64 filter -> 224x224/112x112 is +0.024 EAO at
+#     32 channels. INDEPENDENTLY CORROBORATED HERE: at matched sigma/target = 1/16 this
+#     project's hardware measured the finer map winning by +0.0222 R / +0.0082 EAO
+#     (arm_res64.md sec.25.1). Two sources, two datasets, same sign. The shipping arm sits at
+#     the geometry both of them call the worse one.
+#
+# device_note: ZCU104 = Zynq UltraScale+ ZU7EV. VEK280 = Versal AI Edge VE2802. BRAM is
+# counted in 36Kb blocks on the Zynq part and 18Kb blocks on the Versal part; bram36_equiv
+# normalises both so the ratio column means something.
+block,system,platform,config,metric,value,unit,used_abs,available_abs,used_pct,source,note
+tracking,deepDCF 3 scales (THE HARDWARE ARM),ZCU104,CONV 8ch 4bit 128x128 ROI / 64x64 filter,A,0.491,IoU,,,,danilowicz2022 Table 1,VOT2015 supervised; rotated-polygon GT
+tracking,deepDCF 3 scales (THE HARDWARE ARM),ZCU104,CONV 8ch 4bit 128x128 ROI / 64x64 filter,R,2.082,failures/sequence,,,,danilowicz2022 Table 1,LOWER IS BETTER -- opposite convention to ours
+tracking,deepDCF 3 scales (THE HARDWARE ARM),ZCU104,CONV 8ch 4bit 128x128 ROI / 64x64 filter,EAO,0.183,,,,,danilowicz2022 Table 1,window [108 371]
+tracking,deepDCF 3 scales,software model,CONV 32ch 4bit 128x128 ROI / 64x64 filter,EAO,0.184,,,,,danilowicz2022 Table 1,ties the 8ch arm
+tracking,deepDCF 3 scales,software model,CONV 16ch 4bit 128x128 ROI / 64x64 filter,EAO,0.174,,,,,danilowicz2022 Table 1,anomalously low in their own table
+tracking,deepDCF 3 scales,software model,CONV 4ch 4bit 128x128 ROI / 64x64 filter,EAO,0.145,,,,,danilowicz2022 Table 1,the collapse point
+tracking,deepDCF 5 scales,software model,CONV 32ch 4bit 224x224 ROI / 112x112 filter,EAO,0.207,,,,,danilowicz2022 Table 1,+0.024 over the same bank at the smaller geometry
+tracking,deepDCF 5 scales,software model,CONV 64ch 4bit 224x224 ROI / 112x112 filter,EAO,0.203,,,,,danilowicz2022 Table 1,64ch does not beat 32ch
+tracking,deepDCF original (Danelljan ICCVW15),software model,CONV 96ch float 224x224 ROI,R,1.75,failures/sequence,,,,danilowicz2022 Table 1,float reference; they give no EAO
+tracking,DSST (VOT2015 committee),CPU,HOG 2x target,EAO,0.17,,,,,danilowicz2022 Table 1,A 0.54 R 2.56
+tracking,KCF (VOT2015 committee),CPU,HOG 2.5x target,EAO,0.17,,,,,danilowicz2022 Table 1,A 0.48 R 2.17
+tracking,this work,VEK280,rgb_l1relu SHIPPING,A,0.5129,IoU,,,,results/arms.csv,VOT-STb2022 multistart; mask-fitted axis-aligned GT
+tracking,this work,VEK280,rgb_l1relu SHIPPING,R,0.4279,fraction of frames tracked,,,,results/arms.csv,HIGHER IS BETTER -- opposite convention to theirs
+tracking,this work,VEK280,rgb_l1relu SHIPPING,EAO,0.1960,,,,,results/arms.csv,window [115 755]
+resource,deepDCF,ZCU104 (ZU7EV),8ch 64x64 filter 32-bit fixed,LUT,,,156663,230400,68.00,danilowicz2022 Table 2,CNN module alone is 5.40%
+resource,deepDCF,ZCU104 (ZU7EV),8ch 64x64 filter 32-bit fixed,LUTRAM,,,15436,101760,15.17,danilowicz2022 Table 2,
+resource,deepDCF,ZCU104 (ZU7EV),8ch 64x64 filter 32-bit fixed,FF,,,334373,460800,72.56,danilowicz2022 Table 2,
+resource,deepDCF,ZCU104 (ZU7EV),8ch 64x64 filter 32-bit fixed,bram36_equiv,,,270.5,312,86.70,danilowicz2022 Table 2,their BRAM column is already 36Kb blocks
+resource,deepDCF,ZCU104 (ZU7EV),8ch 64x64 filter 32-bit fixed,DSP,,,480,1728,27.78,danilowicz2022 Table 2,
+resource,this work,VEK280 (VE2802),128x128 ch1 build,LUT,,,7694,520704,1.5,results/resources.csv,
+resource,this work,VEK280 (VE2802),128x128 ch1 build,FF,,,7539,1041408,0.7,results/resources.csv,
+resource,this work,VEK280 (VE2802),128x128 ch1 build,bram36_equiv,,,5,600,0.8,results/resources.csv,10 BRAM18 = 5 BRAM36; 1200 BRAM18 available
+resource,this work,VEK280 (VE2802),128x128 ch1 build,DSP,,,44,1312,3.4,results/resources.csv,
+resource,this work,VEK280 (VE2802),128x128 ch1 build,AIE-ML cores,,,6,304,2.0,results/resources.csv,NO COUNTERPART on ZCU104 -- this is where the transforms went
+resource,this work,VEK280 (VE2802),128x128 ch1 build,AIE-ML memory tiles,,,1,76,1.3,results/resources.csv,NO COUNTERPART on ZCU104
+throughput,deepDCF,ZCU104,8ch 64x64 filter 375 MHz,PL module throughput,467.3,fps per scale,,,,danilowicz2022 sec 4.3,NOT an end-to-end frame rate; PS crops and DMAs the patch
+throughput,deepDCF,ZCU104,8ch 64x64 filter 3 scales,projected frame rate,150,fps,,,,danilowicz2022 sec 4.3,THEY STATE IT AS A PROJECTION -- not measured
+throughput,this work,VEK280,gray synthetic UART console,end-to-end frame rate,38.04,fps,,,,results/perf.csv,26.29 ms measured wall clock; 33-scale DSST included
+throughput,this work,VEK280,rgb_l1relu over ssh,end-to-end frame rate,41.5,fps,,,,evidence/arm_l1relu.md,24.07 ms; ssh transport is a confound -- see perf.csv
+energy,deepDCF,ZCU104,,energy per frame,,mJ,,,,danilowicz2022,NOT REPORTED -- and by none of the 25 works their sec 3 reviews
+energy,this work,VEK280,rgb_l1relu,energy per frame,12.2,mJ,,,,results/power.csv,0.487 W dynamic at 25.16 ms; INA226 rails; claim P-12

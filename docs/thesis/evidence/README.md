@@ -23,11 +23,13 @@ status (`TODO_`, `proposed_`), because the status changes and the filename does 
 | [`channel_reliability.md`](channel_reliability.md) | closed | 2026-09-01 | `N-20` | Stage B3 channel reliability: mechanism real, gain not separable from a null |
 | [`confidence_eta.md`](confidence_eta.md) | closed | 2026-09-03 | `N-22`, `N-23`, `N-24`, `M-15`, `M-16`, `O-03` | LMCF-style confidence-modulated eta (PSR and APCE) and the two-filter ensemble premise behind it: both refuted, and the confidence class is closed |
 | [`detector_gain.md`](detector_gain.md) | closed | 2026-08-28 | `R-07` | the position detector is EXONERATED: it recovers 93% of annotated motion |
+| [`embedded_comparison.md`](embedded_comparison.md) | current | 2026-09-03 | `P-13`, `M-17` | Danilowicz & Kryjak 2022 vs this work — what compares, what does not, the two orderings that transfer, and the measured EAO window term |
 | [`eta05.md`](eta05.md) | closed | 2026-08-27 | `R-02`, `M-08` | `MOSSE_ETA=0.05` on hardware: wins on AR, but not by the predicted mechanism |
 | [`evidence_arm0.md`](evidence_arm0.md) | closed | 2026-08-25 | — | the first multi-sequence tracking result: arm A, 8 sequences, 54 trajectories |
 | [`evidence_arm_ab.md`](evidence_arm_ab.md) | closed | 2026-08-25 | — | arm A vs arm B (`HOLD_COAST` 0 vs 1) on the same 54 runs |
 | [`feature_bank.md`](feature_bank.md) | closed | 2026-09-02 | `N-06`, `N-07`, `O-04` | how much the PRETRAINING is worth: a one-hot lift ties the network while `CONV_RELU=0` |
 | [`frozen_detector.md`](frozen_detector.md) | closed | 2026-08-25 | `N-09` | `nature` and `tiger` fail the same way for two completely different reasons |
+| [`harness_validation.md`](harness_validation.md) | current | 2026-09-03 | `R-12` | validating the multistart scoring path against published numbers, and the offline multistart harness that made it possible |
 | [`hold_policy.md`](hold_policy.md) | closed | 2026-08-25 | `N-08` | the HOLD-on-gate policy measured against the dataset |
 | [`layer1_features.md`](layer1_features.md) | closed | 2026-09-01 | — | the offline screen behind the Layer-1 arm: the nonlinearity mechanism confirmed, the arms not |
 | [`mask_bank_transfer.md`](mask_bank_transfer.md) | closed | 2026-09-03 | `R-10`, `N-20`, `N-21`, `M-14`, `O-01`, `O-02` | the spatial mask and Stage B3 channel reliability re-screened on the SHIPPING Layer-1 bank; both refuted, and the mask's sign flips |
@@ -48,6 +50,6 @@ status (`TODO_`, `proposed_`), because the status changes and the filename does 
 | [`subbin_lag.md`](subbin_lag.md) | closed | 2026-08-25 | `N-11` | `nature` fails without the gate firing — and the sub-bin mechanism first proposed for it is REFUTED in-file |
 | [`tiger.md`](tiger.md) | closed | 2026-08-25 | `N-10` | eta, sigma and eps_rel all chased on `tiger`, and why none of them is the answer |
 
-32 notes; 9 cited by no claim
+34 notes; 9 cited by no claim
 (`automation.md`, `evidence_arm0.md`, `evidence_arm_ab.md`, `layer1_features.md`, `phase0a.md`, `phase0b.md`, `phase0c.md`, `phase1.md`, `phase2.md`) — those are bring-up records
 rather than findings, and a note that should carry a claim looks exactly the same, so check.

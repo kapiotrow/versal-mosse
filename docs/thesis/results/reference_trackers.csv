@@ -1,0 +1,41 @@
+# PUBLISHED TRACKERS RUN THROUGH THIS PROJECT'S OWN SCORING PATH.
+# scripts/offline_multistart.py (board multistart protocol, board trajectory format)
+# -> scripts/vot_ingest.py -> `vot analysis`. Same 62 sequences, same 419 anchored runs,
+# same 180,544 frames, same stack as every row in arms.csv. Claim R-12.
+#
+# WHY THIS EXISTS. Until 2026-09-03 the scoring path had only ever been checked against
+# ITSELF. The stack is config-identical to the toolkit's vot2022/shorttermbox baseline, but
+# the sequence conversion, the anchor set, the trajectory format and the staging had no
+# external reference at all, and every row of arms.csv rests on them.
+#
+# THE VALIDATION: opencv-csrt against the PUBLISHED CSRDCF row of Kristan et al. 2022
+# Table 12 (baselines.csv). A -0.006, R -0.033, EAO -0.008. The path reproduces a published
+# tracker. NOTE cv2's CSRT is not byte-identical to the authors' VOT submission, so this is
+# a BAND check; landing this close is stronger than the check was designed to be.
+#
+# THE NON-VALIDATION, and it is an IMPLEMENTATION difference, not a harness one: opencv-kcf
+# lands at R 0.280 against a published 0.532. cv2's TrackerKCF is a weak reimplementation
+# (no scale adaptation by default, different features) and is NOT the KCF that was submitted
+# to VOT. Since CSRT validates the identical path on the identical runs, the KCF gap cannot
+# be the harness. DO NOT quote opencv-kcf as "KCF".
+#
+# THE CONTROLS ARE PART OF THE RESULT:
+#   oracle       returns groundtruth. R = 1.0000 EXACTLY over all 419 runs -- which is what
+#                proves the anchors, run order, frame indexing and trajectory format. A and
+#                EAO fall short of 1.0 by the DATASET's own ceiling, not by an error:
+#                `accuracy += sum(overlaps[0:progress])` counts the init frame (overlap 0 by
+#                construction) and any empty-groundtruth frame. Every board arm pays the same.
+#   oracle-lag1  one-frame-stale groundtruth. The mutant that proves the test can fail.
+#   static       never moves off the init box. The floor.
+#   opencv-kcf-rgb  the COLOUR-ORDER mutant: the toolkit hands out RGB and cv2's trackers
+#                expect BGR. A genuine bug, found here, fixed in opencv-csrt/opencv-kcf.
+#                BUT IT IS NOT WHAT AILS KCF -- correcting it is worth +0.0065 R and -0.0036
+#                EAO, a null. Kept because the first reading of this run blamed it, and the
+#                control is what refuted that.
+tracker,kind,A,R,EAO,frames,published_A,published_R,published_EAO,note,tracker_pl
+oracle,control-ceiling,0.9963,1.0000,0.9994,180544,,,,"R exactly 1.0000 -- the harness self-test",wyrocznia (sufit)
+oracle-lag1,control-mutant,0.8290,0.9851,0.8004,179003,,,,"one-frame lag; the test can fail",wyrocznia z opóźnieniem 1 klatki
+static,control-floor,0.3938,0.1996,0.0781,34541,,,,"init box held forever",pudełko początkowe (podłoga)
+opencv-csrt,reference,0.5134,0.5471,0.2432,113147,0.519,0.580,0.251,"THE VALIDATION -- reproduces published CSRDCF",CSRDCF (OpenCV)
+opencv-kcf,reference,0.5229,0.2797,0.1418,65009,0.542,0.532,0.239,"cv2 KCF is not the VOT KCF -- do not quote as KCF",KCF (OpenCV)
+opencv-kcf-rgb,control-mutant,0.5315,0.2732,0.1454,61195,,,,"colour-order mutant; the fix is a null",KCF z odwróconą kolejnością kanałów

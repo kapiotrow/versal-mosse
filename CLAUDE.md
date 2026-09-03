@@ -370,9 +370,17 @@ on `agility` against `sigma4`'s 24.55** — 32 channels and 147 taps for slightl
 out of the column loop, `kc` unrolled, the PLIO read stored straight from the word).
 Frame breakdown: [`docs/engineering/performance.md`](docs/engineering/performance.md).
 
-Where this sits against the 41 published VOT-STb2022 trackers:
+Where this sits against the 41 published VOT-STb2022 trackers, and against the nearest
+published EMBEDDED equivalent (Danilowicz & Kryjak 2022):
 [`docs/engineering/baselines.md`](docs/engineering/baselines.md). The split is sharp — **A is
-inside the classical-DCF band; R is below every one of the 41.** The gate is the AFTERMATH of a
+inside the classical-DCF band; R is below every one of the 41.**
+**On COST the comparison is valid and this design wins it** — 20.4x fewer LUT, 44.4x fewer FF,
+54.1x less BRAM, 10.9x fewer DSP than their ZCU104 deepDCF at the same geometry, because the
+transforms moved onto 6 of 304 AIE-ML cores (`P-13`). **On TRACKING it is not valid**: their EAO
+is on VOT2015 with a [108, 371] window, an inverted `R`, and polygon ground truth.
+**The window term alone is +0.0827 on the shipping arm — 1.39x this project's entire arm
+ladder** (`M-17`, `results/eao_window.csv`), so 0.1960-against-0.183 is an artefact, not a
+result. **Never put a re-windowed number in a table beside theirs.** The gate is the AFTERMATH of a
 loss, not its cause: 95.8% of vetoes land after the run is already at IoU <= 0.1. **It walks off
 the target confidently — do not spend a sweep relaxing the gate, and do not look for the fault in
 localisation.**
@@ -799,6 +807,19 @@ scripts/
                          #   per-frame-index, never a pooled mean
   check_ebox_crosscheck.py  # the board's filter_box_energy_fraction against the offline
                          #   box_energy_fraction on the SAME H, plus 5 injected mutants
+  offline_multistart.py  # runs a HOST-SIDE tracker under the BOARD's multistart protocol and
+                         #   writes the board's trajectory format, so vot_ingest.py scores it
+                         #   exactly like a sweep. THIS IS WHAT VALIDATED THE SCORING PATH:
+                         #   CSRDCF reproduces its published row to 0.008 EAO (R-12), and the
+                         #   `oracle` control returns R = 1.0000 EXACTLY -- run it first, always.
+                         #   Controls: oracle / oracle-lag1 / static / opencv:<kind>-rgb.
+                         #   Needs opencv-contrib-python for csrt+kcf. Parallelise per RUN;
+                         #   pin cv2.setNumThreads(1) or 30 workers become 780 threads
+  eao_window.py          # RE-SCORES EXISTING trajectories under a second EAO window, using the
+                         #   toolkit's own analysis. The window is a property of the CHALLENGE:
+                         #   [115,755] here, [108,371] on VOT2015. Worth +0.0827 on the shipping
+                         #   arm -- 1.39x the whole arm ladder -- so no cross-era EAO comparison
+                         #   means anything without it. NOT a VOT2015 score; see M-17
   vot_ar_offline.py      # VOT's failure rule applied to OFFLINE single-start runs. NOT the
                          #   toolkit's AR, and its resolution is MEASURED at ~0.02 in R,
                          #   including one pair it got BACKWARDS. Decides whether an arm
