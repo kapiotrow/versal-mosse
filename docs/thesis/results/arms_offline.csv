@@ -13,3 +13,7 @@ off_dec2,2026-08-28,"decimate 2x — passes the artifact test",,,,19903,,-0.0086
 off_warp8_transcale,2026-08-28,"Bolme 3.4 init perturbations: translation + isotropic scale",,,,19903,,,0.0081,runs/vot/0828_offline-warp8,N-02
 off_warp8_aspect,2026-08-28,"...aspect (roi_h/roi_w independent)",,,,19903,,,-0.0322,runs/vot/0828_offline-warp8,N-02
 off_warp8_rot,2026-08-28,"...rotation 10deg (host pre-rotates); -0.0020 without 3 sequences",,,,19903,,,0.0146,runs/vot/0828_offline-warp8,N-02
+off_l1relu_ctrl,2026-09-03,"SHIPPING Layer-1 bank control (7x7/2, 32ch, 64x64) — reproduces layer1_features.md digit-for-digit",0.5077,0.4364,8686,19903,,,,runs/vot/0903_offline-l1mask,N-21
+off_l1relu_mask0,2026-09-03,"Hann mask on the SHIPPING bank — INVERTS: +0.0601 on the old 3x3 bank, negative here; trim3 -0.0358, P(dR<=0)=0.706",0.4998,0.4269,8497,19903,,-0.0079,-0.0095,runs/vot/0903_offline-l1mask,N-21
+off_l1relu_mask0k2,2026-09-03,"...mask applied twice (the board-implementable width knob) — WORSE on both trims; accuracy gain is the M-02 selection effect",0.5487,0.4175,8309,19903,,0.0410,-0.0189,runs/vot/0903_offline-l1mask,N-21
+off_l1relu_chrel05,2026-09-03,"Stage B3 channel reliability gamma=0.5 re-screened at the new operating point — the licensed re-open is SPENT, N-20 stands",0.5220,0.4356,8669,19903,,0.0143,-0.0008,runs/vot/0903_offline-l1mask,N-20

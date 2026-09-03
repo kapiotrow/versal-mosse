@@ -2,6 +2,12 @@
 
 **Status:** closed · **Updated:** 2026-08-31 · **Scope:** the spatial mask on hardware: EAO +0.0110, not separable from a null, mechanism refuted
 
+**2026-09-03 — THIS IS A RESULT ABOUT THE OLD BANK.** Re-screened offline on the SHIPPING
+Layer-1 arm (7x7/2, 32ch, 64x64) the mask's sign INVERTS: dR +0.0601 there against −0.0127
+paired here, trim-3 −0.0358, P(dR<=0)=0.706. The `e_box` mechanism separates on both banks.
+Do not carry any number below onto the shipping configuration — `evidence/mask_bank_transfer.md`,
+claim `N-21`.
+
 **2026-08-31.** `runs/vot/0831_1528-mask` against `runs/vot/0831_1340-base_stat`, 62 sequences /
 419 trajectories per arm, workspace `~/vot/analysis/0831_mask`. The two arms differ in ONE
 `-D`: `app.flagstamp` diffs to a single line, `-DFILTER_MASK=0` against `=1`, and the

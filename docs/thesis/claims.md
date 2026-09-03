@@ -74,12 +74,12 @@ This is the direction you will actually use.
 | `subsec:kosztTransferow` | P-05, P-06, P-04 |
 | `subsec:optymalizacjaOdrzucona` | P-07 — one case, by the thesis's own scoping |
 | `subsec:modelObalony` | B-09 |
-| `sec:metodykaBadan` | **M-01…M-10**, P-09 |
+| `sec:metodykaBadan` | **M-01…M-10**, M-14, P-09 |
 | `sec:zbioryTestowe` | R-08 (why streaming was needed), `runs/vot/seqs62.txt` |
 | `sec:jakoscSledzenia` | **R-01, R-02, R-03, R-04**, R-06, R-07, A-09 |
 | `sec:wydajnoscZasoby` | **P-01, P-02, P-04**, P-06, A-02, P-08 |
 | `sec:porownanieReferencyjne` | **R-05** — and it answers `przeglad`'s stated hypothesis |
-| `sec:dyskusjaWynikow` | **N-01…N-11, N-14, N-19, N-20**, B-05, R-06, R-07, M-01, M-02, M-03 |
+| `sec:dyskusjaWynikow` | **N-01…N-11, N-14, N-19, N-20, N-21**, B-05, R-06, R-07, M-01, M-02, M-03 |
 | `sec:wnioski` | R-04, R-05, N-01 |
 | `sec:dalszePrace` | **O-01…O-05**, N-13 |
 
@@ -209,7 +209,7 @@ implies.
 | R-07 | On targets that genuinely translate the detector recovers 93% of annotated motion — localisation is not the fault | accepted-offline | `evidence/detector_gain.md` | — | `sec:dyskusjaWynikow` |
 | R-08 | The board's usable heap is ~0.9–1.2 GB, not 12 GB; streaming (`VOT_STREAM_RING`) recovered the five RGB sequences that died on `std::bad_alloc`, with identical digests both ways | accepted-hw | `evidence/board_memory.md` | `0827_1313-streamA/B` | `subsec:zrodlaObrazu` |
 | R-09 | Multi-start determinism: two runs of the same job return byte-identical trajectories, and `RESET_MUTANT` proves the test can fail | accepted-hw | `evidence/phase3.md` | — | `subsec:weryfikacja` |
-| R-10 | The spatial mask: EAO 0.1629 → 0.1740 (+0.0110) and A is **+0.0179** on the common survived prefix — but **the gain is carried by 3 sequences of 62 (top-3 = 133% of it), the per-sequence median dR is 0.0000 and the bootstrap CI includes zero (P(dR≤0)=0.22). NOT distinguishable from a null**, and the mechanism is refuted: init failures 61 → 60 despite the largest `mask_ebox` edge | **weak-hw** | `evidence/spatial_mask.md` | `0831_1528-mask` vs `0831_1340-base_stat` | `sec:jakoscSledzenia` |
+| R-10 | The spatial mask on the OLD bank: EAO 0.1629 → 0.1740 (+0.0110), A +0.0179 on the common survived prefix — but **not distinguishable from a null** (3 sequences of 62 carry it, median dR 0.0000, P(dR≤0)=0.22) and the mechanism is refuted. **It does not carry to the shipping arm: re-screened 2026-09-03 the sign INVERTS (N-21), so this row scores a configuration the board no longer runs** | **weak-hw** | `evidence/spatial_mask.md`, `evidence/mask_bank_transfer.md` | `0831_1528-mask` vs `0831_1340-base_stat` | `sec:jakoscSledzenia` |
 | R-11 | The MAINLOBE WIDTH `sigma/target` is the axis, with an optimum at 1/16 (DSST's `target/16`). At matched width the FINER map wins — the OPPOSITE of the offline proxy. **Superseded as the best arm by `rgb_l1relu` 2026-09-02, and the sigma INTERIOR is closed too** (22-cell grid; 3, 5, 6, 8 all worse) | accepted-hw | `evidence/arm_res64.md` sec.21, sec.25 | `results/arms.csv` row `rgb_sigma4`; `runs/vot/0902_offline-sigmaeta/` | `sec:jakoscSledzenia`, `sec:dyskusjaWynikow` |
 
 ## N — Refuted, and the reason the obvious explanation was wrong
@@ -236,7 +236,8 @@ implies.
 | N-17 | `SCALE_MAX_STEP=1` | refuted — parks the sim's smooth arm 123 of 200 frames and ends 28.0% wrong | GAP (`make scale_sim`) | `subsec:filtrSkali` |
 | N-18 | `SCALE_CONF_MIN` distinguishes a wrong proposal from a big correct one | refuted — it cannot; both match the model poorly for the same reason | GAP | `subsec:filtrSkali` |
 | N-19 | `eps_rel` and `MOSSE_SIGMA` need tuning | settled/retired — ε=1e-3 optimal (closed form `R = G·B/(B+ε)`); PSR is monotone in σ and so cannot select it | GAP | `sec:dyskusjaWynikow` |
-| N-20 | Channel reliability in Stage B3 (CSR-DCF's third contribution) would help | refuted offline 2026-09-01 — **the mechanism HOLDS** (the anti-reliability mutant loses 0.0396 R, so the statistic carries real information) but the gain does not: `gamma=0.5` is +0.0210 pooled and **+0.0023 after drop-top-3** with 39 of 62 sequences exactly tied, `gamma=1` a null, `gamma=2` −0.058. No board time | `evidence/channel_reliability.md` | `sec:dyskusjaWynikow` |
+| N-20 | Channel reliability in Stage B3 (CSR-DCF's third contribution) would help | refuted offline 2026-09-01 — **the mechanism HOLDS** (the anti-reliability mutant loses 0.0396 R, so the statistic carries real information) but the gain does not: `gamma=0.5` is +0.0210 pooled and **+0.0023 after drop-top-3** with 39 of 62 sequences exactly tied, `gamma=1` a null, `gamma=2` −0.058. No board time . **The one licensed re-open (a moved operating point) is SPENT: re-screened 2026-09-03 on the shipping Layer-1 arm at dR −0.0040, trim-3 −0.0378, 39 of 62 tied** | `evidence/channel_reliability.md`, `evidence/mask_bank_transfer.md` | `sec:dyskusjaWynikow` |
+| N-21 | The spatial mask's value carries across the feature bank | **refuted offline 2026-09-03 — the sign INVERTS.** Same script, sequences, eta and gate: dR **+0.0601** on the old 3x3/16ch/128x128 bank against **−0.0127** paired (trim-3 −0.0358, P(dR≤0)=0.706, 35 of 62 tied) on the SHIPPING Layer-1 bank; the k=2 width knob is worse still. The mechanism HELD both times (`e_box` 0.6795 → 0.9547, non-overlapping quartiles), so a confirmed mechanism bounds attributability and never value. **Why it inverts is OPEN** — the "the Layer-1 filter already self-concentrates" guess is not supported by a baseline `e_box` of 0.6795 against 0.6049 | `evidence/mask_bank_transfer.md` | `sec:dyskusjaWynikow` |
 
 ## M — Methodology claims (chapter 8)
 
@@ -255,13 +256,14 @@ implies.
 | M-11 | An aggregate rate can invert when split by the state it depends on: the mask's `NEGATIVE_PEAK` drop (15.4% → 10.2%) is a RISE on the frames that matter (3.07% → 3.87% on target) | `evidence/spatial_mask.md` |
 | M-12 | **A detector that reports "no change" is not necessarily blind — separate the two with the NULL RATE, not the gain.** The scale filter's gain reads as blindness; its null rate (88.4% against 3.0% for a noise argmax) shows it is strongly LOCKED to the current size instead, and the same estimator reaches gain 0.93 in the sim once the target outruns the lock. The loop is self-confirming and the code is sound | `../engineering/scale_filter.md` |
 | M-13 | **Bound the prize before attributing the defect.** The scale filter was fully root-caused before anyone asked what repairing it was worth; an ORACLE over the board's own trajectories puts a PERFECT scale filter at +0.0023 R. Attribution says WHY, an oracle says WHETHER TO CARE, and it is the cheaper of the two | `../engineering/scale_filter.md`, `scripts/scale_oracle_bound.py` |
+| M-14 | **A prior positive screen expires when the operating point moves.** Re-screen whenever the bank, the geometry or the response shape has changed since the arm was scored — not only when something feels suspect. The spatial mask was proposed for hardware on 2026-09-03 on the strength of a screen run against a bank the board no longer runs; eight minutes of CPU inverted it and saved a sweep, an ingest and a card round-trip | `evidence/mask_bank_transfer.md` |
 
 ## O — Open, at the time of writing
 
 | id | item | state | evidence |
 |---|---|---|---|
-| O-01 | Spatial mask on the filter (`FILTER_MASK=1`) | **SWEPT 2026-08-31, NO LONGER OPEN — see R-10.** EAO rose +0.0110 but the arm is not separable from a null, the predicted `PSR_GATE_MIN` re-tune is unsupported (the gate's bite did not move), and the CSR-DCF mechanism is refuted here: it is a PROJECTION not a constraint, and the unmasked filter self-concentrates unaided. The id is kept because `@thesis` tags bind to it | `evidence/spatial_mask.md`, `evidence/arm_mask.md` |
-| O-02 | Channel reliability in Stage B3 | **REFUTED offline 2026-09-01 — see N-20.** Was: untested; both halves available by Parseval inside the existing loop | `evidence/robustness_proposals.md` |
+| O-01 | Spatial mask on the filter (`FILTER_MASK=1`) | **SWEPT 2026-08-31, NO LONGER OPEN — see R-10.** EAO rose +0.0110 but the arm is not separable from a null, the predicted `PSR_GATE_MIN` re-tune is unsupported (the gate's bite did not move), and the CSR-DCF mechanism is refuted here: it is a PROJECTION not a constraint, and the unmasked filter self-concentrates unaided. The id is kept because `@thesis` tags bind to it. **Closed twice over 2026-09-03: on the SHIPPING bank the offline sign inverts (N-21)** | `evidence/spatial_mask.md`, `evidence/arm_mask.md`, `evidence/mask_bank_transfer.md` |
+| O-02 | Channel reliability in Stage B3 | **REFUTED offline 2026-09-01, and re-refuted at the new operating point 2026-09-03 — see N-20.** Was: untested; both halves available by Parseval inside the existing loop | `evidence/robustness_proposals.md`, `evidence/mask_bank_transfer.md` |
 | O-03 | Two-filter temporal ensemble (short/long eta) | untested, host-only | `evidence/robustness_proposals.md` |
 | O-04 | Feature-bank **geometry** — not the weights | **CONFIRMED AND SHIPPED 2026-09-02.** It was the only feature axis left (the weights are a linear lift; one-hot ties the network) and it is the one that paid: 7x7 stride 2, 32 channels, resnet18-PCA bank, ReLU on, 64x64 map → EAO 0.1960. Geometry, not weights, is where feature work belongs | `evidence/feature_bank.md`, `evidence/arm_l1relu.md` |
 | O-05 | Software-pipeline the channel loop (~8.7 ms exposed) | untested | `../engineering/roadmap.md` §PERFORMANCE |

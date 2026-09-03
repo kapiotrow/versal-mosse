@@ -29,6 +29,7 @@ status (`TODO_`, `proposed_`), because the status changes and the filename does 
 | [`frozen_detector.md`](frozen_detector.md) | closed | 2026-08-25 | `N-09` | `nature` and `tiger` fail the same way for two completely different reasons |
 | [`hold_policy.md`](hold_policy.md) | closed | 2026-08-25 | `N-08` | the HOLD-on-gate policy measured against the dataset |
 | [`layer1_features.md`](layer1_features.md) | closed | 2026-09-01 | `N-16` | the offline screen behind the Layer-1 arm: the nonlinearity mechanism confirmed, the arms not |
+| [`mask_bank_transfer.md`](mask_bank_transfer.md) | closed | 2026-09-03 | `R-10`, `N-20`, `N-21`, `M-14`, `O-01`, `O-02` | the spatial mask and Stage B3 channel reliability re-screened on the SHIPPING Layer-1 bank; both refuted, and the mask's sign flips |
 | [`metric_ar_vs_iou.md`](metric_ar_vs_iou.md) | closed | 2026-08-25 | `N-08`, `M-03` | the first AR numbers, and how they REVERSE a verdict mean IoU had given |
 | [`phase0a.md`](phase0a.md) | closed | 2026-08-25 | — | VOT bring-up 0a: the NFS staging link, board <-> PC |
 | [`phase0b.md`](phase0b.md) | closed | 2026-08-24 | — | VOT bring-up 0b: the toolkit result-format round-trip |
@@ -45,6 +46,6 @@ status (`TODO_`, `proposed_`), because the status changes and the filename does 
 | [`subbin_lag.md`](subbin_lag.md) | closed | 2026-08-25 | `N-11` | `nature` fails without the gate firing — and the sub-bin mechanism first proposed for it is REFUTED in-file |
 | [`tiger.md`](tiger.md) | closed | 2026-08-25 | `N-10` | eta, sigma and eps_rel all chased on `tiger`, and why none of them is the answer |
 
-29 notes; 8 cited by no claim
+30 notes; 8 cited by no claim
 (`automation.md`, `evidence_arm0.md`, `evidence_arm_ab.md`, `phase0a.md`, `phase0b.md`, `phase0c.md`, `phase1.md`, `phase2.md`) — those are bring-up records
 rather than findings, and a note that should carry a claim looks exactly the same, so check.

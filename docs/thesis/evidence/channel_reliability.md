@@ -2,6 +2,11 @@
 
 **Status:** closed · **Updated:** 2026-09-01 · **Scope:** Stage B3 channel reliability: mechanism real, gain not separable from a null
 
+**2026-09-03 — THE ONE RE-OPEN THIS NOTE LICENSED IS SPENT.** `chrel05` was re-screened at the
+moved operating point (shipping Layer-1 arm) and is a null-to-loss there too: dR −0.0040 paired,
+trim-3 −0.0378, P(dR<=0)=0.563, 39 of 62 sequences tied. `N-20` stands and there is no second
+re-open — `evidence/mask_bank_transfer.md`.
+
 **2026-09-01.** `runs/vot/0901_offline-chrel/chrel62.json`, `scripts/rgb_vs_gray_loop.py` arm
 suffix `-chrel<N>`, 62 sequences / 19,903 frames, shipping eta 0.05 / gate 5.0, scored with
 `vot_ar_offline.py`. Offline only — no hardware. **Control: the `rgb` arm reproduces the stored

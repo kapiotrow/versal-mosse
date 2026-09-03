@@ -1,6 +1,23 @@
 # Roadmap
 
-**Status:** current · **Updated:** 2026-09-02 · **Scope:** what to try next, ranked, with the evidence behind each rank
+**Status:** current · **Updated:** 2026-09-03 · **Scope:** what to try next, ranked, with the evidence behind each rank
+
+## 2026-09-03 — the spatial mask is REFUTED on the shipping arm, and so is the chrel re-open
+
+`runs/vot/0903_offline-l1mask/`, offline, 62 sequences, 8 minutes. **The mask was the proposed
+hardware arm for the day and the pre-screen inverted it**: dR **+0.0601** on the old 3x3/16ch
+bank against **−0.0127** paired on the shipping Layer-1 one (trim-3 −0.0358, P(dR<=0)=0.706,
+35 of 62 tied); the k=2 width knob is worse on both trims. The `e_box` mechanism HELD on both
+banks (0.6795 -> 0.9547, non-overlapping quartiles), so the projection works and the tracking
+gets worse — **why it inverts is open.** `chrel05`, riding the same sweep, spends the one
+re-open `channel_reliability.md` licensed: −0.0040 paired, 39 of 62 tied.
+**Item 2 below (the spatial mask) and item 3 (channel reliability) are both CLOSED against
+this arm.** `../thesis/evidence/mask_bank_transfer.md`, claims `N-21` / `M-14` / `N-20`.
+**What is left for robustness is item 4, the two-filter temporal ensemble and the
+confidence-modulated learning rate — the only untested mechanism that acts on the 71% of the
+EAO window nothing has moved.**
+
+---
 
 ## 2026-09-02 — the Layer-1 arm SHIPS, and the EAO window is now the constraint
 

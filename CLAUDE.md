@@ -377,9 +377,10 @@ Ranked, with the evidence for each rank, in
   weighted sample SETS; this keeps one running average, which is exactly the "walks off target
   confidently" mechanism); (2) the **two-filter temporal ensemble** — TCLCFcpp, the embedded peer
   at R 0.598, is built on it, and `eta 0.05`/`eta 0.125` already win on different sequences.
-  Host-only, untested. (3) The spatial mask ON TOP of this arm — its mechanism targets drift and it
-  has only ever been measured on the old shipping arm. (4) A two-filter temporal ensemble,
-  untested. **`MOSSE_SIGMA`'s interior is CLOSED** (22-cell grid; 3, 5, 6, 8 all worse).
+  Host-only, untested. (3) ~~The spatial mask ON TOP of this arm~~ — **REFUTED offline 2026-09-03: on the shipping
+  Layer-1 bank its sign INVERTS (+0.0601 on the old bank, −0.0127 paired here, P(dR<=0)=0.706),
+  and the k=2 width knob is worse. `docs/thesis/evidence/mask_bank_transfer.md`, claim N-21.**
+  Stage B3 channel reliability was re-screened on the same sweep and is a null there too. **`MOSSE_SIGMA`'s interior is CLOSED** (22-cell grid; 3, 5, 6, 8 all worse).
 - **FEATURES — mostly closed, and the ceiling is now known.** The bank's weights are a linear
   lift (random ties pretrained, one-hot ties the network), pooling is a null, channel count is
   not trim-separable between 16 and 32, and Danilowicz & Kryjak measure 8ch ~ 32ch ~ 64ch. What
@@ -468,6 +469,11 @@ outstanding async per port. **The CU completion interrupt is never delivered on 
 every KDS launch costs ~503 ms**; the fix is `ROI_CROP_USER_MANAGED=1`. `v++ --package` corrupts
 the 2025.2 rootfs (`make rootfs`). XRT AXIS ports consume a positional argument slot, so set args
 by explicit index. hw_emu wall time is meaningless but its simulated PL cycles are RTL-accurate.
+
+**A PRIOR POSITIVE SCREEN EXPIRES WHEN THE OPERATING POINT MOVES** (M-14, 2026-09-03) — re-screen
+an arm whenever the bank, the geometry or the response shape has changed since it was scored, not
+only when something feels suspect. Eight minutes of CPU inverted the proposed mask arm and saved a
+sweep, an ingest and a card round-trip.
 
 **Settled — do not reopen** ([`docs/engineering/settled.md`](docs/engineering/settled.md)):
 `eps_rel = 1e-3`; padding 2.0, closed three ways;
