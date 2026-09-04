@@ -1,9 +1,48 @@
-# VEK280 xcve2802-vsvh1760-2MP-e-S, measured on the 128x128 ch1 build. AIE core clock 1 GHz.
+# Device utilisation. VEK280 xcve2802-vsvh1760-2MP-e-S, AIE core clock 1 GHz, PL 312.5 MHz.
+#
+# THE QUOTABLE ROWS ARE build=rgb_l1relu -- the SHIPPING arm, from the ROUTED hw
+# implementation of build/hw/64x64/ch32 (aie.flagstamp verified: PATCH 64, N_CHANNELS 32,
+# CONV_IN_CH 3, CONV_KSIZE 7, CONV_STRIDE 2, CONV_RELU 1, 3-3-3, H_SHIFT 15).
+#   PL:  _x/reports/link/imp/impl_1_full_util_routed.rpt (whole design, sections 1/3/4)
+#        _x/reports/link/imp/impl_1_kernel_util_routed.rpt (the platform/kernel split)
+#   AIE: _x/package/aie_control_config.json -- graphs[].core_columns/rows (6 cores) and
+#        SharedBufferConfigs (2 memory tiles: memTileFwd, memTileInv). The AIE compiler is
+#        the only source for these; Vivado's "AI ML Engines" row reads 0.
+#
+# used   = the whole routed design, base platform INCLUDED. This is what the device holds and
+#          it is the conservative number for any "smaller than X" comparison.
+# used_k = the two PL kernels alone (roi_crop + camera_capture), platform excluded.
+#          The platform's share is LUT 3028 / FF 3729 / BRAM 0 / DSP 0; on the AIE side and on
+#          BRAM/DSP the two columns are equal, so used_k is blank there.
+#          Per-kernel: roi_crop LUT 5983 / FF 7738 / BRAM 13 tiles / DSP 53;
+#                      camera_capture LUT 1516 / FF 1785 / DSP 3.
+# BRAM18 counts half-tiles: the routed design holds 12x RAMB36E5 + 2x RAMB18E5 = 13 tiles
+#          = 26 BRAM18 = 13 BRAM36-equivalent (embedded_baselines.csv compares in BRAM36).
+#
+# build=roi_crop_hls_128ch1 is the SUPERSEDED row set, kept because five documents quoted it.
+# It is NOT a device utilisation: it is roi_crop's HLS C-SYNTHESIS ESTIMATE ALONE, from the
+# hw_emu 128x128 ch1 GRAYSCALE build
+# (build/hw_emu/128x128/ch1/_x/reports/roi_crop.hw_emu/hls_reports/roi_crop_csynth.rpt,
+# "Utilization Estimates" summary -- LUT 7694, FF 7539, BRAM_18K 10, DSP 44 reproduce exactly).
+# It omits camera_capture, the base platform and everything place-and-route adds, and it was
+# taken on a 1-channel gray build. DO NOT QUOTE IT, and in particular do not compare it with
+# another system's routed numbers -- that is what embedded_baselines.csv used to do.
+#
+# The AIE-ML memory tile count of 1 in that row set was wrong on every build, not just that
+# one: MEMTILE_TRANSPOSE=1 instantiates TWO shared buffers, and 128x128/ch16, 64x64/ch16 and
+# 64x64/ch32 all report memTileFwd + memTileInv.
+#
 # NOTE: runtime<ratio> is NOT utilization; the mapper's Utilization column shows declared budgets.
-resource,available,used,percent,resource_pl
-AIE-ML cores,304,6,2.0,rdzenie obliczeniowe AIE-ML
-AIE-ML memory tiles,76,1,1.3,kafelki pamięciowe AIE-ML
-BRAM18,1200,10,0.8,bloki pamięci BRAM18
-DSP,1312,44,3.4,bloki DSP
-LUT,520704,7694,1.5,komórki LUT
-FF,1041408,7539,0.7,przerzutniki
+build,resource,available,used,used_k,percent,resource_pl
+rgb_l1relu,AIE-ML cores,304,6,,2.0,rdzenie obliczeniowe AIE-ML
+rgb_l1relu,AIE-ML memory tiles,76,2,,2.6,kafelki pamięciowe AIE-ML
+rgb_l1relu,BRAM18,1200,26,,2.2,bloki pamięci BRAM18
+rgb_l1relu,DSP,1312,56,,4.3,bloki DSP
+rgb_l1relu,LUT,520704,10527,7499,2.0,komórki LUT
+rgb_l1relu,FF,1041408,13252,9523,1.3,przerzutniki
+roi_crop_hls_128ch1,AIE-ML cores,304,6,,2.0,rdzenie obliczeniowe AIE-ML
+roi_crop_hls_128ch1,AIE-ML memory tiles,76,1,,1.3,kafelki pamięciowe AIE-ML
+roi_crop_hls_128ch1,BRAM18,1200,10,,0.8,bloki pamięci BRAM18
+roi_crop_hls_128ch1,DSP,1312,44,,3.4,bloki DSP
+roi_crop_hls_128ch1,LUT,520704,7694,,1.5,komórki LUT
+roi_crop_hls_128ch1,FF,1041408,7539,,0.7,przerzutniki

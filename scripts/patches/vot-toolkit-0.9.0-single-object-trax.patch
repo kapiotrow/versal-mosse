@@ -1,0 +1,59 @@
+Fix the legacy single-object TraX path in vot-toolkit's tracker runtime.
+
+WHAT IS BROKEN. A single-object experiment (every pre-2020 stack, VOT2015
+included) builds its initialization with Experiment._get_initialization, which
+returns a BARE ObjectStatus when `_multiobject` is False. TraxTrackerRuntime.
+initialize then guards with `if len(new) != 1: raise`. ObjectStatus is a
+2-tuple of (region, properties), so len(new) == 2 and EVERY single-object TraX
+tracker fails at initialization with "Tracker does not support multiple
+objects, but multiple objects were provided for initialization".
+
+Declaring the tracker multi-object routes around that guard but breaks the
+other end: the supervised experiment then receives a list where it expects one
+object and dies with "'list' object has no attribute 'properties'". So the
+legacy path is broken at both ends and there is no configuration that works.
+
+VERIFIED IDENTICAL IN 0.8.1 AND 0.9.0 -- this is not a version regression, it
+is the legacy path left behind by the multi-object refactor.
+
+THE FIX. Accept a bare ObjectStatus as the single object it already is. The
+list-of-one case is untouched, so multi-object stacks behave exactly as before.
+
+WHY THIS IS NOT APPLIED TO THE MAIN VENV. Every row of docs/thesis/results/
+arms.csv was scored with vot-toolkit 0.8.1 in ./.venv, and that installation
+must not move. This patch is applied ONLY to the isolated ~/vot/venv-vot09
+used for the VOT2015 known-answer check (R-15). It touches the tracker RUNTIME,
+never the analysis, so no score is computed differently because of it.
+
+--- a/vot/tracker/trax.py
++++ b/vot/tracker/trax.py
+@@ -608,7 +608,11 @@
+         try:
+             if not self.multiobject:
+-                if len(new) != 1:
++                if isinstance(new, ObjectStatus):
++                    # A single-object experiment hands over a bare ObjectStatus,
++                    # which is a (region, properties) 2-tuple -- not a list of
++                    # one object. Use it as-is.
++                    pass
++                elif len(new) != 1:
+                     raise TrackerException("Tracker does not support multiple objects, but multiple objects were provided for initialization", tracker=self._tracker)
+                 else:
+                     new = new[0]
+
+SECOND SITE -- the update guard, and this one is plainly inverted upstream:
+
+    if not self.multiobject and (new is None or len(new) != 0):
+        raise ... "multiple objects were provided for update"
+
+`new is None` is the NORMAL single-object update, where no new object is being
+introduced, so the condition fires on every frame after the first. The intent is
+clearly to reject new objects arriving mid-sequence; `None` must pass.
+
+--- a/vot/tracker/trax.py
++++ b/vot/tracker/trax.py
+@@ -637,7 +637,7 @@
+         try:
+-            if not self.multiobject and (new is None or len(new) != 0):
++            if not self.multiobject and new is not None and len(new) != 0:
+                 raise TrackerException("Tracker does not support multiple objects, but multiple objects were provided for update", tracker=self._tracker)

@@ -1,0 +1,42 @@
+# THE DECOMPOSITION OF R-13. Three arms, 62 sequences, 419 anchored runs each, one workspace
+# (~/vot/analysis/0904_twin_s1), scored by vot_ingest.py -> `vot analysis`. Claim R-16.
+#
+# R-13 measured the float twin against the board arm and could not attribute the +0.0213 R,
+# because the twin differs in TWO ways at once: float64 correlation AND no DSST scale filter.
+# The board run rgb_l1relu_s1 (SCALE_N=1, one host-only flag) supplies the missing cell, so
+# each term below moves exactly ONE thing:
+#
+#   SCALE       l1relu_s1 - board-l1relu       fixed-point both sides; scale filter on/off
+#   ARITHMETIC  mosse-rgb-l1relu - l1relu_s1   no scale filter both sides; fixed-point vs float64
+#   R-13        mosse-rgb-l1relu - board-l1relu  the ORIGINAL, confounded contrast, for reference
+#
+# WHAT "ARITHMETIC" MEANS HERE, PRECISELY. The twin runs the SAME int8 conv datapath as the
+# board -- the same l1_banks bank, quantized weights, saturate(acc >> out_shift), int16 clips,
+# integer Hann. What differs is everything DOWNSTREAM of the feature map: the cint16 FFT/IFFT
+# chain with its 3-3-3 shift budget, the Q1.15 filter with H_SHIFT=15, and the fixed-point B2/B3
+# corrections. So this term does NOT price the int8 FEATURE path, which is common to both arms.
+#
+# STATISTICS are grid_stats.py's definitions, computed per sequence, not pooled: trimN drops the
+# N sequences most FAVOURABLE to the first-named arm (one-sided on purpose), sign_p is a
+# two-sided binomial on better-vs-worse with ties excluded, and p_dr_le0 is the fraction of
+# 10,000 bootstrap resamples over sequences whose mean is <= 0. Seed 20260902, as in grid_stats.
+#
+# READ dR_mean AGAINST dR_trim5. On the ARITHMETIC term the mean is +0.0312 and the trim-5 is
+# +0.0102: three sequences (rabbit2 +0.33, tiger +0.30, surfing +0.27) carry much of the
+# MAGNITUDE. The DIRECTION is not carried by them -- 35 sequences better against 12 worse,
+# sign p 0.001 -- so the term is broad-based and its size is not.
+#
+# CONTROLS. board-l1relu is byte-identical (md5, all 838 files) to /srv/vot/results/l1relu and
+# returns 0.5129 / 0.4279 / 0.1960, its published arms.csv row exactly; mosse-rgb-l1relu returns
+# 0.5125 / 0.4559 / 0.2041, its float_twin.csv row exactly. Both from a results root neither was
+# ingested from before.
+#
+# RESIDUAL CONFOUND ON THE SCALE TERM ONLY: l1relu_s1 ran on a REGENERATED xclbin (65ed581a)
+# because the 0902 bitstream (9cea47ce) was no longer on disk. v++ is not bit-reproducible, so
+# the md5 differs; the aie.flagstamp and crop.flagstamp are byte-identical to the 0902 sweep's,
+# which is what establishes it is the same design. The ARITHMETIC term is unaffected -- both its
+# arms are on the same side of that difference.
+term,contrast,date,dR_mean,dR_median,dR_trim3,dR_trim5,better,worse,tied,sign_p,p_dr_le0,dA_mean,dA_trim5,term_pl
+SCALE,l1relu_s1 - board-l1relu,2026-09-04,-0.0099,0.0000,-0.0171,-0.0210,19,29,14,0.193,0.858,0.0023,-0.0043,filtr skali (wylaczenie)
+ARITHMETIC,mosse-rgb-l1relu - l1relu_s1,2026-09-04,0.0312,0.0047,0.0177,0.0102,35,12,15,0.001,0.001,-0.0060,-0.0133,arytmetyka stalopozycyjna
+R-13,mosse-rgb-l1relu - board-l1relu,2026-09-04,0.0213,0.0047,0.0079,0.0018,36,21,5,0.063,0.053,-0.0038,-0.0124,"kontrast pierwotny, splatany"

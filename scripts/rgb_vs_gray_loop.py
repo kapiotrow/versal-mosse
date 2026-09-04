@@ -232,6 +232,197 @@ def split_ceta(name):
     return m.group(1), (-1.0 if tok == 'neg' else int(tok) / 10.0)
 
 
+def split_smem(name):
+    """'rgb-smem8' -> ('rgb', (8, None)).  'rgb-smem8p20' -> ('rgb', (8, 0.20)).
+
+    THE TRAINING-SAMPLE MEMORY -- R-06, and the last untested algorithmic
+    candidate after the 2026-09-03 closures.
+
+    THE MECHANISM IT ATTACKS. This tracker keeps ONE exponentially-weighted
+    running average (A, B <- (1-eta)*old + eta*new). At eta 0.05 its effective
+    memory is ~20 frames, so after ~20 drifting frames the filter is built
+    ENTIRELY from drifted crops and nothing anchors it to the target it was
+    initialised on. That is exactly the measured failure: ACCEPT 82.0% at median
+    PSR 18.83 in the 5 frames before a loss, box moving 1.88 px/frame -- it
+    walks off the target CONFIDENTLY (R-06, evidence/robustness_gap.md).
+    SRDCF/CSRDCF keep weighted sample SETS instead, and CSRDCF still beats this
+    tracker's own float twin by +0.0144 R trim-5 (P=0.018), a gap no arithmetic
+    explains.
+
+    THIS IS A MIXTURE, NOT A SELECTOR, and that distinction is what keeps it
+    open. The two-filter ensemble is CLOSED (N-22, N-24, O-03), but everything
+    closed there used a second filter as a CONFIDENCE signal -- a validator or a
+    per-frame selection rule -- and the pure-observer probe refuted the premise
+    that peak disagreement predicts a loss (AUC 0.461 frozen / 0.555 slow).
+    Nothing there touches combining several samples into ONE filter, which is
+    why `roadmap.md` still lists R-06 as untested. Do not re-derive the
+    selector result here.
+
+    THE CONTROL IS BUILT IN, and it must be run first. With no pin and M large,
+    a weighted sample set IS the running average -- A = SUM w_i a_i with
+    w_i <- (1-eta) w_i and w_new = eta is exactly the exponential recursion. So
+    `-smem<M>` with a generous M must REPRODUCE the baseline arm, and if it does
+    not, the implementation is wrong and no pinned result from it means
+    anything.
+
+    `p<pct>` PINS THE INIT SAMPLE at that fraction of total weight. That is the
+    anchor: the one sample guaranteed to be on the target, held at a floor the
+    exponential decay cannot erode, so a run of drifted frames can no longer
+    take the whole memory. It is the treatment.
+    """
+    m = re.match(r'^(.*?)-smem(\d+)(?:p(\d+))?$', name)
+    if not m:
+        return name, None
+    pin = (float(m.group(3)) / 100.0) if m.group(3) else None
+    return m.group(1), (int(m.group(2)), pin)
+
+
+class SampleMemory:
+    """A weighted set of training samples, replacing the single running average.
+
+    Each sample holds the SAME quantities the running average accumulates --
+    a_i = conj(G_i) * F_i and b_i = SUM_ch |F_i|^2 -- so the filter built from
+    the set is the same estimator, differing only in how weight is distributed
+    over history. See split_smem() for why that makes the no-pin case a control.
+
+    COST, stated because it decides whether this can ever reach the board: one
+    sample is `channels x rows x cols` complex plus `rows x cols` real -- 2 MB
+    per sample at 32ch/64x64 in complex128, against the 2 MB of filter state the
+    board already carries. M=8 is 16 MB on the host. Halving to complex64 is
+    available if the board ever wants it; it is not done here because fidelity
+    matters more than footprint while the question is still "does it work".
+    """
+
+    def __init__(self, m, pin, a0, b0):
+        self.m, self.pin = m, pin
+        self.a = [a0.copy()]
+        self.b = [b0.copy()]
+        self.w = [1.0]
+
+    def update(self, F, Gt, eta):
+        a_new = np.conj(Gt)[None, :, :] * F
+        b_new = np.sum(np.abs(F) ** 2, axis=0)
+        self.w = [x * (1.0 - eta) for x in self.w]
+        self.a.append(a_new); self.b.append(b_new); self.w.append(eta)
+        if len(self.w) > self.m:
+            # EVICT BY MERGING, NEVER BY DROPPING, and this is the whole design.
+            #
+            # Dropping the lowest weight DESTROYS MASS: at eta 0.05 a set of M
+            # samples retains only 1-(1-eta)^M of the total (34% at M=8), and
+            # renormalising what survives silently turns the arm into a much
+            # SHORTER memory -- an effective eta near 0.125, which is a measured
+            # WORSE setting (0.05 beats 0.125 by +0.0218 R). Screened that way,
+            # M=8 lost basketball at frame 21 against never, and the result was
+            # about the memory LENGTH, not about keeping a sample set at all.
+            #
+            # Merging the two lowest weights preserves SUM(w) exactly, so the
+            # effective memory length is unchanged and M becomes a pure
+            # RESOLUTION knob on old history -- which is the quantity R-06 is
+            # actually about. Weights are monotone in age, so this coarsens the
+            # oldest samples first, exactly as intended.
+            lo = 1 if self.pin is not None else 0
+            order = sorted(range(lo, len(self.w)), key=lambda i: self.w[i])
+            j, k = order[0], order[1]
+            wj, wk = self.w[j], self.w[k]
+            tot = wj + wk
+            if tot > 0:
+                self.a[k] = (wj * self.a[j] + wk * self.a[k]) / tot
+                self.b[k] = (wj * self.b[j] + wk * self.b[k]) / tot
+            self.w[k] = tot
+            del self.a[j]; del self.b[j]; del self.w[j]
+
+    def filter(self):
+        w = np.asarray(self.w, dtype=np.float64)
+        if self.pin is not None and len(w) > 1:
+            # Renormalise the tail to (1-pin) and hold the anchor at pin.
+            tail = w[1:].sum()
+            w = np.concatenate(([self.pin],
+                                w[1:] * ((1.0 - self.pin) / tail) if tail > 0
+                                else np.zeros(len(w) - 1)))
+        tot = w.sum()
+        if tot <= 0:
+            return self.a[0], self.b[0]
+        w = w / tot
+        A = np.zeros_like(self.a[0])
+        B = np.zeros_like(self.b[0])
+        for wi, ai, bi in zip(w, self.a, self.b):
+            if wi == 0.0:
+                continue
+            A += wi * ai
+            B += wi * bi
+        return A, B
+
+
+def split_hq(name):
+    """'rgb-hq' -> ('rgb', 'max').  'rgb-hq99.9' -> ('rgb', 99.9).  else (name, None).
+
+    THE BOARD'S FILTER QUANTIZATION, which the float twin does not have and
+    which no instrument on the board can see.
+
+    WHY THIS ARM EXISTS. The matched comparison of 2026-09-04 (board SCALE_N=1
+    against the float twin, both without a scale filter) puts the fixed-point
+    implementation at +0.0102 R trim-5, P(dR<=0)=0.002 -- the largest
+    unattributed term left. The RESPONSE path is not the cause: over 180,125
+    evaluated frames of runs/vot/0904_1225-l1relu_s1 the response sits at a
+    median 15.4% of full scale, i.e. ~12.3 bits of 15, so its quantization
+    noise is ~2^-12 of peak.
+
+    H IS THE REMAINING CANDIDATE, and it is invisible to every board
+    instrument. `mosse_filter.cpp:publish_packed` normalises H to Q1.15 against
+    a SINGLE GLOBAL MAX over all channels and all bins, and its own comment
+    records why that is dangerous: a MOSSE filter is SPIKY -- max|H| sits where
+    |F| is SMALLEST, because that is where the regularized inverse peaks -- so
+    normalizing the peak bin to full scale leaves every informative bin far
+    below it. `rails`, `accum_max` and `resp_max` all measure the RESPONSE and
+    are blind to this, which is why the shift-budget work could not have found
+    it.
+
+    THE CLIPPED VARIANT IS THE CANDIDATE FIX, and it is HOST-ONLY. Normalising
+    to a percentile of |H| instead of its max buys every informative bin the
+    bits the outlier was hoarding, at the price of saturating the few bins above
+    the percentile. It changes only the DATA written to `gmio_cmul_in` -- no
+    AIE_FLAGS, no rebuild, no re-flash. A per-CHANNEL scale is NOT available:
+    cmul_accum applies ONE shift across the whole accumulation.
+    """
+    m = re.match(r'^(.*?)-hq([0-9.]+)?$', name)
+    if not m:
+        return name, None
+    return m.group(1), (float(m.group(2)) if m.group(2) else 'max')
+
+
+def quantize_h_board(H, mode='max'):
+    """H -> Q1.15 exactly as mosse_filter.cpp:publish_packed does it.
+
+    Global scale from ONE max over every channel and bin, `nearbyint`, then a
+    PER-COMPONENT clamp to +/-32767 (never -32768: cmul_accum computes
+    in.re*flt.re + in.im*flt.im in int32, and all four operands at -32768 is
+    exactly 2^31, one past INT32_MAX).
+
+    Returns H in LSB units. That is a UNIFORM rescale of the filter, which
+    moves neither the argmax nor PSR -- both are scale-free -- so the only
+    thing this arm changes is the quantization itself. `mode` is 'max' for the
+    board's rule or a percentile of |H| for the clipped candidate.
+    """
+    mag = np.abs(H)
+    peak = float(mag.max())
+    if peak <= 0.0:
+        return H, (0.0, 0.0, 0.0)
+    ref = peak if mode == 'max' else float(np.percentile(mag, mode))
+    if not (ref > 0.0):
+        ref = peak
+    scale = 32767.0 / ref
+    # NOT named `re`/`im`: `re` is the regex module this file parses arm names with.
+    qre = np.clip(np.rint(H.real * scale), -32767.0, 32767.0)
+    qim = np.clip(np.rint(H.imag * scale), -32767.0, 32767.0)
+    # DIAGNOSTICS, and they are the point of the first run: how many bits the
+    # MEDIAN bin actually receives, the spikiness that decides it, and how much
+    # was clipped to buy them.
+    med_bits = float(np.log2(max(float(np.median(mag)) * scale, 1e-12)))
+    spike = float(peak / max(float(np.median(mag)), 1e-300))
+    sat = float(np.mean((np.abs(qre) >= 32767.0) | (np.abs(qim) >= 32767.0)))
+    return qre + 1j * qim, (med_bits, spike, sat)
+
+
 def split_chrel(name):
     """'rgb-chrel10' -> ('rgb', 1.0).  'rgb-chrelneg' -> ('rgb', -1.0).  else (name, None).
 
@@ -680,7 +871,7 @@ def run_arm(arm, wq, bias, shift, gt, n_frames, oracle_scale, verbose,
             mask_power=1, rect=None, chrel_gamma=None, stride=1, blur_n=1,
             pool_n=1, pool_mode_ov=None,
             ceta_lo=None, ceta_stat='psr', ceta_warmup=12, lt_eta=None,
-            frames=None):
+            quant_h=None, smem=None, padding=None, frames=None):
     # float_conv = (w_float, b_fold) runs the UNQUANTIZED conv instead of the
     # int8 one, everything else identical. See conv_features_float's docstring:
     # this arm exists to answer whether quantization causes the tracker's poor
@@ -724,6 +915,7 @@ def run_arm(arm, wq, bias, shift, gt, n_frames, oracle_scale, verbose,
     # look healthy while it happens.
     rec = {'iou': [], 'cerr': [], 'psr': [], 'holds': 0, 'lost_at': None,
            'step': [], 'resp00': [], 'ebox': [], 'etascale': [], 'ltdiv': [],
+           'hq': [], 'bdyn': [],
            # `box` is the TRAJECTORY: (row, col, h, w) per visited frame, in run
            # order, init frame included. The bench scores itself from `iou` and
            # never needed it; the multistart protocol scores the boxes and
@@ -746,6 +938,7 @@ def run_arm(arm, wq, bias, shift, gt, n_frames, oracle_scale, verbose,
     # signal that is NOT inside a single response map. If the peaks do not
     # diverge before the loss, the two-filter ensemble (O-03) is dead too.
     A_lt = B_lt = None
+    mem = None                 # the training-sample memory (R-06), see split_smem
     # Built once: the mask is fixed in PATCH coordinates, so it does not move
     # with the box. Its fixedness is the whole reason it is host-only and free.
     # mask_power k: the mask is m**k. THIS IS A REAL, BOARD-IMPLEMENTABLE WIDTH
@@ -774,7 +967,16 @@ def run_arm(arm, wq, bias, shift, gt, n_frames, oracle_scale, verbose,
             g = gt[f - 1]
             if g[2] > 0 and g[3] > 0:
                 bh, bw = g[2], g[3]
-        roi_h, roi_w = int(round(bh * PADDING)), int(round(bw * PADDING))
+        # PADDING IS A KNOB, NOT A CONSTANT, and it is coupled to MOSSE_SIGMA.
+        # The target spans `map / padding` BINS, so sigma/target = sigma*padding
+        # / map: moving padding silently moves the MAINLOBE WIDTH, which R-11
+        # identifies as THE axis with an optimum at 1/16. The 2026-08-28
+        # hardware refutation of padding 3.0 ran at sigma 2.0, i.e.
+        # sigma/target = 1/10.7 -- 1.5x too wide -- so it moved two magnitudes
+        # at once. Pass `padding` and `sigma` together or the arm is not a
+        # padding arm. See split_smem()'s note on M-14 for the general rule.
+        pad = PADDING if padding is None else padding
+        roi_h, roi_w = int(round(bh * pad)), int(round(bw * pad))
         roi_row = int(round(row - roi_h / 2.0))
         roi_col = int(round(col - roi_w / 2.0))
 
@@ -866,6 +1068,11 @@ def run_arm(arm, wq, bias, shift, gt, n_frames, oracle_scale, verbose,
             # carried forward untouched.
             if lt_eta is not None:
                 A_lt, B_lt = A.copy(), B.copy()
+            if smem is not None:
+                # Seeded from the init state, AFTER the warp normalisation, so
+                # the anchor is exactly the filter the tracker had at frame 1 --
+                # the one sample guaranteed to sit on the target.
+                mem = SampleMemory(smem[0], smem[1], A, B)
             rec['ltdiv'].append(float('nan'))     # no detection on the init frame
             rec['iou'].append(box_iou((row, col, bh, bw), gt[f - 1]))
             rec['cerr'].append(float(np.hypot(row - gt[f-1][0], col - gt[f-1][1])))
@@ -899,6 +1106,28 @@ def run_arm(arm, wq, bias, shift, gt, n_frames, oracle_scale, verbose,
         # it reflects the mask if one is applied and the baseline if not. The
         # box is measured in bins from THIS frame's resample ratio, so it tracks
         # the box size instead of assuming the initial one.
+        # DENOMINATOR CONDITIONING -- the quantity Bolme 3.3's perturbation
+        # argument turns on. The 2026-08-28 refutation of init perturbations
+        # rests on "bins below 1e-6*mean(B) are 0.00%", measured on the 3x3
+        # mobilenet bank at 16 channels. Both the bank and the channel count
+        # moved on 2026-09-02, and a RECTIFIED 7x7/2 map is far more low-pass,
+        # so its spectrum is DC-heavy and its high bins are relatively smaller.
+        # Logged per frame so the claim can be re-checked on any bank.
+        _bm = float(np.mean(B))
+        if _bm > 0:
+            rec['bdyn'].append((float(np.min(B)) / _bm,
+                                float(np.percentile(B, 1)) / _bm,
+                                float(np.mean(B < 1e-6 * _bm)),
+                                float(np.mean(B < 1e-3 * _bm))))
+
+        if quant_h is not None:
+            # LAST, after chrel and the mask: on the board cmul_accum only ever
+            # sees the PUBLISHED H, so everything downstream here -- ebox and
+            # the response alike -- must see the quantized one too. A and B stay
+            # float, as they do on the board.
+            H, hstat = quantize_h_board(H, quant_h)
+            rec['hq'].append(hstat)
+
         rec['ebox'].append(box_energy_fraction(H, bh * fr / roi_h, bw * fc / roi_w))
 
         resp = np.real(np.fft.ifft2(np.sum(F * np.conj(H), axis=0)))
@@ -994,7 +1223,14 @@ def run_arm(arm, wq, bias, shift, gt, n_frames, oracle_scale, verbose,
             # cased -- one code path, no branch that could differ).
             if lt_eta is not None and A_lt is not None:
                 A_lt, B_lt = FG.filter_update(A_lt, B_lt, F, Gt, lt_eta)
-            A, B = FG.filter_update(A, B, F, Gt, eta_eff)
+            if mem is not None:
+                # THE SAMPLE SET REPLACES THE RUNNING AVERAGE. With no pin and a
+                # generous M this is arithmetically the same recursion, which is
+                # what makes `-smem<M>` the control -- see split_smem().
+                mem.update(F, Gt, eta_eff)
+                A, B = mem.filter()
+            else:
+                A, B = FG.filter_update(A, B, F, Gt, eta_eff)
         else:
             rec['holds'] += 1        # hold position AND skip the update, both
             # A vetoed frame does not update, so it does not enter the history
@@ -1043,6 +1279,8 @@ def resolve_arm(a, W, w_rgb, w_gray, b_fold, quiet=False):
     stem, mask_plateau = split_mask(stem)
     stem, rand_seed = split_rand(stem)
     stem, bank_kind = split_bank(stem)
+    stem, smem = split_smem(stem)
+    stem, quant_h = split_hq(stem)
     stem, chrel_gamma = split_chrel(stem)
     stem, ceta_lo = split_ceta(stem)
     stem, l1_kind = split_l1(stem)
@@ -1166,7 +1404,8 @@ def resolve_arm(a, W, w_rgb, w_gray, b_fold, quiet=False):
     return dict(stem=stem, base=base, bank=bank, n_warps=n_warps,
                 mask_plateau=mask_plateau, chrel_gamma=chrel_gamma,
                 ceta_lo=ceta_lo, rect=rect, stride=stride, blur_n=blur_n,
-                pool_n=pool_n, pool_mode_ov=pool_mode_ov)
+                pool_n=pool_n, pool_mode_ov=pool_mode_ov, quant_h=quant_h,
+                smem=smem)
 
 
 def main():

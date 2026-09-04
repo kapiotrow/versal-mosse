@@ -36,10 +36,15 @@
  *                 A windowing result from one port does NOT generalise to
  *                 another: the identical change was 7x better on one GMIO and 4x
  *                 worse on its sibling.
- *   memory tiles  1 of 76 used, for the transpose between the row and column
- *                 passes (MEMTILE_TRANSPOSE=1, which also deleted four GMIO
- *                 ports). A ONE-SIDED flag is a board deadlock, not a compile
- *                 error. docs/thesis/results/resources.csv.
+ *   memory tiles  2 of 76 used — memTileFwd here and memTileInv in ifft_graph.h,
+ *                 for the transpose between the row and column passes
+ *                 (MEMTILE_TRANSPOSE=1, which also deleted four GMIO ports). A
+ *                 ONE-SIDED flag is a board deadlock, not a compile error.
+ *                 docs/thesis/results/resources.csv (build=rgb_l1relu). This said
+ *                 "1 of 76" until 2026-09-04 and was wrong on every build: the
+ *                 flag instantiates one shared buffer per direction, and
+ *                 aie_control_config.json reports both on 128x128/ch16,
+ *                 64x64/ch16 and 64x64/ch32 alike.
  *   numerics      DSPLib's cint16 FFT loss is ADDITIVE, not a gain factor: each
  *                 pass subtracts ~21 from a summed DC bin, independent of
  *                 amplitude. So row_dc = PATCH_COLS*c - 21 and accum0 =

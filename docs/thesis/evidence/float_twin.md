@@ -2,6 +2,26 @@
 
 **Status:** current · **Updated:** 2026-09-04 · **Scope:** this project's own tracker in float under the multistart protocol; the pre-registered prediction FIRED, its attribution is open, and the scale bracket is now COMPLETE
 
+## WHERE THIS ENDED UP
+
+**2026-09-04, later the same day — TWO CORRECTIONS, one of them to this note's central argument.**
+
+1. **The confound is RESOLVED.** The board's `SCALE_N=1` run supplies the missing cell. The
+   scale term is a NULL (dR trim-5 **-0.0210**, P(dR<=0)=0.858) and the deconfounded arithmetic
+   term is LARGER than the contrast below (trim-5 **+0.0102**, P=0.001). The headline was NOT
+   the scale filter. See `evidence/fixed_point_cost.md` and claim `R-16`.
+2. **THIS NOTE'S TRIM FIGURES FOR `twin - board` WERE COMPUTED TWO-SIDED, AND THE ARGUMENT
+   BUILT ON THEM IS WITHDRAWN.** `drop-top-5 +0.0222` is a five-off-EACH-END trim. Under
+   `grid_stats.py`'s stated one-sided definition -- drop the 5 sequences most FAVOURABLE to the
+   arm -- it is **+0.0018**, and the dA figure is **-0.0124**, not -0.0027. Dropping the most
+   favourable sequences cannot RAISE a mean, so "larger than the untrimmed mean" was the tell
+   and it was read as evidence instead. **`R-13` was not trim-stable.** Its direction survives
+   (36/21/5) and the deconfounded `R-16` contrast is trim-stable where this one was not.
+   **Every OTHER trim in this note was re-checked against the same trajectories and is
+   one-sided and correct** -- oracle-twin -0.0032, oracle-board +0.0210, CSRDCF-twin +0.0144,
+   oracle dA +0.0766 all reproduce exactly, as do all four arms' A/R/EAO
+   (workspace `0904_trimcheck`).
+
 **2026-09-04.** No board time. `scripts/offline_multistart.py --tracker mosse:rgb-l1relu`, 62
 sequences, 419 anchored runs, 180,544 frames, scored by `vot_ingest.py` exactly as a board
 sweep. Numbers: `results/float_twin.csv`. Claim `R-13`.
@@ -24,14 +44,18 @@ would be the finding."*
 Paired per sequence, twin minus board, n = 62:
 
 ```
-dR  mean +0.0213   median +0.0047   drop-top-5 +0.0222   36 better / 21 worse / 5 tied   P(dR<=0) 0.055
-dA  mean -0.0038   median -0.0025   drop-top-5 -0.0027   30/32/0                          P(dA<=0) 0.709
+dR  mean +0.0213   median +0.0047   trim-5 +0.0018   36 better / 21 worse / 5 tied   P(dR<=0) 0.055
+dA  mean -0.0038   median -0.0025   trim-5 -0.0124   29/32/1                          P(dA<=0) 0.709
 ```
 
-**The prediction FIRED.** The twin is better, not worse, and the effect is trim-stable (+0.0222
-after dropping the top five sequences, larger than the untrimmed mean). Accuracy is a clean null.
-`P(dR<=0) = 0.055` is above the 0.05 line, and this project treats `P` as necessary and never
-sufficient anyway — the trim stability is the stronger half of the evidence.
+**CORRECTED 2026-09-04** (see WHERE THIS ENDED UP): these two rows read `drop-top-5 +0.0222` and
+`-0.0027`, which were TWO-SIDED trims. The one-sided figures are above.
+
+**The prediction FIRED**, in DIRECTION: the twin is better, not worse, on 36 sequences against 21.
+**The trim-stability claim this note originally made here is WITHDRAWN** — one-sided trim-5 is
++0.0018, so a handful of sequences carry most of the magnitude, and `P(dR<=0) = 0.055` is above
+the 0.05 line with nothing stronger behind it. Accuracy is a clean null either way. The
+deconfounded contrast in `R-16` is the one that is trim-stable (+0.0102, P = 0.001).
 
 ## Did the mechanism hold? NO — and the headline must not be reported as a quantization result
 
@@ -146,6 +170,9 @@ run came out.**
 - **The twin does not scale like the OpenCV arms.** 31 ms/frame at 4 workers but 189 ms/frame at
   30: the numpy FFT work is memory-bandwidth bound, so the full 62 takes ~13 min per bracket
   mode, not the ~3 min a linear extrapolation predicts. Budget accordingly.
-- Do not read `P(dR<=0) = 0.055` as "not significant, therefore nothing". The trim-5 figure
-  (+0.0222) exceeds the untrimmed mean, which is the pattern of an effect spread across
-  sequences rather than carried by a few.
+- **WITHDRAWN 2026-09-04.** This bullet read: *do not treat `P(dR<=0) = 0.055` as nothing,
+  because the trim-5 figure (+0.0222) exceeds the untrimmed mean.* That figure was a TWO-SIDED
+  trim; one-sided it is +0.0018, and a trim that exceeds its own mean is arithmetically
+  impossible under the one-sided definition, which is exactly the tell that was missed. The
+  effect IS carried by a few sequences on magnitude. What survives is the direction (36/21/5)
+  and, after deconfounding, `R-16`.

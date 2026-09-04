@@ -18,16 +18,36 @@ The device tree declares all three banks; `/proc/iomem` shows only
 `00000000-7fffffff : System RAM`, with the 2 GB at `0x8_00000000` reserved and
 the 8 GB at `0x500_00000000` absent. The figure below is the PART's capacity and
 has been misread as an available-memory budget once already; AIE core clock 1 GHz
-(`directives/post_sys_link.tcl`). Measured on the 128×128 ch1 build:
+(`directives/post_sys_link.tcl`). **The ROUTED shipping build** — `build/hw/64x64/ch32`,
+`aie.flagstamp` verified, PL 312.5 MHz:
 
-| Resource | Available | Used | % |
-|---|---|---|---|
-| AIE-ML cores | 304 | 6 | 2% |
-| AIE-ML memory tiles | 76 | 1 | 1% |
-| BRAM18 | 1200 | 10 | 0.8% |
-| DSP | 1312 | 44 | 3.4% |
-| LUT | 520704 | 7694 | 1.5% |
-| FF | 1041408 | 7539 | 0.7% |
+| Resource | Available | Used | % | of which the 2 PL kernels |
+|---|---|---|---|---|
+| AIE-ML cores | 304 | 6 | 2.0% | — |
+| AIE-ML memory tiles | 76 | 2 | 2.6% | — |
+| BRAM18 | 1200 | 26 | 2.2% | 26 (all `roi_crop`) |
+| DSP | 1312 | 56 | 4.3% | 56 |
+| LUT | 520704 | 10527 | 2.0% | 7499 |
+| FF | 1041408 | 13252 | 1.3% | 9523 |
+
+`Used` includes the base platform (LUT 3028 / FF 3729); `roi_crop` is LUT 5983 / FF 7738 /
+BRAM 13 tiles / DSP 53 and `camera_capture` LUT 1516 / FF 1785 / DSP 3
+(`_x/reports/link/imp/impl_1_{full,kernel}_util_routed.rpt`). BRAM18 counts half-tiles: the
+design holds 12× RAMB36E5 + 2× RAMB18E5 = 13 tiles. The AIE rows come from the AIE compiler's
+`aie_control_config.json`, the only source for them — Vivado's "AI ML Engines" row reads 0.
+
+**CORRECTED 2026-09-04, and the old numbers were not a utilisation at all.** This table used to
+read BRAM18 10 / DSP 44 / LUT 7694 / FF 7539 / 1 memory tile "measured on the 128×128 ch1 build".
+Those four PL figures reproduce byte-for-byte from `roi_crop`'s **HLS C-synthesis estimate** on an
+`hw_emu` 128×128 **single-channel grayscale** build — one kernel, no `camera_capture`, no
+platform, no place-and-route, and not an arm that ever produced a tracking number. The memory-tile
+count of 1 was wrong on *every* build: `MEMTILE_TRANSPOSE=1` instantiates `memTileFwd` **and**
+`memTileInv`. This fed `P-13`'s comparison against Danilowicz & Kryjak, whose ratios fall from
+20.4/44.4/54.1/10.9× to **14.9/25.2/20.8/8.6×** — the conclusion holds, the numbers are now
+defensible. `docs/thesis/evidence/embedded_comparison.md` sec.6; the superseded rows are kept in
+`results/resources.csv` under `build=roi_crop_hls_128ch1`, marked non-quotable.
+**A resource claim must name the report file it came from, and that file must be a routed
+implementation of the arm the tracking numbers came from.**
 
 **The design uses 2% of the AIE array.** Check any "we can't afford it on AIE" claim against
 that first — the binding constraints have always been tile memory (64 KB/tile) and host DMA
@@ -69,6 +89,16 @@ stalls, trustworthy for sizing but not a profile.
 | 08-21 | blocked `unpack_spectrum` | 28.64 | 34.92 | `run_0821_1635` |
 | 08-21 | tail split onto core 1 (`TAIL_PARALLEL`) | **26.23** | **38.15** | `run_0821_1712` |
 | 08-24 | RGB (`CONV_IN_CH=3`) — cost is host memory, not conv2d | 28.58 | 34.99 | `run_0824_1457` |
+| 09-04 | **SHIPPING arm on the serial console** — car1, 742 frames, 0 gated | **25.82** | **38.73** | `0904_l1relu_console/runV_uart.log` |
+| 09-04 | ...the same ELF and sequence over ssh — **transport = 0.91 ms** | 24.91 | 40.14 | `0904_l1relu_console/runV_ssh.log` |
+
+**THE LAST TWO ROWS ARE NOT LADDER STEPS.** Everything above them is the 128x128 / ch16 / 3x3
+build on the synthetic scene, each row one accepted optimisation of the row above. The
+2026-09-04 rows are a **different design on a different scene** (VOT `car1`), measured because
+the shipping arm had only ever been timed over ssh. 25.82 against 26.29 is not an improvement of
+anything. **The shipping arm cannot be run on the synthetic scene at all** — it gates 128 of 199
+frames there, so the tail runs on 0.4 calls/frame and the number comes out ~2.6 ms LOW.
+[`../thesis/evidence/frame_time_shipping.md`](../thesis/evidence/frame_time_shipping.md).
 
 **Every one of these was accepted on a bit-identical-tracking test**, and that criterion has now
 caught two bugs it was not designed for (the `g_target_shift` race, the `FFT_COL_WS` datapath
@@ -88,7 +118,34 @@ UNATTRIBUTED    +1.261  +1.284
 
 **The frame is 84% CPU-BOUND**, not wait-bound: host CPU = APU 15.4 + GMIO async 6.6 + roi_crop
 1.0 + unattributed 1.2 = 24.2 ms of a 28.7 ms frame (measured pre-threading). Only 41% of GMIO
-blocks. **The second core's value is splitting 24 ms of work, not filling 4.5 ms of gaps**;
+blocks.
+
+### Where the frame goes — the SHIPPING arm, 25.82 ms console / 24.91 ssh (2026-09-04)
+
+```
+                 console    ssh      (VOT car1 job 0, 742 frames, 741 accepted / 0 gated)
+APU subtotal      9.627    9.602
+of which OVERLAP -2.582   -2.581
+APU wall          7.045    7.021
+GMIO              9.960    9.876    (async 6.8 / wait 3.1 — only 31% BLOCKS, was 41%)
+roi_crop launch   7.422    7.528    <-- 28.7% OF THE FRAME, and 99% of it is a POLL
+UNATTRIBUTED     +1.389   +0.485    <-- the whole console/ssh difference lands here
+frame total      25.82    24.91
+```
+
+**`roi_crop` is now the largest single item in the frame, and 7.495 of its 7.569 ms is
+`crop_ip poll ap_done`** — the host spinning on the PL's completion flag, 0.23 ms per channel
+across 32 channels, 4386 poll iterations. It grew 7.3x from the ch16 arm's 1.013 ms because the
+crop is 128x128 (4x the output pixels; `roi_crop` scales with OUTPUT pixels) across twice as many
+channels. **So the shipping frame is *more* CPU-bound than 84% — 24.4 of 24.91 ms — but a third
+of that "CPU" is a busy-wait that a sleeping wait or a pipelined launch would return.**
+`scale extract` (2.211 ms) is **not** the head of the tail on this arm, which the ch16 measurement
+in `../thesis/evidence/arm_res64.md` sec.19.5 had concluded.
+
+**The console transport term is 0.91 ms, not 3.79** (`P-09` measured the UART at
+progress-every-frame; this build prints at `PROGRESS_EVERY=25`, and the cost is bytes on the
+wire). The pair is its own control: the two runs agree stage-for-stage to under 0.15 ms and the
+entire difference appears in `unattributed`, within 0.006 ms of the frame delta. **The second core's value is splitting 24 ms of work, not filling 4.5 ms of gaps**;
 perfect two-core use floors at ≈12-15 ms, 65-80 FPS. That slack is also why RGB is nearly free
 (see "RGB costs what the HOST pays").
 

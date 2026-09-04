@@ -268,8 +268,10 @@ after all channels:
   ~2.9 ms. Anything writing `frame_bo` directly (`rc_control_cu_probe`'s zero-fill) must run
   before the first push.
 
-**Resources: the design uses 2% of the AIE array** (6 of 304 cores, 1 of 76 memory tiles, 0.8%
-BRAM18, 3.4% DSP, 1.5% LUT). Check any "we can't afford it on AIE" claim against that — the
+**Resources: the design uses 2% of the AIE array** (6 of 304 cores, 2 of 76 memory tiles, 2.2%
+BRAM18, 4.3% DSP, 2.0% LUT — the ROUTED shipping build; **re-measured 2026-09-04**, the figures
+this line used to carry were `roi_crop`'s HLS estimate on a single-channel gray build). Check
+any "we can't afford it on AIE" claim against that — the
 binding constraints have always been tile memory (64 KB/tile) and host DMA orchestration, never
 core count, and `runtime<ratio>` is not utilization. **Usable heap is ~0.9-1.2 GB, NOT the
 part's 12 GB** (Linux maps 2 GB, 512 MB of it CMA); it cost 5 of 62 sequences on the RGB VOT arm
@@ -362,9 +364,18 @@ different chip. `results/power.csv`, `evidence/power.md`, claim `P-12`.
 collapses and any difference clears "2 s.e." — which is exactly how three null rails first
 reported `CONTROL FAILED` at ±0.000 W.
 
-**Best hardware FPS: 26.29 ms/frame = 38.04 FPS** (`runs/run_0821_1725.log`, gray, synthetic,
-UART console). **Quote FPS only from a serial-console run** — over ssh the same work reads
-differently, and the UART alone was 3.79 ms. On the ssh instrument the shipping arm is **24.07 ms
+**THE SHIPPING ARM ON THE SERIAL CONSOLE: 25.82 ms/frame = 38.7 FPS** (`car1`, 742 frames,
+0 gated, 2026-09-04, `runs/perf/0904_l1relu_console/`); the same ELF and sequence over ssh reads
+24.91, so **the transport term is 0.91 ms, NOT `P-09`'s 3.79** — that figure was measured at
+progress-every-frame and this build prints at `PROGRESS_EVERY=25`. The older
+**26.29 ms = 38.04 FPS** (`runs/run_0821_1725.log`) is gray/ch16/3x3 on the SYNTHETIC scene: a
+different arm on a different scene, so it is not a comparator. **The shipping arm CANNOT be run
+on the synthetic scene** — it gates 128 of 199 frames there (mean IoU 0.69), so the tail runs on
+0.4 calls/frame and the frame time comes out ~2.6 ms low, while the UART number inflates to
+58.53 ms on the gated frames' warning lines. **Read a run's gate summary before quoting its frame
+time** (`evidence/frame_time_shipping.md`). **`roi_crop` is now 28.7% of the frame and 99% of that
+is the `ap_done` BUSY-WAIT** (7.495 of 7.569 ms) — the biggest performance target on this arm.
+**Quote FPS only from a serial-console run.** On the ssh instrument the shipping arm is **24.07 ms
 on `agility` against `sigma4`'s 24.55** — 32 channels and 147 taps for slightly less than the old
 16-channel 3x3 arm, after the 2026-09-02 conv2d rework (2.39x on the schedule; row bases hoisted
 out of the column loop, `kc` unrolled, the PLIO read stored straight from the word).
@@ -398,11 +409,21 @@ Two results, both without board time:
   THEMSELVES, and every row of `arms.csv` rests on them. `opencv-kcf` does NOT reproduce — cv2's
   KCF is not the VOT KCF; **never quote it as KCF.** `evidence/harness_validation.md`.
 - **`R-13` — the float twin BEATS the board arm**, R 0.4559 against 0.4279, EAO 0.2041 against
-  0.1960, paired dR +0.0213 (trim-5 +0.0222), accuracy a null. **The pre-registered prediction
-  from `settled.md` FIRED.** But it is **CONFOUNDED and is not a quantization result**: the twin
-  also has NO scale filter, so arithmetic and scale handling both moved.
-  **`SCALE_N=1` on the board separates them and is one host-only flag.**
-  `evidence/float_twin.md`, `results/float_twin.csv`.
+  0.1960, paired dR +0.0213 (**trim-5 +0.0018** — CORRECTED 2026-09-04, the note's +0.0222 was a
+  TWO-SIDED trim and its trim-stability argument is withdrawn), accuracy a null. **The
+  pre-registered prediction FIRED in DIRECTION** (36 sequences better, 21 worse).
+  **THE CONFOUND IS NOW RESOLVED — see `R-16` below.** `evidence/float_twin.md`,
+  `results/float_twin.csv`.
+- **`R-16` — `SCALE_N=1` on the board decides it: the ARITHMETIC, not the scale filter.**
+  Disabling the DSST filter is a NULL (dR trim-5 **−0.0210**, P(dR<=0)=0.858; pooled says +0.0055
+  and INVERTS in sign — do not quote it). With scale handling matched on both sides, float64
+  against fixed-point is dR mean +0.0312, **trim-5 +0.0102**, 35 better / 12 worse, sign p 0.001,
+  **P(dR<=0) = 0.001** — stronger than the confounded contrast it came from.
+  **SCOPE: the fixed-point CORRELATION pipeline (cint16 FFT/IFFT, Q1.15 filter, `H_SHIFT`), NOT
+  the int8 FEATURE path** — the twin runs the same int8 conv datapath, so `settled.md`'s "the
+  int8 feature path HELPS" is untouched. Accuracy moves the OTHER way (dA trim-5 −0.0133), and
+  EAO moves only 0.2000 → 0.2041. `evidence/fixed_point_cost.md`, `results/scale_ablation.csv`,
+  `arms.csv` row `rgb_l1relu_s1`.
 
 **Perfect scale buys ACCURACY, not survival — corroborated closed-loop** (`M-13`). The
 oracle-scale twin gains A +0.0766 trimmed (P=0.000) and **no** survival (dR trim-5 −0.0032),
@@ -421,11 +442,12 @@ on a cross-paper comparison.
 Ranked, with the evidence for each rank, in
 [`docs/engineering/roadmap.md`](docs/engineering/roadmap.md). Headlines:
 
-- **THE CHEAPEST OPEN ITEM: `SCALE_N=1` on the board.** One host-only flag, an scp not a card
-  swap. It gives *fixed-point + no scale filter*, the matched comparison to the twin's *float +
-  no scale filter*, and so decides whether `R-13`'s +0.0213 R is the ARITHMETIC (which would
-  overturn `settled.md`'s quantization entry) or the board's BROKEN SCALE FILTER (a broken
-  estimator being worse than none). Nothing else separates them.
+- **DONE, ANSWERED — `SCALE_N=1` on the board (`R-16`, 2026-09-04).** It was NOT one host-only
+  flag: the 0902 bitstream was gone and `CONV_RELU` reaches `AIE_FLAGS`, so it cost a full AIE
+  rebuild and a re-flash. **The answer is the ARITHMETIC.** Disabling the scale filter is a null
+  (trim-5 −0.0210, P=0.858); at matched scale handling the fixed-point CORRELATION pipeline costs
+  trim-5 +0.0102, P=0.001. The board's broken scale filter costs nothing, so **the whole scale
+  direction stays closed for a second, independent reason.**
 - **DONE, REJECTED — `MOSSE_ETA=0.1`.** EAO 0.1960 → 0.1817 (sec.13). The named assumption is
   what broke: the grid ran at 128x128/sigma 4, the arm at 64x64/sigma 2, and `sigma/target`
   governs SIGMA only. **The methodological result outlives the arm — see below.**
@@ -572,9 +594,12 @@ sweep, an ingest and a card round-trip.
 **Settled — do not reopen** ([`docs/engineering/settled.md`](docs/engineering/settled.md)):
 `eps_rel = 1e-3`; padding 2.0, closed three ways;
 fDSST's PCA (the real-input DFT was the win, and is done);
-Hermitian halving of the host filter (premise false in fixed point); **quantization is NOT the
-cause of the poor robustness — removing it makes tracking WORSE**, so the fixed-point design
-costs nothing in accuracy or robustness and the frame rate is bought at no algorithmic price;
+Hermitian halving of the host filter (premise false in fixed point); **the INT8 FEATURE PATH is
+not the cause of the poor robustness — removing it makes tracking WORSE** (and note it was scored
+on the pre-Layer-1 gray bank, so `M-14` says it has expired as a screen, not that it is refuted);
+**the CORRELATION pipeline's fixed point is a different question and is NO LONGER SETTLED —
+`R-16` measures it at dR trim-5 +0.0102, P=0.001**, so "the fixed-point design costs nothing in
+robustness" is WITHDRAWN;
 init perturbations (the 16-channel denominator is already the cure); **aggregation over this map
 — box average, max and decimate, on the linear AND the rectified bank** (a null at best, and a
 LOSS of −0.0242 on the shipping bank; its old "linearity" explanation is WITHDRAWN — the linear
@@ -866,7 +891,25 @@ scripts/
                          #   and NO DSST SCALE FILTER (held fixed, or --oracle-scale; the two
                          #   BRACKET it, priced at +0.0023 R by scale_oracle_bound.py). Its
                          #   knobs default to the SHIPPING arm (eta 0.05, gate 5.0), NOT to
-                         #   rgb_vs_gray_loop's pre-08-27 defaults
+                         #   rgb_vs_gray_loop's pre-08-27 defaults.
+                         #   `deepdcf:<preset>` is DANILOWICZ & KRYJAK'S PUBLISHED TRACKER,
+                         #   unmodified, from the pinned clone in external/ (gitignored;
+                         #   /usr/bin/git -- Vivado's git has no https helper). It moves THEIR
+                         #   tracker to OUR benchmark, which dissolves M-17's three
+                         #   incomparabilities at once; the reverse would need a VOT2015
+                         #   conversion AND the supervised protocol this harness lacks.
+                         #   Presets best|hw|hw32|hw32w -- hw32 vs hw32w is the R-11 mainlobe-
+                         #   width control on THEIR geometry claim, whose sigma is in map bins
+                         #   with no geometry term. CUDA cannot be forked: the pool uses spawn
+                         #   for this backend. R-15
+  deepdcf_vot2015.py     # VOT toolkit glue for Danilowicz & Kryjak's deepDCF: THEIR tracker
+                         #   under THEIR protocol (VOT2015 supervised), as the KNOWN-ANSWER
+                         #   CHECK before any STb2022 number from the `deepdcf:` backend is
+                         #   quoted. Ours, not theirs -- their vot_integration.py hardcodes an
+                         #   absolute config path, and external/deep_mosse stays UNMODIFIED
+                         #   (scripts/patches/ is empty and that is the result). All arms are
+                         #   the FLOAT software model: their 4-bit checkpoint is not in the
+                         #   repo, so this is a BAND check, never a reproduction. R-15
   eao_window.py          # RE-SCORES EXISTING trajectories under a second EAO window, using the
                          #   toolkit's own analysis. The window is a property of the CHALLENGE:
                          #   [115,755] here, [108,371] on VOT2015. Worth +0.0827 on the shipping

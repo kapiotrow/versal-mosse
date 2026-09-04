@@ -26,6 +26,15 @@
 #     PERCENTAGES: the devices differ in size by ~2.3x in LUT, so percent flatters this work.
 #     used_pct is carried only so each number can be traced back to its source table.
 #
+#     CORRECTED 2026-09-04. Until then that sentence was true of THEIR side only: this work's
+#     rows were roi_crop's HLS C-synthesis ESTIMATE from an hw_emu 128x128 SINGLE-CHANNEL
+#     GRAYSCALE build (LUT 7694, FF 7539, BRAM18 10, DSP 44) -- one kernel, no camera_capture,
+#     no platform, no place-and-route, and not the arm that produced any tracking number here.
+#     It compared their 8-channel RGB design against a 1-channel gray one. The rows below are
+#     now the ROUTED shipping build (64x64 / ch32 / 7x7-s2 / RGB), from resources.csv. Every
+#     ratio fell: LUT 20.4x -> 14.9x, FF 44.4x -> 25.2x, BRAM36 54.1x -> 20.8x, DSP 10.9x ->
+#     8.6x. The conclusion is unchanged and the numbers are defensible; the old ones were not.
+#
 #   block=throughput  NOT COMPARABLE AS FPS, and this is the trap. Their 467.3 fps is the PL
 #     module's throughput for ONE scale at 375 MHz with the PS cropping the patch and feeding
 #     it over DMA (their Fig. 2) -- it is not an end-to-end frame rate, and their 150 fps for
@@ -70,12 +79,12 @@ resource,deepDCF,ZCU104 (ZU7EV),8ch 64x64 filter 32-bit fixed,LUTRAM,,,15436,101
 resource,deepDCF,ZCU104 (ZU7EV),8ch 64x64 filter 32-bit fixed,FF,,,334373,460800,72.56,danilowicz2022 Table 2,
 resource,deepDCF,ZCU104 (ZU7EV),8ch 64x64 filter 32-bit fixed,bram36_equiv,,,270.5,312,86.70,danilowicz2022 Table 2,their BRAM column is already 36Kb blocks
 resource,deepDCF,ZCU104 (ZU7EV),8ch 64x64 filter 32-bit fixed,DSP,,,480,1728,27.78,danilowicz2022 Table 2,
-resource,this work,VEK280 (VE2802),128x128 ch1 build,LUT,,,7694,520704,1.5,results/resources.csv,
-resource,this work,VEK280 (VE2802),128x128 ch1 build,FF,,,7539,1041408,0.7,results/resources.csv,
-resource,this work,VEK280 (VE2802),128x128 ch1 build,bram36_equiv,,,5,600,0.8,results/resources.csv,10 BRAM18 = 5 BRAM36; 1200 BRAM18 available
-resource,this work,VEK280 (VE2802),128x128 ch1 build,DSP,,,44,1312,3.4,results/resources.csv,
-resource,this work,VEK280 (VE2802),128x128 ch1 build,AIE-ML cores,,,6,304,2.0,results/resources.csv,NO COUNTERPART on ZCU104 -- this is where the transforms went
-resource,this work,VEK280 (VE2802),128x128 ch1 build,AIE-ML memory tiles,,,1,76,1.3,results/resources.csv,NO COUNTERPART on ZCU104
+resource,this work,VEK280 (VE2802),shipping 64x64 ch32 7x7-s2 RGB routed,LUT,,,10527,520704,2.0,results/resources.csv,routed whole design; the two PL kernels alone are 7499
+resource,this work,VEK280 (VE2802),shipping 64x64 ch32 7x7-s2 RGB routed,FF,,,13252,1041408,1.3,results/resources.csv,routed whole design; the two PL kernels alone are 9523
+resource,this work,VEK280 (VE2802),shipping 64x64 ch32 7x7-s2 RGB routed,bram36_equiv,,,13,600,2.2,results/resources.csv,12x RAMB36 + 2x RAMB18 = 13 tiles = 26 BRAM18; all of it roi_crop
+resource,this work,VEK280 (VE2802),shipping 64x64 ch32 7x7-s2 RGB routed,DSP,,,56,1312,4.3,results/resources.csv,
+resource,this work,VEK280 (VE2802),shipping 64x64 ch32 7x7-s2 RGB routed,AIE-ML cores,,,6,304,2.0,results/resources.csv,NO COUNTERPART on ZCU104 -- this is where the transforms went
+resource,this work,VEK280 (VE2802),shipping 64x64 ch32 7x7-s2 RGB routed,AIE-ML memory tiles,,,2,76,2.6,results/resources.csv,NO COUNTERPART on ZCU104; memTileFwd + memTileInv
 throughput,deepDCF,ZCU104,8ch 64x64 filter 375 MHz,PL module throughput,467.3,fps per scale,,,,danilowicz2022 sec 4.3,NOT an end-to-end frame rate; PS crops and DMAs the patch
 throughput,deepDCF,ZCU104,8ch 64x64 filter 3 scales,projected frame rate,150,fps,,,,danilowicz2022 sec 4.3,THEY STATE IT AS A PROJECTION -- not measured
 throughput,this work,VEK280,gray synthetic UART console,end-to-end frame rate,38.04,fps,,,,results/perf.csv,26.29 ms measured wall clock; 33-scale DSST included

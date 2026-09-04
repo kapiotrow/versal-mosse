@@ -14,7 +14,7 @@ measures neither. claims.md calls this out as the one debt with no claim behind 
 
 WHY A DIFFERENCE AND NOT A READING
 ----------------------------------
-The design uses 2% of the AIE array (6 of 304 cores, 1 of 76 memory tiles, 3.4% DSP) and
+The design uses 2% of the AIE array (6 of 304 cores, 2 of 76 memory tiles, 4.3% DSP) and
 the frame is 84% CPU-bound. A VEK280 is a development board: fans, PHYs, the System
 Controller itself and regulator loss dominate anything this design draws. A board-total
 wattage would therefore be a true number that answers the wrong question, and would rank
@@ -447,7 +447,7 @@ def summarise(rows, window, settle_s):
 
 def report(rows, windows, outdir, args, frames, frame_ms_log, settle=None):
     """Statistics, the verdict, and summary.csv. Shared by a live run and --reanalyse."""
-    settle_s = settle_s if settle is None else settle
+    settle_s = args.settle_s if settle is None else settle
     # --- per-phase statistics ----------------------------------------------
     stats = {p: summarise(rows, w_, settle_s) for p, w_ in windows.items()}
     channels = sorted({c for s in stats.values() for c in s})

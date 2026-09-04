@@ -1,4 +1,17 @@
 # Frame time history. Every row was accepted on a bit-identical-tracking test.
+#
+# THE ARM COLUMN IS LOAD-BEARING AND THE LADDER IS NOT CONTINUOUS. Rows through 2026-08-24 are
+# the 128x128 / ch16 / 3x3 build on the SYNTHETIC scene, each row one accepted optimisation of
+# the row above. The two 2026-09-04 rows are the SHIPPING arm (64x64 / ch32 / 7x7-s2 / RGB) on
+# VOT car1 job 0, 742 frames -- a different design on a different scene. They extend the table,
+# they do not continue the ladder, and 25.82 vs 26.29 is NOT an optimisation step.
+#
+# Why the shipping arm is not on the synthetic scene: it does not track it. 128 of 199 frames
+# gate NEGATIVE_PEAK, mean IoU 0.69, so the filter update / publish / scale extract run on 0.4
+# calls per frame and the frame time under-counts the tail by ~2.6 ms. Over the UART the same
+# run reads 58.53 ms because each gated frame prints six warning lines that VERBOSITY=0 does
+# not suppress. Both synthetic numbers are in runs/perf/0904_l1relu_console/ and NEITHER is
+# quotable. See docs/thesis/evidence/frame_time_shipping.md.
 date,change,frame_ms,fps,log,arm,change_pl
 ,baseline (console at 115200),880,1.14,,gray-synth,punkt odniesienia (konsola 115200)
 2026-08-20,console gating (VERBOSITY),180.6,5.54,runs/run_0820_1528.log,gray-synth,ograniczenie diagnostyki (VERBOSITY)
@@ -15,3 +28,5 @@ date,change,frame_ms,fps,log,arm,change_pl
 2026-08-21,tail split onto core 1 (TAIL_PARALLEL),26.23,38.15,runs/run_0821_1712.log,gray-synth,podział ogona na rdzeń 1 (TAIL_PARALLEL)
 2026-08-21,same build re-measured at VERBOSITY=0 — THE quoted best FPS,26.29,38.04,runs/run_0821_1725.log,gray-synth,ta sama kompilacja zmierzona przy VERBOSITY=0
 2026-08-24,RGB (CONV_IN_CH=3) — cost is host memory not conv2d,28.58,34.99,runs/run_0824_1457.log,rgb-synth,RGB (CONV_IN_CH=3)
+2026-09-04,"SHIPPING ARM (rgb_l1relu, 64x64/ch32/7x7-s2/RGB) — NOT an optimisation step: a different design, measured on the serial console for the first time",25.82,38.73,runs/perf/0904_l1relu_console/runV_uart.log,l1relu-vot,"ARM DOCELOWY (rgb_l1relu) — nie krok optymalizacji, lecz inny projekt zmierzony po raz pierwszy na konsoli szeregowej"
+2026-09-04,"...the same ELF and sequence over ssh — the TRANSPORT term is 0.91 ms, not phase4's 3.79",24.91,40.14,runs/perf/0904_l1relu_console/runV_ssh.log,l1relu-vot,"...ten sam plik ELF i sekwencja przez ssh — koszt transportu wynosi 0,91 ms"

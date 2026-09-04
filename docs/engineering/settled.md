@@ -209,7 +209,23 @@ version and a link.
 
 ## Settled questions — do not reopen
 
-- **`eps_rel = 1e-3` is optimal.** The response has a closed form `R = G·B/(B+ε)`. Sweeping the
+- **`eps_rel = 1e-3` — THE SCREEN HAS EXPIRED ON THE LAYER-1 BANK (2026-09-04, `R-17`,
+  `docs/thesis/evidence/layer1_rescreen.md`).** The sweep below ran where **15.8% of `B`'s bins sat
+  below `1e-3*mean(B)`**; on the shipping bank that fraction is **0.000%** and the SMALLEST bin is
+  `5.13e-3*mean(B)` — the regularizer now sits five times BELOW the worst bin it exists to
+  protect, moving that bin by ~20% and a typical bin by 0.1%. It is nearly inert and its optimum
+  has no reason to have stayed put. Host-only.
+  **RE-SCREENED 2026-09-04 — INERT, AND `1e-3` STANDS FOR A NEW REASON.** 12 sequences, paired:
+  `1e-5`/`1e-4`/`1e-3`/`3e-3` are IDENTICAL to the last digit (mean dIoU +-0.0003, median 0.0000,
+  trim-3 **0.0000**, 0-1 sequences moving at all). Above that nothing is trim-stable: `3e-2` shows
+  mean **+0.0112** with median EXACTLY 0.0000 and trim-3 **-0.0009**, and `1e-1` is trim-3
+  **-0.0090** — the carried-by-a-handful signature. **So the entry's ORIGINAL claim is now vacuous
+  rather than wrong**: the old sweep had a real peak (ratio 16.15 at 1e-3 against 4.01 at 1e-1),
+  and on this bank the curve is FLAT. Any value in 1e-5..3e-3 is the same tracker.
+  **CAVEAT WORTH KEEPING: `eps` is inert because `B` is well conditioned, not because it is
+  unnecessary.** It is the safety net for a bank whose denominator is NOT — the mobilenet 3x3 bank
+  had 15.8% of bins below `1e-3*mean(B)` — so do not delete it, and re-screen it with any new bank.
+  *(Original entry:)* **`eps_rel = 1e-3` is optimal.** The response has a closed form `R = G·B/(B+ε)`. Sweeping the
   integer pipeline: ratio 12.90 / 13.96 / **16.15** / 10.62 / 4.01 at ε = 1e-5…1e-1. Bolme
   Fig. 4's flat curve does not transfer — his ε is absolute on the denominator, ours is relative
   to `mean(B)`.
@@ -233,7 +249,19 @@ version and a link.
   and is why the correction sat unapplied for months. A DCF is linear in feature space; a half-wave rectifier throws away half the signal
   and the filter cannot undo it. Caveat: one patch (s6), held out by circular shift, and it
   diverges from Danelljan §3.3.
-- **Padding ≥2; recommend 2.0 — REOPENED 2026-08-24, and CLOSED 2026-08-28 IN FAVOUR OF 2.0.**
+- **Padding ≥2; recommend 2.0 — the 2026-08-28 refutation was CONFOUNDED; RE-SCREENED AT MATCHED
+  WIDTH 2026-09-04 AND STRENGTHENED (`R-18`, `docs/thesis/evidence/layer1_rescreen.md`).** The
+  target spans `map/padding` BINS, so `sigma/target = sigma*padding/map`: the hardware `pad30` arm
+  ran padding 3.0 at **sigma 2.0 = 1/10.7**, a mainlobe **1.5x too wide**, and nobody re-tuned
+  sigma — it moved two magnitudes at once, the same defect that re-attributed the 64x64 arm
+  (`R-11`) and gutted the resolution term (`R-14`). Re-screened with sigma matched, padding 3.0 is
+  **WORSE**, not better (mean dIoU **-0.1946** matched against -0.1182 unmatched; pad 2.5 matched
+  -0.0567), so **2.0 stands for a better reason than before**. **The matched arm losing to the unmatched one was FOLLOWED UP as `R-18` and does NOT overturn
+  `R-11`**: with the sigma range extended until all three padding columns bracket, `sigma/target`
+  matches two of three and `sigma/map` only the degenerate one. Padding 3.0 is the exception and
+  is the padding this file already flags as tripping the ALIASING detector — noisier features
+  favour a wider target. **Padding is not a clean lever for testing width above 2.0.**
+  *(Original entry:)* **REOPENED 2026-08-24, and CLOSED 2026-08-28 IN FAVOUR OF 2.0.**
   See the feature-geometry entry in this file: on all 62 sequences, every padding under 2.0 is WORSE
   (R 0.2251 at 1.5 against 0.2910 at 2.0), and at two matched px/bin points padding 2.0
   wins both. The original static-scene objection stands and the answer came out the same.
@@ -269,13 +297,23 @@ version and a link.
   `fft_ifft_2d_graph` halves its memory tile for real input via `fft_dit_2ch_real_graph`, which
   computes only the independent half rather than computing both and discarding one. That saves
   work instead of reconstructing it, so per-stage rounding never enters the argument.
-- **QUANTIZATION IS NOT THE CAUSE OF THE POOR ROBUSTNESS. Removing it makes tracking
+- **THE INT8 FEATURE PATH IS NOT THE CAUSE OF THE POOR ROBUSTNESS. Removing it makes tracking
   WORSE — measured 2026-08-27, offline, 8 sequences, 2841 frames.** The suspects are bracketed
   rather than argued:
 
+  **PARTIALLY OVERTURNED 2026-09-04 — ROW 1 ONLY (`R-16`, `evidence/fixed_point_cost.md`).**
+  This entry used to be titled "QUANTIZATION IS NOT THE CAUSE", which over-claimed: it
+  bracketed three suspects and only two of them survive. The cint16/Q1.15/`H_SHIFT` row was
+  exonerated by a QUALITATIVE reproduction argument, never a paired contrast, and the paired
+  measurement now contradicts it. **Rows 2 and 3 stand and are NOT touched** — the float twin
+  that measures row 1 runs the SAME int8 conv datapath, so it says nothing about the feature
+  path. Note also that row 3 was measured on the GRAY mobilenet 3x3 bank before the Layer-1 arm
+  existed; per `M-14` that screen has EXPIRED for the current operating point even though
+  nothing refutes it.
+
   | suspect | verdict | what settles it |
   |---|---|---|
-  | cint16 / Q1.15 / `H_SHIFT` pipeline | exonerated | `rgb_vs_gray_loop.py` is **float64 downstream of the features** and reproduces the board's failures anyway |
+  | cint16 / Q1.15 / `H_SHIFT` pipeline | **CONTRADICTED 2026-09-04** | was: "`rgb_vs_gray_loop.py` is float64 downstream of the features and reproduces the board's failures anyway" — a reproduction argument, not a contrast. Measured paired against the board at matched scale handling: **dR trim-5 +0.0102, 35 better / 12 worse, P(dR<=0)=0.001** (`R-16`). It costs accuracy back (dA trim-5 −0.0133) and only +0.0041 EAO |
   | saturation / rails | exonerated | `corr(rail rate, mean IoU)` = **−0.025**; the shipping arm has **zero** rails over 101,564 frames and still scores R = 0.307 |
   | the int8 FEATURE path | **exonerated — it HELPS** | `--arms gray gray-float`: frame-weighted mean IoU **0.2533 → 0.2350**, **zero of eight sequences improve** |
 
@@ -291,7 +329,21 @@ version and a link.
   background; and a hold policy whose duration exceeds the recovery budget. **Corollary for the
   write-up: the fixed-point design costs nothing in accuracy or robustness, so the frame rate is
   bought at no algorithmic price.**
-- **INIT PERTURBATIONS (Bolme §3.4) — CLOSED 2026-08-28. The 16-CHANNEL DENOMINATOR IS
+- **INIT PERTURBATIONS (Bolme §3.4) — CLOSED 2026-08-28, and RE-SCREENED AND STRENGTHENED ON THE
+  LAYER-1 BANK 2026-09-04 (`R-17`, `docs/thesis/evidence/layer1_rescreen.md`).** The argument below
+  is bank-scoped by its own wording ("a property of the FEATURE BANK"), and the bank, the channel
+  count and the rectifier all moved on 2026-09-02 — so it was re-measured rather than assumed.
+  **`B`'s conditioning went the OTHER WAY from the prediction**: the denominator floor is **173x
+  HIGHER** on the shipping bank (min `B`/mean 2.96e-05 -> **5.13e-03**) and the fraction of bins
+  below `1e-3*mean(B)` falls **15.80% -> 0.000%**. Bolme's defect is not merely cured here, it is
+  ABSENT, so perturbations are refuted A FORTIORI and the entry now clears a threshold **1000x
+  tighter** than the `1e-6` one below. 32 RECTIFIED channels each add non-negative energy at every
+  bin, so more channels FILL the spectrum in rather than thinning it.
+  **COROLLARY, worth more than the arm was: the 16% of losing runs that fail within 10 frames of
+  init are NOT a conditioning problem** — they survive with `B` essentially perfectly conditioned,
+  so no regularizer and no perturbation scheme addresses them. That family of cures is closed and
+  the question re-points at the init box and target distinctiveness.
+  *(2026-08-28 entry, verdict unchanged:)* The 16-CHANNEL DENOMINATOR IS
   ALREADY THE CURE.** `mosse_tracker.cpp` carried "TODO: affine perturbations for
   initialisation; this is the N=1 case" from the start, and the board says it matters:
   `scripts/vot_init_anatomy.py` measures **61 of 373 losing runs (16%) failing within 10 frames

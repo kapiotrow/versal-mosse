@@ -108,7 +108,23 @@ else
 fi
 [[ -n "$LIST" ]] || { echo "ERROR: sequence list is empty" >&2; exit 1; }
 
-ELF=${ELF:-build/hw/128x128/ch16/mosse_tracker.elf}
+# DERIVED FROM THE MAKEFILE, never copied -- the same rule calib_build.sh follows.
+# This used to hardcode build/hw/128x128/ch16/, which was the geometry until
+# 2026-09-02. After the defaults moved to 64x64/ch32 that stale path still
+# EXISTED on disk, so a sweep launched without --elf pushed a whole different
+# arm and produced a complete, plausible, wrong result -- the exact failure
+# class this pipeline's mutation tests exist for. Caught by --dry-run 2026-09-04.
+if [[ -z "$ELF" ]]; then
+    # `print-%` emits "NAME = value", so take the last field.
+    _pr=$(make -s print-PATCH_ROWS  2>/dev/null | awk '{print $NF}') || _pr=""
+    _pc=$(make -s print-PATCH_COLS  2>/dev/null | awk '{print $NF}') || _pc=""
+    _nc=$(make -s print-N_CHANNELS  2>/dev/null | awk '{print $NF}') || _nc=""
+    if [[ -z "$_pr" || -z "$_pc" || -z "$_nc" ]]; then
+        echo "cannot derive the ELF path from the Makefile (print-PATCH_ROWS/COLS, print-N_CHANNELS)." >&2
+        echo "pass --elf explicitly." >&2; exit 2
+    fi
+    ELF="build/hw/${_pr}x${_pc}/ch${_nc}/mosse_tracker.elf"
+fi
 BUILD_DIR=$(dirname "$ELF")
 CARD_SRC="$BUILD_DIR/package/sd_card"
 OUT=${OUT:-runs/vot/$(date +%m%d_%H%M)-$ARM}

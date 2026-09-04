@@ -2,7 +2,28 @@
 
 **Status:** current · **Updated:** 2026-09-04 · **Scope:** what to try next, ranked, with the evidence behind each rank
 
-## 2026-09-04 — the offline path is validated, and `SCALE_N=1` is now the top item
+## 2026-09-04 (later) — `SCALE_N=1` RAN, and the answer is the ARITHMETIC
+
+**`R-16`, `evidence/fixed_point_cost.md`.** The section below is superseded on its top item and
+on two of its factual premises; it is kept because its reasoning is what the run tested.
+
+- **The answer is (a).** Disabling the DSST filter is a NULL — dR mean −0.0099, **trim-5 −0.0210**,
+  P(dR<=0)=0.858, 19 sequences better against 29 worse. Pooled says +0.0055 and **inverts in
+  sign**; do not quote it. With scale handling matched, float64 against fixed-point is dR mean
+  +0.0312, **trim-5 +0.0102**, 35/12, P=**0.001** — stronger than the confounded `R-13` contrast.
+- **SCOPE, and it is narrower than "quantization".** The twin runs the SAME int8 conv datapath,
+  so this prices the fixed-point CORRELATION pipeline (cint16 FFT/IFFT, Q1.15, `H_SHIFT`) and
+  NOT the int8 feature path. `settled.md` row 1 is contradicted; rows 2 and 3 stand.
+- **It was NOT "one host-only flag, an scp rather than a card swap"** — that premise below was
+  stale. The 0902 bitstream was no longer on disk and `CONV_RELU` reaches `AIE_FLAGS`, so it
+  cost a full AIE rebuild, a re-flash and a regenerated xclbin (`v++` is not bit-reproducible).
+- **`R-13`'s trim figure below (+0.0213 paired, "trim-stable") is CORRECTED**: its published
+  drop-top-5 of +0.0222 was a TWO-SIDED trim and one-sided it is +0.0018. `R-13` was not
+  trim-stable; `R-16` is.
+- **The scale direction is now closed for a SECOND, independent reason.** `scale_oracle_bound.py`
+  priced a perfect filter at +0.0023 R; this prices the harm of the broken one at ~0.
+
+## 2026-09-04 — the offline path is validated, and `SCALE_N=1` is now the top item (SUPERSEDED ABOVE)
 
 **New top of the list: `SCALE_N=1` on the board.** The float twin (`R-13`) beat the shipping arm
 by +0.0213 R paired, which fired the pre-registered prediction from `settled.md` — but the twin
@@ -335,7 +356,22 @@ geometry arm.
 
 ### Next, in order — PERFORMANCE
 
-The APU is a **flat tail** — biggest single item 5.2 ms — so the remaining wins are structural.
+**RE-RANKED 2026-09-04 by the shipping arm's first per-stage measurement**
+([`../thesis/evidence/frame_time_shipping.md`](../thesis/evidence/frame_time_shipping.md)).
+The list below was built on the 128x128 / ch16 / 3x3 arm and its premise no longer holds:
+
+0. **`roi_crop`'s `ap_done` POLL — 7.495 ms/frame, 28.7% of the frame, the single largest item.**
+   0.23 ms per channel x 32 channels, 4386 poll iterations, and it is a **busy-wait**: the host
+   spins on the PL's completion flag. It grew 7.3x from the ch16 arm's 1.013 ms because the crop
+   is 128x128 (4x the output pixels) across twice the channels. Overlap it with the host's
+   per-channel work, exactly as `roi_crop` itself was pipelined on 08-21 (5.196 -> 1.020 ms), or
+   make the wait sleep. **This subsumes item 1 below and is a bigger, simpler target.**
+   Note `scale extract` (2.211 ms) is **NOT** the head of the tail on this arm — `arm_res64.md`
+   sec.19.5 concluded that from the ch16 arm and it does not transfer.
+
+The APU was a **flat tail** on the ch16 arm — biggest single item 5.2 ms — so the remaining wins
+were structural. On the shipping arm the APU wall is only 7.0 ms of 24.9 and the tail is flatter
+still; the frame is now `roi_crop` + GMIO.
 
 1. **Software-pipeline the CHANNEL loop.** The `fft_col_out` + `accum_out` pair (~8.7 ms) is the
    col-FFT + cmul production time for 16 channels, proven immune to transaction count. Overlap it

@@ -116,21 +116,32 @@ median exactly 0.0000, trim-5 −0.0040, P(dR<=0)=0.205; `harness_validation.md`
 
 | | deepDCF (ZCU104) | this work (VEK280) | ratio |
 |---|---|---|---|
-| LUT | 156,663 (68.0%) | 7,694 (1.5%) | **20.4x** |
-| FF | 334,373 (72.6%) | 7,539 (0.7%) | **44.4x** |
-| BRAM (36Kb equiv.) | 270.5 (86.7%) | 5 (0.8%) | **54.1x** |
-| DSP | 480 (27.8%) | 44 (3.4%) | **10.9x** |
+| LUT | 156,663 (68.0%) | 10,527 (2.0%) | **14.9x** |
+| FF | 334,373 (72.6%) | 13,252 (1.3%) | **25.2x** |
+| BRAM (36Kb equiv.) | 270.5 (86.7%) | 13 (2.2%) | **20.8x** |
+| DSP | 480 (27.8%) | 56 (4.3%) | **8.6x** |
+
+**Re-measured 2026-09-04 and every ratio fell** — was 20.4 / 44.4 / 54.1 / 10.9x. Those came
+from `roi_crop`'s HLS C-synthesis ESTIMATE on an hw_emu 128x128 **single-channel grayscale**
+build; this work's column is now the ROUTED shipping arm (64x64 / ch32 / 7x7-s2 / RGB), base
+platform included. `embedded_comparison.md` sec.6 records the whole thing; the direction and the
+mechanism are unchanged. **Never quote a resource number that does not name its report file.**
 
 Quote the ABSOLUTE counts — the VEK280 is 2.26x the ZCU104 in LUT/FF, so percent flatters this
 work (though it has *fewer* DSPs, 1312 against 1728). **And attribute it correctly: the
 transforms did not get cheaper, they moved onto 6 of 304 AIE-ML cores.** The defensible claim is
 about the platform choice, not about a better-engineered filter. Their design is at 86.7% BRAM
-for **8 channels at one scale**; this runs 32 channels and 33 scales at 0.8%.
+for **8 channels at one scale**; this runs 32 channels and 33 scales at 2.2%.
 
 **FPS does not compare and is the trap.** Their 467.3 fps is the PL module's throughput for ONE
 scale with the PS cropping and DMAing the patch; their 150 fps for 3 scales is a projection they
 state as one. This project's 38.04 FPS is measured wall clock for a whole frame that is 84%
-CPU-bound. A like-for-like row (`SCALE_N=1`, AIE/PL share isolated from the APU tail) is cheap and
-has **not been built — do not quote one until it is**. Energy has no counterpart at all: they
+CPU-bound. The `SCALE_N=1` half of a like-for-like row **was built on 2026-09-04** (`R-16`) and
+removing the 33-scale filter they do not have is worth **0.34 ms of a 25 ms frame** (25.16 →
+24.82, ssh) — `TAIL_PARALLEL` hides the scale path behind the filter update, so the obvious
+objection is measured and does not close the gap. **A single quotable FPS number is still
+blocked, on the INSTRUMENT**: `frame_budget.csv` isolates the AIE/PL share for the 128x128/ch16
+arm only, and the shipping arm has never been timed on the serial console (over UART it would be
+≈27.9 ms ≈ 35.9 FPS, `P-09`'s 3.79 ms transport). `embedded_comparison.md` sec.3.1-3.2. Energy has no counterpart at all: they
 report none, nor does any of the 25 works they review, so `P-12`'s 12.2 mJ/frame fills a gap
 rather than winning a contest.

@@ -1,6 +1,18 @@
-# Against the nearest published embedded equivalent: the cost axis is comparable and this design wins it 20-54x; the tracking axis is not comparable at all
+# Against the nearest published embedded equivalent: the cost axis is comparable and this design wins it 8.6-25x; the tracking axis is not comparable at all
 
-**Status:** current · **Updated:** 2026-09-03 · **Scope:** Danilowicz & Kryjak 2022 vs this work — what compares, what does not, the two orderings that transfer, and the measured EAO window term
+**Status:** current · **Updated:** 2026-09-04 · **Scope:** Danilowicz & Kryjak 2022 vs this work — what compares, what does not, the two orderings that transfer, and the measured EAO window term
+
+> **WHERE THIS ENDED UP.** Two corrections, both 2026-09-04, neither reversing a verdict.
+>
+> - **Section 2's ratios were measured against the wrong build and every one of them fell**:
+>   LUT 20.4x → **14.9x**, FF 44.4x → **25.2x**, BRAM36 54.1x → **20.8x**, DSP 10.9x → **8.6x**.
+>   Section 2 carries the corrected table; section 6 records what was wrong. **The headline is
+>   "8.6-25x", not "20-54x".**
+> - **Section 3's like-for-like row HAS now been built** — `SCALE_N=1` on the board, for `R-16`.
+>   Removing the 33-scale DSST filter they do not have is worth **0.34 ms of a 25 ms frame**, so
+>   the obvious objection to section 3's position is answered and the position is unchanged.
+>   A single quotable FPS number is still blocked, but on the INSTRUMENT now, not the arm — see
+>   sections 3.1 and 3.2.
 
 **2026-09-03.** No new run. Danilowicz & Kryjak 2022 (`docs/papers/danilowicz2022_embedded_dcf.pdf`)
 against this project's existing `results/resources.csv`, `results/perf.csv`, `results/power.csv`
@@ -66,17 +78,26 @@ Both sides are post-implementation utilisation of a named device for a named bui
 **Quote the absolute counts.** The percentages are in the CSV only so each number traces back
 to its source table — the devices are not the same size, so percent flatters this work:
 
+**Corrected 2026-09-04** — this work's column is now the ROUTED shipping build
+(64x64 / ch32 / 7x7-s2 / RGB), not the HLS estimate it used to be; see section 6.
+
 | resource | deepDCF (ZCU104) | this work (VEK280) | ratio |
 |---|---|---|---|
-| LUT | 156,663 (68.0%) | 7,694 (1.5%) | **20.4x** |
-| FF | 334,373 (72.6%) | 7,539 (0.7%) | **44.4x** |
-| BRAM (36Kb equiv.) | 270.5 (86.7%) | 5 (0.8%) | **54.1x** |
-| DSP | 480 (27.8%) | 44 (3.4%) | **10.9x** |
+| LUT | 156,663 (68.0%) | 10,527 (2.0%) | **14.9x** |
+| FF | 334,373 (72.6%) | 13,252 (1.3%) | **25.2x** |
+| BRAM (36Kb equiv.) | 270.5 (86.7%) | 13 (2.2%) | **20.8x** |
+| DSP | 480 (27.8%) | 56 (4.3%) | **8.6x** |
 | AIE-ML cores | — | 6 of 304 (2.0%) | no counterpart |
+| AIE-ML memory tiles | — | 2 of 76 (2.6%) | no counterpart |
+
+This work's column **includes the base platform** (LUT 3,028 / FF 3,729 / BRAM 0 / DSP 0), which
+is the conservative choice: the two PL kernels alone are LUT 7,499 and FF 9,523, which would read
+20.9x and 35.1x. **Quote the platform-inclusive ratios** unless their Table 2 can be shown to
+exclude their own shell, which the paper does not say.
 
 **And the explanation is the architecture, not cleverness — say so in the write-up.** The
 transforms did not get cheaper; they moved off the fabric onto 6 of 304 AIE-ML cores. The claim
-that survives scrutiny is *"the same algorithm class costs 20-54x less programmable-logic fabric
+that survives scrutiny is *"the same algorithm class costs 8.6-25x less programmable-logic fabric
 when the FFT/conv/cmul chain runs on an AIE array"*, which is a result about the platform choice
 and is exactly what `cha:przeglad` sets up. The claim that does not survive is any suggestion
 that this is a better-engineered filter.
@@ -87,7 +108,7 @@ uniformly generous, and the DSP row is the one place where absolute and relative
 same story.
 
 Their design is also **at the edge of its device** — 86.7% BRAM and 72.6% FF for **8 channels at
-one scale**. This project runs 32 channels and 33 scales at 0.8% BRAM. That headroom is the
+one scale**. This project runs 32 channels and 33 scales at 2.2% BRAM. That headroom is the
 practical form of the result and is worth one sentence.
 
 ## 3. THROUGHPUT DOES NOT COMPARE AS FPS — and this is the trap
@@ -100,13 +121,66 @@ including the APU tail, on a frame that is **84% CPU-bound** (`P-02`) and that c
 33-scale DSST filter they do not have.
 
 Put those in one column and a reader will divide them and conclude this design is 4x slower. The
-defensible statements are narrower and there are two of them:
+defensible statements are narrower and there are three of them:
 
 - **Neither number bounds the other**, because they measure different spans of the pipeline.
-- **A like-for-like row is buildable and cheap**: this project at `SCALE_N=1` removes the DSST
-  filter they do not have, and `results/frame_budget.csv` already isolates the AIE/PL share from
-  the APU tail. That is the row to build if the thesis wants a speed comparison at all.
-  **It has not been built, so do not quote one.**
+- **The scale-filter half of a like-for-like row was BUILT on 2026-09-04, and it buys 0.34 ms.**
+  See below — the obvious way to close the gap is now measured, and it does not close it.
+- **The shipping arm now HAS a serial-console frame time and a per-stage budget** (2026-09-04):
+  25.82 ms = 38.7 FPS, `results/frame_budget.csv` column `l1relu_ms`. So a like-for-like row is
+  now buildable end to end — see 3.2.
+
+### 3.1 The `SCALE_N=1` row exists now, and it is nearly a null (2026-09-04)
+
+**Corrects this section**, which said until now that the row "has not been built". It has:
+`runs/vot/0904_1225-l1relu_s1`, `arms.csv` row `rgb_l1relu_s1`, built for `R-16` rather than for
+this comparison. Its `app.flagstamp` differs from the shipping arm on `-DSCALE_N=33` →
+`-DSCALE_N=1` and nothing else; `aie.flagstamp` and `crop.flagstamp` are identical. So it is
+exactly the arm this section asked for: **this tracker with the 33-scale DSST filter they do not
+have removed.**
+
+| | shipping (`SCALE_N=33`) | scale-free (`SCALE_N=1`) | delta |
+|---|---|---|---|
+| frame time (ssh) | 25.16 ms | **24.82 ms** | **−0.34 ms** |
+| energy | 12.24 mJ/frame | 12.76 mJ/frame | no material change |
+
+**Removing a 33-scale filter is worth 0.34 ms of a ~25 ms frame**, and the reason was
+pre-registered in `fixed_point_cost.md`: `TAIL_PARALLEL=1` hides the ~2.89 ms scale path behind
+the ~4.80 ms filter update on the second core, so deleting it frees a core that was not the
+critical path. **This strengthens section 3 rather than weakening it.** The intuitive rebuttal —
+*"of course they are faster, they do not run 33 scales"* — is now measured and is worth ~1.4% of
+the frame. The gap to their 467.3 fps is not the scale filter; it is that their number times a PL
+module and this one times a whole CPU-bound frame.
+
+**Do not quote the 12.76 mJ as a scale-filter energy cost.** It moved the wrong way against a
+smaller frame time, and `fixed_point_cost.md` attributes that to console I/O and per-frame
+flushes landing on the APU rail, which carries 68% of the dynamic power (`P-12`).
+
+### 3.2 What is still missing, and it is a measurement not an argument
+
+Both gaps that stood here on 2026-09-04 have since been closed by the console run
+(`evidence/frame_time_shipping.md`). Kept with their resolutions, because the second one records
+an estimate this note got wrong:
+
+1. ~~**`frame_budget.csv` is the wrong build.**~~ **RESOLVED 2026-09-04**: it now carries an
+   `l1relu_ms` column for the shipping arm (VOT `car1`, 742 frames, 0 gated). The PL/AIE share is
+   `roi_crop launch` **7.422 ms** plus GMIO **9.960 ms** against an APU wall of **7.045 ms** — and
+   the caveat that matters for any comparison with a PL-only throughput figure is that
+   **99% of the roi_crop item is the host POLLING `ap_done`**, so it is PL latency presenting as
+   host time, not PL work the way their Fig. 2 module reports it.
+2. ~~**The two FPS figures are on different instruments.**~~ **MEASURED 2026-09-04, and the
+   estimate this bullet carried was WRONG.** The shipping arm now has a serial-console run:
+   **25.82 ms = 38.7 FPS** on `car1`, 742 frames, 0 gated, with the ssh twin of the same ELF at
+   24.91 ms. **The transport term is 0.91 ms, not 3.79** — `P-09` measured the UART at
+   progress-every-frame and this build prints at `PROGRESS_EVERY=25`, so the cost scales with
+   bytes on the wire. My arithmetic estimate of ≈27.9-29.0 ms was **1.5-3.2 ms too high**, which
+   is exactly the failure `M-09` warns about and exactly why it was labelled arithmetic rather
+   than quoted. `evidence/frame_time_shipping.md`, `P-14`.
+
+So the honest position for the thesis is unchanged in substance: **give their number and this
+one in separate rows with their spans named, and do not divide them.** What has changed is that
+the one cheap objection to that position — "just turn the scale filter off" — has been tested and
+answered.
 
 ## 4. ENERGY HAS NO COUNTERPART
 
@@ -162,7 +236,55 @@ decisions.** No arm accepted at [115, 755] would have been rejected at [108, 371
 stating plainly, because it bounds the damage: the window artefact invalidates cross-paper
 comparison, not this project's own internal history.
 
-### Controls
+### 6. 2026-09-04 — THE COST TABLE WAS MEASURED ON THE WRONG BUILD
+
+No new run: the shipping build's routed reports were already on disk and had never been read.
+
+**What section 2's "this work" column actually was.** `results/resources.csv`'s PL rows —
+LUT 7,694 / FF 7,539 / BRAM18 10 / DSP 44 — reproduce byte-for-byte from
+`build/hw_emu/128x128/ch1/_x/reports/roi_crop.hw_emu/hls_reports/roi_crop_csynth.rpt`,
+the **"Utilization Estimates" summary of `roi_crop`'s HLS C-synthesis**. So the column was:
+
+- **one kernel**, not the design — no `camera_capture`, no base platform, nothing the linker adds;
+- an **estimate**, not a placed-and-routed result;
+- from an **`hw_emu`** build, not a `hw` one;
+- and from **128x128 / ch1 / grayscale** — a single-channel build that has never produced a
+  tracking number in `arms.csv`.
+
+Section 2's own opening sentence — *"Both sides are post-implementation utilisation of a named
+device for a named build"* — was therefore true of their side only. **The comparison put their
+8-channel RGB design against this project's 1-channel gray one.**
+
+**The corrected numbers**, from `build/hw/64x64/ch32` (`aie.flagstamp` verified as the shipping
+config), `impl_1_full_util_routed.rpt` and `impl_1_kernel_util_routed.rpt`:
+
+| | old ("this work") | shipping, routed | ratio then → now |
+|---|---|---|---|
+| LUT | 7,694 | **10,527** (kernels 7,499 + platform 3,028) | 20.4x → **14.9x** |
+| FF | 7,539 | **13,252** (kernels 9,523 + platform 3,729) | 44.4x → **25.2x** |
+| BRAM36-equiv | 5 | **13** (12x RAMB36 + 2x RAMB18, all `roi_crop`) | 54.1x → **20.8x** |
+| DSP | 44 | **56** (`roi_crop` 53, `camera_capture` 3) | 10.9x → **8.6x** |
+| AIE-ML memory tiles | 1 | **2** | — |
+
+**The memory-tile count was wrong on every build, not just this one.** `MEMTILE_TRANSPOSE=1`
+instantiates two shared buffers, and `128x128/ch16`, `64x64/ch16` and `64x64/ch32` all report
+`memTileFwd` + `memTileInv` in `aie_control_config.json`. The core count of 6 was right
+everywhere — the graph is fixed and channels are processed serially.
+
+**Why this matters even though the conclusion is unchanged.** A reviewer who opens the routed
+report finds a number 37% larger in LUT and 76% larger in FF than the thesis quotes, in the
+section whose whole argument is that this design is small. The ratios remain decisive and the
+mechanism claim (the transforms moved to the AIE array) is untouched — but "20-54x" was not a
+number this project had measured.
+
+**The rule this cost.** *A resource claim must name the report file it came from, and that file
+must be a routed implementation of the arm that produced the tracking numbers.* An HLS estimate
+and a routed utilisation are different quantities with the same column headings, which is exactly
+the shape of `M-05` and of the two-statistics-both-called-PSR trap — the same failure applied to
+device utilisation. The old row set is kept in `resources.csv` under `build=roi_crop_hls_128ch1`,
+marked non-quotable, because five documents quoted it.
+
+## Controls
 
 - **The published column is the control and it is exact.** All eight `eao_115_755` values
   reproduce their `results/arms.csv` rows to four decimals — 0.1367, 0.1474, 0.1600, 0.1629,
@@ -216,3 +338,8 @@ comparison, not this project's own internal history.
   channel-filter modules of their Fig. 3, which is the part this project moved to AIE.
 - The percentage columns were the first thing written here and they overstated the result at
   every row. Absolute counts, then the device-size caveat, is the order that survives review.
+- **Do not go back to the 20-54x figures.** They are an HLS estimate of one kernel on a
+  single-channel gray build; section 6 records how they got here. `resources.csv` keeps them
+  under `build=roi_crop_hls_128ch1` so the provenance is traceable, not so they can be requoted.
+- **Do not compare an HLS `csynth` estimate with anyone's routed table**, in either direction.
+  They differ in what they contain (one kernel vs the design) as well as in accuracy.

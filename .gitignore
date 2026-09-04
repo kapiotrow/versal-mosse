@@ -55,3 +55,7 @@ docs/thesis/figures/*.pdf
 docs/thesis/figures/*.png
 # Generated LaTeX tables: the CSVs in docs/thesis/results/ are the source.
 docs/thesis/tables/*.tex
+
+# Pinned third-party checkouts (Danilowicz deepDCF). Fetched, never vendored --
+# see the DeepDCF block in scripts/offline_multistart.py.
+/external/

@@ -1,0 +1,28 @@
+date       2026-09-04
+purpose    frame time + per-stage frame budget for the SHIPPING arm (rgb_l1relu),
+           on the serial console and over ssh. Closes the gap that perf.csv's best
+           row (26.29 ms, 38.04 FPS) was a gray ch16 3x3 128x128 build the board no
+           longer runs, while every shipping-arm frame time was ssh-only.
+xclbin_md5 65ed581a8cca32feb55978a585d0f351   (on the card, = build/hw/64x64/ch32/package/sd_card/a.xclbin)
+weights    d8a7d6ff009841cc12481c858e5f1f42
+git        c3ae63e40211dfd1256e63f530cf817e09f9e137 DIRTY
+
+runs, all with the SAME ELF a31696c5472302338d7d42ecdd8411c0 (mosse_tracker.perfV.elf),
+which differs from the 0904 SCALE_N=1 sweep ELF on exactly -DSCALE_N:
+  runV_uart.log   car1 job 0, 742 frames, stdout -> /dev/ttyAMA0 (115200)  25.82 ms
+  runV_ssh.log    car1 job 0, 742 frames, stdout -> ssh pipe              24.91 ms
+  transport term = 0.91 ms
+
+synthetic-scene runs, ELF dd2ae52ad93b7cfc0781b375d1503b99 (perfA, FRAME_SOURCE=synth,
+ITER_CNT=200). NOT QUOTABLE -- see runA0_file_stdout.log and the note: the shipping arm
+does not track the synthetic scene (128 of 199 frames NEGATIVE_PEAK-gated, mean IoU 0.69),
+so the tail runs on 0.4 calls/frame and the UART number is dominated by warning spam.
+  runA0_file_stdout.log  stdout -> file   23.23 ms   (tail UNDER-counted)
+  console_session.log    stdout -> UART   58.53 ms   (gating spam, 6 lines x 128 frames)
+
+instrument  the console is /dev/ttyUSB1 at 115200 on the PC. Root login on the board is
+            LOCKED (board_provision.sh: key-only ssh is the deliberate posture) and the
+            petalinux account demands a forced password change, so the UART runs were
+            launched over ssh with stdout redirected to the board's console tty
+            /dev/ttyAMA0. Verified equivalent: stdout is still a tty (line buffered) and
+            every byte still crosses the same 115200 UART. No board state was changed.

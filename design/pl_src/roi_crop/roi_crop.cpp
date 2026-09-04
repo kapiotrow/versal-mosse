@@ -44,8 +44,16 @@
  *   memory        one BRAM scratch patch (16 KB at ROI_IN_CH=1, 48 KB at 3).
  *                 sum_x2 peaks at 2.111e14 against ap_uint<48>'s 2.815e14, so a
  *                 FOURTH plane would not fit; the reference model asserts the width.
- *   PL resources  BRAM18 10 of 1200, DSP 44 of 1312, LUT 7694, FF 7539 for the
- *                 whole design. docs/thesis/results/resources.csv.
+ *   PL resources  ROUTED, shipping build: this kernel is LUT 5983, FF 7738,
+ *                 DSP 53, 13 BRAM tiles (= 26 BRAM18) — nearly all of the
+ *                 design's PL cost. Whole routed design incl. the base platform:
+ *                 LUT 10527 of 520704, FF 13252 of 1041408, DSP 56 of 1312,
+ *                 BRAM18 26 of 1200. docs/thesis/results/resources.csv
+ *                 (build=rgb_l1relu). The figures this line carried until
+ *                 2026-09-04 (LUT 7694 / FF 7539 / DSP 44 / BRAM18 10, "the
+ *                 whole design") were THIS FILE's HLS csynth ESTIMATE on an
+ *                 hw_emu single-channel gray build — not a routed number and not
+ *                 the whole design. See embedded_comparison.md sec.6.
  *   bilinear      Still NEVER EXERCISED ON HARDWARE: every build to date has
  *                 roi_h == patch_rows, which collapses the interpolator to a copy.
  *                 Real ground-truth boxes would activate it for the first time.

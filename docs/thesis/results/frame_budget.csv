@@ -1,10 +1,27 @@
-# Where the frame goes. VERBOSITY=0, serial console, synthetic scene.
-# gray = run_0821_1725, RGB = run_0824_1457. Quote FPS only from a serial-console run.
-stage,gray_ms,rgb_ms,note,stage_pl
-APU subtotal,15.639,17.442,,suma czasów APU
-of which overlapped on core 1,-2.762,-2.746,ran concurrently,w tym wykonane równolegle na rdzeniu 1
-APU wall,12.876,14.696,what the frame actually spent,rzeczywisty czas APU
-GMIO total,11.134,11.133,async 6.6 / wait 4.5 — UNCHANGED by RGB,GMIO łącznie
-roi_crop launch,1.013,1.471,"channel 0 Stage A, structurally exposed",uruchomienie roi_crop
-unattributed,1.261,1.284,"residual — printed, not hidden",nieprzypisane
-frame total,26.29,28.58,,klatka łącznie
+# Where the frame goes. VERBOSITY=0.
+#
+# gray/rgb  = the 128x128 / ch16 / 3x3 arm on the SYNTHETIC scene, serial console,
+#             run_0821_1725 / run_0824_1457, 200 frames.
+# l1relu    = the SHIPPING arm (64x64 / ch32 / 7x7-s2 / RGB) on VOT car1 job 0, 742 frames,
+#             741/742 accepted and 0 gated, 2026-09-04. Serial console (stdout -> the board's
+#             /dev/ttyAMA0 at 115200); the ssh twin of the same ELF and sequence read 24.91 ms
+#             and differed ONLY in the unattributed row (0.485 vs 1.389) -- the transport term
+#             is 0.91 ms and lands entirely in the console bucket, which is the control.
+#             runs/perf/0904_l1relu_console/, evidence/frame_time_shipping.md.
+#
+# THE STAGE LISTS ARE NOT THE SAME EXPERIMENT. Quote a column, never a row-wise difference
+# between columns: the arms differ in geometry, channel count, kernel, scene AND frame source.
+# The shipping column is the one the thesis should use -- it is the arm that produced
+# arms.csv's A/R/EAO.
+#
+# Quote FPS only from a serial-console run (measurement.md). The shipping arm is 25.82 ms =
+# 38.7 FPS there; the historical 26.29 ms / 38.04 FPS is a DIFFERENT ARM on a DIFFERENT scene,
+# so the two are adjacent, not a ladder step -- see perf.csv's header.
+stage,gray_ms,rgb_ms,l1relu_ms,note,stage_pl
+APU subtotal,15.639,17.442,9.627,,suma czasów APU
+of which overlapped on core 1,-2.762,-2.746,-2.582,ran concurrently,w tym wykonane równolegle na rdzeniu 1
+APU wall,12.876,14.696,7.045,what the frame actually spent,rzeczywisty czas APU
+GMIO total,11.134,11.133,9.960,async 6.8 / wait 3.1 on the shipping arm — only 31% blocks,GMIO łącznie
+roi_crop launch,1.013,1.471,7.422,"SHIPPING ARM: 99% of it is the ap_done POLL (7.495 of 7.569 ms, 0.23 ms x 32 channels) — a busy-wait on the PL, not host work",uruchomienie roi_crop
+unattributed,1.261,1.284,1.389,"residual — printed, not hidden; carries the console transport (0.485 over ssh)",nieprzypisane
+frame total,26.29,28.58,25.82,,klatka łącznie

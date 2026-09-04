@@ -43,6 +43,10 @@ from pathlib import Path
 
 import numpy as np
 
+# Danilowicz & Kryjak's checkout. Gitignored and PINNED -- see the DeepDCF
+# block below for the commit and why it is not vendored into this repo.
+DEEP_ROOT_DEFAULT = str(Path(__file__).resolve().parent.parent / "external" / "deep_mosse")
+
 
 # --------------------------------------------------------------------------
 # Tracker backends. A backend is init(image, box) -> None and update(image) ->
@@ -150,6 +154,172 @@ class OpenCV:
         return self.last
 
 
+# --------------------------------------------------------------------------
+# DANILOWICZ & KRYJAK'S deepDCF -- THEIR PUBLISHED CODE, on THIS benchmark.
+#
+# WHY THIS EXISTS. Their tracker is the architecturally nearest neighbour in the
+# literature (conv1 features into a multichannel MOSSE, quantised, on an
+# embedded SoC-FPGA, at this project's own 128x128 ROI -> 64x64 filter
+# geometry), but their numbers are VOT2015 supervised with an inverted R, a
+# [108,371] EAO window and polygon ground truth -- M-17, and the window term
+# alone is 1.39x this project's whole arm ladder. NONE of that has to be
+# reconciled if their tracker is run HERE instead: same 62 sequences, same 419
+# anchored runs, same vot_ingest -> `vot analysis` path that R-12 validated
+# against published CSRDCF. Bring their tracker to our benchmark, never the
+# reverse -- the reverse needs a VOT2015 conversion AND the supervised/reset
+# protocol this harness does not implement, i.e. a second unvalidated path.
+#
+# THE CODE IS UNMODIFIED. external/deep_mosse is a pinned clone of
+# github.com/mdanilow/MOSSE_fpga @ ee0f93ab (branch deep_features, MIT), and
+# nothing in it is patched: their float path builds torchvision vgg11
+# features[:3] (conv 3x3 -> ReLU -> 2x2 maxpool) and runs as published. Anything
+# that ever DOES need patching belongs in scripts/patches/ as a reviewable diff,
+# never as an edit in place -- the whole value of this comparison is that the
+# algorithm is theirs.
+#
+# WHAT CANNOT BE REPRODUCED, and it must be said in the write-up: their 4-bit
+# QUANTIZED arm -- the one that actually ran on the ZCU104 -- needs
+# `savegame_0_15000.pth.tar`, referenced by an absolute path on the author's
+# machine and NOT in the repo. So these arms are their SOFTWARE MODEL. Their
+# own section 6 licenses that stand-in: the hardware "yielded the same results
+# on sequences from the VOT2015 set" as the software model.
+#
+# THE SIGMA CONFOUND, found while reading _get_gauss_response and worth as much
+# as the comparison itself. Their response is exp(-r^2 / (2*sigma)) with r in
+# FEATURE-MAP BINS and the map at ROI_SIZE/stride, while `sigma` is a single
+# global config value with no geometry term. So their Table 1 row that reports
+# +0.024 EAO for the 224/112 geometry over 128/64 moves the map AND the mainlobe
+# width together -- which is precisely the confound R-11 caught in this
+# project's own 64x64 arm, where the gain turned out to be the width the arm
+# carried by accident and the resolution term was a null (R-14). Their ordering
+# is the last external support for a 128x128 Layer-1 arm, so the `hw32w` preset
+# below exists to separate the two terms IN THEIR TRACKER: same map as `hw32`,
+# sigma rescaled to hold the width. sigma is a VARIANCE in this parameterisation
+# (std = sqrt(sigma)), so holding std/target across a 2x map change scales sigma
+# by 4: 7 -> 1.75.
+DEEP_PRESETS = {
+    # their configs/config.json verbatim -- Table 1's best software row
+    # (EAO 0.207, results/embedded_baselines.csv)
+    "best":  dict(ROI_SIZE=224, num_scales=5, channels=32, sigma=7),
+    # the geometry that went to the ZCU104 (Table 1's hardware row, EAO 0.183,
+    # results/embedded_baselines.csv)
+    "hw":    dict(ROI_SIZE=128, num_scales=3, channels=8,  sigma=7),
+    # ...at THIS project's channel count, so only the algorithm differs
+    "hw32":  dict(ROI_SIZE=128, num_scales=3, channels=32, sigma=7),
+    # ...and at matched MAINLOBE WIDTH. The R-11 control on their own tracker.
+    "hw32w": dict(ROI_SIZE=128, num_scales=3, channels=32, sigma=1.75),
+}
+
+_DEEP = {}
+
+
+def _deep_setup(root):
+    """Per-WORKER setup, cached: import their package, memoize the backbone.
+
+    DeepMosse.__init__ calls get_VGG_backbone() per instance and this harness
+    builds one tracker per RUN (419 of them), so an unmemoized backbone is 419
+    vgg11 constructions. The memo wraps THEIR function from outside rather than
+    editing it -- see the note above about keeping their code unmodified.
+    """
+    key = str(root)
+    if key not in _DEEP:
+        import sys, json
+        rp = Path(root)
+        if not (rp / "deep_mosse.py").exists():
+            raise SystemExit(
+                f"no deepDCF checkout at {rp}.\n"
+                f"  /usr/bin/git clone https://github.com/mdanilow/MOSSE_fpga "
+                f"{rp}\n"
+                f"  cd {rp} && /usr/bin/git checkout ee0f93ab183d8b2f712de039f1ec6d4776847fb2\n"
+                f"NOTE /usr/bin/git explicitly: Vivado puts its own git 2.50.0 "
+                f"first on PATH and that build has no https remote helper.\n"
+                f"Deps: uv pip install easydict imutils fxpmath brevitas")
+        # THEIR ROOT GOES ON sys.path ONLY FOR THE DURATION OF THE IMPORT, and
+        # this is not tidiness. Their repo ships a top-level `vot.py` -- the VOT
+        # toolkit's own tracker-integration stub -- which SHADOWS the installed
+        # `vot` package the moment their directory is on the path. The symptom
+        # is `ModuleNotFoundError: No module named 'vot.dataset'; 'vot' is not a
+        # package` from plan_sequence, i.e. this harness losing the toolkit
+        # underneath itself. Their `utils` and `finnmodels` are equally generic.
+        # Import under priority, then restore, so only sys.modules keeps them.
+        saved = list(sys.path)
+        sys.path.insert(0, str(rp))
+        try:
+            import deep_mosse as DM
+            import utils as DU
+        finally:
+            sys.path[:] = saved
+        for mod in (DM, DU):
+            got = Path(mod.__file__).resolve().parent
+            if got != rp.resolve():
+                raise SystemExit(
+                    f"{mod.__name__} resolved to {got}, not the pinned "
+                    f"checkout {rp.resolve()} -- a name collision, not a "
+                    f"tracking result. Rename the shadowing module.")
+        import importlib
+        if importlib.import_module("vot").__file__ and \
+                Path(importlib.import_module("vot").__file__).resolve().parent == rp.resolve():
+            raise SystemExit(
+                "the installed `vot` toolkit is shadowed by their vot.py; "
+                "the restore above failed and no score from this run is valid.")
+        memo = {}
+        orig = DU.get_VGG_backbone
+
+        def cached(*a, **k):
+            if "b" not in memo:
+                memo["b"] = orig(*a, **k)
+            return memo["b"]
+
+        DM.get_VGG_backbone = cached
+        base = json.loads((rp / "configs" / "config.json").read_text())
+        _DEEP[key] = (DM, base)
+    return _DEEP[key]
+
+
+class DeepDCF:
+    """Danilowicz & Kryjak's DeepMosse behind this harness's init/update API.
+
+    Their tracker takes BGR (it is driven by cv2.imread in their own
+    vot_integration.py) and the toolkit hands out RGB, so the flip here is the
+    same one the OpenCV arms need -- and `opencv-kcf-rgb` is the standing
+    negative control proving the flip is not free to get wrong.
+    """
+    def __init__(self, preset, root):
+        if preset not in DEEP_PRESETS:
+            raise SystemExit(f"unknown deepdcf preset '{preset}'; "
+                             f"expected one of {sorted(DEEP_PRESETS)}")
+        self.preset, self.root = preset, root
+        _deep_setup(root)          # fail fast, in the parent
+
+    def _prep(self, image):
+        # ascontiguousarray, not a bare ::-1 view: their crop path goes straight
+        # into cv2.copyMakeBorder/cv2.resize, which want a real buffer.
+        import numpy as np
+        return np.ascontiguousarray(image[:, :, ::-1])
+
+    def init(self, image, box, gt=None):
+        DM, base = _deep_setup(self.root)
+        cfg = dict(base)
+        cfg.update(DEEP_PRESETS[self.preset])
+        # The 4-bit checkpoint is not in the repo (see above), so every arm here
+        # is the float software model. Pinned explicitly rather than inherited
+        # from their config file, which is what a reader will check first.
+        cfg["deep"], cfg["quantized"] = True, False
+        self.t = DM.DeepMosse(self._prep(image), [float(v) for v in box], cfg)
+        self.last = tuple(float(v) for v in box)
+
+    def update(self, image, gt=None):
+        b = self.t.track(self._prep(image))
+        # Their track() returns ints and holds the last box once target_lost is
+        # set. Both are the TRACKER's properties, not this harness's: an integer
+        # box cannot reach the oracle accuracy ceiling, exactly as for the cv2
+        # arms, and a hold is what the board does on a gate veto. Say so when
+        # reporting an A.
+        if b is not None and len(b) == 4 and b[2] > 0 and b[3] > 0:
+            self.last = tuple(float(v) for v in b)
+        return self.last
+
+
 def make_tracker(spec):
     if spec == "oracle":
         return Oracle(lag=0)
@@ -159,6 +329,10 @@ def make_tracker(spec):
         return Static()
     if spec.startswith("mosse:"):
         return None          # batch path; run_task dispatches, see run_mosse
+    if spec.startswith("deepdcf:"):
+        rest = spec.split(":", 1)[1]
+        preset, _, root = rest.partition("@")
+        return DeepDCF(preset, root or DEEP_ROOT_DEFAULT)
     if spec.startswith("opencv:"):
         kind = spec.split(":", 1)[1]
         if kind.endswith("-rgb"):          # the colour-order mutant
@@ -255,7 +429,14 @@ def run_mosse(seqdir, name, frames, spec, opts):
                      rect=res['rect'], chrel_gamma=res['chrel_gamma'],
                      stride=res['stride'], blur_n=res['blur_n'],
                      ceta_lo=res['ceta_lo'], pool_n=res['pool_n'],
-                     pool_mode_ov=res['pool_mode_ov'])
+                     pool_mode_ov=res['pool_mode_ov'],
+                     # THE BOARD'S FILTER QUANTIZATION (`-hq`, `-hq<pct>`).
+                     # Forwarded explicitly: an arm whose suffix parsed but
+                     # never reached run_arm would score as the plain twin and
+                     # look like a null, which is the failure this whole file
+                     # exists to make impossible.
+                     quant_h=res['quant_h'], smem=res['smem'],
+                     padding=opts.get('padding'))
     # run_arm works in CENTRE convention (row, col, h, w); the trajectory file
     # is TOP-LEFT (x, y, w, h). Same conversion as vot_source.cpp's as_text().
     return [(c - w / 2.0, r - h / 2.0, w, h) for r, c, h, w in rec['box']]
@@ -377,7 +558,11 @@ def main():
     ap = argparse.ArgumentParser(
         description=__doc__, formatter_class=argparse.RawDescriptionHelpFormatter)
     ap.add_argument("--tracker", required=True,
-                    help="oracle | oracle-lag1 | static | opencv:csrt | opencv:kcf | opencv:mil (append -rgb for the colour-order mutant) | mosse:<arm>, e.g. mosse:rgb-l1relu")
+                    help="oracle | oracle-lag1 | static | opencv:csrt | opencv:kcf | "
+                         "opencv:mil (append -rgb for the colour-order mutant) | "
+                         "mosse:<arm>, e.g. mosse:rgb-l1relu | "
+                         "deepdcf:<preset> (best|hw|hw32|hw32w), optionally "
+                         "deepdcf:<preset>@<path-to-checkout>")
     ap.add_argument("--arm", default=None, help="output arm name (default: the tracker spec)")
     ap.add_argument("--out", type=Path, default=None,
                     help="results root; one subdirectory per arm (default $VOT_ROOT/results-offline)")
@@ -393,12 +578,17 @@ def main():
     ap.add_argument("--psr-min", type=float, default=5.0, help="PSR_GATE_MIN")
     ap.add_argument("--sigma", type=float, default=None,
                     help="MOSSE_SIGMA in BINS; default 2.0 = sigma/target 1/16")
+    ap.add_argument("--padding", type=float, default=None,
+                    help="TARGET_PADDING. COUPLED TO --sigma: the target spans "
+                         "map/padding bins, so sigma/target = sigma*padding/map "
+                         "and 1/16 is the measured optimum (R-11). Padding 3.0 "
+                         "at the shipping sigma 2.0 is 1/10.7, not 1/16")
     ap.add_argument("--oracle-scale", action="store_true",
                     help="box size from groundtruth. The twin has NO DSST scale "
                          "filter; this and the default BRACKET what scale is worth")
     a = ap.parse_args()
     opts = dict(eta=a.eta, psr_min=a.psr_min, sigma=a.sigma,
-                oracle_scale=a.oracle_scale)
+                padding=a.padding, oracle_scale=a.oracle_scale)
 
     # Pin the thread pools BEFORE numpy/cv2 are imported in any worker.
     for v in ("OMP_NUM_THREADS", "OPENBLAS_NUM_THREADS", "MKL_NUM_THREADS",
@@ -440,6 +630,18 @@ def main():
               f"sigma {a.sigma or 'default 2.0'}, "
               f"scale {'ORACLE' if a.oracle_scale else 'HELD FIXED (no DSST filter)'}")
 
+    if a.tracker.startswith("deepdcf:"):
+        preset = a.tracker.split(":", 1)[1].partition("@")[0]
+        cfg = DEEP_PRESETS.get(preset, {})
+        print(f"  deepDCF preset {preset}: " +
+              ", ".join(f"{k} {v}" for k, v in cfg.items()) +
+              "\n  FLOAT software model (the 4-bit checkpoint is not in their "
+              "repo); their code UNMODIFIED at the pinned commit.")
+        if a.jobs > 4:
+            print(f"  NOTE --jobs {a.jobs}: the backbone runs on the GPU and "
+                  f"every worker opens its own CUDA context. Time a single "
+                  f"sequence before scaling this up.")
+
     print(f"tracker   {a.tracker}\narm       {arm}\nout       {outdir}")
     print(f"sequences {len(names)} from {seqdir}\njobs      {a.jobs}\n")
 
@@ -473,7 +675,13 @@ def main():
 
     if a.jobs > 1:
         import multiprocessing as mp
-        with mp.Pool(a.jobs) as pool:
+        # SPAWN, not the default fork, whenever a worker will touch CUDA:
+        # "Cannot re-initialize CUDA in forked subprocess". Spawn re-imports the
+        # module per worker (a few seconds each, once) and the pool is
+        # long-lived, so the cost is amortised over hundreds of runs. Every
+        # other backend keeps fork, which is cheaper to start.
+        ctx = mp.get_context("spawn") if a.tracker.startswith("deepdcf:") else mp
+        with ctx.Pool(a.jobs) as pool:
             for res in pool.imap_unordered(run_task, tasks, chunksize=1):
                 note(res)
     else:

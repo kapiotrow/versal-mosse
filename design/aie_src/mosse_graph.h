@@ -59,8 +59,15 @@
  *                 FRAME TIME: the frame is 84% CPU-bound, only 41% of GMIO
  *                 blocks, and RGB's +4.59 ms of conv2d does not appear in the
  *                 frame at all. Size host work first.
- *   utilisation   6 of 304 AIE-ML cores (2%), 1 of 76 memory tiles, BRAM18 10 of
- *                 1200, DSP 44 of 1312, LUT 7694 of 520704, FF 7539 of 1041408.
+ *   utilisation   ROUTED shipping build: 6 of 304 AIE-ML cores (2%), 2 of 76
+ *                 memory tiles, BRAM18 26 of 1200, DSP 56 of 1312, LUT 10527 of
+ *                 520704, FF 13252 of 1041408 (base platform included; the two
+ *                 PL kernels alone are LUT 7499 / FF 9523).
+ *                 docs/thesis/results/resources.csv, build=rgb_l1relu.
+ *                 CORRECTED 2026-09-04 — this line previously carried 1 memory
+ *                 tile / BRAM18 10 / DSP 44 / LUT 7694 / FF 7539, which was
+ *                 roi_crop's HLS csynth ESTIMATE on an hw_emu single-channel
+ *                 gray build, not a utilisation of this design.
  *                 Check any "we cannot afford it on AIE" claim against that: the
  *                 binding constraints here have always been TILE MEMORY (64 KB)
  *                 and host DMA orchestration, never core count. Note that the

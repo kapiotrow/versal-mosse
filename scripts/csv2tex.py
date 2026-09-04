@@ -79,10 +79,14 @@ TABLE_SPEC = {
         ("fps", "FPS", "r", "num"),
     ], lambda r: bool(r.get("frame_ms"))),
 
+    # Three arms; l1relu is the SHIPPING one and the column the thesis should quote.
+    # See the CSV header: the stage lists are not the same experiment, so a row-wise
+    # difference between columns is not a measurement of anything.
     "frame_budget": ("frame_budget.csv", [
         ("stage_pl", "Etap", "l", "text"),
         ("gray_ms", "Skala szarości [ms]", "r", "num"),
         ("rgb_ms", "RGB [ms]", "r", "num"),
+        ("l1relu_ms", "Arm docelowy [ms]", "r", "num"),
     ], lambda r: True),
 
     "apu_stages": ("apu_stages.csv", [
@@ -103,12 +107,15 @@ TABLE_SPEC = {
     ], lambda r: r.get("channel") in
        ("VCC_PSFP", "VCC1V1_LP4", "VCC_SOC", "VCCINT")),
 
+    # SHIPPING ARM ONLY. resources.csv also carries the superseded roi_crop_hls_128ch1 row
+    # set (an HLS estimate, not a utilisation) -- see that file's header. A table mixing the
+    # two would put an estimate and a routed number in the same column.
     "resources": ("resources.csv", [
         ("resource_pl", "Zasób", "l", "text"),
         ("available", "Dostępne", "r", "int"),
         ("used", "Wykorzystane", "r", "int"),
         ("percent", "Udział [\\%]", "r", "num"),
-    ], lambda r: True),
+    ], lambda r: r.get("build") == "rgb_l1relu"),
 
     "aie_compute": ("aie_compute.csv", [
         ("kernel", "Jądro", "l", "text"),
